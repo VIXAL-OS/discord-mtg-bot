@@ -1,0 +1,24 @@
+{
+  "name": "Limited Aggro",
+  "format": "limited",
+  "description": "40-card aggro: tests 40-card minimum, small library, 20 life, duplicates allowed, basic combat keywords.",
+  "colors": ["R", "W"],
+  "cards": [
+    {"name": "Goblin Shortcutter", "quantity": 2},
+    {"name": "Akroan Crusader", "quantity": 2},
+    {"name": "Cavalry Pegasus", "quantity": 2},
+    {"name": "Boros Elite", "quantity": 2},
+    {"name": "Lightning Strike", "quantity": 2},
+    {"name": "Shock", "quantity": 2},
+    {"name": "Pacifism", "quantity": 2},
+    {"name": "Skyknight Legionnaire", "quantity": 2},
+    {"name": "Blade Instructor", "quantity": 2},
+    {"name": "Goblin Motivator", "quantity": 1},
+    {"name": "Healer's Hawk", "quantity": 2},
+    {"name": "Leonin Vanguard", "quantity": 1},
+    {"name": "Inspiring Captain", "quantity": 1},
+    {"name": "Fireblade Artist", "quantity": 1},
+    {"name": "Mountain", "quantity": 8},
+    {"name": "Plains", "quantity": 8}
+  ]
+}

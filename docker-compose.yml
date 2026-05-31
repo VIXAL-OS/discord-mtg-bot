@@ -1,0 +1,26 @@
+# discord-mtg-bot turnkey deploy.
+#
+#   docker compose up -d --build     # first run (and after `git pull`)
+#   docker compose logs -f           # watch it connect
+#   docker compose down              # stop
+#
+# Requires a .env (DISCORD_TOKEN + ANTHROPIC_API_KEY; see .env.example) and a
+# config.json (see config.json.example) in this directory.
+services:
+  bot:
+    build: .
+    container_name: discord-mtg-bot
+    restart: unless-stopped
+    env_file: .env            # DISCORD_TOKEN, ANTHROPIC_API_KEY, (optional) DEEPSEEK_API_KEY
+    volumes:
+      # Secrets + persistent state on the HOST, not the image.
+      - ./config.json:/app/config.json:ro    # channel IDs + tokens (gitignored)
+      - ./data:/app/data                      # decks, card cache, game saves
+      - ./logs:/app/logs                      # autoplay console + discord logs
+      # XMage rules bridge (Tier 2.5) — the JAR + its generated card-DB cache.
+      # Build the JAR on the host (`cd rules/xmage-bridge && mvn package`); these
+      # mounts then pick it up with no image rebuild. Optional: absent => the
+      # engine falls back to template + LLM resolution (no crash).
+      - ./rules/xmage-bridge/target:/app/rules/xmage-bridge/target
+      - ./rules/xmage-bridge/db:/app/rules/xmage-bridge/db
+      - ./db:/app/db

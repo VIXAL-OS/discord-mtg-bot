@@ -1,0 +1,29 @@
+# Keep the build context (and image) lean.
+.git
+.gitignore
+.claude/
+venv/
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+
+# Secrets + mutable state — bind-mounted via docker-compose.yml instead
+.env
+config.json
+data/
+logs/
+*.log
+mageserver.log
+**/mageserver.log
+
+# XMage bridge assets + generated card-DB caches — bind-mounted at runtime, NOT
+# baked. The JAR is gitignored (build with `mvn package`); the db/ dirs are the
+# JAR's regenerated card-scan cache.
+db/
+rules/xmage-bridge/db/
+rules/xmage-bridge/target/
+
+# Docs / assets not needed at runtime
+docs/
+README.md

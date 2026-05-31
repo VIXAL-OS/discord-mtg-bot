@@ -1,0 +1,20 @@
+{
+  "name": "Mono-Red Burn",
+  "format": "modern",
+  "description": "60-card burn: tests 20 life, 4-of, haste, prowess, suspend (Rift Bolt), direct damage math.",
+  "colors": ["R"],
+  "cards": [
+    {"name": "Goblin Guide", "quantity": 4},
+    {"name": "Monastery Swiftspear", "quantity": 4},
+    {"name": "Eidolon of the Great Revel", "quantity": 4},
+    {"name": "Lightning Bolt", "quantity": 4},
+    {"name": "Lava Spike", "quantity": 4},
+    {"name": "Rift Bolt", "quantity": 4},
+    {"name": "Searing Blaze", "quantity": 4},
+    {"name": "Skullcrack", "quantity": 4},
+    {"name": "Light Up the Stage", "quantity": 3},
+    {"name": "Shard Volley", "quantity": 2},
+    {"name": "Searing Blood", "quantity": 3},
+    {"name": "Mountain", "quantity": 20}
+  ]
+}

@@ -1,0 +1,20 @@
+{
+  "name": "Mono-Red Burn (Pauper)",
+  "format": "pauper",
+  "description": "60-card commons-only burn: tests 20 life, 4-of, suspend (Rift Bolt), landfall (Searing Blaze), alt sac costs (Fireblast/Shard Volley), tap-untap activation (Thermo-Alchemist), prowess-like trigger (Kiln Fiend), and pauper banlist enforcement (no Monastery Swiftspear — it's banned in pauper).",
+  "colors": ["R"],
+  "cards": [
+    {"name": "Lightning Bolt", "quantity": 4},
+    {"name": "Lava Spike", "quantity": 4},
+    {"name": "Chain Lightning", "quantity": 4},
+    {"name": "Rift Bolt", "quantity": 4},
+    {"name": "Searing Blaze", "quantity": 4},
+    {"name": "Fireblast", "quantity": 4},
+    {"name": "Shard Volley", "quantity": 4},
+    {"name": "Incinerate", "quantity": 4},
+    {"name": "Lightning Strike", "quantity": 4},
+    {"name": "Thermo-Alchemist", "quantity": 4},
+    {"name": "Kiln Fiend", "quantity": 4},
+    {"name": "Mountain", "quantity": 16}
+  ]
+}

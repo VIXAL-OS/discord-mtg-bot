@@ -1,0 +1,33 @@
+{
+  "name": "Jund Midrange",
+  "format": "modern",
+  "description": "60-card midrange: tests discard, cascade (Bloodbraid Elf), planeswalker activation, diverse removal.",
+  "colors": ["B", "R", "G"],
+  "cards": [
+    {"name": "Tarmogoyf", "quantity": 4},
+    {"name": "Bloodbraid Elf", "quantity": 4},
+    {"name": "Ragavan, Nimble Pilferer", "quantity": 4},
+    {"name": "Scavenging Ooze", "quantity": 2},
+    {"name": "Thoughtseize", "quantity": 4},
+    {"name": "Lightning Bolt", "quantity": 4},
+    {"name": "Fatal Push", "quantity": 3},
+    {"name": "Kolaghan's Command", "quantity": 2},
+    {"name": "Assassin's Trophy", "quantity": 2},
+    {"name": "Liliana of the Veil", "quantity": 3},
+    {"name": "Wrenn and Six", "quantity": 2},
+    {"name": "Inquisition of Kozilek", "quantity": 2},
+    {"name": "Verdant Catacombs", "quantity": 4},
+    {"name": "Bloodstained Mire", "quantity": 2},
+    {"name": "Wooded Foothills", "quantity": 2},
+    {"name": "Blood Crypt", "quantity": 2},
+    {"name": "Stomping Ground", "quantity": 1},
+    {"name": "Overgrown Tomb", "quantity": 1},
+    {"name": "Blackcleave Cliffs", "quantity": 3},
+    {"name": "Raging Ravine", "quantity": 2},
+    {"name": "Swamp", "quantity": 2},
+    {"name": "Forest", "quantity": 1},
+    {"name": "Mountain", "quantity": 1},
+    {"name": "Nurturing Peatland", "quantity": 2},
+    {"name": "Castle Locthwain", "quantity": 1}
+  ]
+}

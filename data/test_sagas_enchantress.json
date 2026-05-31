@@ -1,0 +1,264 @@
+{
+  "name": "Sagas + Enchantress (Sythis)",
+  "format": "commander",
+  "commander": "Sythis, Harvest's Hand",
+  "description": "Tests Saga lore counter progression and SBA 704.5s (sacrifice at final chapter), enchantress card draw triggers, and enchantment-matters synergies.",
+  "colors": [
+    "G",
+    "W"
+  ],
+  "cards": [
+    {
+      "name": "Sythis, Harvest's Hand",
+      "quantity": 1
+    },
+    {
+      "name": "Sigil of the Empty Throne",
+      "quantity": 1
+    },
+    {
+      "name": "History of Benalia",
+      "quantity": 1
+    },
+    {
+      "name": "Karametra, God of Harvests",
+      "quantity": 1
+    },
+    {
+      "name": "Calix, Destiny's Hand",
+      "quantity": 1
+    },
+    {
+      "name": "The Birth of Meletis",
+      "quantity": 1
+    },
+    {
+      "name": "Elspeth Conquers Death",
+      "quantity": 1
+    },
+    {
+      "name": "Fall of the Thran",
+      "quantity": 1
+    },
+    {
+      "name": "Song of the Worldsoul",
+      "quantity": 1
+    },
+    {
+      "name": "The Restoration of Eiganjo",
+      "quantity": 1
+    },
+    {
+      "name": "Teachings of the Kirin",
+      "quantity": 1
+    },
+    {
+      "name": "Enchantress's Presence",
+      "quantity": 1
+    },
+    {
+      "name": "Mesa Enchantress",
+      "quantity": 1
+    },
+    {
+      "name": "Setessan Champion",
+      "quantity": 1
+    },
+    {
+      "name": "Eidolon of Blossoms",
+      "quantity": 1
+    },
+    {
+      "name": "Satyr Enchanter",
+      "quantity": 1
+    },
+    {
+      "name": "Verduran Enchantress",
+      "quantity": 1
+    },
+    {
+      "name": "Herald of the Pantheon",
+      "quantity": 1
+    },
+    {
+      "name": "Sterling Grove",
+      "quantity": 1
+    },
+    {
+      "name": "Mirari's Wake",
+      "quantity": 1
+    },
+    {
+      "name": "Privileged Position",
+      "quantity": 1
+    },
+    {
+      "name": "Femeref Enchantress",
+      "quantity": 1
+    },
+    {
+      "name": "Solitary Confinement",
+      "quantity": 1
+    },
+    {
+      "name": "Ghostly Prison",
+      "quantity": 1
+    },
+    {
+      "name": "Sphere of Safety",
+      "quantity": 1
+    },
+    {
+      "name": "Aura Shards",
+      "quantity": 1
+    },
+    {
+      "name": "Banishing Light",
+      "quantity": 1
+    },
+    {
+      "name": "Oblivion Ring",
+      "quantity": 1
+    },
+    {
+      "name": "Seal of Cleansing",
+      "quantity": 1
+    },
+    {
+      "name": "Seal of Primordium",
+      "quantity": 1
+    },
+    {
+      "name": "Rancor",
+      "quantity": 1
+    },
+    {
+      "name": "Ethereal Armor",
+      "quantity": 1
+    },
+    {
+      "name": "All That Glitters",
+      "quantity": 1
+    },
+    {
+      "name": "Ancestral Mask",
+      "quantity": 1
+    },
+    {
+      "name": "Bear Umbra",
+      "quantity": 1
+    },
+    {
+      "name": "Hallowed Haunting",
+      "quantity": 1
+    },
+    {
+      "name": "Destiny Spinner",
+      "quantity": 1
+    },
+    {
+      "name": "Starfield of Nyx",
+      "quantity": 1
+    },
+    {
+      "name": "Replenish",
+      "quantity": 1
+    },
+    {
+      "name": "Open the Vaults",
+      "quantity": 1
+    },
+    {
+      "name": "Idyllic Tutor",
+      "quantity": 1
+    },
+    {
+      "name": "Enlightened Tutor",
+      "quantity": 1
+    },
+    {
+      "name": "Heroic Intervention",
+      "quantity": 1
+    },
+    {
+      "name": "Swords to Plowshares",
+      "quantity": 1
+    },
+    {
+      "name": "Sol Ring",
+      "quantity": 1
+    },
+    {
+      "name": "Arcane Signet",
+      "quantity": 1
+    },
+    {
+      "name": "Selesnya Signet",
+      "quantity": 1
+    },
+    {
+      "name": "Thought Vessel",
+      "quantity": 1
+    },
+    {
+      "name": "Wild Growth",
+      "quantity": 1
+    },
+    {
+      "name": "Utopia Sprawl",
+      "quantity": 1
+    },
+    {
+      "name": "Fertile Ground",
+      "quantity": 1
+    },
+    {
+      "name": "Temple Garden",
+      "quantity": 1
+    },
+    {
+      "name": "Sunpetal Grove",
+      "quantity": 1
+    },
+    {
+      "name": "Canopy Vista",
+      "quantity": 1
+    },
+    {
+      "name": "Windswept Heath",
+      "quantity": 1
+    },
+    {
+      "name": "Command Tower",
+      "quantity": 1
+    },
+    {
+      "name": "Bountiful Promenade",
+      "quantity": 1
+    },
+    {
+      "name": "Reliquary Tower",
+      "quantity": 1
+    },
+    {
+      "name": "Hall of Heliod's Generosity",
+      "quantity": 1
+    },
+    {
+      "name": "Serra's Sanctum",
+      "quantity": 1
+    },
+    {
+      "name": "Nykthos, Shrine to Nyx",
+      "quantity": 1
+    },
+    {
+      "name": "Forest",
+      "quantity": 20
+    },
+    {
+      "name": "Plains",
+      "quantity": 19
+    }
+  ]
+}

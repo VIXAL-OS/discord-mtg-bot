@@ -1,0 +1,45 @@
+# Environment and secrets
+.env
+*.env
+
+# Config (contains user IDs and personal context)
+config.json
+
+# Personal memories (contains private context)
+memories/*.json
+!memories/*.template
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Java build artifacts (XMage bridge)
+rules/*.class
+rules/target/
+
+# Audit-script artifacts (tools/audit_card_cache.py)
+data/card_data_cache.json.bak
+audit_report*.json
+
+# YouTube transcripts (may contain private content from links shared in DMs/server)
+data/transcripts/
+

@@ -1,0 +1,360 @@
+{
+  "name": "Claude's Flickering Futures (Opus 4.6)",
+  "format": "commander",
+  "commander": "Aminatou, the Fateshifter",
+  "description": "Esper blink and top-deck manipulation. Every ETB triggers twice, every card drawn was chosen three turns ago. Wins through accumulated value and inevitability, not hard locks. Opus 4.6 energy: sees patterns in everything, makes connections across time, genuinely enjoys the complexity. Political in multiplayer — will make deals and honor them.",
+  "cards": [
+    {
+      "name": "Aminatou, the Fateshifter",
+      "quantity": 1
+    },
+    {
+      "name": "Plains",
+      "quantity": 5
+    },
+    {
+      "name": "Island",
+      "quantity": 5
+    },
+    {
+      "name": "Swamp",
+      "quantity": 5
+    },
+    {
+      "name": "Hallowed Fountain",
+      "quantity": 1
+    },
+    {
+      "name": "Watery Grave",
+      "quantity": 1
+    },
+    {
+      "name": "Godless Shrine",
+      "quantity": 1
+    },
+    {
+      "name": "Flooded Strand",
+      "quantity": 1
+    },
+    {
+      "name": "Polluted Delta",
+      "quantity": 1
+    },
+    {
+      "name": "Marsh Flats",
+      "quantity": 1
+    },
+    {
+      "name": "Arcane Sanctum",
+      "quantity": 1
+    },
+    {
+      "name": "Command Tower",
+      "quantity": 1
+    },
+    {
+      "name": "Exotic Orchard",
+      "quantity": 1
+    },
+    {
+      "name": "Caves of Koilos",
+      "quantity": 1
+    },
+    {
+      "name": "Underground River",
+      "quantity": 1
+    },
+    {
+      "name": "Adarkar Wastes",
+      "quantity": 1
+    },
+    {
+      "name": "Prairie Stream",
+      "quantity": 1
+    },
+    {
+      "name": "Sunken Hollow",
+      "quantity": 1
+    },
+    {
+      "name": "Obscura Storefront",
+      "quantity": 1
+    },
+    {
+      "name": "Morphic Pool",
+      "quantity": 1
+    },
+    {
+      "name": "Sea of Clouds",
+      "quantity": 1
+    },
+    {
+      "name": "Vault of Champions",
+      "quantity": 1
+    },
+    {
+      "name": "Sol Ring",
+      "quantity": 1
+    },
+    {
+      "name": "Arcane Signet",
+      "quantity": 1
+    },
+    {
+      "name": "Orzhov Signet",
+      "quantity": 1
+    },
+    {
+      "name": "Dimir Signet",
+      "quantity": 1
+    },
+    {
+      "name": "Azorius Signet",
+      "quantity": 1
+    },
+    {
+      "name": "Talisman of Progress",
+      "quantity": 1
+    },
+    {
+      "name": "Talisman of Dominance",
+      "quantity": 1
+    },
+    {
+      "name": "Thought Vessel",
+      "quantity": 1
+    },
+    {
+      "name": "Mulldrifter",
+      "quantity": 1
+    },
+    {
+      "name": "Cloudblazer",
+      "quantity": 1
+    },
+    {
+      "name": "Ravenous Chupacabra",
+      "quantity": 1
+    },
+    {
+      "name": "Shriekmaw",
+      "quantity": 1
+    },
+    {
+      "name": "Gonti, Lord of Luxury",
+      "quantity": 1
+    },
+    {
+      "name": "Sphinx of Uthuun",
+      "quantity": 1
+    },
+    {
+      "name": "Agent of Treachery",
+      "quantity": 1
+    },
+    {
+      "name": "Nevermaker",
+      "quantity": 1
+    },
+    {
+      "name": "Cavalier of Dawn",
+      "quantity": 1
+    },
+    {
+      "name": "Meteor Golem",
+      "quantity": 1
+    },
+    {
+      "name": "Baleful Strix",
+      "quantity": 1
+    },
+    {
+      "name": "Wall of Omens",
+      "quantity": 1
+    },
+    {
+      "name": "Charming Prince",
+      "quantity": 1
+    },
+    {
+      "name": "Solemn Simulacrum",
+      "quantity": 1
+    },
+    {
+      "name": "Sun Titan",
+      "quantity": 1
+    },
+    {
+      "name": "Venser, Shaper Savant",
+      "quantity": 1
+    },
+    {
+      "name": "Restoration Angel",
+      "quantity": 1
+    },
+    {
+      "name": "Yorion, Sky Nomad",
+      "quantity": 1
+    },
+    {
+      "name": "Felidar Guardian",
+      "quantity": 1
+    },
+    {
+      "name": "Thassa, Deep-Dwelling",
+      "quantity": 1
+    },
+    {
+      "name": "Brago, King Eternal",
+      "quantity": 1
+    },
+    {
+      "name": "Snapcaster Mage",
+      "quantity": 1
+    },
+    {
+      "name": "Recruiter of the Guard",
+      "quantity": 1
+    },
+    {
+      "name": "Trinket Mage",
+      "quantity": 1
+    },
+    {
+      "name": "Dream Stalker",
+      "quantity": 1
+    },
+    {
+      "name": "Conjurer's Closet",
+      "quantity": 1
+    },
+    {
+      "name": "Panharmonicon",
+      "quantity": 1
+    },
+    {
+      "name": "Sensei's Divining Top",
+      "quantity": 1
+    },
+    {
+      "name": "Scroll Rack",
+      "quantity": 1
+    },
+    {
+      "name": "Ephemerate",
+      "quantity": 1
+    },
+    {
+      "name": "Ghostly Flicker",
+      "quantity": 1
+    },
+    {
+      "name": "Momentary Blink",
+      "quantity": 1
+    },
+    {
+      "name": "Eerie Interlude",
+      "quantity": 1
+    },
+    {
+      "name": "Swords to Plowshares",
+      "quantity": 1
+    },
+    {
+      "name": "Path to Exile",
+      "quantity": 1
+    },
+    {
+      "name": "Utter End",
+      "quantity": 1
+    },
+    {
+      "name": "Counterspell",
+      "quantity": 1
+    },
+    {
+      "name": "Dovin's Veto",
+      "quantity": 1
+    },
+    {
+      "name": "Teferi's Protection",
+      "quantity": 1
+    },
+    {
+      "name": "Anguished Unmaking",
+      "quantity": 1
+    },
+    {
+      "name": "Oath of Teferi",
+      "quantity": 1
+    },
+    {
+      "name": "Rhystic Study",
+      "quantity": 1
+    },
+    {
+      "name": "Smothering Tithe",
+      "quantity": 1
+    },
+    {
+      "name": "Animate Dead",
+      "quantity": 1
+    },
+    {
+      "name": "Omen of the Sea",
+      "quantity": 1
+    },
+    {
+      "name": "Teferi, Time Raveler",
+      "quantity": 1
+    },
+    {
+      "name": "Austere Command",
+      "quantity": 1
+    },
+    {
+      "name": "Terminus",
+      "quantity": 1
+    },
+    {
+      "name": "Teleportation Circle",
+      "quantity": 1
+    },
+    {
+      "name": "Wishclaw Talisman",
+      "quantity": 1
+    },
+    {
+      "name": "Altar of the Brood",
+      "quantity": 1
+    },
+    {
+      "name": "Spark Double",
+      "quantity": 1
+    },
+    {
+      "name": "Clever Impersonator",
+      "quantity": 1
+    },
+    {
+      "name": "Peregrine Drake",
+      "quantity": 1
+    },
+    {
+      "name": "Soulherder",
+      "quantity": 1
+    },
+    {
+      "name": "Phantasmal Image",
+      "quantity": 1
+    },
+    {
+      "name": "Spell Queller",
+      "quantity": 1
+    },
+    {
+      "name": "Ashiok, Dream Render",
+      "quantity": 1
+    }
+  ]
+}

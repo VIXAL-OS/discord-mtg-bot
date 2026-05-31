@@ -1,0 +1,3030 @@
+"""Spell casting + resolution flow + suspend + sagas + XMage serialization.
+
+Six free functions extracted from GameEngine. The core is `cast_spell_async`
+— the main entry point that routes a spell from "in player's hand" through
+mana payment, stack placement, replacement effects, target validation,
+trigger ordering, and final resolution.
+
+Public free functions (each takes a GameEngine instance as first arg):
+
+    cast_spell_async(engine, ...)              (async)
+        The main spell-casting orchestrator. ~1400 lines.
+
+    resolve_special_effects(engine, ...)
+        Tier 1 hardcoded ETB / spell handlers (~15 specific cards: Terror
+        of the Peaks, Warstorm Surge, Soul of the Harvest, etc.). Free,
+        instant, 100% reliable.
+
+    _resolve_suspend_spell(engine, ...)
+        When a suspended spell's time counters reach zero, this casts it
+        from exile.
+
+    _process_suspend_upkeep(engine, ...)
+        Tick the time counter on each suspended spell at upkeep.
+
+    _advance_sagas(engine, ...)
+        Add a lore counter to each saga at the start of the controller's
+        first main phase. SBA fires the chapter abilities.
+
+    _serialize_for_xmage(engine, ...)
+        Snapshot the game state into the JSON shape the XMage Java bridge
+        expects for trigger discovery.
+
+State touched on `engine`:
+
+    engine.rules                — RulesEngine instance
+    engine.spell_resolver       — Tier 2 SpellResolver
+    engine.claude_ai            — anthropic client wrapper
+    engine.xmage_bridge         — XMage Java bridge handle
+    engine._xmage_translator    — XMage action translator
+    engine._cached_xmage_*      — XMage state snapshot cache
+    engine.draw_cards           — for cantrip-style effects
+    engine._handle_etb_triggers, engine._check_cast_triggers,
+    engine._check_creature_etb_triggers,
+    engine._check_creature_etb_triggers_sync — Phase 2E delegators
+    engine._activate_day_night_if_needed,
+    engine._flush_pending_messages,
+    engine._queue_async_trigger
+    engine._get_saga_chapter_text,
+    engine._get_saga_total_chapters
+
+Extracted from mtg/engine.py during the Phase 2 OSS-readability refactor
+(Phase 2G).
+"""
+
+import asyncio
+import json
+import random
+import re
+from typing import Any, Dict, List, Optional, Tuple
+
+from mtg.constants import Phase, Zone, COMMAND_ZONE_FORMATS
+from mtg.helpers import _should_emit_resolve_hint
+from mtg.models import Card, Player, GameState, StackEntry
+
+# Optional: Tier 2 spell resolver
+try:
+    from rules import SpellResolver, TargetMode, ExecutionContext
+    HAS_SPELL_RESOLVER = True
+except ImportError:
+    HAS_SPELL_RESOLVER = False
+
+# Optional: Tier 1.5 effect templates
+try:
+    from rules.effect_templates import get_effect_library, build_game_context
+    HAS_EFFECT_TEMPLATES = True
+except ImportError:
+    HAS_EFFECT_TEMPLATES = False
+
+# Optional: layers (granted abilities)
+try:
+    from rules.layers import Layer, create_pump_effect
+    HAS_LAYERS_ENGINE = True
+except ImportError:
+    HAS_LAYERS_ENGINE = False
+
+# Optional: replacement effects
+try:
+    from rules.replacement import GameEvent, EventType
+    HAS_REPLACEMENT_ENGINE = True
+except ImportError:
+    HAS_REPLACEMENT_ENGINE = False
+
+# Optional: targeting validation
+try:
+    from rules.targeting_helpers import (
+        _validate_target_for_action,
+        _validate_player_target_for_action,
+        _find_any_valid_target,
+        _spell_requires_targets,
+        _check_resolution_targets,
+    )
+    HAS_TARGETING = True
+except ImportError:
+    HAS_TARGETING = False
+
+# Optional: structured mana cost parser
+try:
+    from rules.mana import ManaCost
+    HAS_MANA_ENGINE = True
+except ImportError:
+    HAS_MANA_ENGINE = False
+
+# Optional: planeswalker abilities
+try:
+    from rules.planeswalker import PlaneswalkerManager
+    HAS_PLANESWALKER = True
+except ImportError:
+    HAS_PLANESWALKER = False
+
+# Optional: XMage bridge for trigger discovery (used by _serialize_for_xmage)
+try:
+    from rules.xmage_bridge import Permanent as XMagePermanent
+    from rules.xmage_bridge import GameState as XMageGameState
+    HAS_XMAGE_BRIDGE = True
+except ImportError:
+    HAS_XMAGE_BRIDGE = False
+
+
+def _serialize_for_xmage(engine, game: GameState) -> Tuple['XMageGameState', Dict[str, str]]:
+    """Convert engine GameState to XMage bridge format for subprocess calls.
+
+    Returns:
+        (xmage_state, player_name_map) where player_name_map maps
+        real names ("playerA-name") to bridge identifiers ("playerA").
+    """
+    # Cache check — skip re-serializing when board unchanged
+    current_fp = game._state_fingerprint()
+    if (current_fp == engine._cached_xmage_fingerprint
+            and engine._cached_xmage_state is not None):
+        print(f"[XMAGE-CACHE] HIT (fp={current_fp})")
+        return engine._cached_xmage_state, engine._cached_xmage_name_map
+
+    xmage_state = XMageGameState()
+
+    # Map player names to playerA/playerB
+    player_name_map = {}
+    for i, p in enumerate(game.players):
+        key = f"player{'A' if i == 0 else 'B'}"
+        player_name_map[p.name] = key
+        xmage_state.player_life[key] = p.life
+        xmage_state.poison_counters[key] = getattr(p, 'poison', 0)
+        xmage_state.hands[key] = [c.name for c in p.hand]
+        xmage_state.graveyards[key] = [c.name for c in p.graveyard]
+        xmage_state.untapped_lands[key] = len(p.untapped_lands())
+
+    xmage_state.active_player = player_name_map.get(
+        game.active_player.name if game.active_player else game.players[0].name,
+        "playerA"
+    )
+    xmage_state.phase = game.phase.value
+    xmage_state.stack_size = len(game.stack)
+
+    # Serialize battlefield permanents
+    for player in game.players:
+        player_key = player_name_map.get(player.name, "playerA")
+        for card in player.battlefield:
+            # Use get_effective_power/toughness for accurate P/T including layers
+            eff_power = card.get_effective_power(game) if hasattr(card, 'get_effective_power') else 0
+            eff_tough = card.get_effective_toughness(game) if hasattr(card, 'get_effective_toughness') else 0
+
+            perm = XMagePermanent(
+                name=card.name,
+                controller=player_key,
+                is_creature=card.is_creature(),
+                is_legendary="legendary" in (card.type_line or "").lower(),
+                power=eff_power,
+                toughness=eff_tough,
+                power_modifier=0,  # Already folded into effective values above
+                toughness_modifier=0,
+                plus_counters=card.counters.get('+1/+1', 0),
+                minus_counters=card.counters.get('-1/-1', 0),
+                damage_marked=getattr(card, 'damage_marked', 0),
+                tapped=card.tapped,
+                summoning_sick=getattr(card, 'summoning_sick', False),
+                keywords=list(card.keywords) if card.keywords else [],
+            )
+            xmage_state.battlefield.append(perm)
+
+    # Store in cache for next call
+    engine._cached_xmage_state = xmage_state
+    engine._cached_xmage_fingerprint = current_fp
+    engine._cached_xmage_name_map = player_name_map
+    print(f"[XMAGE-CACHE] MISS — rebuilt (fp={current_fp})")
+    return xmage_state, player_name_map
+
+
+async def cast_spell_async(engine, game: GameState, player: Player, card: Card, pay_mana: bool = True, target: Any = None, additional_cost: int = 0) -> Tuple[bool, str, List[str]]:
+    """Cast a spell with full effect resolution (async version).
+
+    Args:
+        game: Game state
+        player: Casting player
+        card: Card to cast
+        pay_mana: Whether to pay mana cost
+        target: Optional target for the spell
+        additional_cost: Additional generic mana cost (e.g., commander tax)
+
+    Returns:
+        Tuple of (success, message, effect_messages)
+    """
+    # Reset per-cast resolution flag. `card._spell_resolved` is set by Tier 1
+    # / Tier 1.5 / Tier 3 handlers to prevent double-resolution within a
+    # single cast — but the flag persisted on the Card instance after the
+    # spell moved to graveyard. May 13 audit: Lingering Souls cast normally
+    # → resolved → moved to graveyard → re-cast next turn → tier-1.5 template
+    # skipped (because `_spell_resolved` still True from previous cast) →
+    # spell logged "(no automatic state change)" with no tokens created.
+    # Same risk for any spell that can be re-cast (flashback, escape,
+    # disturb, jump-start, returned to hand). Clear at the start of every
+    # cast so each cast gets a fresh template/SpellResolver run.
+    if hasattr(card, '_spell_resolved'):
+        card._spell_resolved = False
+
+    # Check rules
+    can_cast, reason = engine.rules.can_cast_spell(game, player, card)
+    if not can_cast:
+        return False, reason, []
+
+    if card not in player.hand:
+        return False, "Card not in hand", []
+
+    # CR 601.2c: a spell that requires a target can't be cast unless at least
+    # one legal target exists. May 17 audit: previously the engine would let
+    # auras be cast with no legal target, charge mana, and then fizzle on
+    # resolution. Spider Umbra in the May 16 batch showed this — mana wasted,
+    # nothing happened, AI confused. Aura is the most common offender; the
+    # broader "any spell that says target" check is too invasive to ship
+    # today, so we narrow to auras here.
+    _oracle_lower = (card.oracle_text or '').lower()
+    _type_line_lower = (card.type_line or '').lower()
+    if 'aura' in _type_line_lower and ('enchant creature' in _oracle_lower or 'enchant permanent' in _oracle_lower):
+        # Quick legal-target scan: does ANY permanent on the battlefield
+        # satisfy "enchant creature" / "enchant permanent"? Hexproof/shroud
+        # checks are done at resolution; here we just want to see one body.
+        is_creature_only = 'enchant creature' in _oracle_lower
+        any_target = False
+        for p in game.players:
+            for c in p.battlefield:
+                if c.id == card.id:
+                    continue
+                if is_creature_only and not c.is_creature():
+                    continue
+                any_target = True
+                break
+            if any_target:
+                break
+        if not any_target:
+            return (False,
+                    f"{card.name} can't be cast — no legal targets on the battlefield (CR 601.2c)",
+                    [])
+
+    # CR 903.4: a card may not be cast in a singleton command-zone format if its
+    # color identity is outside the player's commander color identity. Apr 30
+    # audit: deck-validation warned but didn't enforce, so a {B} spell got cast
+    # in a U/G partner deck. Block at cast time when we can compute the answer
+    # cheaply. Skipped if either side has empty/unknown color identity (avoids
+    # blocking on cache misses).
+    if game.format in ('commander', 'edh', 'brawl', 'oathbreaker'):
+        try:
+            commander_colors = set(player._get_commander_colors())
+            # May 7 audit: when casting a partner commander, the cast pipeline
+            # removes the card from `command_zone` BEFORE this check runs (see
+            # mtg/autoplay.py:1070 and similar paths in cog.py / engine.py),
+            # so `_get_commander_colors()` sees only the OTHER partner and
+            # reports identity {B,W} for a Thrasios cast in Thrasios+Tymna.
+            # If the card being cast is itself a commander, fold its identity
+            # back into the union so the cast is never blocked by its own
+            # removal-during-cast.
+            if getattr(card, 'is_commander', False):
+                commander_colors.update(getattr(card, 'color_identity', []) or [])
+            card_identity = set(getattr(card, 'color_identity', []) or [])
+            if commander_colors and card_identity and not card_identity.issubset(commander_colors):
+                outside = card_identity - commander_colors
+                msg = f"{card.name} ({{{','.join(sorted(card_identity))}}}) is outside commander identity ({{{','.join(sorted(commander_colors))}}}) — extra: {','.join(sorted(outside))}"
+                print(f"[COLOR-IDENTITY] Blocked {player.name} from casting {card.name}: {msg}")
+                # Track blocked-this-game cards on the player so the AI's
+                # next decision prompt can list them under "DO NOT CAST".
+                # Without this, the May 3 batch logged 24 repeated attempts
+                # to cast Bloom Tender in a single deck — same card, same
+                # block reason, every turn.
+                if not hasattr(player, '_color_id_blocklist'):
+                    player._color_id_blocklist = set()
+                player._color_id_blocklist.add(card.name)
+                return False, msg, []
+        except Exception as e:
+            print(f"[COLOR-IDENTITY] Check failed for {card.name}: {e}")
+
+    # Block counterspells when nothing is on the stack to target (CR 601.2c).
+    # May 14 audit: this rejection treats "counter target spell" as a hard
+    # requirement, but it's actually one of N modes on modal spells (Mystic
+    # Confluence, Archmage's Charm, Cryptic Command, etc.). Those spells have
+    # bounce/draw/exile modes that work fine on an empty stack. Only block
+    # cast when the spell ONLY has counter-target-spell and no other modes.
+    # Caused 7+ counterspells to die in Baral's hand across game
+    # 1504535777634160680 because she "couldn't cast" Mystic Confluence in
+    # her own main phase even though its bounce/draw modes were available.
+    oracle_lower = (card.oracle_text or '').lower()
+    if 'counter target' in oracle_lower and 'spell' in oracle_lower:
+        stack_has_spells = any(
+            entry for entry in getattr(game, 'stack', [])
+            if hasattr(entry, 'card') and entry.card
+        )
+        # A creature with counter-in-oracle is cast for its body; even if
+        # the ETB counter fizzles on empty stack, the creature still enters.
+        is_creature = card.is_creature()
+        # Modal spells have bullet markers ('•') OR an explicit "choose one"
+        # / "choose N" clause. Either is enough to indicate non-counter modes
+        # exist that are legal on an empty stack.
+        is_modal_with_other_modes = (
+            ('•' in oracle_lower
+             and any(kw in oracle_lower for kw in (
+                 'draw a card', 'draw cards', 'return target', 'tap target',
+                 'gain', 'destroy target', 'create', 'exile target', 'put a',
+             )))
+            or 'choose one' in oracle_lower
+            or 'choose two' in oracle_lower
+            or 'choose three' in oracle_lower
+        )
+        if not stack_has_spells and not is_creature and not is_modal_with_other_modes:
+            return False, f"{card.name} requires a target spell on the stack", []
+
+    # [TARGETING] Pre-cast target validation (CR 601.2c) — block spells with
+    # no legal targets.  Only checks instant/sorcery spells that require targets.
+    # Permissive: if the targeting module errors or can't parse, allows the cast.
+    if HAS_TARGETING and _spell_requires_targets(card):
+        if not _find_any_valid_target(game, card, player.name):
+            print(f"[TARGETING] {card.name} has no valid targets — cast blocked")
+            return False, f"{card.name} has no valid targets", []
+
+    # Calculate total cost including commander tax
+    # Handle X-cost spells: X defaults to all available mana minus fixed costs
+    # Use adventure cost if casting the adventure half
+    effective_mana_cost = card.mana_cost
+    effective_cmc = card.cmc
+    # Use flashback cost if casting via flashback / Snapcaster-granted flashback.
+    # May 13 audit: previously gated on `card not in player.hand`, but the
+    # graveyard-cast pipeline moves the card briefly into `player.hand`
+    # before invoking cast_spell_async (to reuse the from-hand machinery),
+    # so the zone check was always False and the spell paid the regular
+    # cost (Lingering Souls {2}{W} instead of flashback {1}{B}). The
+    # `_flashback_cost` marker is the authoritative signal — it's only set
+    # by the graveyard-cast initiator.
+    if getattr(card, '_flashback_cost', None):
+        effective_mana_cost = card._flashback_cost
+        print(f"[FLASHBACK] Using flashback cost {card._flashback_cost} instead of {card.mana_cost}")
+        card._flashback_cost = None  # Clear after use
+    if getattr(card, 'cast_as_adventure', False) and card.adventure_cost:
+        effective_mana_cost = card.adventure_cost
+        # Calculate adventure CMC from its mana cost
+        adv_cost_upper = card.adventure_cost.upper()
+        effective_cmc = sum(int(m) for m in re.findall(r'\{(\d+)\}', adv_cost_upper))
+        effective_cmc += sum(adv_cost_upper.count(f'{{{c}}}') for c in ['W', 'U', 'B', 'R', 'G'])
+        print(f"[ADVENTURE] Using adventure cost {card.adventure_cost} (CMC {effective_cmc}) instead of creature cost {card.mana_cost}")
+    elif (' // ' in (effective_mana_cost or '')
+          and getattr(card, 'adventure_name', '')):
+        # May 20 audit fix: adventure cards' card.mana_cost is the FULL
+        # Scryfall split form "{2}{U} // {2}{U}". When casting as the creature
+        # half (default — cast_as_adventure=False), strip to just the creature
+        # cost before the half-separator so the mana parser doesn't sum BOTH
+        # halves (game_1506618589132755035:1003 tapped 4 sources for what
+        # should be CMC 3 because parser found 4 brace-groups). Fix the
+        # display too — "{2}{U}" is clearer than "{2}{U} // {2}{U}".
+        creature_half = effective_mana_cost.split(' // ', 1)[0].strip()
+        if creature_half:
+            print(f"[ADVENTURE] Casting as creature half — using {creature_half} "
+                  f"(stripped from {effective_mana_cost})")
+            effective_mana_cost = creature_half
+            # Recompute effective_cmc against the stripped creature cost.
+            ch_upper = creature_half.upper()
+            effective_cmc = sum(int(m) for m in re.findall(r'\{(\d+)\}', ch_upper))
+            effective_cmc += sum(ch_upper.count(f'{{{c}}}') for c in ['W', 'U', 'B', 'R', 'G'])
+    elif getattr(card, 'cast_as_split_half', -1) >= 0 and card.split_costs:
+        half_idx = card.cast_as_split_half
+        effective_mana_cost = card.split_costs[half_idx]
+        # Calculate split half CMC from its mana cost
+        half_cost_upper = effective_mana_cost.upper()
+        effective_cmc = sum(int(m) for m in re.findall(r'\{(\d+)\}', half_cost_upper))
+        effective_cmc += sum(half_cost_upper.count(f'{{{c}}}') for c in ['W', 'U', 'B', 'R', 'G'])
+        half_name = card.split_names[half_idx] if card.split_names else card.name
+        print(f"[SPLIT] Using {half_name} cost {effective_mana_cost} (CMC {effective_cmc}) instead of full card cost {card.mana_cost}")
+
+    # Block suspend-only cards from being cast normally (Mox Tantalite, Lotus Bloom, etc.)
+    # These have no mana cost and can only be suspended, not cast from hand
+    if not effective_mana_cost and card.oracle_text:
+        oracle_lower = card.oracle_text.lower()
+        if re.search(r'suspend\s+\d', oracle_lower) and card in player.hand:
+            return False, f"{card.name} has no mana cost — it can only be suspended, not cast from hand", []
+
+    total_cost = effective_cmc + additional_cost
+    x_value_chosen = 0
+
+    if effective_mana_cost and 'X' in effective_mana_cost.upper():
+        # [MANA-ENGINE] Use ManaCost for structured X-cost parsing when available
+        if HAS_MANA_ENGINE:
+            _xp = ManaCost.parse(effective_mana_cost)
+            x_count = _xp.x_count
+            fixed_cost = _xp.cmc  # ManaCost.cmc treats X as 0
+        else:
+            cost_upper = effective_mana_cost.upper()
+            x_count = cost_upper.count('X')
+            colored_cost = sum(cost_upper.count(f'{{{c}}}') for c in ['W', 'U', 'B', 'R', 'G'])
+            generic_cost = sum(int(m) for m in re.findall(r'\{(\d+)\}', cost_upper))
+            fixed_cost = colored_cost + generic_cost
+        
+        # Check if caller specified X value via _x_value attribute
+        if hasattr(card, '_x_value') and card._x_value is not None:
+            x_value_chosen = card._x_value
+            total_cost = fixed_cost + (x_value_chosen * x_count) + additional_cost
+        else:
+            # Auto-calculate: use all available mana for X
+            available = player.available_mana()
+            remaining_for_x = max(0, available - fixed_cost - additional_cost)
+            x_value_chosen = remaining_for_x // max(x_count, 1)
+            total_cost = fixed_cost + (x_value_chosen * x_count) + additional_cost
+        
+        print(f"[X-COST] {card.name}: X={x_value_chosen}, fixed={fixed_cost}, total={total_cost}")
+        # Store X value on card so templates/context can access it
+        card._x_value = x_value_chosen
+
+        # [X-TARGET-CHECK] If the oracle text restricts targets by X (e.g.
+        # Prismatic Ending: "target nonland permanent with mana value X or
+        # less"), the initial target check at ~10810 ran with X=0 and may
+        # have been permissive. Re-check now that X is known so we don't
+        # commit mana to a spell with zero legal targets.
+        if HAS_TARGETING and _spell_requires_targets(card):
+            _oracle_lower = (card.oracle_text or '').lower()
+            _x_restricted = re.search(
+                r'target[^.]*?mana value\s+x\s+or\s+(less|greater)',
+                _oracle_lower,
+            )
+            if _x_restricted:
+                # Scan all nonland permanents and see if any fit the MV bound.
+                _found = False
+                _op = _x_restricted.group(1)
+                for _pl in game.players:
+                    for _perm in _pl.battlefield:
+                        if _perm.is_land():
+                            continue
+                        _mv = getattr(_perm, 'cmc', 0) or 0
+                        if (_op == 'less' and _mv <= x_value_chosen) or \
+                           (_op == 'greater' and _mv >= x_value_chosen):
+                            _found = True
+                            break
+                    if _found:
+                        break
+                if not _found:
+                    print(f"[X-TARGET-CHECK] {card.name}: no legal targets "
+                          f"with MV {_op} X={x_value_chosen} — cast blocked")
+                    return False, (
+                        f"{card.name}: no legal targets with mana value X={x_value_chosen} "
+                        f"or {_op}"
+                    ), []
+
+    # Check for free-cast from turn effects (Rishkar's Expertise, Cascade, etc.)
+    free_cast_source = None
+    if pay_mana and hasattr(game, 'turn_effects'):
+        player_idx = game.players.index(player) if player in game.players else 0
+        for te in game.turn_effects:
+            if (te.get('type') == 'free_cast'
+                    and te.get('controller') == player_idx
+                    and not te.get('used', False)):
+                max_mv = te.get('max_mv', 5)
+                card_mv = card.cmc or 0
+                if card_mv <= max_mv:
+                    te['used'] = True
+                    pay_mana = False
+                    free_cast_source = te.get('source', 'ability')
+                    print(f"[FREE-CAST] {card.name} (MV {card_mv}) cast for free via {free_cast_source} (max MV {max_mv})")
+                    break
+
+    # Check for alternate costs (Force of Will, Pact of Negation, etc.)
+    used_alternate_cost = False
+    if pay_mana and (effective_mana_cost or additional_cost > 0):
+        oracle_lower = (card.oracle_text or '').lower()
+        # Force of Will: "You may pay 1 life and exile a blue card from your hand rather than pay this spell's mana cost"
+        if 'pay 1 life and exile a' in oracle_lower and 'from your hand' in oracle_lower:
+            # Check if player can't afford mana but can pay alternate cost
+            available = player.available_mana()
+            if available < total_cost:
+                # Find a card of the right color to exile
+                exile_color = None
+                for color in ['U', 'B', 'R', 'G', 'W']:
+                    if f'{color.lower()} card' in oracle_lower or f'{color.lower()} card' in oracle_lower:
+                        exile_color = color
+                        break
+                if not exile_color:
+                    # Parse "a blue card" etc.
+                    color_map = {'blue': 'U', 'black': 'B', 'red': 'R', 'green': 'G', 'white': 'W'}
+                    for color_name, color_code in color_map.items():
+                        if color_name in oracle_lower:
+                            exile_color = color_code
+                            break
+                if exile_color:
+                    exile_candidates = [c for c in player.hand if c != card and c.mana_cost and exile_color in c.mana_cost.upper()]
+                    if exile_candidates:
+                        # Pick least valuable card to exile
+                        to_exile = min(exile_candidates, key=lambda c: c.cmc or 0)
+                        player.hand.remove(to_exile)
+                        player.exile.append(to_exile)
+                        player.life -= 1
+                        effect_messages = [f"💫 {card.name} cast via alternate cost: exile {to_exile.name}, pay 1 life (Life: {player.life})"]
+                        pay_mana = False
+                        used_alternate_cost = True
+                        print(f"[ALTERNATE-COST] {card.name}: exiled {to_exile.name}, paid 1 life")
+        # Fireblast: "You may sacrifice two Mountains rather than pay this spell's mana cost"
+        elif 'sacrifice' in oracle_lower and 'rather than pay' in oracle_lower:
+            available = player.available_mana()
+            if available < total_cost:
+                # Parse what to sacrifice (e.g., "two Mountains")
+                sac_match = re.search(r'sacrifice (\w+) (\w+)', oracle_lower)
+                if sac_match:
+                    count_word = sac_match.group(1)
+                    perm_type = sac_match.group(2).rstrip('s')  # "mountains" -> "mountain"
+                    count_map = {'two': 2, 'three': 3, 'a': 1, 'an': 1, 'one': 1}
+                    sac_count = count_map.get(count_word, 1)
+                    # Find matching permanents
+                    candidates = [c for c in player.battlefield
+                                  if perm_type in c.name.lower() or perm_type in (c.type_line or '').lower()]
+                    if len(candidates) >= sac_count:
+                        for i in range(sac_count):
+                            sac_card = candidates[i]
+                            game.unregister_static_effects(sac_card)
+                            player.battlefield.remove(sac_card)
+                            player.graveyard.append(sac_card)
+                        sac_names = [candidates[i].name for i in range(sac_count)]
+                        effect_messages = [f"💫 {card.name} cast via alternate cost: sacrifice {', '.join(sac_names)}"]
+                        pay_mana = False
+                        used_alternate_cost = True
+                        print(f"[ALTERNATE-COST] {card.name}: sacrificed {', '.join(sac_names)}")
+        # Pact of Negation, Pact of the Titan, etc.: costs 0 now, pay next upkeep
+        elif card.cmc == 0 and 'pact' in card.name.lower() and effective_mana_cost in ('', '{0}', None):
+            pay_mana = False
+            used_alternate_cost = True
+            print(f"[PACT] {card.name} cast for free (pact cost due next upkeep)")
+
+    # [CONVOKE] Tap untapped creatures to help pay for spells with convoke
+    # Each tapped creature pays {1} or one mana of its color
+    convoke_reduction = 0
+    if pay_mana and card.oracle_text and 'convoke' in card.oracle_text.lower():
+        untapped_creatures = [c for c in player.creatures() if not c.tapped and c != card]
+        # Tap creatures to reduce generic cost (simple: each taps for {1})
+        generic_cost = 0
+        if effective_mana_cost:
+            for sym in re.findall(r'\{(\d+)\}', effective_mana_cost):
+                generic_cost += int(sym)
+        generic_cost += additional_cost
+        creatures_to_tap = min(len(untapped_creatures), generic_cost)
+        for i in range(creatures_to_tap):
+            untapped_creatures[i].tapped = True
+            convoke_reduction += 1
+        if convoke_reduction > 0:
+            additional_cost = max(0, additional_cost - convoke_reduction)
+            print(f"[CONVOKE] {card.name}: tapped {convoke_reduction} creature(s) to help pay")
+
+    # [DELVE] Exile cards from graveyard to reduce generic mana cost
+    # Each exiled card pays {1} generic (CR 702.66)
+    delve_reduction = 0
+    if pay_mana and card.oracle_text and 'delve' in card.oracle_text.lower():
+        # Auto-select: exile highest-CMC non-creature cards first (preserve reanimation targets)
+        gy_candidates = sorted(player.graveyard, key=lambda c: -(c.cmc or 0))
+        generic_cost = 0
+        if effective_mana_cost:
+            for sym in re.findall(r'\{(\d+)\}', effective_mana_cost):
+                generic_cost += int(sym)
+        generic_cost += additional_cost - convoke_reduction
+        cards_to_exile = min(len(gy_candidates), max(0, generic_cost))
+        exiled_names = []
+        for i in range(cards_to_exile):
+            c = gy_candidates[i]
+            player.graveyard.remove(c)
+            player.exile.append(c)
+            delve_reduction += 1
+            exiled_names.append(c.name)
+        if delve_reduction > 0:
+            # May 20 audit (Bug F): show ALL exiled names when ≤6, append "..."
+            # when truncating. Was "exiled 5 card(s) from graveyard (A, B, C)"
+            # — count says 5 but only listed 3, looked like a truncation bug.
+            _names_str = ', '.join(exiled_names) if len(exiled_names) <= 6 else (
+                ', '.join(exiled_names[:6]) + f', ... +{len(exiled_names) - 6} more'
+            )
+            print(f"[DELVE] {card.name}: exiled {delve_reduction} card(s) from graveyard ({_names_str})")
+
+    # [IMPROVISE] Tap untapped non-creature artifacts to reduce generic cost
+    # Each tapped artifact pays {1} generic (CR 702.126)
+    improvise_reduction = 0
+    if pay_mana and card.oracle_text and 'improvise' in card.oracle_text.lower():
+        untapped_artifacts = [c for c in player.active_battlefield()
+                              if not c.tapped and c.is_artifact() and not c.is_creature() and c != card]
+        generic_cost = 0
+        if effective_mana_cost:
+            for sym in re.findall(r'\{(\d+)\}', effective_mana_cost):
+                generic_cost += int(sym)
+        generic_cost += additional_cost - convoke_reduction - delve_reduction
+        artifacts_to_tap = min(len(untapped_artifacts), max(0, generic_cost))
+        for i in range(artifacts_to_tap):
+            untapped_artifacts[i].tapped = True
+            improvise_reduction += 1
+        if improvise_reduction > 0:
+            print(f"[IMPROVISE] {card.name}: tapped {improvise_reduction} artifact(s) to help pay")
+
+    total_alt_reduction = convoke_reduction + delve_reduction + improvise_reduction
+
+    # Pay mana cost — use color-aware tapping when mana engine is available
+    if pay_mana and (effective_mana_cost or additional_cost > 0):
+        # [MANA-ENGINE] Color-aware tapping ensures we tap the RIGHT lands
+        # (e.g., Plains for W, Island for U) instead of naively tapping N lands.
+        has_phyrexian = bool(effective_mana_cost and '/P}' in effective_mana_cost.upper())
+        if HAS_MANA_ENGINE and effective_mana_cost:
+            # Delve/convoke/improvise reduce the GENERIC portion of the cost,
+            # not the additional cost (commander tax). Pass as negative additional
+            # to reduce the parsed generic requirement from the mana cost string.
+            tapped_ok = player.tap_sources_for_cost(
+                effective_mana_cost,
+                additional_generic=additional_cost - total_alt_reduction,
+                x_value=x_value_chosen,
+                pay_phyrexian_with_life=has_phyrexian,
+            )
+        else:
+            # Fallback: amount-based tapping (no color awareness)
+            tapped_ok = player.tap_lands_for_mana(max(0, total_cost - total_alt_reduction))
+        if not tapped_ok:
+            tax_note = f" + {additional_cost} commander tax" if additional_cost > 0 else ""
+            cast_name = card.adventure_name if getattr(card, 'cast_as_adventure', False) else card.name
+            return False, f"Not enough mana to cast {cast_name} (needs {effective_cmc}{tax_note} = {total_cost} total)", []
+        # Track mana paid for X spell calculations
+        card._mana_paid = total_cost
+
+    player.hand.remove(card)
+
+    # Track spells cast this turn (for day/night, werewolf transform, Esper Sentinel)
+    player.spells_cast_this_turn += 1
+    if not card.is_creature():
+        player.noncreature_spells_cast_this_turn += 1
+
+    # May 14 audit (A7): track per-game spell-type counts on the game state so
+    # the strategist can detect "opponent has cast 0 noncreature spells in 8
+    # turns — your Mana Drain is dead this matchup, pivot." Without this, the
+    # control deck holds counterspells for 20 turns and dies.
+    if not hasattr(game, '_spell_counts_by_player'):
+        game._spell_counts_by_player = {}  # player_name -> {creature, noncreature, instant, sorcery, total}
+    counts = game._spell_counts_by_player.setdefault(
+        player.name, {'creature': 0, 'noncreature': 0, 'instant': 0, 'sorcery': 0, 'total': 0}
+    )
+    type_l = (card.type_line or '').lower()
+    counts['total'] += 1
+    if 'creature' in type_l:
+        counts['creature'] += 1
+    else:
+        counts['noncreature'] += 1
+    if 'instant' in type_l:
+        counts['instant'] += 1
+    elif 'sorcery' in type_l:
+        counts['sorcery'] += 1
+
+    effect_messages = []
+    if free_cast_source:
+        effect_messages.append(f"🆓 {card.name} cast for free via {free_cast_source}!")
+
+    # [STACK] Push spell onto the stack
+    player_idx = game.players.index(player) if player in game.players else 0
+    stack_entry = StackEntry(
+        card=card,
+        controller_name=player.name,
+        controller_index=player_idx,
+        target=target,
+        is_spell=True,
+    )
+    game.stack.append(stack_entry)
+    print(f"[STACK] {card.name} goes on the stack (controller: {player.name}, stack size: {len(game.stack)})")
+
+    # May 18 audit: helper to keep game.stack and PrioritySystem.stack in
+    # sync. The fast-path resolution (0.5s auto-resolve when no opponent
+    # interaction) bypasses PrioritySystem._resolve_top_of_stack and just
+    # pops from game.stack directly. Without this dual-pop, the
+    # PrioritySystem holds phantom StackObjects for already-resolved
+    # spells, and when its priority cycle later fires, it calls
+    # on_stack_resolve(phantom_obj) → "[STACK] No priority_id match for X,
+    # using shared event" (a harmless no-op, but visibly noisy). This was
+    # the cascade visible in `game_1505768915773685800` where 5 spells
+    # showed the warning while combat priority spun until timeout.
+    def _drop_from_priority_stack():
+        pid = getattr(stack_entry, 'priority_id', None)
+        if not pid:
+            return
+        ps = getattr(game, '_priority_system', None)
+        if ps is None:
+            return
+        try:
+            if hasattr(ps, 'remove_stack_entry_by_priority_id'):
+                ps.remove_stack_entry_by_priority_id(pid)
+        except Exception as _ps_err:
+            print(f"[STACK] priority-stack sync failed for {card.name}: {_ps_err}")
+
+    # May 7 audit fix #1: emit cast announcement BEFORE the priority wait so it
+    # appears in Discord before any counterspell response messages. Without this,
+    # the response ("B responds with Counterspell!") races ahead of the cast
+    # ("A cast Sun Titan"), producing the out-of-order: response → cast → countered.
+    # Only when stack is enabled + send_func wired; caller still adds its own
+    # announcement (which becomes a duplicate-suppressed echo in the same path).
+    early_cast_announced = False
+    if game.stack_enabled and getattr(game, '_stack_send_func', None):
+        try:
+            send_func = game._stack_send_func
+            source_tag = ""
+            if getattr(card, 'cast_from_command_zone', False):
+                source_tag = " from command zone"
+            elif getattr(card, '_cast_from_graveyard', False):
+                source_tag = " from graveyard"
+            await send_func(f"✨ {player.name} cast **{card.name}**{source_tag}")
+            stack_entry._cast_announced = True
+            # Mark on the game so callers can suppress duplicate announcement.
+            # Use a dict keyed by id(card) so multiple in-flight casts don't collide.
+            if not hasattr(game, '_early_announced_casts'):
+                game._early_announced_casts = set()
+            game._early_announced_casts.add(id(card))
+            early_cast_announced = True
+        except Exception as e:
+            print(f"[STACK] Early cast announcement failed: {e}")
+
+    # Cast triggers fire when spell is put on stack (before resolution/countering)
+    # This is correct for Rhystic Study, Esper Sentinel, etc. — they trigger on cast
+    cast_trigger_msgs = await engine._check_cast_triggers(game, player, card)
+    effect_messages.extend(cast_trigger_msgs)
+
+    # If stack is enabled, announce to PrioritySystem and wait for resolution
+    if game.stack_enabled and game._priority_system:
+        from rules.priority import PriorityAction
+
+        # Stack depth guard — prevent infinite counter-counter loops
+        MAX_STACK_DEPTH = 10
+        if len(game.stack) > MAX_STACK_DEPTH:
+            print(f"[STACK] Max depth {MAX_STACK_DEPTH} reached for {card.name}, skipping priority interaction")
+        else:
+            # Per-entry resolution event (enables stack wars — each spell has its own signal)
+            stack_entry.resolution_event = asyncio.Event()
+
+            # May 14 audit: the GameEngine advances its phase state independently
+            # of rules.priority.PrioritySystem.phase. Nobody calls
+            # priority_system.advance_phase(), so its `active_player` stays
+            # frozen at `players[0]` ("Rick") and its `priority_holder` can
+            # be left as the previous-turn's caster ("Claude" after she
+            # responded last turn). That means when Rick now casts a
+            # main-phase spell on his turn, player_action() rejects it
+            # silently ("not your priority") — and cast_spell_async then
+            # waits 6s on a resolution_event nobody will ever fire. Across
+            # game_1504535777634160680 the audited Baral matchup, only 1/15
+            # Rick casts got a priority response window because of this.
+            # Sync the priority system with the actual caster + active player
+            # before announcing the cast.
+            ps = game._priority_system
+            try:
+                caster_name = player.name
+                active_name = game.players[game.active_player_index].name
+                if ps.active_player != active_name:
+                    print(f"[STACK] Resyncing priority_system.active_player "
+                          f"({ps.active_player} → {active_name})")
+                    ps.active_player = active_name
+                if ps.priority_holder != caster_name:
+                    print(f"[STACK] Resyncing priority_system.priority_holder "
+                          f"({ps.priority_holder} → {caster_name}) — caster has "
+                          f"priority by CR 117.1a (they just initiated a cast)")
+                    ps.priority_holder = caster_name
+                    # Drop stale pass tracking — the new caster's action starts
+                    # a fresh priority round.
+                    ps._passes_in_succession = []
+            except Exception as e:
+                print(f"[STACK] Priority resync failed (continuing): {e}")
+
+            # Announce spell — caster retains priority, auto-pass timer starts
+            result = await game._priority_system.player_action(
+                player.name,
+                PriorityAction.cast(card.name, targets=[str(target)] if target else [])
+            )
+            # May 14 audit: if player_action still rejects after resync (race
+            # condition or unexpected state), surface it so a future audit
+            # can spot recurring failures. The fallback to a short timeout
+            # below prevents a dead 6s wait.
+            cast_rejected = bool(result) and not result.get("success", True)
+            if cast_rejected:
+                print(f"[STACK] player_action rejected cast for {card.name} "
+                      f"after resync: {result.get('message', 'unknown')} — "
+                      f"skipping priority window, resolving directly")
+            # Correlate this StackEntry with the PrioritySystem's StackObject
+            if result and result.get("stack_object"):
+                stack_entry.priority_id = result["stack_object"]["id"]
+
+            # Wait for this specific spell to resolve (or be countered)
+            # Bug #34/#37: Use game-mode-appropriate timeout to prevent hangs
+            resolution_timeout = 30.0
+            if getattr(game, 'is_autoplay', False):
+                # [STACK-PRIORITY] Check if opponent has affordable instant-speed interaction
+                # before choosing timeout. Without this, 0.5s timeout resolves spells
+                # before the AI can evaluate counterspells (decide_response is an API call).
+                opponent_has_interaction = False
+                caster_idx = game.players.index(player) if player in game.players else 0
+                for opp_idx, opp in enumerate(game.players):
+                    if opp_idx == caster_idx:
+                        continue
+                    if engine.claude_ai:
+                        opp_instants = engine.claude_ai.has_instant_speed_cards(opp)
+                        if opp_instants:
+                            affordable = [c for c in opp_instants if opp.can_pay_mana_cost(c.mana_cost)[0]]
+                            if affordable:
+                                opponent_has_interaction = True
+                                instant_names = [c.name for c in affordable[:3]]
+                                print(f"[STACK-PRIORITY] Opponent {opp.name} has affordable interaction: "
+                                      f"{', '.join(instant_names)} — extending timeout for AI response")
+                                break
+                if opponent_has_interaction:
+                    # Was 12s when decide_response was broken (bug May 3 audit
+                    # #1) and never actually responded — that wasted ~2.6h
+                    # across the May 3 batch on dead-air waits. Now that
+                    # decide_response works, the typical path is:
+                    #   API call (1-3s) + decide_pass (~0s) + auto-pass timer
+                    #   (~0.5s) → event fires within ~3s.
+                    # If the AI casts a counterspell instead, the response
+                    # cast cycle adds another ~2s. 6s gives a generous
+                    # safety margin without leaving idle.
+                    resolution_timeout = 6.0
+                    # May 7 audit: track whether decide_response was actually
+                    # queried during the priority window. If timeout fires
+                    # without the AI ever being asked, we want a tagged log
+                    # so an audit can distinguish "AI was queried and chose
+                    # to pass" from "AI never got the question."
+                    stack_entry._stack_ai_queried = False
+                else:
+                    resolution_timeout = 0.5  # No interaction possible — resolve fast
+            elif game._priority_system and hasattr(game._priority_system, 'auto_pass_seconds'):
+                resolution_timeout = max(game._priority_system.auto_pass_seconds * 10, 3.0)
+            # May 14 audit: if player_action rejected the cast, drop timeout
+            # to ~0 — there's no priority window to wait for, no resolution
+            # event will ever fire, and waiting 6s is pure dead-air.
+            if cast_rejected:
+                resolution_timeout = 0.1
+            try:
+                await asyncio.wait_for(stack_entry.resolution_event.wait(), timeout=resolution_timeout)
+            except asyncio.TimeoutError:
+                # Safety net: only auto-resolve when this entry is at the TOP of
+                # the stack (CR 608 — LIFO). If a counterspell or other later
+                # cast is sitting on top of us, the underlying spell must wait
+                # for that to resolve first. Without this guard, our timer
+                # races the counter and resolves the targeted spell out-of-order,
+                # then the counter "fizzles — no longer on the battlefield".
+                # When not at top, extend the wait by one more cycle so the
+                # later cast gets to resolve first.
+                if game.stack and game.stack[-1] is not stack_entry:
+                    print(f"[STACK] Resolution timeout ({resolution_timeout}s) for {card.name}, "
+                          f"but later cast on top — extending wait for LIFO order")
+                    # May 7 audit: keep extending while a later cast remains on
+                    # top — the previous single extension would still
+                    # auto-resolve out-of-order if a stack war went deeper than
+                    # one response (Supreme Verdict ← Counterspell ← Force of
+                    # Will resolved bottom-up because Verdict's extended
+                    # timeout fired before FoW resolved).
+                    max_lifo_extensions = 5
+                    extensions_used = 0
+                    while extensions_used < max_lifo_extensions:
+                        try:
+                            await asyncio.wait_for(stack_entry.resolution_event.wait(),
+                                                   timeout=resolution_timeout)
+                            # Event fired — spell resolved (or was countered) in proper order.
+                            break
+                        except asyncio.TimeoutError:
+                            extensions_used += 1
+                            # If we've now reached the top, fall through to
+                            # the normal resolve-now path on the next loop
+                            # iteration. If still buried, keep waiting.
+                            if not game.stack or game.stack[-1] is stack_entry:
+                                print(f"[STACK] {card.name} now at top after {extensions_used} extension(s), resolving")
+                                break
+                            print(f"[STACK] {card.name} still buried under {game.stack[-1].card.name if game.stack[-1].card else '?'} — extending again ({extensions_used}/{max_lifo_extensions})")
+                    else:
+                        # Hit the safety cap. Resolve to prevent a deadlock,
+                        # but loudly log so an audit can spot a real LIFO stall.
+                        print(f"[STACK] LIFO extension cap ({max_lifo_extensions}) hit for {card.name}; "
+                              f"resolving anyway to prevent deadlock")
+                    if stack_entry in game.stack and stack_entry is game.stack[-1]:
+                        game.stack.remove(stack_entry)
+                        _drop_from_priority_stack()
+                        print(f"[STACK] Cleaned up timed-out stack entry for {card.name}")
+                else:
+                    print(f"[STACK] Resolution timeout ({resolution_timeout}s) for {card.name}, resolving now")
+                    # May 7 audit: surface "AI never got the chance to respond"
+                    # cases so log audits can distinguish "AI declined" from
+                    # "AI was never queried" (the latter means the priority
+                    # window was too short or the priority system didn't fire).
+                    if hasattr(stack_entry, '_stack_ai_queried') and not stack_entry._stack_ai_queried:
+                        print(f"[STACK-AI] AI not queried (timeout) for response to {card.name}")
+                    if stack_entry in game.stack:
+                        game.stack.remove(stack_entry)
+                        _drop_from_priority_stack()
+                        print(f"[STACK] Cleaned up timed-out stack entry for {card.name}")
+
+        # Check if the spell was countered during the response window
+        if stack_entry.countered:
+            if stack_entry in game.stack:
+                game.stack.remove(stack_entry)
+            _drop_from_priority_stack()
+            # Signature spells return to command zone even when countered
+            if getattr(card, 'is_signature_spell', False) and game.format == "oathbreaker":
+                player.command_zone.append(card)
+                print(f"[OATHBREAKER] {card.name} was countered → returns to command zone")
+                effect_messages.append(f"❌ **{card.name}** was countered! → returns to command zone")
+            else:
+                player.graveyard.append(card)
+                print(f"[STACK] {card.name} was countered — goes to graveyard")
+                effect_messages.append(f"❌ **{card.name}** was countered!")
+            engine.rules.log_event(f"{player.name}'s {card.name} was countered")
+            return True, f"Cast {card.name} (countered)", effect_messages
+
+    # [TARGETING] Resolution-time target validation (CR 608.2b)
+    # If ALL targets are now illegal, the spell fizzles (countered by game rules).
+    if HAS_TARGETING:
+        should_fizzle, fizzle_reason = _check_resolution_targets(game, stack_entry)
+        if should_fizzle:
+            if stack_entry in game.stack:
+                game.stack.remove(stack_entry)
+            _drop_from_priority_stack()
+            # Signature spells return to command zone even when they fizzle
+            if getattr(card, 'is_signature_spell', False) and game.format == "oathbreaker":
+                player.command_zone.append(card)
+                effect_messages.append(f"💨 **{fizzle_reason}** → returns to command zone")
+                print(f"[OATHBREAKER] {card.name} fizzled → returns to command zone")
+            else:
+                player.graveyard.append(card)
+                effect_messages.append(f"💨 **{fizzle_reason}**")
+            print(f"[TARGETING] {fizzle_reason}")
+            engine.rules.log_event(f"{card.name} fizzled — all targets illegal")
+            return True, f"Cast {card.name} (fizzled)", effect_messages
+
+    # Pop from stack before resolving
+    if stack_entry in game.stack:
+        game.stack.remove(stack_entry)
+    _drop_from_priority_stack()
+
+    # Handle split card casting — resolve only the chosen half's effect,
+    # then the card goes to graveyard (both halves share one physical card)
+    if getattr(card, 'cast_as_split_half', -1) >= 0 and card.split_texts:
+        half_idx = card.cast_as_split_half
+        half_name = card.split_names[half_idx] if card.split_names else card.name
+        half_text = card.split_texts[half_idx]
+        half_type = card.split_types[half_idx] if card.split_types else ""
+        print(f"[SPLIT] Casting {half_name} (half {half_idx} of {card.name})")
+
+        # Create a virtual card for the half so tier cascade works correctly
+        split_half_card = Card(
+            name=half_name,
+            mana_cost=card.split_costs[half_idx] if card.split_costs else card.mana_cost,
+            type_line=half_type,
+            oracle_text=half_text,
+        )
+        split_msgs = engine.resolve_special_effects(game, player, split_half_card, target)
+        if not split_msgs and HAS_EFFECT_TEMPLATES and half_text:
+            try:
+                player_idx = game.players.index(player) if player in game.players else 0
+                opponent = game.players[1 - player_idx]
+                ctx = build_game_context(game, player, opponent, card=split_half_card, explicit_target=target)
+                lib = get_effect_library()
+                tmpl_actions, tmpl_explanation = lib.resolve_spell(
+                    card_name=half_name, oracle_text=half_text,
+                    controller=player.name, opponent=opponent.name, game_context=ctx,
+                )
+                if tmpl_actions is not None:
+                    for action in tmpl_actions:
+                        if action.get("action") != "no_action":
+                            try:
+                                msg = engine.rules._execute_action_on_state(game, action)
+                                if msg:
+                                    split_msgs.append(msg)
+                            except Exception as ae:
+                                print(f"[SPLIT-TEMPLATE] Action failed: {ae}")
+            except Exception as e:
+                print(f"[SPLIT] Template error for {half_name}: {e}")
+        if not split_msgs and engine.rules.client:
+            try:
+                resolved_msgs, _ = await engine.rules.resolve_effect(
+                    game, half_text, half_name, player.name
+                )
+                if resolved_msgs:
+                    split_msgs.extend(resolved_msgs)
+            except Exception as e:
+                print(f"[SPLIT] resolve_effect error for {half_name}: {e}")
+        if not split_msgs:
+            _ht = (half_text or '').replace('\n', ' ').strip()
+            if len(_ht) > 500:
+                _ht = _ht[:497].rstrip() + '…'
+            split_msgs = [f"🧙 **{half_name}** resolves — {_ht}"]
+        effect_messages.extend(split_msgs)
+        # Split cards go to graveyard after resolving
+        player.graveyard.append(card)
+        card.cast_as_split_half = -1  # Reset flag
+        engine.rules.log_event(f"{player.name} casts {half_name} (split half of {card.name})")
+        return True, f"Cast {half_name}", effect_messages
+
+    # Handle Adventure casting — adventure half resolves like a sorcery,
+    # then card goes to exile (can be cast as creature from exile later)
+    if card.cast_as_adventure and card.adventure_text:
+        print(f"[ADVENTURE] Casting {card.adventure_name} (adventure of {card.name})")
+        # Resolve the adventure effect using the tier cascade
+        adventure_card = Card(
+            name=card.adventure_name,
+            mana_cost=card.adventure_cost,
+            type_line=card.adventure_type,
+            oracle_text=card.adventure_text,
+        )
+        adv_msgs = engine.resolve_special_effects(game, player, adventure_card, target)
+        # Tier 1.5: try template library on the adventure name (Welcome Home,
+        # Oaken Boon, etc.) — without this, adventure halves leaked
+        # "Complex effect:" text without actually creating tokens / counters.
+        if not adv_msgs:
+            try:
+                # Module-level import at line 74 already provides these names.
+                # A redundant local import here would shadow the module-level
+                # binding for the entire function (Python scope analysis pre-binds
+                # the names as local), causing UnboundLocalError on every other
+                # use site in cast_spell_async. See Apr 29 audit Bug #1.
+                opp_idx_adv = 1 - (game.players.index(player) if player in game.players else 0)
+                opp_adv = game.players[opp_idx_adv]
+                lib_adv = get_effect_library()
+                ctx_adv = build_game_context(game, player, opp_adv, card=adventure_card)
+                adv_actions, adv_desc = lib_adv.resolve_etb(
+                    card_name=card.adventure_name,
+                    oracle_text=card.adventure_text or '',
+                    controller=player.name,
+                    opponent=opp_adv.name,
+                    game_context=ctx_adv,
+                )
+                if adv_actions:
+                    for a_act in adv_actions:
+                        if a_act.get('action') == 'no_action':
+                            continue
+                        try:
+                            a_msg = engine.rules._execute_action_on_state(game, a_act)
+                            if a_msg:
+                                adv_msgs.append(a_msg)
+                        except Exception as e:
+                            print(f"[ADVENTURE-TEMPLATE] Action failed for {card.adventure_name}: {e}")
+                    if adv_msgs:
+                        print(f"[ADVENTURE-TEMPLATE] Resolved {card.adventure_name}: {adv_desc}")
+            except Exception as e:
+                print(f"[ADVENTURE-TEMPLATE] Lookup failed for {card.adventure_name}: {e}")
+        if not adv_msgs and engine.spell_resolver and card.adventure_text:
+            try:
+                result = await engine.spell_resolver.cast_spell(
+                    game, player, adventure_card, target=target, target_mode=TargetMode.AUTO
+                )
+                adv_msgs = result.messages
+            except Exception as e:
+                print(f"[ADVENTURE] SpellResolver error for {card.adventure_name}: {e}")
+        if not adv_msgs:
+            # Fallback: try resolve_effect via Claude API
+            if engine.rules.client:
+                try:
+                    effect_msgs, _ = await engine.rules.resolve_effect(
+                        game, card.adventure_text,
+                        card.adventure_name, player.name
+                    )
+                    if effect_msgs:
+                        adv_msgs.extend(effect_msgs)
+                except Exception as e:
+                    print(f"[ADVENTURE] resolve_effect error for {card.adventure_name}: {e}")
+        if not adv_msgs:
+            _at = (card.adventure_text or '').replace('\n', ' ').strip()
+            if len(_at) > 500:
+                _at = _at[:497].rstrip() + '…'
+            adv_msgs = [f"🧙 **{card.adventure_name}** resolves — {_at}"]
+        effect_messages.extend(adv_msgs)
+        # Adventure cards go to exile after the adventure resolves
+        player.exile.append(card)
+        card.cast_as_adventure = False  # Reset flag
+        engine.rules.log_event(f"{player.name} casts {card.adventure_name} (adventure of {card.name})")
+        return True, f"Cast {card.adventure_name}", effect_messages
+
+    if card.is_instant() or card.is_sorcery():
+        # [TARGETING] Set resolution source context so _execute_action_on_state
+        # can enforce hexproof/protection/shroud on targeted actions.
+        game._current_resolution_source = (card.name, player.name)
+
+        # Preserve cast trigger messages (Eidolon, Rhystic Study, etc.)
+        # before resolution replaces effect_messages
+        cast_trigger_msgs_saved = list(effect_messages)
+
+        # Tier 1: Hardcoded special effects (mass pump, ramp, delayed triggers)
+        effect_messages = engine.resolve_special_effects(game, player, card, target)
+
+        # Bug fix: mark spell as resolved by Tier 1 to prevent duplicate resolution
+        # (Cultivate was resolving twice — once in resolve_special_effects and again in SpellResolver)
+        if effect_messages:
+            card._spell_resolved = True
+            print(f"[SPELL-TIER1] {card.name} resolved via resolve_special_effects")
+
+        # Tier 1.5: Effect template library (card name + oracle pattern matching)
+        if not effect_messages and not getattr(card, '_spell_resolved', False) and HAS_EFFECT_TEMPLATES and card.oracle_text:
+            try:
+                player_idx = game.players.index(player) if player in game.players else 0
+                opponent = game.players[1 - player_idx]
+                ctx = build_game_context(game, player, opponent, card=card, explicit_target=target)
+                # Apr 30 audit fix #21: pass modal mode selection to templates
+                if getattr(card, '_modes_chosen', None):
+                    ctx['_modes'] = card._modes_chosen
+                lib = get_effect_library()
+                tmpl_actions, tmpl_explanation = lib.resolve_spell(
+                    card_name=card.name,
+                    oracle_text=card.oracle_text,
+                    controller=player.name,
+                    opponent=opponent.name,
+                    game_context=ctx,
+                )
+                if tmpl_actions is not None:
+                    spell_fizzled = False
+                    actions_executed = 0  # Apr 30 audit: track action runs separately
+                    for action in tmpl_actions:
+                        # If a counter_spell fizzled, skip remaining actions
+                        # (Arcane Denial shouldn't draw when counter has no target)
+                        if spell_fizzled:
+                            print(f"[SPELL-TEMPLATE] Skipping {action.get('action')} — spell fizzled")
+                            break
+                        if action.get("action") != "no_action":
+                            # May 7 audit fix #6: inject source card name into
+                            # the action so deal_damage can emit per-spell burn
+                            # lines (🔥 Lava Spike deals 3 damage to Claude).
+                            # Without this, burn spells just silently mutate life
+                            # totals — auditors can't trace per-spell events.
+                            if 'source' not in action and '_source_card_name' not in action:
+                                action['_source_card_name'] = card.name
+                                action['_source_controller'] = player.name
+                                # The deal_damage handler reads `source` first;
+                                # set it too for templates that don't supply one.
+                                if action.get('action') == 'deal_damage' and not action.get('source'):
+                                    action['source'] = card.name
+                            try:
+                                msg = engine.rules._execute_action_on_state(game, action)
+                                actions_executed += 1
+                                if msg:
+                                    effect_messages.append(msg)
+                                    if 'fizzle' in msg.lower():
+                                        spell_fizzled = True
+                            except Exception as ae:
+                                print(f"[SPELL-TEMPLATE] Action failed: {ae}")
+                        else:
+                            reason = action.get("reason", "")
+                            if reason:
+                                # May 7 audit fix #7: skip internal-diagnostic
+                                # reasons (no player context, no _foo, etc.) —
+                                # these are template-runtime errors, not
+                                # things the player can act on.
+                                _r_lower = reason.lower()
+                                _is_internal = any(marker in _r_lower for marker in (
+                                    "no player context", "no _player",
+                                    "no context", "context missing",
+                                ))
+                                if not _is_internal:
+                                    effect_messages.append(f"📋 {reason}")
+                                else:
+                                    print(f"[SPELL-TEMPLATE] Suppressed internal-diagnostic reason: {reason}")
+                    # Apr 30 audit fix: even when an action runs silently (flicker
+                    # dedup, etc.), the spell DID resolve — don't fall through to
+                    # Tier 2/3 and emit the misleading "no automatic state change"
+                    # message. Ephemerate had 5 silent-resolution hits in the audit
+                    # because the flicker action produced no message on duplicate
+                    # flickers, and the spell pipeline interpreted that as "tier 1.5
+                    # didn't handle this." If actions executed without error, we mark
+                    # the spell resolved AND emit a minimal "Ephemerate resolves"
+                    # line so players know the spell completed.
+                    if effect_messages:
+                        card._spell_resolved = True
+                        # May 7 audit fix #8: distinguish "Resolved" from
+                        # "Conditional not met". If every action that ran was
+                        # a no_action (Inventors' Fair without 3 artifacts),
+                        # log the failed condition instead of "Resolved".
+                        _any_real = any(
+                            a.get("action") != "no_action" for a in tmpl_actions
+                        )
+                        if _any_real:
+                            print(f"[SPELL-TEMPLATE] {card.name} resolved via template library: {tmpl_explanation}")
+                        else:
+                            _cond_reason = next(
+                                (a.get("reason", "") for a in tmpl_actions
+                                 if a.get("action") == "no_action" and a.get("reason")),
+                                ""
+                            )
+                            print(f"[SPELL-TEMPLATE] Conditional not met for {card.name}: {_cond_reason or tmpl_explanation}")
+                        if not hasattr(game, '_recently_resolved_spells'):
+                            game._recently_resolved_spells = set()
+                        game._recently_resolved_spells.add(card.name)
+                    elif actions_executed > 0:
+                        # Template ran actions but they produced no visible message
+                        # (flicker dedup, no-op fall-through). Spell DID resolve.
+                        # May 24 audit fix: suppress the "(no further state change)"
+                        # Discord post entirely — it's developer-language and the
+                        # cast event itself was already announced. Just mark the
+                        # spell resolved internally. Console line preserved so
+                        # audits can still grep [SPELL-TEMPLATE] activity.
+                        card._spell_resolved = True
+                        print(f"[SPELL-TEMPLATE] {card.name} resolved silently (actions ran but emitted no message)")
+                        if not hasattr(game, '_recently_resolved_spells'):
+                            game._recently_resolved_spells = set()
+                        game._recently_resolved_spells.add(card.name)
+            except Exception as e:
+                print(f"[SPELL-TEMPLATE] Error for {card.name}: {e}")
+
+        # Tier 2: SpellResolver (regex-based oracle text parsing)
+        has_complex_effect = False
+        if not effect_messages and not getattr(card, '_spell_resolved', False) and engine.spell_resolver and card.oracle_text:
+            try:
+                result = await engine.spell_resolver.cast_spell(
+                    game, player, card, target=target, target_mode=TargetMode.AUTO
+                )
+                effect_messages = result.messages
+                # Check if SpellResolver punted to "complex effect" marker (meaning it couldn't parse).
+                # Match case-insensitively so the suffix marker (lowercase "_(complex effect, ...)_")
+                # still triggers Tier 3 escalation while keeping the user-visible text clean.
+                has_complex_effect = any("complex effect" in m.lower() for m in effect_messages)
+            except Exception as e:
+                print(f"[SPELL_RESOLVER] Error resolving {card.name}: {e}")
+                has_complex_effect = True  # Fallback to Tier 3
+        elif not effect_messages:
+            has_complex_effect = True  # No resolver available, try Tier 3
+
+        # Tier 3: Claude API fallback for complex/unparseable instant/sorcery effects
+        if has_complex_effect and card.oracle_text and not getattr(card, '_spell_resolved', False):
+            try:
+                print(f"[SPELL-TIER3] Using resolve_effect for {card.name}")
+                # Include X value in context for X-cost spells so Claude knows what X is
+                spell_context = f"{card.name} was just cast as a spell"
+                if hasattr(card, '_x_value') and card._x_value is not None and card._x_value > 0:
+                    spell_context += f". X was determined to be {card._x_value}."
+                elif hasattr(card, '_mana_paid') and card._mana_paid and 'X' in (card.mana_cost or ''):
+                    # Calculate X from mana paid if _x_value wasn't set
+                    import re as _re
+                    colored = sum(1 for c in (card.mana_cost or '') if c in 'WUBRGC' and c != 'X')
+                    generic = sum(int(m) for m in _re.findall(r'\{(\d+)\}', card.mana_cost or ''))
+                    x_count = (card.mana_cost or '').count('X')
+                    if x_count > 0:
+                        x_val = (card._mana_paid - colored - generic) // x_count
+                        spell_context += f". X was determined to be {max(0, x_val)}."
+                resolve_msgs, resolve_actions = await engine.rules.resolve_effect(
+                    game,
+                    effect_description=card.oracle_text,
+                    source_card=card.name,
+                    controller=player.name,
+                    context=spell_context
+                )
+                if resolve_actions:
+                    effect_messages = resolve_msgs
+                    print(f"[SPELL-TIER3] {card.name} resolved via Claude API: {len(resolve_actions)} actions")
+                    # Track resolved spell to prevent AI double-resolution
+                    if not hasattr(game, '_recently_resolved_spells'):
+                        game._recently_resolved_spells = set()
+                    game._recently_resolved_spells.add(card.name)
+                else:
+                    print(f"[SPELL-TIER3] {card.name}: Claude API returned no actions")
+                    # [AUTOPLAY-JUDGE] Mirror the console suppression on Discord side:
+                    # if Tier 3 produced no state change, strip the raw "complex effect"
+                    # placeholder that SpellResolver emitted so players don't see a bare
+                    # oracle-text line with no outcome. Case-insensitive so the lowercase
+                    # marker (_(complex effect, ...)_) is also stripped.
+                    effect_messages = [m for m in (effect_messages or []) if "complex effect" not in m.lower()]
+                    if not effect_messages:
+                        # May 17 audit: previous "effect could not be resolved
+                        # automatically — no state change" line was internal
+                        # scaffolding leaking to players (Telling Time and other
+                        # library-look effects fell here). Use a natural
+                        # "resolves" form and only mention the unmodeled aspect
+                        # for library-look effects.
+                        oracle_low = (card.oracle_text or "").lower()
+                        if any(p in oracle_low for p in (
+                            "scry ", "look at the top", "look at the next",
+                            "reveal the top", "rearrange them in any order",
+                        )):
+                            effect_messages = [
+                                f"🔮 **{card.name}** resolves — library reordering "
+                                f"is not modeled by the engine."
+                            ]
+                        else:
+                            effect_messages = [f"✨ **{card.name}** resolves."]
+            except Exception as e:
+                print(f"[SPELL-TIER3] Error resolving {card.name}: {e}")
+
+        if not effect_messages:
+            # Include oracle text so players can see what the spell actually does
+            oracle_preview = ""
+            if card.oracle_text:
+                # Strip reminder text in parens, then strip * chars so they don't
+                # break the italic markdown wrapper (Increasing Vengeance has *(This...*))
+                clean_oracle = re.sub(r'\([^)]*\)', '', card.oracle_text).strip()
+                clean_oracle = clean_oracle.replace('*', '')
+                # Strip trailing standalone keyword tokens (Rebound, Flashback,
+                # Cycling, etc.) — they're ability words / static keyword cues,
+                # not part of the spell's effect text.
+                clean_oracle = re.sub(
+                    r'\.\s*(?:Rebound|Flashback|Cycling|Echo|Buyback|Storm|Madness|Suspend|Dredge|Convoke|Delve|Improvise)\s*$',
+                    '.', clean_oracle, flags=re.IGNORECASE).strip()
+                # Use textwrap.shorten to truncate at a word boundary (avoids mid-word cuts)
+                import textwrap as _textwrap
+                clean_oracle = _textwrap.shorten(clean_oracle, width=300, placeholder="...")
+                oracle_preview = f": *{clean_oracle}*" if clean_oracle else ""
+            # The engine didn't generate any state-change actions for this spell.
+            # Most commonly: a complex effect that escalated to Tier 3 with an
+            # explanation but no JSON actions (e.g. modal spells where the
+            # judge can't pick a mode). Keep it player-readable — emit just
+            # "resolves" + oracle preview; don't surface internal scaffolding.
+            effect_messages = [f"🧙 **{card.name}** resolves{oracle_preview}"]
+
+        # Restore cast trigger messages (Eidolon damage, Rhystic Study draw, etc.)
+        # that were dropped when effect_messages was reassigned during resolution
+        if cast_trigger_msgs_saved:
+            effect_messages = cast_trigger_msgs_saved + effect_messages
+
+        # Goes to graveyard after resolving (or command zone for signature spells,
+        # or exile for rebound spells with upkeep re-cast trigger)
+        oracle_lower = (card.oracle_text or '').lower()
+        if getattr(card, 'is_signature_spell', False) and game.format == "oathbreaker":
+            player.command_zone.append(card)
+            effect_messages.append(f"📜 {card.name} returns to command zone (signature spell)")
+            print(f"[OATHBREAKER] {card.name} resolved → returns to command zone")
+        elif 'rebound' in oracle_lower and not getattr(card, '_from_rebound', False):
+            # Rebound: exile instead of graveyard, recast at next upkeep
+            player.exile.append(card)
+            player_idx = game.players.index(player) if player in game.players else 0
+            # Schedule delayed trigger to recast at next upkeep
+            game.delayed_triggers.append({
+                "trigger_at": "upkeep",
+                "source": f"{card.name} (rebound)",
+                "controller": player_idx,
+                "once": True,
+                "turn_delay": 0,
+                "actions": [
+                    {"action": "rebound_cast", "card": card.name, "player": player.name}
+                ],
+            })
+            effect_messages.append(f"🔄 {card.name} exiled with rebound — will recast at your next upkeep")
+            print(f"[REBOUND] {card.name} exiled, scheduled for next upkeep")
+        elif getattr(card, 'is_signature_spell', False) and game.format == "oathbreaker":
+            # CR Oathbreaker: Signature spell returns to command zone on resolve.
+            if not hasattr(player, 'command_zone') or player.command_zone is None:
+                player.command_zone = []
+            player.command_zone.append(card)
+            effect_messages.append(f"👑 {card.name} returns to command zone")
+            print(f"[OATHBREAKER] {card.name} resolved → returns to command zone")
+        else:
+            player.graveyard.append(card)
+        engine.rules.log_event(f"{player.name} casts {card.name} (instant/sorcery)")
+        # [TARGETING] Clear resolution source context
+        game._current_resolution_source = None
+    else:
+        # Permanent goes to battlefield — reset stale state from previous zone
+        # (e.g. commander recast from command zone still had damage_marked from last death)
+        card.reset_battlefield_state()
+        # Only creatures get summoning sickness (planeswalkers, artifacts, enchantments don't)
+        card.summoning_sick = True if card.is_creature() else False
+        card.entered_this_turn = True
+        player.battlefield.append(card)
+        engine.rules.log_event(f"{player.name} casts {card.name} (permanent)")
+
+        # [SAGA] Sagas get their first lore counter on ETB (CR 714.3a)
+        if 'saga' in (card.type_line or '').lower():
+            if not hasattr(card, 'counters') or card.counters is None:
+                card.counters = {}
+            card.counters['lore'] = 1
+            print(f"[SAGA] {card.name} enters with lore counter 1")
+            chapter_text = engine._get_saga_chapter_text(card, 1)
+            if chapter_text:
+                effect_messages.append(f"📖 **{card.name}** — Chapter I: *{chapter_text[:200]}*")
+                # May 20 audit: previously this path ONLY tried the template
+                # library — if no template matched, chapter I silently failed.
+                # game_1506623303794561024 had Fall of the Thran chapter I
+                # ("Destroy all lands.") never fire because no template exists
+                # AND no Tier 3 fallback was wired here. The progression path
+                # at spells.py:_progress_sagas already has the template +
+                # Tier 3 fallback — mirror that pattern for the ETB path.
+                if HAS_EFFECT_TEMPLATES:
+                    template_fired = False
+                    try:
+                        lib = get_effect_library()
+                        opp_idx = 1 - game.players.index(player)
+                        opp = game.players[opp_idx]
+                        actions, desc = lib.resolve_etb(card.name, chapter_text, player.name, opp.name)
+                        if actions:
+                            for act in actions:
+                                result = engine.rules._execute_action_on_state(game, act)
+                                if result:
+                                    effect_messages.append(f"  {result}")
+                            print(f"[SAGA-CHAPTER] Resolved {card.name} chapter I via template")
+                            template_fired = True
+                    except Exception as e:
+                        print(f"[SAGA-CHAPTER] Template error: {e}")
+                    # Tier 3 fallback when no template matched.
+                    if not template_fired:
+                        try:
+                            engine._queue_async_trigger(
+                                game, card, chapter_text, "saga_chapter_1",
+                                player.name,
+                                context=f"{card.name} Chapter I (ETB) of {engine._get_saga_total_chapters(card)}",
+                            )
+                            print(f"[SAGA-CHAPTER] Queued {card.name} chapter I for Tier 3 (no template)")
+                        except Exception as e:
+                            print(f"[SAGA-CHAPTER] Tier 3 queue error: {e}")
+
+        # [CLONE] Handle "enters as a copy" replacement effects (Clone, Phantasmal Image,
+        # Spark Double, Clever Impersonator). Must happen before ETB triggers.
+        if card.is_creature() and card.oracle_text:
+            clone_oracle = card.oracle_text.lower()
+            is_clone = (
+                "enters the battlefield as a copy" in clone_oracle or
+                "enters as a copy" in clone_oracle or
+                ("you may have" in clone_oracle and "enter as a copy" in clone_oracle)
+            )
+            if is_clone:
+                copy_target = None
+                # [CLONE] Honor the AI-specified target first if it resolves to a
+                # legal creature on the battlefield (any controller). Falls back to
+                # the best-power heuristic only if no target was given or it can't
+                # be found. Applies to Clone, Spark Double, Phantasmal Image,
+                # Body Double, Phyrexian Metamorph, Sakashima the Impostor, etc.
+                target_name = None
+                if target is not None:
+                    if hasattr(target, 'name'):
+                        target_name = target.name
+                    elif isinstance(target, str):
+                        target_name = target
+                    elif isinstance(target, dict) and target.get('name'):
+                        target_name = target['name']
+                if target_name:
+                    for sp in game.players:
+                        for c in sp.battlefield:
+                            if c.id == card.id or not c.is_creature():
+                                continue
+                            if c.name.lower() == target_name.lower():
+                                copy_target = c
+                                break
+                        if copy_target:
+                            break
+                    if copy_target:
+                        print(f"[CLONE] Honoring AI target '{target_name}' for {card.name}")
+                    else:
+                        print(f"[CLONE] AI target '{target_name}' not found on battlefield for {card.name} — falling back")
+                if not copy_target:
+                    best_value = -1
+                    for sp in game.players:
+                        for c in sp.battlefield:
+                            if c.id == card.id or not c.is_creature():
+                                continue
+                            try:
+                                p_val = c.get_effective_power(game) if hasattr(c, 'get_effective_power') else (int(c.power) if c.power else 0)
+                                t_val = c.get_effective_toughness(game) if hasattr(c, 'get_effective_toughness') else (int(c.toughness) if c.toughness else 0)
+                            except (ValueError, TypeError):
+                                p_val, t_val = 0, 0
+                            if p_val + t_val > best_value:
+                                best_value = p_val + t_val
+                                copy_target = c
+                if copy_target:
+                    original_name = card.name
+                    card.name = copy_target.name
+                    card.power = copy_target.power
+                    card.toughness = copy_target.toughness
+                    card.type_line = copy_target.type_line
+                    card.oracle_text = copy_target.oracle_text
+                    card.mana_cost = copy_target.mana_cost
+                    card.cmc = copy_target.cmc
+                    if copy_target.keywords:
+                        card.keywords = list(copy_target.keywords)
+                    card._is_copy = True
+                    card._copy_of = copy_target.name
+                    card._original_name = original_name
+                    # Spark Double: enters with an additional +1/+1 counter
+                    if "spark double" in original_name.lower():
+                        card.counters['+1/+1'] = card.counters.get('+1/+1', 0) + 1
+                    effect_messages.append(f"🪞 {original_name} enters as a copy of {copy_target.name}!")
+                    print(f"[CLONE] {original_name} copies {copy_target.name} ({copy_target.power}/{copy_target.toughness})")
+                else:
+                    print(f"[CLONE] {card.name} found no creature to copy — enters as 0/0")
+
+        # [TRANSFORM] Activate day/night cycle if a daybound card enters
+        dn_msgs = engine._activate_day_night_if_needed(game, card)
+        effect_messages.extend(dn_msgs)
+
+        # [ETB-TAPPED] Check if permanent enters tapped (oracle text + replacement effects)
+        if not card.is_land():
+            enters_tapped, etb_msg = engine.rules._check_enters_tapped(game, card, player)
+            if enters_tapped:
+                card.tapped = True
+                effect_messages.append(f"⏳ {card.name} enters the battlefield tapped{etb_msg}")
+
+        # Handle Aura attachment
+        if card.is_enchantment() and card.oracle_text:
+            oracle_lower = card.oracle_text.lower()
+
+            # Bug #9: Animate Dead / Dance of the Dead / Necromancy — target graveyard, not battlefield
+            reanimate_auras = ["animate dead", "dance of the dead", "necromancy"]
+            if ("enchant creature card in a graveyard" in oracle_lower or
+                card.name.lower() in reanimate_auras):
+                # Find best creature in any graveyard
+                target_card, target_player = None, None
+                best_power = -1
+                for p in game.players:
+                    for c in p.graveyard:
+                        if c.is_creature():
+                            try:
+                                p_val = c.get_effective_power(game) if hasattr(c, 'get_effective_power') else 0
+                            except (ValueError, TypeError):
+                                p_val = int(c.power) if c.power and str(c.power).lstrip('-').isdigit() else 0
+                            if p_val > best_power:
+                                best_power, target_card, target_player = p_val, c, p
+                if target_card and target_player:
+                    target_player.graveyard.remove(target_card)
+                    target_card.reset_battlefield_state()
+                    target_card.entered_this_turn = True
+                    player.battlefield.append(target_card)
+                    # Attach aura to the reanimated creature
+                    card.attached_to = target_card.id
+                    if not hasattr(target_card, 'attachments'):
+                        target_card.attachments = []
+                    target_card.attachments.append(card.id)
+                    # May 14 audit (L4): set the two-way binding so the SBA
+                    # cleanup at sba.py:251 ([REANIMATE-AURA]) can sacrifice
+                    # the reanimated creature when the binding aura leaves.
+                    # Without this, Animate Dead → graveyard would leave the
+                    # creature on battlefield permanently — and the LTB trigger
+                    # display would say "sacrifice it" without anything
+                    # actually being sacrificed.
+                    card._bound_creature_id = target_card.id
+                    target_card._reanimated_by_aura_id = card.id
+                    print(f"[REANIMATE-BIND] {card.name} bound to {target_card.name}")
+                    effect_messages.append(f"💀 {card.name} reanimates {target_card.name}!")
+                    print(f"[REANIMATE] {card.name} brought back {target_card.name} from {target_player.name}'s graveyard")
+                    # Fire ETB triggers for reanimated creature
+                    etb_msgs, _ = engine._check_creature_etb_triggers_sync(game, player, target_card)
+                    if etb_msgs:
+                        effect_messages.extend(etb_msgs)
+                else:
+                    effect_messages.append(f"💨 {card.name} fizzles (no creatures in any graveyard)")
+                    if card in player.battlefield:
+                        player.battlefield.remove(card)
+                    player.graveyard.append(card)
+                # Skip normal aura attachment — we handled it
+                pass
+
+            elif "enchant creature" in oracle_lower or "enchant permanent" in oracle_lower:
+                # This is an Aura - attach to target
+                target_card = None
+                # [AURA-TARGET] Resolve target from AI action — accept Card, Player
+                # (reject), string name, or dict with a 'name' key. Honor the AI's
+                # choice over the auto-select heuristic.
+                if target is not None:
+                    resolved_name = None
+                    if isinstance(target, Card):
+                        target_card = target
+                    elif isinstance(target, str):
+                        resolved_name = target
+                    elif isinstance(target, dict) and target.get('name'):
+                        resolved_name = target['name']
+                    elif hasattr(target, 'name') and not isinstance(target, Player):
+                        resolved_name = target.name
+                    if resolved_name and not target_card:
+                        for p in game.players:
+                            for c in p.battlefield:
+                                if c.id == card.id:
+                                    continue
+                                if c.name.lower() == resolved_name.lower() or c.id == resolved_name:
+                                    target_card = c
+                                    break
+                            if target_card:
+                                break
+                    # Validate AI-chosen target against oracle restriction + hexproof/ward
+                    if target_card:
+                        is_creature_only_check = "enchant creature" in oracle_lower
+                        if is_creature_only_check and not target_card.is_creature():
+                            print(f"[AURA-TARGET] AI target {target_card.name} is not a creature — falling back to auto-select")
+                            target_card = None
+                        elif HAS_TARGETING:
+                            # Find the target's controller for validation
+                            target_controller = None
+                            for p in game.players:
+                                if target_card in p.battlefield:
+                                    target_controller = p
+                                    break
+                            if target_controller:
+                                legal, reason = _validate_target_for_action(
+                                    game, target_card, target_controller, card, player.name)
+                                if not legal:
+                                    print(f"[AURA-TARGET] AI target {target_card.name} illegal ({reason}) — falling back")
+                                    target_card = None
+                    if target_card:
+                        print(f"[AURA-TARGET] Honoring AI target {target_card.name} for {card.name}")
+
+                if not target_card:
+                    # No target provided — auto-select from valid targets
+                    # "enchant creature" targets creatures; "enchant permanent" targets any permanent
+                    is_creature_only = "enchant creature" in oracle_lower
+                    valid_targets = []
+                    for p in game.players:
+                        for c in p.battlefield:
+                            if c.id == card.id:
+                                continue  # Skip the aura itself
+                            if is_creature_only and not c.is_creature():
+                                continue
+                            # Full targeting validation (hexproof, shroud, protection, ward)
+                            if HAS_TARGETING:
+                                legal, reason = _validate_target_for_action(
+                                    game, c, p, card, player.name)
+                                if not legal:
+                                    print(f"[AURA-TARGET] {card.name} cannot enchant {c.name}: {reason}")
+                                    continue
+                            else:
+                                # Fallback: basic hexproof/shroud check
+                                if c not in player.battlefield:
+                                    if c.has_keyword("Hexproof") or c.has_keyword("Shroud"):
+                                        continue
+                            valid_targets.append(c)
+
+                    print(f"[AURA] {card.name}: creature_only={is_creature_only}, valid_targets={[c.name for c in valid_targets]}")
+
+                    # May 20 audit: hoist beneficial/detrimental classification out
+                    # of the `if valid_targets:` block so the fizzle-hint code path
+                    # downstream can see it even when valid_targets was empty.
+                    detrimental_cues = (
+                        "can't attack", "can't block", "can't be activated",
+                        "doesn't untap", "loses all abilities", "loses flying",
+                        "is a creature with base power and toughness",
+                        "gets -",
+                    )
+                    is_detrimental = any(cue in oracle_lower for cue in detrimental_cues)
+
+                    if valid_targets:
+                        own_creatures = [c for c in valid_targets if c in player.battlefield]
+                        opp_creatures = [c for c in valid_targets if c not in player.battlefield]
+                        if is_detrimental and opp_creatures:
+                            target_card = opp_creatures[0]
+                        elif is_detrimental and not opp_creatures:
+                            # Detrimental aura with no opponent creature — fizzle
+                            # rather than punish caster.
+                            print(f"[AURA] {card.name} is detrimental but no opponent creature legal — fizzling")
+                            target_card = None
+                        elif own_creatures:
+                            target_card = own_creatures[0]
+                        else:
+                            # Beneficial aura but only opponent creatures legal —
+                            # fizzle rather than buff opponent.
+                            print(f"[AURA] {card.name} is beneficial but only opponent targets — fizzling")
+                            target_card = None
+                        if target_card:
+                            print(f"[AURA] Auto-selected target {target_card.name} for {card.name} (detrimental={is_detrimental})")
+
+                if target_card:
+                    card.attached_to = target_card.id
+                    target_card.attachments.append(card.id)
+                    effect_messages.append(f"✨ {card.name} enchants {target_card.name}")
+                else:
+                    # Genuinely no valid targets on battlefield - fizzle
+                    player.battlefield.remove(card)
+                    player.graveyard.append(card)
+                    # May 20 audit: the hint must respect the same beneficial/detrimental
+                    # split that drove the fizzle. Suggesting opponent's commander for a
+                    # beneficial aura ("Try !play Ethereal Armor target Thassa") is a UX
+                    # bug because the play would either fizzle again (filtered by the
+                    # same beneficial-aura branch) or buff opponent if user forces it.
+                    own_creature_names = [c.name for c in player.battlefield if c.is_creature()]
+                    opp_creature_names = [
+                        c.name for p in game.players for c in p.battlefield
+                        if c.is_creature() and p is not player
+                    ]
+                    if is_detrimental and opp_creature_names:
+                        hint_target = opp_creature_names[0]
+                    elif not is_detrimental and own_creature_names:
+                        hint_target = own_creature_names[0]
+                    else:
+                        hint_target = None
+                    if hint_target:
+                        effect_messages.append(f"💨 {card.name} fizzles (no valid target). Try `!play {card.name} target {hint_target}`")
+                    else:
+                        kind = "opponent creature" if is_detrimental else "creature you control"
+                        effect_messages.append(f"💨 {card.name} fizzles (no valid target — no {kind} on battlefield)")
+                    return True, f"Cast {card.name}", effect_messages
+        
+        # Handle Living Weapon (Batterskull, etc.)
+        # Creates a 0/0 Germ token and auto-attaches the equipment
+        if card.is_artifact() and card.oracle_text and 'living weapon' in card.oracle_text.lower():
+            # Create 0/0 black Phyrexian Germ creature token with stable id
+            import uuid as _uuid_lw
+            germ = Card(
+                name="Phyrexian Germ",
+                mana_cost="",
+                type_line="Creature Token — Phyrexian Germ",
+                oracle_text="",
+                power="0",
+                toughness="0",
+            )
+            germ.id = f"token_Phyrexian_Germ_{_uuid_lw.uuid4().hex[:8]}"
+            germ.is_token = True
+            germ.summoning_sick = True
+            germ.entered_this_turn = True
+            germ.owner_index = game.players.index(player) if player in game.players else 0
+            # Defensive: ensure attachments list exists on the token (dataclass default
+            # should handle this, but re-initialize in case a subclass reset it).
+            if not hasattr(germ, 'attachments') or germ.attachments is None:
+                germ.attachments = []
+            player.battlefield.append(germ)
+            # Attach equipment to the germ. MUST happen before any SBA check —
+            # without the attachment, Germ has 0 toughness and dies immediately.
+            card.attached_to = germ.id
+            germ.attachments.append(card.id)
+            # Verify bonus is visible right after attachment to catch future breakage.
+            try:
+                eff_p = germ.get_effective_power(game)
+                eff_t = germ.get_effective_toughness(game)
+                print(f"[LIVING-WEAPON] {card.name} -> {germ.name} (germ_id={germ.id}, equip_id={card.id}) effective={eff_p}/{eff_t}")
+                if eff_t <= 0:
+                    print(f"[LIVING-WEAPON] WARNING: {germ.name} still has 0 toughness after attachment. Equipment oracle: {card.oracle_text[:100]!r}")
+            except Exception as _lw_exc:
+                print(f"[LIVING-WEAPON] P/T check raised: {_lw_exc}")
+            effect_messages.append(f"⚔️ {card.name} — Living weapon creates a 0/0 Phyrexian Germ token, equipped with {card.name}")
+
+        # Handle "As ~ enters, pay any amount of life" (Phyrexian Processor)
+        if card.oracle_text and card.is_artifact():
+            oracle_lower = card.oracle_text.lower()
+            if 'pay any amount of life' in oracle_lower and 'enters' in oracle_lower:
+                # Prompt the player to choose how much life to pay
+                game.pending_action = {
+                    'type': 'pay_life_etb',
+                    'card_id': card.id,
+                    'card_name': card.name,
+                    'player_idx': game.players.index(player),
+                }
+                effect_messages.append(
+                    f"💀 **{card.name}** — As it enters, you may pay any amount of life.\n"
+                    f"  Use `!target <amount>` to choose how much life to pay (0 for none).\n"
+                    f"  (Current life: {player.life})"
+                )
+                print(f"[ETB] {card.name}: waiting for life payment choice")
+
+        # Handle "enters with X +1/+1 counters" (Omarthis, Walking Ballista, etc.)
+        # This is a REPLACEMENT EFFECT - counters apply AS it enters, not after
+        if card.oracle_text and card.is_creature():
+            oracle_lower = card.oracle_text.lower()
+            if (("enters with x" in oracle_lower or "enters the battlefield with x" in oracle_lower) 
+                and "+1/+1 counter" in oracle_lower):
+                # Figure out X from _x_value (set during casting) or mana paid
+                # For {X}{X} costs like Omarthis, X = total_paid / 2
+                # For {X} costs like Walking Ballista, X = total_paid - colored_costs
+                x_value = 0
+                # Prefer _x_value set during cast_spell_async (most reliable)
+                if hasattr(card, '_x_value') and card._x_value is not None and card._x_value > 0:
+                    x_value = card._x_value
+                elif card.mana_cost:
+                    cost_upper = card.mana_cost.upper()
+                    # Count X's in cost
+                    x_count = cost_upper.count('X')
+                    # Count colored mana requirements
+                    colored_cost = sum(cost_upper.count(f'{{{c}}}') for c in ['W', 'U', 'B', 'R', 'G'])
+                    # Parse generic mana (numbers in braces)
+                    generic_cost = 0
+                    for match in re.findall(r'\{(\d+)\}', cost_upper):
+                        generic_cost += int(match)
+
+                    # X = (mana_paid - colored - generic) / x_count
+                    if x_count > 0 and hasattr(card, '_mana_paid') and card._mana_paid > 0:
+                        x_value = (card._mana_paid - colored_cost - generic_cost) // x_count
+                    else:
+                        # No mana tracking — shouldn't happen after the X-cost fix,
+                        # but as a fallback, use 1 so 0/0 creatures don't instantly die
+                        x_value = max(1, (card.cmc - colored_cost - generic_cost) // max(x_count, 1))
+                
+                if x_value > 0:
+                    card.counters['+1/+1'] = card.counters.get('+1/+1', 0) + x_value
+                    effect_messages.append(f"⭕ {card.name} enters with {x_value} +1/+1 counter(s)")
+        
+        # Initialize planeswalker loyalty
+        if card.is_planeswalker():
+            base_loyalty = 0
+            if card.loyalty:
+                try:
+                    base_loyalty = int(card.loyalty)
+                except (ValueError, TypeError):
+                    base_loyalty = 0
+            
+            # Special planeswalker loyalty rules
+            oracle_lower = card.oracle_text.lower() if card.oracle_text else ""
+            
+            # Jeska, Thrice Reborn: enters with loyalty = times you've cast a commander
+            if "jeska" in card.name.lower() and "enters with a number of loyalty counters" in oracle_lower:
+                # Count total times commanders have been cast from command zone
+                total_commander_casts = 0
+                for cmd in player.command_zone:
+                    total_commander_casts += cmd.times_cast_from_command_zone
+                # Include any commanders on battlefield
+                for perm in player.battlefield:
+                    if perm.is_commander:
+                        total_commander_casts += perm.times_cast_from_command_zone
+                # Minimum of 1 (since we're casting Jeska, that's at least 1 commander cast)
+                card.loyalty_counters = max(1, total_commander_casts)
+                effect_messages.append(f"⚡ {card.name} enters with {card.loyalty_counters} loyalty")
+            else:
+                card.loyalty_counters = base_loyalty
+                if base_loyalty > 0:
+                    effect_messages.append(f"⚡ {card.name} enters with {card.loyalty_counters} loyalty")
+        
+        # Handle ETB effects for permanents
+        # Only match SELF-ETB effects, not ongoing "whenever" triggers
+        if card.oracle_text:
+            oracle_lower = card.oracle_text.lower()
+            card_name_lower = card.name.lower()
+            
+            # Extract just the engine-ETB paragraph(s) from oracle text
+            etb_paragraphs = []
+            for paragraph in card.oracle_text.split('\n'):
+                p_lower = paragraph.lower().strip()
+                if not p_lower:
+                    continue
+                
+                # Match engine-ETB patterns:
+                # "When [card name] enters..." 
+                # "When this [type] enters..."
+                # "When ~ enters..." (Scryfall uses card name, not ~)
+                # But NOT "Whenever another creature enters..." (ongoing trigger)
+                # And NOT "Whenever a land enters..." (landfall - ongoing)
+                is_self_etb = False
+                
+                if p_lower.startswith("when") and "enters" in p_lower:
+                    if not p_lower.startswith("whenever"):
+                        # "When X enters" — standard one-time ETB
+                        is_self_etb = True
+                    elif card.name.lower() in p_lower:
+                        # "Whenever Inferno Titan enters the battlefield or attacks"
+                        # Modern combined ETB+attack template — still a engine-ETB
+                        is_self_etb = True
+                
+                # Also match "As [card name] enters" (replacement effects like clone)
+                if p_lower.startswith("as ") and "enters" in p_lower:
+                    is_self_etb = True
+                
+                if is_self_etb:
+                    etb_paragraphs.append(paragraph.strip())
+            
+            if etb_paragraphs:
+                # Tier 1: Check special effects (handles ramp creatures like Wood Elves)
+                effect_messages = engine.resolve_special_effects(game, player, card, target)
+                
+                # Tier 1.5: Try effect template library (data-driven, no API)
+                if not effect_messages and HAS_EFFECT_TEMPLATES:
+                    try:
+                        etb_text = "\n".join(etb_paragraphs)
+                        opponent_idx = 1 - (game.players.index(player) if player in game.players else 0)
+                        opponent = game.players[opponent_idx]
+                        
+                        ctx = build_game_context(game, player, opponent, card=card, explicit_target=target)
+                        lib = get_effect_library()
+                        actions, explanation = lib.resolve_etb(
+                            card_name=card.name,
+                            oracle_text=etb_text,
+                            controller=player.name,
+                            opponent=opponent.name,
+                            game_context=ctx,
+                        )
+                        
+                        if actions is not None:
+                            if actions:  # Non-empty action list
+                                _any_action_executed = False  # May 13: track silent successes
+                                for action in actions:
+                                    action_type = action.get("action", "")
+                                    if action_type == "no_action":
+                                        reason = action.get("reason", "")
+                                        if reason:
+                                            effect_messages.append(f"📜 {reason}")
+                                        continue
+                                    # [TARGETING] Validate target for targeted ETB actions
+                                    # (e.g., Ravenous Chupacabra targeting a hexproof creature)
+                                    if HAS_TARGETING and action.get("target_card"):
+                                        target_name = action.get("target_card", "")
+                                        target_ctrl = action.get("target_controller", "")
+                                        legal, reason = _validate_target_for_action(
+                                            game, target_name, target_ctrl, card, player.name)
+                                        if not legal:
+                                            print(f"[ETB-TARGET] {card.name} can't target {target_name}: {reason}")
+                                            effect_messages.append(f"⚡ {card.name}'s ETB fizzles — {target_name} {reason}")
+                                            continue
+                                    try:
+                                        msg = engine.rules._execute_action_on_state(game, action)
+                                        _any_action_executed = True
+                                        if msg:
+                                            effect_messages.append(msg)
+                                    except Exception as e:
+                                        print(f"[TEMPLATE] Action failed for {card.name}: {action} — {e}")
+
+                                # May 13 audit: template fired, action executed,
+                                # but the action handler returned None (e.g. scry
+                                # that kept all cards on top — Omenspeaker, Watcher
+                                # in the Mist scry/surveil). Without a fallback
+                                # line `effect_messages` stays empty, the "resolved"
+                                # bookkeeping below is skipped, and we fall through
+                                # to ETB-UNHANDLED + the manual `!resolve` prompt
+                                # even though the template DID handle it.
+                                if _any_action_executed and not effect_messages:
+                                    effect_messages.append(f"📜 {card.name}: {explanation}")
+
+                                if effect_messages:
+                                    # May 7 audit fix #8: same as spell-template
+                                    # path — distinguish "Resolved" from
+                                    # "Conditional not met" (Charming Prince
+                                    # picking a mode whose effect ended up
+                                    # silent because of internal RNG).
+                                    _any_real_etb = any(
+                                        a.get("action") != "no_action" for a in actions
+                                    )
+                                    if _any_real_etb:
+                                        print(f"[ETB-TEMPLATE] Resolved {card.name} via template: {explanation}")
+                                    else:
+                                        _cond_etb = next(
+                                            (a.get("reason", "") for a in actions
+                                             if a.get("action") == "no_action" and a.get("reason")),
+                                            ""
+                                        )
+                                        print(f"[ETB-TEMPLATE] Conditional not met for {card.name}: {_cond_etb or explanation}")
+                                    # Track resolved ETB to prevent AI double-resolution
+                                    if not hasattr(game, '_recently_resolved_etbs'):
+                                        game._recently_resolved_etbs = set()
+                                    game._recently_resolved_etbs.add(card.name)
+                                    # Also add to _recently_resolved_spells for broader dedup
+                                    if not hasattr(game, '_recently_resolved_spells'):
+                                        game._recently_resolved_spells = set()
+                                    game._recently_resolved_spells.add(card.name)
+                                    # Prevent double-resolution: clear pending_resolves for this card
+                                    # so the AI doesn't re-fire via {"type":"resolve"}
+                                    if hasattr(game, 'pending_resolves') and game.pending_resolves:
+                                        game.pending_resolves = [
+                                            pr for pr in game.pending_resolves
+                                            if card.name.lower() not in pr.lower()
+                                        ]
+                                    # Panharmonicon: if on battlefield, fire the ETB again
+                                    has_panharmonicon = any(
+                                        p.name.lower() == "panharmonicon"
+                                        for p in player.battlefield
+                                        if p != card  # Panharmonicon doesn't double itself
+                                    )
+                                    # Panharmonicon doubles artifact AND creature ETBs (CR 603.1).
+                                    # Restricting to entering type ensures non-ETB triggers can
+                                    # never reach this announcement branch.
+                                    if has_panharmonicon and (card.is_creature() or card.is_artifact()):
+                                        print(f"[PANHARMONICON] Doubling ETB for {card.name}")
+                                        effect_messages.append(f"⚡ Panharmonicon doubles {card.name}'s ETB!")
+                                        # Re-resolve template with FRESH context (board state changed after 1st ETB)
+                                        try:
+                                            ctx2 = build_game_context(game, player, opponent, card=card, explicit_target=target)
+                                            actions2, explanation2 = lib.resolve_etb(
+                                                card_name=card.name,
+                                                oracle_text="\n".join(etb_paragraphs),
+                                                controller=player.name,
+                                                opponent=opponent.name,
+                                                game_context=ctx2,
+                                            )
+                                            pan_actions = actions2 if actions2 else actions  # Fall back to original if re-resolve fails
+                                        except Exception:
+                                            pan_actions = actions  # Fall back to replaying same actions
+                                        for action in pan_actions:
+                                            if action.get("action") == "no_action":
+                                                continue
+                                            try:
+                                                msg = engine.rules._execute_action_on_state(game, action)
+                                                if msg:
+                                                    effect_messages.append(f"⚡ (Panharmonicon) {msg}")
+                                            except Exception as e:
+                                                print(f"[PANHARMONICON] Action failed: {action} — {e}")
+                            else:
+                                # Empty list = template returned no actions. This is normal for:
+                                #  - cards with only static/keyword ETB clauses (ex: trample, flying)
+                                #  - X-counter creatures (Walking Ballista, Hangarback) — handled
+                                #    separately by the "enters with X +1/+1 counters" block below
+                                oracle_lower_t = (card.oracle_text or '').lower()
+                                if 'enters with x' in oracle_lower_t or 'enters the battlefield with x' in oracle_lower_t:
+                                    print(f"[ETB-TEMPLATE] {card.name}: deferred to X-counter handler")
+                                else:
+                                    print(f"[ETB-TEMPLATE] {card.name}: no ETB actions (static abilities only)")
+                    except Exception as e:
+                        print(f"[TEMPLATE] Error for {card.name}: {e}")
+                
+                # Tier 2: If no special handling, try SpellResolver with just the ETB text
+                if not effect_messages and engine.spell_resolver:
+                    try:
+                        etb_text = "\n".join(etb_paragraphs)
+                        
+                        # Temporarily swap oracle text for ETB-only parsing
+                        original_oracle = card.oracle_text
+                        card.oracle_text = etb_text
+                        
+                        result = await engine.spell_resolver.cast_spell(
+                            game, player, card, target=target, target_mode=TargetMode.AUTO
+                        )
+                        
+                        # Restore original oracle text
+                        card.oracle_text = original_oracle
+                        
+                        # Check if SpellResolver actually handled it or just dumped a "complex effect" marker
+                        resolved_by_spell_resolver = False
+                        for msg in result.messages:
+                            if "complex effect" not in msg.lower() and "effects not automated" not in msg:
+                                effect_messages.append(msg)
+                                resolved_by_spell_resolver = True
+                        
+                        # If SpellResolver couldn't handle it, try XMage bridge (tier 2.5)
+                        if not resolved_by_spell_resolver and engine._xmage_available and engine._xmage_translator:
+                            try:
+                                print(f"[ETB] SpellResolver punted on {card.name}, trying XMage bridge")
+                                xmage_state, name_map = engine._serialize_for_xmage(game)
+                                reverse_map = {v: k for k, v in name_map.items()}
+
+                                triggers = await engine.xmage_bridge.get_triggers(
+                                    "enters", xmage_state, source=card.name
+                                )
+
+                                # Filter to engine-ETB triggers from THIS card
+                                self_triggers = [
+                                    t for t in triggers
+                                    if t.get("source", "").lower() == card.name.lower()
+                                    and "enters" in t.get("ability", "").lower()
+                                ]
+
+                                if self_triggers:
+                                    opponent_idx = 1 - (game.players.index(player) if player in game.players else 0)
+                                    opponent = game.players[opponent_idx]
+                                    ctx = build_game_context(game, player, opponent, card=card)
+
+                                    for trigger in self_triggers:
+                                        trig_ctrl = reverse_map.get(trigger.get("controller", ""), player.name)
+                                        trig_opp_key = "playerB" if trigger.get("controller") == "playerA" else "playerA"
+                                        trig_opp = reverse_map.get(trig_opp_key, opponent.name)
+
+                                        t_actions, t_expl = engine._xmage_translator.translate_trigger(
+                                            source_card=card.name,
+                                            ability_text=trigger["ability"],
+                                            controller=trig_ctrl,
+                                            opponent=trig_opp,
+                                            game_context=ctx,
+                                        )
+
+                                        if t_actions is not None:
+                                            for action in t_actions:
+                                                if action.get("action") == "no_action":
+                                                    reason = action.get("reason", "")
+                                                    if reason:
+                                                        effect_messages.append(f"📜 {reason}")
+                                                    continue
+                                                try:
+                                                    msg = engine.rules._execute_action_on_state(game, action)
+                                                    if msg:
+                                                        effect_messages.append(msg)
+                                                except Exception as e:
+                                                    print(f"[XMAGE-ETB] Action failed for {card.name}: {e}")
+
+                                            if effect_messages:
+                                                print(f"[XMAGE-ETB] Resolved {card.name} ETB: {t_expl}")
+                            except Exception as e:
+                                print(f"[XMAGE-ETB] Error for {card.name}: {e}")
+
+                        # Early-exit: if the ETB paragraph contains no actionable
+                        # verb, don't waste a Tier 3 API call. Matches paragraphs
+                        # like "When X enters, you may..." that got captured by the
+                        # pattern but have no effect the engine could execute
+                        # (Swiftfoot Boots-style false positives where the ETB
+                        # paragraph is flavor or conditional with no trigger body).
+                        if not resolved_by_spell_resolver and not effect_messages:
+                            _etb_lower = "\n".join(etb_paragraphs).lower()
+                            _verbs = (
+                                'draw', 'deal', 'damage', 'create', 'destroy',
+                                'exile', 'return', 'counter', 'gain', 'lose',
+                                'sacrifice', 'search', 'scry', 'surveil',
+                                'tap', 'untap', 'put', 'add', 'mill', 'discard',
+                                'reveal', 'copy', 'fight', 'transform', 'regenerate',
+                                '+1/+1', '-1/-1', 'counter on', 'token',
+                            )
+                            if not any(v in _etb_lower for v in _verbs):
+                                print(f"[ETB] {card.name}: no actionable verb in ETB text — skipping Tier 3")
+                                effect_messages.append(f"📜 {card.name} enters the battlefield")
+                        if not resolved_by_spell_resolver and not effect_messages:
+                            print(f"[ETB] Using resolve_effect (tier 3) for {card.name}")
+                            controller_name = player.name
+                            resolve_msgs, actions = await engine.rules.resolve_effect(
+                                game,
+                                effect_description=etb_text,
+                                source_card=card.name,
+                                controller=controller_name,
+                                context=f"{card.name} just entered the battlefield"
+                            )
+                            effect_messages.extend(resolve_msgs)
+                            if actions:
+                                print(f"[ETB] resolve_effect executed {len(actions)} action(s) for {card.name}")
+                            elif resolve_msgs:
+                                # Tier 3 returned an explanation but no executable actions (e.g. "no valid targets")
+                                # This counts as "handled" — don't fall through to ETB-UNHANDLED
+                                print(f"[ETB] resolve_effect: no actions but has explanation for {card.name}")
+                            else:
+                                # Tier 3 returned nothing at all (JSON parse error,
+                                # API outage, library-look short-circuit, dedupe).
+                                # Don't post a false "no effect" / "fizzled" line:
+                                # the trigger queue (drain_pending_triggers) often
+                                # resolves the same ETB seconds later, and players
+                                # see contradictory messages. Let it handle itself
+                                # silently — pending_resolves still logs anything
+                                # genuinely unhandled for diagnostics.
+                                print(f"[ETB] resolve_effect returned no actions for {card.name} — suppressing (trigger queue may still handle it)")
+                                
+                    except Exception as e:
+                        print(f"[SPELL_RESOLVER] Error resolving ETB for {card.name}: {e}")
+                
+                # If still nothing resolved, log for future hardcoding
+                if not effect_messages:
+                    etb_text = "\n".join(etb_paragraphs)
+                    print(f"[ETB-UNHANDLED] {card.name}: {etb_text[:150]}")
+                    if _should_emit_resolve_hint(game, f"etb:{card.name}"):
+                        effect_messages.append(
+                            f"📜 **{card.name}** ETB: *{etb_text[:200]}{'...' if len(etb_text) > 200 else ''}*\n"
+                            f"  *(Use `!resolve {card.name} ETB` or `!fix` to handle manually)*"
+                        )
+                    # Track for AI — so it knows to resolve this on its turn
+                    game.pending_resolves.append(
+                        f"{card.name} ETB: {etb_text[:150]}"
+                    )
+        
+        # Check for "whenever another creature enters" triggers (Terror of the Peaks, etc.)
+        if card.is_creature():
+            terror_triggers = await engine._check_creature_etb_triggers(game, player, card)
+            effect_messages.extend(terror_triggers)
+
+    # [LAYERS] Register static keyword-granting abilities and recalculate
+    # [REPLACEMENT] Register replacement effects (Furnace of Rath, Rest in Peace, etc.)
+    if card in player.battlefield:
+        game.register_static_keyword_grants(card, player.name)
+        game.register_static_pt_effects(card, player.name)
+        game.register_replacement_effects(card, player.name)
+        game.recalculate_granted_keywords()
+        game.recalculate_power_toughness()
+
+    # Flush draw-trigger side-channel (Smothering Tithe, Consecrated Sphinx)
+    engine._flush_pending_messages(game, effect_messages)
+    return True, f"Cast {card.name}", effect_messages
+
+# =========================================================================
+# PENDING ASYNC TRIGGER QUEUE
+# =========================================================================
+# Sync paths (advance_phase, end_turn, _handle_etb_triggers, SBA loops) can't
+# call the async Tier 3 resolver. Instead of emitting a `*(Use !resolve ...)*`
+# hint and dropping the trigger, they enqueue here. The next async caller
+# drains the queue via drain_pending_triggers() and actually resolves the
+# effects via engine.rules.resolve_effect(). See CLAUDE.md "Known Limitation:
+# Sync Trigger Gap".
+
+
+def _advance_sagas(engine, game: GameState, player: Player) -> List[str]:
+    """Add a lore counter to each saga the player controls and fire chapter abilities.
+    Called after draw step (CR 714.3a). Also handles saga ETB (first lore counter)."""
+    messages = []
+    for card in list(player.battlefield):
+        tl = (card.type_line or '').lower()
+        if 'saga' not in tl:
+            continue
+        # Add lore counter
+        if not hasattr(card, 'counters') or card.counters is None:
+            card.counters = {}
+        old_lore = card.counters.get('lore', 0)
+        card.counters['lore'] = old_lore + 1
+        new_lore = card.counters['lore']
+        print(f"[SAGA] {card.name}: lore counter {old_lore} → {new_lore}")
+        # Fire chapter ability — parse oracle text for chapter N text
+        chapter_text = engine._get_saga_chapter_text(card, new_lore)
+        if chapter_text:
+            messages.append(f"📖 **{card.name}** — Chapter {new_lore}: *{chapter_text[:200]}*")
+            # May 20 audit (Fix #50): for the FINAL chapter of a transforming
+            # saga, the chapter ability IS the transform (CR 715.4: "exile
+            # this Saga, then return it to the battlefield transformed").
+            # SBA SAGA_COMPLETE handler at mtg/sba.py performs the transform
+            # using _TRANSFORMING_SAGA_BACK_FACES. Running Tier 3 on the
+            # chapter text in parallel produces a duplicate drain — visible in
+            # game_1506623303794561024:1209-1213 where Restoration of Eiganjo
+            # transformed AND then ran [DRAIN-SAGA_CHAPTER_3] on the back face.
+            # Skip the chapter-resolution step when the chapter text describes
+            # the transform itself.
+            from mtg.sba import _TRANSFORMING_SAGA_BACK_FACES
+            saga_chapters = engine._get_saga_total_chapters(card)
+            is_final_chapter = new_lore >= saga_chapters
+            is_transforming_saga = (
+                is_final_chapter
+                and (card.name or '').lower() in _TRANSFORMING_SAGA_BACK_FACES
+            )
+            # Belt-and-suspenders: also catch raw "exile this saga ... return
+            # ... transformed" text for sagas not yet in the lookup table.
+            chapter_lower = (chapter_text or '').lower()
+            looks_like_transform_chapter = (
+                'exile this saga' in chapter_lower
+                and ('return' in chapter_lower)
+                and ('transformed' in chapter_lower or 'transforms' in chapter_lower)
+            )
+            if is_transforming_saga or looks_like_transform_chapter:
+                print(f"[SAGA-CHAPTER] {card.name} chapter {new_lore} IS the transform — "
+                      f"skipping Tier 3 resolution (SBA SAGA_COMPLETE will handle)")
+            elif HAS_EFFECT_TEMPLATES:
+                # Try to resolve the chapter via template/tier system
+                try:
+                    lib = get_effect_library()
+                    opp_idx = 1 - game.players.index(player)
+                    opp = game.players[opp_idx]
+                    actions, desc = lib.resolve_etb(card.name, chapter_text, player.name, opp.name)
+                    if actions:
+                        for act in actions:
+                            result = engine.rules._execute_action_on_state(game, act)
+                            if result:
+                                messages.append(f"  {result}")
+                        print(f"[SAGA-CHAPTER] Resolved {card.name} chapter {new_lore} via template")
+                    else:
+                        # Queue for async Tier 3 drain (sync context). Don't post a
+                        # "queued for Tier 3 resolution" line to Discord — the actual
+                        # outcome appears when drain_pending_triggers fires, which
+                        # is more useful than an internal status placeholder.
+                        engine._queue_async_trigger(
+                            game, card, chapter_text, f"saga_chapter_{new_lore}",
+                            player.name,
+                            context=f"{card.name} Chapter {new_lore} of {engine._get_saga_total_chapters(card)}",
+                        )
+                except Exception as e:
+                    print(f"[SAGA-CHAPTER] Error resolving {card.name} chapter {new_lore}: {e}")
+                    engine._queue_async_trigger(
+                        game, card, chapter_text, f"saga_chapter_{new_lore}",
+                        player.name,
+                        context=f"{card.name} Chapter {new_lore} (template error)",
+                    )
+        # Check if saga is complete (sacrifice via SBA)
+        saga_chapters = engine._get_saga_total_chapters(card)
+        if new_lore >= saga_chapters:
+            print(f"[SAGA] {card.name}: final chapter reached ({new_lore}/{saga_chapters}), will sacrifice via SBA")
+    return messages
+
+
+def _process_suspend_upkeep(engine, game: GameState) -> List[str]:
+    """Process suspended cards at upkeep - remove time counters and cast if 0."""
+    messages = []
+    player = game.active_player
+    player_idx = game.players.index(player) if player in game.players else 0
+    opponent = game.players[1 - player_idx]
+    
+    # Find all suspended cards in exile
+    cards_to_cast = []
+    for card in player.exile:
+        if card.suspended and card.counters.get('time', 0) > 0:
+            # Remove a time counter
+            card.counters['time'] -= 1
+            remaining = card.counters['time']
+            messages.append(f"⏳ {card.name}: removed time counter ({remaining} remaining)")
+            
+            # If no counters left, queue it for casting
+            if remaining <= 0:
+                cards_to_cast.append(card)
+    
+    # Cast cards with no time counters left
+    for card in cards_to_cast:
+        card.suspended = False
+        if 'time' in card.counters:
+            del card.counters['time']
+        
+        # Move from exile
+        player.exile.remove(card)
+        oracle = card.oracle_text.lower() if card.oracle_text else ""
+        
+        if card.is_creature():
+            # Creatures from suspend have haste
+            card.summoning_sick = False
+            if 'Haste' not in card.temp_keywords:
+                card.temp_keywords.append('Haste')
+            player.battlefield.append(card)
+            card.entered_this_turn = True
+            messages.append(f"⏰ {card.name} comes off suspend and enters the battlefield with haste!")
+            
+            # Check for ETB triggers
+            etb_msgs = engine._handle_etb_triggers(game, player, card)
+            messages.extend(etb_msgs)
+            
+        elif card.is_land():
+            # Lands just enter
+            player.battlefield.append(card)
+            messages.append(f"⏰ {card.name} comes off suspend and enters the battlefield!")
+            
+        elif card.is_instant() or card.is_sorcery():
+            # Resolve spell effects
+            messages.append(f"⏰ {card.name} comes off suspend!")
+            spell_msgs = engine._resolve_suspend_spell(game, player, card, opponent)
+            messages.extend(spell_msgs)
+            # Goes to graveyard after resolving (or command zone for signature spells)
+            if getattr(card, 'is_signature_spell', False) and game.format == "oathbreaker":
+                player.command_zone.append(card)
+                messages.append(f"📜 {card.name} returns to command zone (signature spell)")
+            else:
+                player.graveyard.append(card)
+            
+        else:
+            # Artifact, enchantment, planeswalker - enters battlefield
+            player.battlefield.append(card)
+            card.entered_this_turn = True
+            messages.append(f"⏰ {card.name} comes off suspend and enters the battlefield!")
+            
+            # Handle planeswalker loyalty
+            if card.is_planeswalker() and card.loyalty:
+                try:
+                    card.loyalty_counters = int(card.loyalty)
+                except:
+                    pass
+            
+            # Check for ETB triggers
+            etb_msgs = engine._handle_etb_triggers(game, player, card)
+            messages.extend(etb_msgs)
+    
+    return messages
+
+
+def _resolve_suspend_spell(engine, game: GameState, player: Player, card: Card, opponent: Player) -> List[str]:
+    """Resolve a spell that came off suspend."""
+    messages = []
+    oracle = card.oracle_text.lower() if card.oracle_text else ""
+    
+    # Ancestral Vision: "Target player draws three cards."
+    if "draws three cards" in oracle or "draw three cards" in oracle:
+        drawn = engine.draw_cards(player, 3, game=game)
+        messages.append(f"🎴 {player.name} draws {len(drawn)} cards!")
+        return messages
+    
+    # Wheel of Fate: "Each player discards their hand, then draws seven cards."
+    if "discards their hand" in oracle and "draws seven" in oracle:
+        for p in game.players:
+            discarded = len(p.hand)
+            p.graveyard.extend(p.hand)
+            p.hand = []
+            drawn = engine.draw_cards(p, 7, game=game)
+            messages.append(f"🔄 {p.name} discards {discarded}, draws {len(drawn)}")
+        return messages
+    
+    # Lotus Bloom is an artifact - it enters battlefield, not resolved as spell
+    # This code path shouldn't be hit for Lotus Bloom, but just in case:
+    if "lotus bloom" in card.name.lower():
+        # Lotus Bloom enters as an artifact, user activates to sac for mana
+        messages.append(f"✨ {card.name} enters the battlefield! Use !activate to sacrifice for 3 mana.")
+        return messages
+    
+    # Restore Balance: "Each player chooses a number of lands they control equal to 
+    # the number of lands controlled by the player who controls the fewest, then sacrifices the rest. 
+    # Players sacrifice creatures and discard cards the same way."
+    if "balance" in card.name.lower() or ("sacrifices the rest" in oracle and "fewest" in oracle):
+        messages.append(f"⚖️ {card.name} resolves!")
+        
+        # Balance lands
+        land_counts = []
+        for p in game.players:
+            lands = [c for c in p.battlefield if c.is_land()]
+            land_counts.append((p, lands, len(lands)))
+        
+        min_lands = min(count for _, _, count in land_counts)
+        for p, lands, count in land_counts:
+            to_sacrifice = count - min_lands
+            if to_sacrifice > 0:
+                # Sacrifice from end of list (most recent)
+                sacrificed = []
+                for _ in range(to_sacrifice):
+                    if lands:
+                        land = lands.pop()
+                        game.unregister_static_effects(land)
+                        p.battlefield.remove(land)
+                        p.graveyard.append(land)
+                        sacrificed.append(land.name)
+                if sacrificed:
+                    messages.append(f"🏔️ {p.name} sacrifices {to_sacrifice} land(s): {', '.join(sacrificed[:3])}{'...' if len(sacrificed) > 3 else ''}")
+        
+        # Balance creatures
+        creature_counts = []
+        for p in game.players:
+            creatures = [c for c in p.battlefield if c.is_creature()]
+            creature_counts.append((p, creatures, len(creatures)))
+        
+        min_creatures = min(count for _, _, count in creature_counts)
+        for p, creatures, count in creature_counts:
+            to_sacrifice = count - min_creatures
+            if to_sacrifice > 0:
+                sacrificed = []
+                for _ in range(to_sacrifice):
+                    if creatures:
+                        creature = creatures.pop()
+                        game.unregister_static_effects(creature)
+                        p.battlefield.remove(creature)
+                        p.graveyard.append(creature)
+                        sacrificed.append(creature.name)
+                if sacrificed:
+                    messages.append(f"💀 {p.name} sacrifices {to_sacrifice} creature(s): {', '.join(sacrificed[:3])}{'...' if len(sacrificed) > 3 else ''}")
+        
+        # Balance hand size
+        hand_counts = [(p, len(p.hand)) for p in game.players]
+        min_hand = min(count for _, count in hand_counts)
+        for p, count in hand_counts:
+            to_discard = count - min_hand
+            if to_discard > 0:
+                discarded = []
+                for _ in range(to_discard):
+                    if p.hand:
+                        # Discard from end (most recently drawn)
+                        card_to_discard = p.hand.pop()
+                        p.graveyard.append(card_to_discard)
+                        discarded.append(card_to_discard.name)
+                if discarded:
+                    messages.append(f"🗑️ {p.name} discards {to_discard} card(s)")
+        
+        return messages
+    
+    # Living End: "Each player exiles all creature cards from their graveyard, 
+    # then sacrifices all creatures they control, then puts all cards exiled this way onto the battlefield."
+    if "living end" in card.name.lower() or ("exiles all creature cards from their graveyard" in oracle):
+        for p in game.players:
+            # Collect graveyard creatures
+            gy_creatures = [c for c in p.graveyard if c.is_creature()]
+            # Collect battlefield creatures
+            bf_creatures = [c for c in p.battlefield if c.is_creature()]
+            
+            # Move graveyard creatures to battlefield
+            for c in gy_creatures:
+                p.graveyard.remove(c)
+                c.entered_this_turn = True
+                c.summoning_sick = True
+                p.battlefield.append(c)
+            
+            # Move battlefield creatures to graveyard
+            for c in bf_creatures:
+                game.unregister_static_effects(c)
+                p.battlefield.remove(c)
+                p.graveyard.append(c)
+            
+            messages.append(f"💀 {p.name}: {len(bf_creatures)} creatures die, {len(gy_creatures)} return!")
+        return messages
+    
+    # Hypergenesis: "Starting with you, each player may put an artifact, creature, 
+    # enchantment, or land card from their hand onto the battlefield. Repeat this process 
+    # until no one puts a card onto the battlefield."
+    if "hypergenesis" in card.name.lower() or ("each player may put" in oracle and "artifact, creature, enchantment, or land" in oracle):
+        messages.append(f"🌀 {card.name} resolves!")
+        
+        # For simplicity: both players put ALL permanents from hand onto battlefield
+        for p in game.players:
+            permanents_to_play = []
+            for c in list(p.hand):
+                # Check if it's a permanent (not instant/sorcery)
+                if c.is_creature() or c.is_land() or c.is_artifact() or c.is_enchantment() or c.is_planeswalker():
+                    permanents_to_play.append(c)
+            
+            played_names = []
+            for c in permanents_to_play:
+                p.hand.remove(c)
+                p.battlefield.append(c)
+                c.entered_this_turn = True
+                c.summoning_sick = True if c.is_creature() else False
+                
+                # Handle planeswalker loyalty
+                if c.is_planeswalker() and c.loyalty:
+                    try:
+                        c.loyalty_counters = int(c.loyalty)
+                    except:
+                        pass
+                
+                played_names.append(c.name)
+            
+            if played_names:
+                messages.append(f"🎭 {p.name} puts {len(played_names)} permanent(s): {', '.join(played_names[:5])}{'...' if len(played_names) > 5 else ''}")
+            else:
+                messages.append(f"🎭 {p.name} puts nothing onto the battlefield")
+        
+        # Trigger ETBs for all new creatures
+        for p in game.players:
+            for c in p.battlefield:
+                if c.entered_this_turn and c.is_creature():
+                    etb_msgs = engine._handle_etb_triggers(game, p, c)
+                    messages.extend(etb_msgs)
+        
+        return messages
+    
+    # Generic damage spell
+    damage_match = re.search(r'deals? (\d+) damage', oracle)
+    if damage_match:
+        damage = int(damage_match.group(1))
+        if "to any target" in oracle or "target creature or player" in oracle:
+            # Default to opponent
+            actual_dmg = engine.rules._apply_noncombat_damage_to_player(game, opponent, damage, card.name)
+            if actual_dmg > 0:
+                messages.append(f"🔥 {card.name} deals {actual_dmg} damage to {opponent.name}!")
+            return messages
+        elif "to each creature" in oracle:
+            killed = []
+            for p in game.players:
+                for c in list(p.battlefield):
+                    if c.is_creature():
+                        c.damage_marked += damage
+                        # Let SBAs handle the actual death checks
+            # Run SBAs to properly kill creatures (handles */* CDA creatures)
+            game._recently_died = getattr(game, '_recently_died', [])
+            sba_msgs = engine.rules.process_state_based_actions(game)
+            killed = [m.split(" dies")[0].replace("☠️ ", "") for m in sba_msgs if "dies" in m]
+            if killed:
+                messages.append(f"🔥 {card.name} kills: {', '.join(killed)}")
+            else:
+                messages.append(f"🔥 {card.name} deals {damage} to each creature")
+            return messages
+    
+    # Fallback — couldn't parse effect. Emit the full oracle (up to 500 chars)
+    # so the user sees what the spell was supposed to do. Previous 200-char
+    # truncation cut "costs less" and similar descriptions mid-sentence.
+    otxt = card.oracle_text or 'none'
+    # Collapse internal newlines so the Discord bullet doesn't break up.
+    otxt = otxt.replace('\n', ' ').strip()
+    if len(otxt) > 500:
+        otxt = otxt[:497].rstrip() + '…'
+    messages.append(f"🧙 **{card.name}** resolves — {otxt}")
+    return messages
+
+
+def resolve_special_effects(engine, game: GameState, player: Player, card: Card, target: Any = None) -> List[str]:
+    """
+    Handle special effects that SpellResolver doesn't cover:
+    - Mass pump ("creatures you control get +X/+X")
+    - Variable calculations ("X = greatest power")
+    - Delayed triggers ("whenever you attack this turn")
+    
+    Returns effect messages, or empty list if no special handling needed.
+    """
+    messages = []
+    oracle = card.oracle_text.lower() if card.oracle_text else ""
+    card_name_lower = card.name.lower()
+    player_idx = game.players.index(player) if player in game.players else 0
+    opponent_idx = 1 - player_idx
+    opponent = game.players[opponent_idx]
+
+    # Chaos Warp: target permanent → shuffle into library, reveal top, if permanent put onto battlefield
+    if "chaos warp" in card_name_lower or (
+        "shuffles it into their library" in oracle and "reveals the top card" in oracle
+    ):
+        # Find target permanent — prefer opponent's most threatening non-land, or use explicit target
+        target_permanent = None
+        target_owner = None
+
+        if target:
+            # Explicit target provided
+            for p in game.players:
+                for c in p.battlefield:
+                    if (isinstance(target, str) and (c.name.lower() == target.lower() or c.id == target)) \
+                            or c is target:
+                        target_permanent = c
+                        target_owner = p
+                        break
+                if target_permanent:
+                    break
+
+        if not target_permanent:
+            # Auto-select: opponent's best non-land permanent
+            opp_perms = [c for c in opponent.battlefield if not c.is_land()]
+            if opp_perms:
+                # Prefer creatures, then planeswalkers, then other
+                creatures = [c for c in opp_perms if c.is_creature()]
+                pws = [c for c in opp_perms if c.is_planeswalker()]
+                pick_from = creatures or pws or opp_perms
+                # Pick biggest threat (highest power for creatures, first PW, or first)
+                def threat_val(c):
+                    try:
+                        return c.get_effective_power(game) if hasattr(c, 'get_effective_power') else 0
+                    except (ValueError, TypeError):
+                        return 0
+                target_permanent = max(pick_from, key=threat_val)
+                target_owner = opponent
+            elif opponent.battlefield:
+                # Only lands — pick any
+                target_permanent = opponent.battlefield[0]
+                target_owner = opponent
+
+        if target_permanent and target_owner:
+            game.unregister_static_effects(target_permanent)
+            target_owner.battlefield.remove(target_permanent)
+            # Shuffle into library
+            target_owner.library.append(target_permanent)
+            import random as _rng
+            _rng.shuffle(target_owner.library)
+            messages.append(f"🌀 Chaos Warp shuffles {target_permanent.name} into {target_owner.name}'s library!")
+            # Reveal top card
+            if target_owner.library:
+                revealed = target_owner.library[0]
+                messages.append(f"🔮 {target_owner.name} reveals: **{revealed.name}**")
+                if not (revealed.is_instant() or revealed.is_sorcery()):
+                    # It's a permanent — put onto battlefield
+                    target_owner.library.pop(0)
+                    revealed.entered_this_turn = True
+                    revealed.summoning_sick = True if revealed.is_creature() else False
+                    # Planeswalkers enter with starting loyalty (CR 306.5b)
+                    if revealed.is_planeswalker() and hasattr(revealed, 'loyalty') and revealed.loyalty:
+                        try:
+                            revealed.current_loyalty = int(revealed.loyalty)
+                            print(f"[CHAOS-WARP] {revealed.name} enters with {revealed.current_loyalty} starting loyalty")
+                        except (ValueError, TypeError):
+                            pass
+                    target_owner.battlefield.append(revealed)
+                    messages.append(f"🌍 {revealed.name} enters the battlefield under {target_owner.name}'s control!")
+                else:
+                    messages.append(f"📚 {revealed.name} is not a permanent — stays on top")
+            else:
+                messages.append(f"📚 {target_owner.name}'s library is empty — nothing revealed")
+        else:
+            messages.append("⚠️ Chaos Warp: no valid target")
+        return messages
+
+    # Cyclonic Rift: bounce 1 target (base) or all opponents' nonland permanents (overload)
+    # Tier 1 hardcoded to prevent Tier 3 always overloading
+    if "cyclonic rift" in card_name_lower:
+        mana_paid = getattr(card, '_mana_paid', 0) or 0
+        if mana_paid >= 7:
+            # Overloaded: bounce ALL nonland permanents opponents control
+            bounced = 0
+            for opp in game.players:
+                if opp == player:
+                    continue
+                to_bounce = [c for c in opp.battlefield if not c.is_land()]
+                for perm in to_bounce:
+                    game.unregister_static_effects(perm)
+                    opp.battlefield.remove(perm)
+                    if getattr(perm, 'is_token', False):
+                        print(f"[TOKEN-SBA] {perm.name} bounced — token ceases to exist")
+                    else:
+                        opp.hand.append(perm)
+                    bounced += 1
+            messages.append(f"🌊 Cyclonic Rift (overloaded): Bounced {bounced} nonland permanents!")
+        else:
+            # Normal: bounce one target nonland permanent opponent controls
+            target_card = None
+            if target:
+                for c in opponent.battlefield:
+                    if (isinstance(target, str) and (c.name.lower() == target.lower() or c.id == target)) or c is target:
+                        target_card = c
+                        break
+            if not target_card:
+                # Auto-select best opponent nonland permanent
+                opp_nonlands = [c for c in opponent.battlefield if not c.is_land()]
+                if opp_nonlands:
+                    opp_nonlands.sort(key=lambda c: c.cmc if c.cmc else 0, reverse=True)
+                    target_card = opp_nonlands[0]
+            if target_card:
+                game.unregister_static_effects(target_card)
+                opponent.battlefield.remove(target_card)
+                if getattr(target_card, 'is_token', False):
+                    print(f"[TOKEN-SBA] {target_card.name} bounced — token ceases to exist")
+                else:
+                    opponent.hand.append(target_card)
+                messages.append(f"🌊 Cyclonic Rift: {target_card.name} returned to {opponent.name}'s hand")
+            else:
+                messages.append("⚠️ Cyclonic Rift: no valid target")
+        return messages
+
+    # Craterhoof Behemoth: handled by Tier 1.5 template in effect_templates.py
+    # (Tier 1 handler removed — was double-applying P/T pump via both power_modifier
+    # AND layers engine, causing accumulating deltas like -1381/-1381 on tokens)
+
+    # Overwhelming Stampede: creatures get +X/+X and trample where X = greatest power
+    if "creatures you control" in oracle and "trample" in oracle and "greatest power" in oracle:
+        max_power = 0
+        for c in player.battlefield:
+            if c.is_creature():
+                try:
+                    p = c.get_effective_power(game) if hasattr(c, 'get_effective_power') else 0
+                    max_power = max(max_power, p)
+                except:
+                    pass
+        
+        if max_power > 0:
+            count = 0
+            for c in player.battlefield:
+                if c.is_creature():
+                    if not (HAS_LAYERS_ENGINE and game.layers_engine):
+                        c.power_modifier += max_power
+                        c.toughness_modifier += max_power
+                    # [LAYERS] Register Stampede pump as Layer 7c
+                    if HAS_LAYERS_ENGINE and game.layers_engine:
+                        _os_effs = create_pump_effect(
+                            source_name="Overwhelming Stampede",
+                            source_id=f"stampede_{c.id}",
+                            controller=player.name, target_id=c.id,
+                            power_mod=max_power, toughness_mod=max_power,
+                            keywords=["Trample"], duration="end_of_turn")
+                        for _pe in _os_effs:
+                            game.layers_engine.add_effect(_pe)
+                    if 'Trample' not in c.temp_keywords:
+                        c.temp_keywords.append('Trample')
+                    count += 1
+            messages.append(f"💪 {count} creature(s) get +{max_power}/+{max_power} and trample until end of turn!")
+        else:
+            messages.append("⚠️ No creatures to pump (greatest power is 0)")
+        return messages
+    
+    # Overrun-style: creatures get +X/+X and trample
+    overrun_match = re.search(r'creatures you control get \+(\d+)/\+(\d+) and gain trample', oracle)
+    if overrun_match:
+        power_boost = int(overrun_match.group(1))
+        tough_boost = int(overrun_match.group(2))
+        count = 0
+        for c in player.battlefield:
+            if c.is_creature():
+                if not (HAS_LAYERS_ENGINE and game.layers_engine):
+                    c.power_modifier += power_boost
+                    c.toughness_modifier += tough_boost
+                # [LAYERS] Register overrun pump as Layer 7c
+                if HAS_LAYERS_ENGINE and game.layers_engine:
+                    _or_effs = create_pump_effect(
+                        source_name="Overrun", source_id=f"overrun_{c.id}",
+                        controller=player.name, target_id=c.id,
+                        power_mod=power_boost, toughness_mod=tough_boost,
+                        keywords=["Trample"], duration="end_of_turn")
+                    for _pe in _or_effs:
+                        game.layers_engine.add_effect(_pe)
+                if 'Trample' not in c.temp_keywords:
+                    c.temp_keywords.append('Trample')
+                count += 1
+        messages.append(f"💪 {count} creature(s) get +{power_boost}/+{tough_boost} and trample!")
+        return messages
+    
+    # Generic mass pump: "creatures you control get +X/+X"
+    pump_match = re.search(r'creatures you control get \+(\d+)/\+(\d+)', oracle)
+    if pump_match:
+        power_boost = int(pump_match.group(1))
+        tough_boost = int(pump_match.group(2))
+        count = 0
+        for c in player.battlefield:
+            if c.is_creature():
+                if not (HAS_LAYERS_ENGINE and game.layers_engine):
+                    c.power_modifier += power_boost
+                    c.toughness_modifier += tough_boost
+                # [LAYERS] Register generic mass pump as Layer 7c
+                if HAS_LAYERS_ENGINE and game.layers_engine:
+                    _gp_effs = create_pump_effect(
+                        source_name=card.name, source_id=f"masspump_{c.id}",
+                        controller=player.name, target_id=c.id,
+                        power_mod=power_boost, toughness_mod=tough_boost,
+                        duration="end_of_turn")
+                    for _pe in _gp_effs:
+                        game.layers_engine.add_effect(_pe)
+                count += 1
+        messages.append(f"💪 {count} creature(s) get +{power_boost}/+{tough_boost} until end of turn!")
+        return messages
+    
+    # Delayed attack trigger (Jaya's -2 style)
+    if "whenever you attack this turn" in oracle and "number of attacking creatures" in oracle:
+        if target:
+            game.turn_effects.append({
+                "type": "on_attack_damage",
+                "source": card.name,
+                "target_id": target.id if hasattr(target, 'id') else None,
+                "target_name": target.name if hasattr(target, 'name') else str(target),
+                "calc": "num_attackers",
+                "controller": player_idx
+            })
+            messages.append(f"🎯 {target.name} will take damage equal to attacking creatures when you attack!")
+        return messages
+    
+    # Shamanic Revelation style (draw per creature + ferocious)
+    if "draw a card for each creature you control" in oracle:
+        creature_count = sum(1 for c in player.battlefield if c.is_creature())
+        drawn = engine.draw_cards(player, creature_count, game=game)
+        messages.append(f"🎴 {player.name} draws {len(drawn)} card(s)")
+
+        if "with power 4 or greater" in oracle:
+            big_creatures = sum(1 for c in player.battlefield
+                              if c.is_creature() and c.get_effective_power(game) >= 4)
+            if big_creatures > 0:
+                life_gain = big_creatures * 4
+                player.life += life_gain
+                messages.append(f"💚 {player.name} gains {life_gain} life (life: {player.life})")
+        return messages
+    
+    # "Draw cards equal to greatest power" (Rishkar's Expertise, Soul's Majesty, etc.)
+    if ("draw" in oracle and "equal to" in oracle and
+            ("greatest power" in oracle or "power" in oracle) and
+            "creatures you control" in oracle):
+        max_power = 0
+        for c in player.battlefield:
+            if c.is_creature():
+                max_power = max(max_power, c.get_effective_power(game))
+        if max_power > 0:
+            drawn = engine.draw_cards(player, max_power, game=game)
+            messages.append(f"🎴 {player.name} draws {len(drawn)} card(s) (greatest power = {max_power})")
+        else:
+            messages.append(f"⚠️ No creatures — no cards drawn")
+
+        # Rishkar's Expertise: "you may cast a spell with mana value 5 or less without paying"
+        if "cast" in oracle and "without paying" in oracle:
+            mv_match = re.search(r'mana value (\d+) or less', oracle)
+            max_mv = int(mv_match.group(1)) if mv_match else 5
+            castable = [c for c in player.hand
+                        if (c.cmc or 0) <= max_mv and not c.is_land()]
+            if castable:
+                messages.append(f"🆓 May cast a spell with MV {max_mv} or less for free! (Use `!play <card>` — mana cost will be waived)")
+                # Set a flag so the next cast is free
+                game.turn_effects.append({
+                    "type": "free_cast",
+                    "max_mv": max_mv,
+                    "controller": player_idx,
+                    "source": card.name,
+                    "used": False
+                })
+        return messages
+
+    # =================================================================
+    # RAMP SPELLS (search library for lands)
+    # =================================================================
+    
+    # Detect ramp spells: search library for land + put onto battlefield
+    # Also handles "Forest card", "Island card" etc (Wood Elves, Nature's Lore)
+    has_land_search = ("land" in oracle or "forest card" in oracle or "island card" in oracle or 
+                      "plains card" in oracle or "mountain card" in oracle or "swamp card" in oracle)
+    is_ramp = ("search your library" in oracle and has_land_search and 
+               ("onto the battlefield" in oracle or "put that card onto" in oracle or 
+                "put it onto" in oracle or "put them onto" in oracle))
+    
+    if is_ramp:
+        # Skip if already resolved by template library (prevents double-resolution)
+        recently_resolved = getattr(game, '_recently_resolved_spells', set())
+        if card.name in recently_resolved:
+            print(f"[RAMP] {card.name} already resolved by template library — skipping resolve_special_effects ramp handler")
+            return messages
+        # [PW-STATIC] Ashiok, Dream Render: opponents can't search their library
+        blocker = engine.rules._opponent_prevents_library_search(game, player)
+        if blocker:
+            print(f"[PW-STATIC] {blocker} prevents {player.name} from searching their library (ramp spell: {card.name})")
+            messages.append(f"🚫 {player.name} can't search their library ({blocker})")
+            return messages
+        # Determine what types of lands we can get
+        can_get_basic = "basic" in oracle
+        can_get_forest = "forest" in oracle
+        can_get_island = "island" in oracle  
+        can_get_plains = "plains" in oracle
+        can_get_mountain = "mountain" in oracle
+        can_get_swamp = "swamp" in oracle
+        
+        # Nature's Lore, Three Visits: "Forest card" (includes duals!)
+        forest_card = "forest card" in oracle
+        
+        # How many lands?
+        # Variable X: "up to X basic land cards, where X is the greatest power"
+        # Handles Traverse the Outlands and similar
+        if "greatest power" in oracle and ("up to x" in oracle or "where x is" in oracle):
+            max_power = 0
+            for c in player.battlefield:
+                if c.is_creature():
+                    p = c.get_effective_power(game)
+                    max_power = max(max_power, p)
+            num_lands = max(0, max_power)
+            print(f"[RAMP] {card.name}: X = greatest power = {num_lands}")
+        elif "two" in oracle or "up to two" in oracle:
+            num_lands = 2
+        elif "three" in oracle:
+            num_lands = 3
+        elif "four" in oracle or "up to four" in oracle:
+            num_lands = 4
+        else:
+            num_lands = 1
+        
+        # Spell-level enters-tapped (Rampant Growth says "tapped", Nature's Lore says "untapped")
+        spell_enters_tapped = "tapped" in oracle and "untapped" not in oracle
+        if "untapped" in oracle:
+            spell_enters_tapped = False
+
+        # To hand instead? (Cultivate puts one to hand)
+        one_to_hand = "put one onto the battlefield" in oracle and "into your hand" in oracle
+
+        # Find matching lands
+        found_lands = []
+        for c in player.library[:]:  # Copy to avoid mutation during iteration
+            if not c.is_land():
+                continue
+
+            type_line_lower = c.type_line.lower()
+            name_lower = c.name.lower()
+
+            # Check if this land matches the search criteria
+            matches = False
+
+            if can_get_basic and "basic" in type_line_lower:
+                matches = True
+            elif forest_card and "forest" in type_line_lower:
+                # Forest card includes Tropical Island, Breeding Pool, etc.
+                matches = True
+            elif can_get_forest and ("forest" in name_lower or "forest" in type_line_lower):
+                matches = True
+            elif can_get_island and ("island" in name_lower or "island" in type_line_lower):
+                matches = True
+            elif can_get_plains and ("plains" in name_lower or "plains" in type_line_lower):
+                matches = True
+            elif can_get_mountain and ("mountain" in name_lower or "mountain" in type_line_lower):
+                matches = True
+            elif can_get_swamp and ("swamp" in name_lower or "swamp" in type_line_lower):
+                matches = True
+            elif not any([can_get_basic, can_get_forest, can_get_island, can_get_plains,
+                         can_get_mountain, can_get_swamp, forest_card]):
+                # Generic "land card" - any land works
+                matches = True
+
+            if matches:
+                found_lands.append(c)
+                if len(found_lands) >= num_lands:
+                    break
+
+        if found_lands:
+            battlefield_lands = []
+            hand_lands = []
+            any_tapped = False
+
+            for i, land in enumerate(found_lands):
+                player.library.remove(land)
+
+                # Cultivate: first to battlefield, second to hand
+                if one_to_hand and i == len(found_lands) - 1 and len(found_lands) > 1:
+                    player.hand.append(land)
+                    hand_lands.append(land.name)
+                else:
+                    # Check land's own ETB-tapped + replacement effects, OR spell-level tapped
+                    land_tapped, _ = engine.rules._check_enters_tapped(game, land, player)
+                    enters_tapped = spell_enters_tapped or land_tapped
+                    land.tapped = enters_tapped
+                    land.entered_this_turn = True
+                    player.battlefield.append(land)
+                    battlefield_lands.append(land.name)
+                    if enters_tapped:
+                        any_tapped = True
+
+            if battlefield_lands:
+                tapped_str = " tapped" if any_tapped else ""
+                messages.append(f"🌍 {player.name} puts {', '.join(battlefield_lands)} onto the battlefield{tapped_str}")
+            if hand_lands:
+                messages.append(f"✋ {player.name} puts {', '.join(hand_lands)} into their hand")
+            
+            # Shuffle library after searching
+            import random
+            random.shuffle(player.library)
+            messages.append("📚 Library shuffled")
+        else:
+            messages.append("⚠️ No matching land found in library")
+            import random
+            random.shuffle(player.library)
+        
+        return messages
+    
+    # =================================================================
+    # THUNDERMAW HELLKITE / TARGETED MASS DAMAGE (ETB)
+    # "deals N damage to each creature with flying your opponents control" + tap
+    # Must come BEFORE the generic mass damage handler to catch the qualified pattern
+    # =================================================================
+    if ("each creature with flying" in oracle and "opponents control" in oracle and
+            re.search(r'deals?\s+(\d+)\s+damage', oracle)):
+        dmg_match = re.search(r'deals?\s+(\d+)\s+damage', oracle)
+        dmg = int(dmg_match.group(1))
+        hit_count = 0
+        should_tap = "tap those creatures" in oracle or "tap them" in oracle
+
+        for p in game.players:
+            if p == player:
+                continue  # Only opponent's creatures
+            for c in list(p.battlefield):
+                all_kws = [kw.lower() for kw in (c.keywords or [])] + [kw.lower() for kw in (c.temp_keywords or [])]
+                if c.is_creature() and 'flying' in all_kws:
+                    c.damage_marked += dmg
+                    if should_tap:
+                        c.tapped = True
+                    hit_count += 1
+
+        tap_msg = " and taps them" if should_tap else ""
+        messages.append(f"🔥 {card.name} deals {dmg} damage to {hit_count} creature(s) with flying opponents control{tap_msg}")
+        return messages
+
+    # =================================================================
+    # MASS DAMAGE ("deals N damage to each creature" / "to each creature and each player")
+    # Handles: Kozilek's Return, Anger of the Gods, Blasphemous Act, Pyroclasm, etc.
+    # IMPORTANT: Only matches UNQUALIFIED "each creature" — NOT "each creature with flying
+    # your opponents control" (Thundermaw) or other filtered variants. Those need their own
+    # handlers above this point or in the ETB system.
+    # =================================================================
+    mass_dmg_match = re.search(r'deals?\s+(\d+)\s+damage\s+to\s+each\s+creature(?!\s+with\b)(?!\s+an?\s+opponent)', oracle)
+    if mass_dmg_match:
+        dmg = int(mass_dmg_match.group(1))
+        hit_count = 0
+        for p in game.players:
+            for c in list(p.battlefield):
+                if c.is_creature():
+                    c.damage_marked += dmg
+                    hit_count += 1
+        messages.append(f"🔥 {card.name} deals {dmg} damage to each creature ({hit_count} hit)")
+        # Also check "and each player" / "and each planeswalker"
+        if "each player" in oracle:
+            for p in game.players:
+                actual_dmg = engine.rules._apply_noncombat_damage_to_player(game, p, dmg, card.name)
+                if actual_dmg > 0:
+                    messages.append(f"🔥 {card.name} deals {actual_dmg} damage to {p.name} ({p.life} life)")
+        return messages
+
+    # =================================================================
+    # THROUGH THE BREACH / SNEAK ATTACK SPELLS
+    # "Put a creature card from your hand onto the battlefield. It gains haste.
+    #  Sacrifice it at the beginning of the next end step."
+    # =================================================================
+    if ("put" in oracle and "creature" in oracle and "from your hand" in oracle
+            and "onto the battlefield" in oracle and "haste" in oracle and "sacrifice" in oracle):
+        creatures_in_hand = [c for c in player.hand if c.is_creature()]
+        if not creatures_in_hand:
+            messages.append(f"⚠️ {card.name}: No creature cards in hand to put onto the battlefield.")
+            return messages
+        # Store pending action for creature selection
+        game.pending_action = {
+            'type': 'permanent_ability',
+            'effect_type': 'sneak_creature',
+            'card_id': card.id,
+            'ability': {'effect': 'haste sacrifice'},
+            'player_idx': player_idx,
+        }
+        lines = [f"🎭 **{card.name}** — Choose a creature from your hand to put onto the battlefield:"]
+        for i, c in enumerate(creatures_in_hand):
+            lines.append(f"  `{i}` - {c.name} ({c.power}/{c.toughness}) [{c.mana_cost}]")
+        lines.append(f"\n*Reply with `!target <number>` to select*")
+        messages.append("\n".join(lines))
+        return messages
+
+    return messages  # Empty = let SpellResolver handle it

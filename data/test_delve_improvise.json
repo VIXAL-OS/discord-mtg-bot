@@ -1,0 +1,87 @@
+{
+  "name": "Delve + Improvise Stress Test",
+  "format": "modern",
+  "description": "Tests Delve (exile from GY to reduce cost) and Improvise (tap artifacts for generic). Fills graveyard with cheap artifacts/cantrips to fuel Delve, then casts big spells cheaply.",
+  "colors": [
+    "U",
+    "B"
+  ],
+  "cards": [
+    {
+      "name": "Logic Knot",
+      "quantity": 4
+    },
+    {
+      "name": "Telling Time",
+      "quantity": 2
+    },
+    {
+      "name": "Tasigur, the Golden Fang",
+      "quantity": 2
+    },
+    {
+      "name": "Gurmag Angler",
+      "quantity": 4
+    },
+    {
+      "name": "Murderous Cut",
+      "quantity": 2
+    },
+    {
+      "name": "Thought Scour",
+      "quantity": 4
+    },
+    {
+      "name": "Consider",
+      "quantity": 4
+    },
+    {
+      "name": "Fatal Push",
+      "quantity": 2
+    },
+    {
+      "name": "Thoughtseize",
+      "quantity": 2
+    },
+    {
+      "name": "Mishra's Bauble",
+      "quantity": 4
+    },
+    {
+      "name": "Chromatic Star",
+      "quantity": 2
+    },
+    {
+      "name": "Darksteel Citadel",
+      "quantity": 2
+    },
+    {
+      "name": "Snapcaster Mage",
+      "quantity": 2
+    },
+    {
+      "name": "Brainstorm",
+      "quantity": 4
+    },
+    {
+      "name": "Polluted Delta",
+      "quantity": 4
+    },
+    {
+      "name": "Watery Grave",
+      "quantity": 4
+    },
+    {
+      "name": "Island",
+      "quantity": 6
+    },
+    {
+      "name": "Swamp",
+      "quantity": 4
+    },
+    {
+      "name": "Darkslick Shores",
+      "quantity": 2
+    }
+  ]
+}

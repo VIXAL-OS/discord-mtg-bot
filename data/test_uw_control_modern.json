@@ -1,0 +1,111 @@
+{
+  "name": "UW Control",
+  "format": "modern",
+  "description": "60-card control: tests board wipes (destroy all), counterspells on stack, planeswalker loyalty, flash.",
+  "colors": [
+    "W",
+    "U"
+  ],
+  "cards": [
+    {
+      "name": "Snapcaster Mage",
+      "quantity": 4
+    },
+    {
+      "name": "Solitude",
+      "quantity": 2
+    },
+    {
+      "name": "Counterspell",
+      "quantity": 4
+    },
+    {
+      "name": "Archmage's Charm",
+      "quantity": 2
+    },
+    {
+      "name": "Mana Leak",
+      "quantity": 2
+    },
+    {
+      "name": "Supreme Verdict",
+      "quantity": 4
+    },
+    {
+      "name": "Wrath of God",
+      "quantity": 2
+    },
+    {
+      "name": "Prismatic Ending",
+      "quantity": 3
+    },
+    {
+      "name": "Path to Exile",
+      "quantity": 2
+    },
+    {
+      "name": "Opt",
+      "quantity": 2
+    },
+    {
+      "name": "Teferi, Hero of Dominaria",
+      "quantity": 2
+    },
+    {
+      "name": "Jace, the Mind Sculptor",
+      "quantity": 1
+    },
+    {
+      "name": "Detention Sphere",
+      "quantity": 2
+    },
+    {
+      "name": "Hallowed Fountain",
+      "quantity": 4
+    },
+    {
+      "name": "Flooded Strand",
+      "quantity": 4
+    },
+    {
+      "name": "Celestial Colonnade",
+      "quantity": 4
+    },
+    {
+      "name": "Glacial Fortress",
+      "quantity": 2
+    },
+    {
+      "name": "Mystic Gate",
+      "quantity": 1
+    },
+    {
+      "name": "Island",
+      "quantity": 4
+    },
+    {
+      "name": "Plains",
+      "quantity": 2
+    },
+    {
+      "name": "Field of Ruin",
+      "quantity": 2
+    },
+    {
+      "name": "Castle Vantress",
+      "quantity": 1
+    },
+    {
+      "name": "Eiganjo, Seat of the Empire",
+      "quantity": 1
+    },
+    {
+      "name": "Otawara, Soaring City",
+      "quantity": 1
+    },
+    {
+      "name": "Shark Typhoon",
+      "quantity": 2
+    }
+  ]
+}

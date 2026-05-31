@@ -1,0 +1,27 @@
+# Discord
+discord.py>=2.3.0
+
+# Anthropic Claude API
+anthropic>=0.39.0
+
+# HTTP client for Scryfall API
+aiohttp>=3.9.0
+
+# Environment variables
+python-dotenv>=1.0.0
+
+# Timezone data (needed on Windows)
+tzdata>=2024.1
+
+# Image processing for visual board rendering
+Pillow>=10.0.0
+
+# Optional: DeepSeek adapter for cost-efficient autoplay testing (~12x cheaper
+# than Claude on both sides). Set DEEPSEEK_API_KEY in .env to enable; the bot
+# auto-switches the actor/strategist split when it's present.
+openai>=1.40.0
+
+# Optional (Java 11+ required separately): XMage rules-engine bridge.
+# Build via `cd rules/xmage-bridge && mvn package`. Bot works without it but
+# falls back to LLM-only resolution for cards the template library doesn't
+# cover.

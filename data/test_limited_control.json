@@ -1,0 +1,23 @@
+{
+  "name": "Limited Control",
+  "format": "limited",
+  "description": "40-card control: tests draw-heavy with small library, removal, potential library-out SBA.",
+  "colors": ["U", "B"],
+  "cards": [
+    {"name": "Murder", "quantity": 2},
+    {"name": "Divination", "quantity": 3},
+    {"name": "Essence Scatter", "quantity": 2},
+    {"name": "Read the Bones", "quantity": 2},
+    {"name": "Omenspeaker", "quantity": 2},
+    {"name": "Hired Poisoner", "quantity": 2},
+    {"name": "Nightveil Predator", "quantity": 1},
+    {"name": "Dimir Guildgate", "quantity": 2},
+    {"name": "Notion Rain", "quantity": 2},
+    {"name": "Thought Erasure", "quantity": 1},
+    {"name": "Watcher in the Mist", "quantity": 2},
+    {"name": "Mnemonic Wall", "quantity": 1},
+    {"name": "Disfigure", "quantity": 1},
+    {"name": "Island", "quantity": 9},
+    {"name": "Swamp", "quantity": 8}
+  ]
+}

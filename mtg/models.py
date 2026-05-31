@@ -1,0 +1,3431 @@
+"""Game data model: FormatValidator, Card, Player, StackEntry, GameState.
+
+These are the domain dataclasses the rest of the engine operates on.
+Together with the optional rules/ subsystems (mana cost parser, layers
+engine, replacement effects) they form the state representation for a
+Magic game.
+
+Class roster:
+
+    FormatValidator — static methods for deck-format legality checks
+    Card            — a card instance in any zone (mutable dataclass)
+    Player          — a player's zones, life, mana pool, etc.
+    StackEntry      — one entry on the spell stack
+    GameState       — top-level container (players + stack + phase + turn)
+
+Extracted from mtg_game.py during the Phase 1 OSS-readability refactor.
+Originally lived between the FORMAT VALIDATION and RULES ENGINE section
+markers of the monolith (~lines 696-3393 before the Phase 1A extractions).
+"""
+
+import asyncio
+import hashlib
+import random
+import re
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple
+
+from mtg.constants import (
+    Phase, Zone,
+    FORMAT_DECK_SIZE, SINGLETON_FORMATS, COMMAND_ZONE_FORMATS,
+    BASIC_LAND_NAMES, BANNED_CARDS,
+    _KEYWORD_LIST,
+)
+
+from mtg.helpers import get_mdfc_info
+
+# Optional: structured mana cost parser (rules/mana.py)
+try:
+    from rules.mana import (
+        ManaCost, ManaPool as RulesManaPool, ManaPaymentValidator, ManaColor,
+    )
+    HAS_MANA_ENGINE = True
+except ImportError:
+    HAS_MANA_ENGINE = False
+
+# Optional: 7-layer continuous effects (CR 613)
+try:
+    from rules.layers import (
+        LayersEngine, ContinuousEffect, Layer, Sublayer, LayeredPermanent,
+        create_anthem_effect, create_humility_effect,
+        create_blood_moon_effect, create_color_change_effect,
+    )
+    HAS_LAYERS_ENGINE = True
+except ImportError:
+    HAS_LAYERS_ENGINE = False
+
+# Optional: "if would, instead" replacement effects
+try:
+    from rules.replacement import ReplacementEngine, scan_oracle_for_replacements
+    HAS_REPLACEMENT_ENGINE = True
+except ImportError:
+    HAS_REPLACEMENT_ENGINE = False
+
+
+# =============================================================================
+# FORMAT VALIDATION
+# =============================================================================
+
+class FormatValidator:
+    """Validates decks against format rules."""
+    
+    @staticmethod
+    def get_color_identity(card) -> List[str]:
+        """
+        Extract color identity from a card's mana cost and oracle text.
+        Color identity includes: mana cost colors + mana symbols in rules text.
+
+        For MDFCs / transform cards / split cards, the mana cost on the
+        front face alone misses the back face's pips (e.g. Jorn, God of
+        Winter is mono-G on the front but Sultai counting Kaldring's
+        {U}{B}). When the card already has a populated `color_identity`
+        attribute (typically loaded from Scryfall), prefer that — it
+        reflects the canonical card-pool view that includes both faces.
+        """
+        existing = getattr(card, 'color_identity', None)
+        if existing:
+            # Treat as authoritative if any colors are listed.
+            return sorted([c for c in existing if c in 'WUBRG'])
+
+        colors = set()
+
+        # From mana cost
+        if card.mana_cost:
+            symbols = re.findall(r'\{([^}]+)\}', card.mana_cost)
+            for sym in symbols:
+                # Handle hybrid mana {W/U}
+                for part in sym.split('/'):
+                    part = part.replace('P', '')  # Phyrexian
+                    if part in 'WUBRG':
+                        colors.add(part)
+
+        # From oracle text (mana symbols in abilities)
+        if card.oracle_text:
+            symbols = re.findall(r'\{([WUBRGC])\}', card.oracle_text)
+            for sym in symbols:
+                if sym in 'WUBRG':
+                    colors.add(sym)
+
+        # MDFC / transform back-face fallback: cards loaded before the deck
+        # loader populated color_identity from Scryfall (e.g. older test
+        # cards) won't have a populated color_identity attribute, but if
+        # they have transform back-face metadata we should union those
+        # mana symbols too. CR 903.4 — color identity for commander
+        # legality is computed across BOTH faces.
+        if getattr(card, 'has_transform', False):
+            back_cost = getattr(card, 'back_face_mana_cost', '') or ''
+            back_oracle = getattr(card, 'back_face_oracle_text', '') or ''
+            for sym in re.findall(r'\{([^}]+)\}', back_cost + back_oracle):
+                for part in sym.split('/'):
+                    part = part.replace('P', '')
+                    if part in 'WUBRG':
+                        colors.add(part)
+
+        return sorted(list(colors))
+    
+    @staticmethod
+    def validate_deck(cards: List, format_name: str, commander=None) -> Tuple[bool, List[str]]:
+        """
+        Validate a deck against format rules.
+
+        Args:
+            cards: List of Card objects
+            format_name: Format name (commander, modern, etc.)
+            commander: Commander card, or list of commander cards (for
+                Partner / Friends Forever / Background / etc. — color
+                identity is computed as the union of all commanders).
+
+        Returns:
+            (is_valid, list_of_issues)
+        """
+        issues = []
+        format_name = format_name.lower()
+        # Normalize commander argument to a list so partner pairs work.
+        if commander is None:
+            commanders = []
+        elif isinstance(commander, (list, tuple, set)):
+            commanders = [c for c in commander if c is not None]
+        else:
+            commanders = [commander]
+        
+        # Check deck size
+        if format_name in FORMAT_DECK_SIZE:
+            min_size, max_size = FORMAT_DECK_SIZE[format_name]
+            deck_size = len(cards)
+            
+            if deck_size < min_size:
+                issues.append(f"Deck has {deck_size} cards, minimum is {min_size}")
+            if max_size and deck_size > max_size:
+                issues.append(f"Deck has {deck_size} cards, maximum is {max_size}")
+        
+        # Check singleton rule
+        if format_name in SINGLETON_FORMATS:
+            card_counts = {}
+            for card in cards:
+                name = card.name.lower()
+                if name not in BASIC_LAND_NAMES:
+                    card_counts[name] = card_counts.get(name, 0) + 1
+            
+            duplicates = {name: count for name, count in card_counts.items() if count > 1}
+            if duplicates:
+                for name, count in duplicates.items():
+                    issues.append(f"Singleton violation: {name.title()} appears {count} times")
+        
+        # Check banned cards
+        if format_name in BANNED_CARDS:
+            banned = BANNED_CARDS[format_name]
+            for card in cards:
+                if card.name.lower() in banned:
+                    issues.append(f"**{card.name}** is banned in {format_name}")
+        
+        # Check color identity for commander.
+        # CR 903.4: deck color identity is the union of every commander's
+        # color identity (Partner, Friends Forever, Doctor's Companion,
+        # Choose-a-Background — multi-commander mechanics).
+        if format_name in COMMAND_ZONE_FORMATS and commanders:
+            commander_identity = set()
+            for cmdr in commanders:
+                commander_identity.update(FormatValidator.get_color_identity(cmdr))
+            commander_names = {c.name for c in commanders}
+
+            for card in cards:
+                if card.name in commander_names:
+                    continue
+                card_identity = set(FormatValidator.get_color_identity(card))
+
+                # Card's color identity must be subset of commander identity
+                if not card_identity.issubset(commander_identity):
+                    extra_colors = card_identity - commander_identity
+                    issues.append(
+                        f"**{card.name}** has colors {extra_colors} outside commander's identity {commander_identity or {'C'}}"
+                    )
+
+        # Apr 29 audit: pauper legality check — uses Scryfall's authoritative
+        # `legalities.pauper` field rather than rarity (cached rarity is
+        # whichever printing was last reprinted, so Lightning Bolt shows up as
+        # Uncommon even though it has many Common printings). We look up each
+        # card name in the on-disk Scryfall cache; cards missing from the
+        # cache silently pass (load-time will populate them).
+        if format_name == "pauper":
+            try:
+                import json as _json
+                import os as _os
+                cache_path = _os.path.join(
+                    _os.path.dirname(_os.path.dirname(__file__)),
+                    "data", "card_data_cache.json"
+                )
+                if _os.path.exists(cache_path):
+                    with open(cache_path, 'r', encoding='utf-8') as f:
+                        scry_cache = _json.load(f)
+                else:
+                    scry_cache = {}
+            except Exception:
+                scry_cache = {}
+            for card in cards:
+                if card.name.lower() in BASIC_LAND_NAMES:
+                    continue
+                scry = scry_cache.get(card.name.lower(), {})
+                legal = (scry.get('legalities') or {}).get('pauper', '')
+                if legal == 'not_legal' or legal == 'banned':
+                    issues.append(
+                        f"**{card.name}** is not pauper-legal ({legal})"
+                    )
+
+        return len(issues) == 0, issues
+    
+    @staticmethod
+    def check_commander_legality(card) -> Tuple[bool, str]:
+        """Check if a card can be a commander."""
+        type_line = card.type_line.lower() if card.type_line else ""
+        oracle_text = card.oracle_text.lower() if card.oracle_text else ""
+        
+        # Must be legendary creature or have "can be your commander"
+        is_legendary_creature = "legendary" in type_line and "creature" in type_line
+        is_legendary_planeswalker = "legendary" in type_line and "planeswalker" in type_line
+        can_be_commander = "can be your commander" in oracle_text
+        
+        if is_legendary_creature or can_be_commander:
+            return True, ""
+        elif is_legendary_planeswalker:
+            # Some planeswalkers can be commanders (check for explicit text)
+            if can_be_commander:
+                return True, ""
+            else:
+                return False, f"{card.name} is a planeswalker but doesn't have 'can be your commander'"
+        else:
+            return False, f"{card.name} is not a legendary creature"
+    
+    @staticmethod
+    def format_validation_message(issues: List[str], format_name: str) -> str:
+        """Format validation issues into a Discord message."""
+        if not issues:
+            return f"✅ Deck is valid for **{format_name.title()}**!"
+        
+        msg = f"⚠️ **Deck Validation Issues for {format_name.title()}:**\n"
+        for issue in issues[:10]:  # Limit to first 10 issues
+            msg += f"• {issue}\n"
+        
+        if len(issues) > 10:
+            msg += f"\n*...and {len(issues) - 10} more issues*"
+        
+        return msg
+
+
+# =============================================================================
+# DATA CLASSES
+# =============================================================================
+
+@dataclass
+class Card:
+    """Represents a card in any zone."""
+    name: str
+    id: str = ""  # Unique instance ID
+    owner_index: int = 0
+    
+    # Card data (loaded from Scryfall or deck)
+    mana_cost: str = ""
+    cmc: int = 0  # Converted mana cost
+    type_line: str = ""
+    oracle_text: str = ""
+    power: Optional[str] = None
+    toughness: Optional[str] = None
+    loyalty: Optional[int] = None
+    keywords: List[str] = field(default_factory=list)  # Flying, Trample, etc.
+    
+    # State (when on battlefield)
+    tapped: bool = False
+    summoning_sick: bool = True  # Can't attack/tap for abilities until controller's next turn
+    entered_this_turn: bool = False  # For "when ~ enters" triggers
+    counters: Dict[str, int] = field(default_factory=dict)
+    attached_to: Optional[str] = None  # ID of permanent this is attached to
+    attachments: List[str] = field(default_factory=list)  # IDs of attached cards
+    
+    # Combat state
+    attacking: bool = False
+    attacking_player: Optional[int] = None
+    blocking: List[str] = field(default_factory=list)  # IDs of creatures being blocked
+    blocked_by: List[str] = field(default_factory=list)  # IDs of blocking creatures
+    damage_marked: int = 0
+    deathtouch_damage: int = 0  # Damage from sources with deathtouch (CR 704.5h)
+
+    # Temporary modifiers (from pump effects, etc.)
+    power_modifier: int = 0
+    toughness_modifier: int = 0
+    temp_keywords: List[str] = field(default_factory=list)  # Keywords granted until end of turn
+    
+    # Planeswalker loyalty counters
+    loyalty_counters: int = 0
+    
+    # MDFC (Modal Double-Faced Card) tracking
+    played_face: str = ""  # "front" or "back" - which face this card entered as
+    mdfc_back_name: str = ""  # Name of the back face if this is an MDFC
+
+    # Transform / Double-Faced Card tracking
+    has_transform: bool = False  # True if this card can transform (layout: "transform")
+    is_transformed: bool = False  # True if currently showing back face
+    back_face_name: str = ""
+    back_face_type_line: str = ""
+    back_face_oracle_text: str = ""
+    back_face_power: str = ""
+    back_face_toughness: str = ""
+    back_face_mana_cost: str = ""
+    front_face_name: str = ""  # Stored so we can always find the original front face name
+
+    # Adventure tracking
+    adventure_name: str = ""  # Name of the adventure half (e.g., "Fertile Footsteps")
+    adventure_cost: str = ""  # Mana cost of the adventure
+    adventure_text: str = ""  # Oracle text of the adventure effect
+    adventure_type: str = ""  # Type line of adventure (e.g., "Sorcery — Adventure")
+    cast_as_adventure: bool = False  # Whether this is being cast as the adventure half
+
+    # Split card support (Commit // Memory, Wear // Tear, etc.)
+    split_names: List[str] = field(default_factory=list)  # ["Commit", "Memory"]
+    split_costs: List[str] = field(default_factory=list)  # ["{3}{U}", "{4}{U}{U}"]
+    split_types: List[str] = field(default_factory=list)  # ["Instant", "Sorcery"]
+    split_texts: List[str] = field(default_factory=list)  # [oracle for each half]
+    cast_as_split_half: int = -1  # which half is being cast (-1 = not a split cast)
+    
+    # Commander tracking
+    is_commander: bool = False  # Is this card a commander?
+    is_signature_spell: bool = False  # Is this card an oathbreaker signature spell?
+    is_companion: bool = False  # Is this card a companion?
+    color_identity: List[str] = field(default_factory=list)  # Color identity (W/U/B/R/G)
+    times_cast_from_command_zone: int = 0  # For commander tax calculation
+
+    # Control-change tracking (for Agent of Treachery, Act of Treason, etc.)
+    original_controller_index: Optional[int] = None  # Player index before steal
+    control_gained_by: Optional[str] = None  # Card name that stole this (for LTB return)
+
+    # Mutate tracking
+    mutated_cards: List['Card'] = field(default_factory=list)  # Cards merged via mutate
+    mutated_under: bool = False  # True if this card was placed under via mutate
+
+    # Suspend tracking (for cards in exile)
+    suspended: bool = False  # Is this card suspended?
+    
+    def __post_init__(self):
+        if not self.id:
+            self.id = f"{self.name}_{random.randint(10000, 99999)}"
+        # Ensure cmc is always an int (Scryfall data or deck loading may pass strings)
+        if isinstance(self.cmc, str):
+            try:
+                self.cmc = int(float(self.cmc))
+            except (ValueError, TypeError):
+                self.cmc = 0
+        elif not isinstance(self.cmc, int):
+            try:
+                self.cmc = int(self.cmc)
+            except (ValueError, TypeError):
+                self.cmc = 0
+        # Ensure card.name is always a string (some JSON data may pass lists)
+        if isinstance(self.name, list):
+            self.name = self.name[0] if self.name else "Unknown"
+        # Parse CMC from mana cost if not set
+        if self.mana_cost and not self.cmc:
+            self.cmc = self._parse_cmc(self.mana_cost)
+        # Parse keywords from oracle text
+        if self.oracle_text and not self.keywords:
+            self.keywords = self._parse_keywords(self.oracle_text)
+    
+    def reset_battlefield_state(self):
+        """Reset all battlefield-specific state when a card changes zones.
+
+        Per MTG rules (400.7), when an object changes zones it becomes a new object
+        with no memory of its previous state. This resets combat state, damage,
+        temporary modifiers, and other battlefield-only attributes so that a card
+        re-entering the battlefield (e.g. a commander recast from command zone)
+        doesn't carry stale state that would cause incorrect SBA deaths.
+        """
+        self.damage_marked = 0
+        self.deathtouch_damage = 0
+        self.power_modifier = 0
+        self.toughness_modifier = 0
+        self.temp_keywords = []
+        self.tapped = False
+        self.attacking = False
+        self.attacking_player = None
+        self.blocking = []
+        self.blocked_by = []
+        self.summoning_sick = True
+        self.entered_this_turn = False
+        self.attached_to = None
+        self.attachments = []
+        # Reset transform state — cards re-enter on their front face (CR 712.10a)
+        if self.is_transformed and self.has_transform:
+            self.transform()
+
+    def transform(self) -> bool:
+        """Transform this double-faced card, swapping front and back face data.
+
+        Returns True if the card was transformed, False if it can't transform.
+        Per MTG rules (CR 712), transforming swaps all printed characteristics
+        of the two faces. Counters, damage, and attachments remain.
+        """
+        if not self.has_transform:
+            return False
+        # Swap name
+        self.name, self.back_face_name = self.back_face_name, self.name
+        # Swap type line
+        self.type_line, self.back_face_type_line = self.back_face_type_line, self.type_line
+        # Swap oracle text
+        self.oracle_text, self.back_face_oracle_text = self.back_face_oracle_text, self.oracle_text
+        # Swap power/toughness (as strings — may be None or "*")
+        self.power, self.back_face_power = self.back_face_power, self.power
+        self.toughness, self.back_face_toughness = self.back_face_toughness, self.toughness
+        # Swap mana cost (back face of transform cards often has no mana cost)
+        self.mana_cost, self.back_face_mana_cost = self.back_face_mana_cost, self.mana_cost
+        # Toggle transformed state
+        self.is_transformed = not self.is_transformed
+        # Re-parse keywords from new oracle text
+        if self.oracle_text:
+            self.keywords = self._parse_keywords(self.oracle_text)
+        else:
+            self.keywords = []
+        print(f"[TRANSFORM] {self.back_face_name} transforms into {self.name}")
+        return True
+
+    def _parse_cmc(self, mana_cost: str) -> int:
+        """Parse converted mana cost from mana cost string like '{2}{U}{U}'.
+
+        Uses rules/mana.py ManaCost.parse() for accurate CMC calculation
+        (handles hybrid generic like {2/W} = CMC 2 correctly).  Falls back
+        to inline regex if the engine isn't available or parsing fails.
+        """
+        if not mana_cost:
+            return 0
+        # Structured parser — handles hybrid generic ({2/W} = CMC 2) correctly
+        if HAS_MANA_ENGINE:
+            try:
+                return ManaCost.parse(mana_cost).cmc
+            except Exception:
+                pass  # Fall through to inline
+        # Inline fallback
+        cmc = 0
+        symbols = re.findall(r'\{([^}]+)\}', mana_cost)
+        for sym in symbols:
+            if sym.isdigit():
+                cmc += int(sym)
+            elif sym in ['W', 'U', 'B', 'R', 'G']:
+                cmc += 1
+            elif '/' in sym:  # Hybrid mana like {W/U}
+                cmc += 1
+            elif sym == 'X':
+                pass  # X doesn't add to CMC when not on stack
+            else:
+                cmc += 1  # Phyrexian, snow, etc.
+        return cmc
+
+    def _parse_keywords(self, oracle_text: str) -> List[str]:
+        """Extract keyword abilities from oracle text.
+
+        Derives the keyword list from the Keyword enum (rules/keywords.py)
+        so there's a single source of truth for recognized keywords.
+
+        May 13 audit: the previous naive `if kw.lower() in text_lower` matched
+        anywhere in oracle text, producing phantom keywords any time the card
+        MENTIONED a keyword without having it. Craterhoof Behemoth (creatures
+        you control gain trample and haste) got Trample+Haste attributed to
+        itself; Bogardan Hellkite (Flash, Flying + nothing else) somehow got
+        Haste because the parser saw it in some interaction; Curious Pair
+        (adventure) got Flying from the Food token's reminder text. ~21 cards
+        in the May 11 cache had phantom keywords.
+
+        MTG keyword abilities appear in oracle text as a STANDALONE keyword
+        line (possibly comma-separated) at the start of the text, e.g.:
+          "Flying"
+          "Flying, vigilance"
+          "Trample\nFirst strike"
+          "Ward {2}"
+          "Annihilator 4"
+          "Protection from black"
+
+        They do NOT appear as the keyword inside larger sentences:
+          "Whenever ~ enters, creatures gain haste."  (grants haste, doesn't HAVE haste)
+          "Counter target creature spell with flying."  (mentions flying)
+          "Each creature with reach blocks..."           (mentions reach)
+
+        This implementation: strip reminder text, split on newlines, and only
+        accept a paragraph as a keyword line if it's a comma-separated list
+        of bare keyword tokens (each optionally followed by a numeric arg or
+        a "{mana}" payment, e.g. Ward {2} / Annihilator 4 / Protection from X).
+        """
+        if not oracle_text:
+            return []
+        # Strip reminder text. Anything in parens is flavor-explanatory and
+        # not a separate ability paragraph.
+        text = re.sub(r'\s*\([^)]*\)', '', oracle_text)
+        # Lowercase keyword vocabulary for quick lookup; preserve canonical
+        # spelling for the output.
+        canonical = {kw.lower(): kw for kw in _KEYWORD_LIST}
+        # Match: bare keyword, "keyword N", "keyword {cost}", "keyword from X",
+        # or "keyword X — Y". Each comma-separated piece must be a keyword.
+        piece_re = re.compile(
+            r'^([a-z][a-z\s\']*?)'                                # keyword name
+            r'(?:\s+(?:\d+|\{[^}]+\}|from\s+[a-z]+(?:\s+and\s+[a-z]+)?))?'  # optional arg
+            r'$',
+            re.IGNORECASE,
+        )
+
+        found = []
+        for raw_paragraph in text.split('\n'):
+            paragraph = raw_paragraph.strip().rstrip('.').strip()
+            if not paragraph:
+                continue
+            # Don't accept paragraphs with verbs that indicate the keyword is
+            # being GRANTED or REFERENCED, not POSSESSED.
+            if re.search(r'\b(gain|gains|have|has|with|target|each|whenever|when|at)\b',
+                         paragraph, re.IGNORECASE):
+                continue
+            # Split on commas. Each piece must be a bare keyword-shaped token
+            # (matches `piece_re` — a word, optionally followed by a number /
+            # mana cost / "from X"). Pieces that match piece_re but aren't in
+            # our known-keyword vocabulary are tolerated (skipped, not
+            # treated as line-killing) — so "Flying, ward 2" still extracts
+            # Flying even when "ward" isn't yet in _KEYWORD_LIST. Pieces that
+            # don't match piece_re at all (a verb-y phrase mid-line) reject
+            # the entire line.
+            parts = [p.strip() for p in re.split(r',\s*', paragraph) if p.strip()]
+            line_keywords = []
+            line_ok = True
+            for part in parts:
+                m = piece_re.match(part)
+                if not m:
+                    line_ok = False
+                    break
+                head = m.group(1).strip().lower()
+                if head in canonical:
+                    line_keywords.append(canonical[head])
+                # else: unknown-but-keyword-shaped (e.g. "ward 2") — skip silently
+            if line_ok and line_keywords:
+                found.extend(line_keywords)
+
+        # Dedupe while preserving order — a card occasionally lists a keyword
+        # twice (e.g. when a face grants it AND the printed line has it).
+        seen = set()
+        unique = []
+        for kw in found:
+            if kw not in seen:
+                seen.add(kw)
+                unique.append(kw)
+        return unique
+    
+    # ---- Equipment bonus helpers ----
+    def _get_equipment_bonuses(self, game=None) -> tuple:
+        """Calculate total P/T bonuses and keywords from all attached equipment.
+        Returns (power_bonus, toughness_bonus, keyword_list)."""
+        p_bonus = 0
+        t_bonus = 0
+        kw_list = []
+        if not self.attachments or game is None:
+            return p_bonus, t_bonus, kw_list
+        for equip_id in self.attachments:
+            result = game.find_card_global(equip_id)
+            if not result:
+                continue
+            equip_card = result[0]
+            if not equip_card.oracle_text:
+                continue
+            # May 16 audit: skip non-equipment attachments. The attachments list
+            # also contains auras, and the regex below ("gets +N/+N") matches
+            # "Enchanted creature gets +N/+N" oracle text just as readily as
+            # "Equipped creature gets +N/+N". Without this filter, every aura
+            # on a creature was double-counted (once here, once in
+            # _get_aura_pump_bonus). Carrion Feeder + Boar Umbra read as 7
+            # power: 1 base + 3 (mis-counted equipment) + 3 (correct aura).
+            if 'equipment' not in (equip_card.type_line or '').lower():
+                continue
+            oracle = equip_card.oracle_text.lower()
+            # Parse "+X/+Y" from "equipped creature gets +X/+Y"
+            pt_match = re.search(r'(?:gets?|has)\s*\+(\d+)/\+(\d+)', oracle)
+            if pt_match:
+                p_bonus += int(pt_match.group(1))
+                t_bonus += int(pt_match.group(2))
+            # Parse granted keywords. May 17 audit: 'shroud' was missing from
+            # this list, so Lightning Greaves' shroud was never granted to the
+            # equipped creature — making it freely targetable. Same gap for
+            # 'fear' / 'intimidate' / 'protection' (the last two rarely come
+            # up but add them while we're here).
+            for kw in ['vigilance', 'lifelink', 'trample', 'flying', 'first strike',
+                        'double strike', 'deathtouch', 'haste', 'hexproof', 'shroud',
+                        'indestructible', 'menace', 'reach', 'fear', 'intimidate']:
+                if kw in oracle and 'equipped creature' in oracle:
+                    kw_list.append(kw)
+        return p_bonus, t_bonus, kw_list
+
+    def get_effective_power(self, game=None) -> int:
+        """Get effective power including base, counters, modifiers, equipment, and anthem effects.
+        Handles */* creatures (Ulvenwald Hydra, Tarmogoyf, etc.) via oracle text.
+
+        IMPORTANT — DO NOT read `card.power` directly for effective P/T checks.
+        That gives you the printed (base) power as a string, which:
+          - Doesn't include +1/+1 / -1/-1 counters
+          - Doesn't include equipment / aura bonuses
+          - Doesn't include layer effects (Humility, anthems, Glorious Anthem)
+          - Doesn't resolve */* CDA creatures (returns the literal '*')
+
+        Layer 7 modifications come from the cached `_layers_power_mod` field,
+        which is refreshed by `GameState.recalculate_power_toughness()` after
+        every action that could change continuous effects (~22 call sites
+        across actions.py, sba.py, spells.py, engine.py). The cache is kept
+        fresh by discipline at the call sites, not by recomputing on every
+        read. If you add a new layer-changing action, call
+        `game.recalculate_power_toughness()` after the mutation.
+
+        For non-battlefield zones (library, hand, graveyard, exile), reading
+        `card.power` raw is correct — layer effects don't apply there.
+        Same for copy effects, which copy the printed values per CR.
+        """
+        # Sylvan Awakening / Living Lands / Wake the Bear etc. animate lands
+        # into 2/2 creatures via _animated_power/toughness EOT attributes. The
+        # land's printed power is empty (None / ''), so without this branch the
+        # base computed below would be 0 and a 0-toughness SBA would destroy
+        # the land — including indestructible ones, because CR 704.5f's
+        # "0 toughness dies even if indestructible" applies. Treat the animated
+        # value as the effective base while the EOT marker is set.
+        if getattr(self, '_animated_until_eot', False) or getattr(self, '_animated_permanent', False):
+            try:
+                base = int(getattr(self, '_animated_power', 0))
+            except (ValueError, TypeError):
+                base = 0
+        else:
+            try:
+                base = int(self.power) if self.power and self.power != '*' else 0
+            except (ValueError, TypeError):
+                base = 0
+        # CDA resolution for */* creatures — check oracle text for common patterns
+        if ((self.power == '*' or base == 0) and self.oracle_text and game
+                and not getattr(self, '_animated_until_eot', False)
+                and not getattr(self, '_animated_permanent', False)):
+            base = self._resolve_star_power(game)
+            if base > 0:
+                self.power_modifier = 0  # CDA recalculates each call; don't accumulate pump
+        result = base + self.power_modifier
+        # Debug: catch impossible CDA power (Tarmogoyf should max at 8)
+        if self.power == '*' and result > 15:
+            eq_p_dbg, _, _ = self._get_equipment_bonuses(game)
+            print(f"[CDA-DEBUG] {self.name}: base={base}, power_mod={self.power_modifier}, "
+                  f"counters_11={self.counters.get('+1/+1', 0)}, equip={eq_p_dbg}, "
+                  f"layers_mod={getattr(self, '_layers_power_mod', 0)}")
+        result += self.counters.get('+1/+1', 0) - self.counters.get('-1/-1', 0)
+        eq_p, _, _ = self._get_equipment_bonuses(game)
+        result += eq_p
+        # Aura static "Enchanted creature gets +N/+M" bonuses (Draconic Destiny, etc.)
+        ap, _ = self._get_aura_pump_bonus(game)
+        result += ap
+        # Self-bonus "for each X attached to it" (Heavenly Blademaster). The
+        # layers engine skips these because the amount is dynamic; compute
+        # on read so combat damage sees the correct effective power.
+        sp, _ = self._get_self_for_each_bonus(game)
+        result += sp
+        # Layer 7: P/T from layers engine (Humility, anthems); falls back to inline scan
+        layers_mod = getattr(self, '_layers_power_mod', 0)
+        # May 20 audit (CRITICAL #2): consult _has_layers_pt_effect sentinel
+        # BEFORE deciding to fall back. When the layers engine has applied
+        # ANY P/T effect (even one that nets to 0 delta), the cached value is
+        # authoritative and the fallback would double-count anthems on top of
+        # a Humility-set base.
+        has_layers_effect = getattr(self, '_has_layers_pt_effect', False)
+        if has_layers_effect or layers_mod != 0:
+            result += layers_mod
+        elif game and self.is_creature():
+            result += self._get_anthem_power_bonus(game)
+        return result
+
+    def get_effective_toughness(self, game=None) -> int:
+        """Get effective toughness including base, counters, modifiers, equipment, and anthem effects.
+        Handles */* creatures via oracle text."""
+        # Animated-land toughness (Sylvan Awakening etc.) — see get_effective_power
+        # for full rationale. Without this, the SBA-zero-toughness check fires
+        # on every land the moment Sylvan Awakening resolves.
+        if getattr(self, '_animated_until_eot', False) or getattr(self, '_animated_permanent', False):
+            try:
+                base = int(getattr(self, '_animated_toughness', 0))
+            except (ValueError, TypeError):
+                base = 0
+        else:
+            try:
+                base = int(self.toughness) if self.toughness and self.toughness != '*' else 0
+            except (ValueError, TypeError):
+                base = 0
+        if ((self.toughness == '*' or base == 0) and self.oracle_text and game
+                and not getattr(self, '_animated_until_eot', False)
+                and not getattr(self, '_animated_permanent', False)):
+            base = self._resolve_star_toughness(game)
+        result = base + getattr(self, 'toughness_modifier', 0)
+        result += self.counters.get('+1/+1', 0) - self.counters.get('-1/-1', 0)
+        _, eq_t, _ = self._get_equipment_bonuses(game)
+        result += eq_t
+        # Aura static "Enchanted creature gets +N/+M" bonuses
+        _, at = self._get_aura_pump_bonus(game)
+        result += at
+        # Self-bonus "for each X attached to it" (Heavenly Blademaster) —
+        # see get_effective_power for rationale.
+        _, st = self._get_self_for_each_bonus(game)
+        result += st
+        # Layer 7: P/T from layers engine; falls back to inline anthem scan
+        # May 20 audit (CRITICAL #2): same sentinel check as get_effective_power.
+        _lt_mod = getattr(self, '_layers_toughness_mod', 0)
+        _has_layers_effect = getattr(self, '_has_layers_pt_effect', False)
+        if _has_layers_effect or _lt_mod != 0:
+            result += _lt_mod
+        elif game and self.is_creature():
+            result += self._get_anthem_toughness_bonus(game)
+        return result
+
+    def _get_attached_auras(self, game):
+        """Return list of aura permanents attached to this card."""
+        if not game:
+            return []
+        auras = []
+        for p in game.players:
+            for perm in p.battlefield:
+                if (getattr(perm, 'attached_to', None) == self.id and
+                        'aura' in (getattr(perm, 'type_line', '') or '').lower()):
+                    auras.append(perm)
+        return auras
+
+    def _get_self_for_each_bonus(self, game):
+        """Return (power, toughness) bonus from "for each X attached to it"
+        self-buffing oracle text (Heavenly Blademaster, Sram's Expertise,
+        Bruna). The layers engine skips these because the bonus is dynamic
+        — it changes with attachment count — so we compute on read instead.
+
+        Patterns:
+            "<name> gets +N/+N for each Aura attached to it"
+            "<name> gets +N/+N for each Equipment attached to it"
+            "<name> gets +N/+N for each Aura and Equipment attached to it"
+        """
+        if not game or not self.oracle_text:
+            return (0, 0)
+        oracle = self.oracle_text.lower()
+        if 'for each' not in oracle or 'attached to it' not in oracle:
+            return (0, 0)
+        import re as _re
+        # Pattern: "gets +N/+M for each <thing> attached to it"
+        match = _re.search(
+            r'gets \+(\d+)/\+(\d+) for each (.+?) attached to it', oracle)
+        if not match:
+            return (0, 0)
+        p_step, t_step = int(match.group(1)), int(match.group(2))
+        what = match.group(3)
+        wants_aura = 'aura' in what
+        wants_equip = 'equipment' in what
+        # Count attached items matching the requested types
+        count = 0
+        for p in game.players:
+            for perm in p.battlefield:
+                if getattr(perm, 'attached_to', None) != self.id:
+                    continue
+                tl = (getattr(perm, 'type_line', '') or '').lower()
+                if wants_aura and 'aura' in tl:
+                    count += 1
+                elif wants_equip and 'equipment' in tl:
+                    count += 1
+        return (p_step * count, t_step * count)
+
+    def _get_aura_pump_bonus(self, game):
+        """Return (power, toughness) bonus from attached auras' static
+        'Enchanted creature gets +N/+M' clauses. Handles both positive
+        (Draconic Destiny, Unholy Strength) and negative (rare) patterns."""
+        if not game:
+            return (0, 0)
+        p_bonus = 0
+        t_bonus = 0
+        import re as _re
+        for aura in self._get_attached_auras(game):
+            oracle = (aura.oracle_text or '').lower()
+            for m in _re.finditer(r'enchanted creature gets \+(\d+)/\+(\d+)', oracle):
+                p_bonus += int(m.group(1))
+                t_bonus += int(m.group(2))
+            for m in _re.finditer(r'enchanted creature gets -(\d+)/-(\d+)', oracle):
+                p_bonus -= int(m.group(1))
+                t_bonus -= int(m.group(2))
+        return (p_bonus, t_bonus)
+
+    def _get_anthem_power_bonus(self, game) -> int:
+        """Calculate total power bonus from anthem-style continuous effects on the battlefield."""
+        bonus = 0
+        controller = self._find_controller(game)
+        if not controller:
+            return 0
+        for p in game.players:
+            for perm in p.battlefield:
+                if perm.id == self.id:
+                    continue  # Don't buff yourself
+                oracle = (perm.oracle_text or '').lower()
+                perm_controller = perm._find_controller(game)
+                # "Creatures you control get +N/+N" (Glorious Anthem, Gaea's Anthem)
+                # "Other creatures you control get +N/+N" (Lord of Atlantis, etc.)
+                if perm_controller == controller:
+                    import re as _re
+                    # Match "+N/+N" patterns for creatures you control
+                    # Covers: "creatures you control", "creature tokens you control",
+                    # "other creature tokens you control" (Intangible Virtue, Phantom General)
+                    for m in _re.finditer(r'(?:other )?creature(?:\s+token)?s you control get \+(\d+)/\+(\d+)', oracle):
+                        if 'other' in oracle[:oracle.index(m.group())+10] and perm.id == self.id:
+                            continue
+                        # "creature tokens" only applies to tokens
+                        if 'creature token' in m.group() and not getattr(self, 'is_token', False):
+                            continue
+                        bonus += int(m.group(1))
+        return bonus
+
+    def _get_anthem_toughness_bonus(self, game) -> int:
+        """Calculate total toughness bonus from anthem-style continuous effects."""
+        bonus = 0
+        controller = self._find_controller(game)
+        if not controller:
+            return 0
+        for p in game.players:
+            for perm in p.battlefield:
+                if perm.id == self.id:
+                    continue
+                oracle = (perm.oracle_text or '').lower()
+                perm_controller = perm._find_controller(game)
+                if perm_controller == controller:
+                    import re as _re
+                    for m in _re.finditer(r'(?:other )?creature(?:\s+token)?s you control get \+(\d+)/\+(\d+)', oracle):
+                        if 'other' in oracle[:oracle.index(m.group())+10] and perm.id == self.id:
+                            continue
+                        if 'creature token' in m.group() and not getattr(self, 'is_token', False):
+                            continue
+                        bonus += int(m.group(2))
+        return bonus
+
+    def _resolve_star_power(self, game) -> int:
+        """Resolve */* power from oracle text (CDA). Used by get_effective_power."""
+        oracle = (self.oracle_text or '').lower()
+        owner = self._find_controller(game)
+        if not owner:
+            return 0
+        if 'number of lands you control' in oracle:
+            return len(owner.lands())
+        if 'number of creatures you control' in oracle:
+            return len(owner.creatures())
+        if 'number of cards in your hand' in oracle:
+            return len(owner.hand)
+        if 'equal to your life total' in oracle:
+            return owner.life
+        if 'card types among cards in all graveyards' in oracle:
+            types_seen = set()
+            for p in game.players:
+                for c in p.graveyard:
+                    for t in ['creature', 'land', 'instant', 'sorcery', 'artifact', 'enchantment', 'planeswalker']:
+                        if t in (c.type_line or '').lower():
+                            types_seen.add(t)
+            return len(types_seen)
+        # Generic "cards in all graveyards" (Lhurgoyf, Mortivore) — MUST be after the type-counting check
+        # above, otherwise Tarmogoyf ("card TYPES among cards in all graveyards") would match this first
+        if 'creature cards in all graveyards' in oracle or 'cards in all graveyards' in oracle:
+            return sum(len(p.graveyard) for p in game.players)
+        if 'cards in your graveyard' in oracle:
+            return len(owner.graveyard)
+        return 0  # Unknown CDA
+
+    def _resolve_star_toughness(self, game) -> int:
+        """Resolve */* toughness from oracle text. Tarmogoyf gets +1."""
+        oracle = (self.oracle_text or '').lower()
+        base = self._resolve_star_power(game)
+        if 'toughness is equal' in oracle and 'plus 1' in oracle:
+            return base + 1
+        return base
+
+    def _find_controller(self, game) -> 'Player':
+        """Find which player controls this card on the battlefield."""
+        if not game:
+            return None
+        for p in game.players:
+            if self in p.battlefield:
+                return p
+        return None
+
+    def is_creature(self, game=None) -> bool:
+        if not self.type_line or "creature" not in self.type_line.lower():
+            return False
+        # Gods with devotion threshold: "As long as your devotion to X is less than N, ~ isn't a creature"
+        if game and "God" in self.type_line and self.oracle_text and "devotion" in self.oracle_text.lower():
+            oracle_lower = self.oracle_text.lower()
+            import re
+            # Match "devotion to {color(s)} is less than {number}"
+            dev_match = re.search(r"devotion to (\w+(?:\s+and\s+\w+)?)\s+is less than (\w+)", oracle_lower)
+            if dev_match:
+                color_map = {"white": "W", "blue": "U", "black": "B", "red": "R", "green": "G"}
+                threshold_map = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7}
+                color_text = dev_match.group(1)
+                threshold = threshold_map.get(dev_match.group(2), 5)
+                # Parse colors (single or "X and Y")
+                symbols = []
+                for word in color_text.split():
+                    if word in color_map:
+                        symbols.append(color_map[word])
+                # Find controller
+                controller = None
+                for p in game.players:
+                    if self in p.battlefield:
+                        controller = p
+                        break
+                if controller and symbols:
+                    # May 25 audit (F23): the old `mc.upper().count(f"{{{sym}}}")`
+                    # only matched literal `{B}` and missed Phyrexian (`{B/P}`),
+                    # hybrid (`{W/B}`), and monocolored-hybrid (`{2/B}`) symbols
+                    # — all of which contribute to devotion per CR 700.2 +
+                    # 107.4f. Iterate symbols and substring-check each color;
+                    # a hybrid counts as 1 devotion toward the combined "X and Y"
+                    # threshold (Gatherer ruling: hybrid contributes once to a
+                    # multi-color devotion, not twice).
+                    import re as _re_dev
+                    devotion = 0
+                    for perm in controller.battlefield:
+                        mc = (perm.mana_cost or "").upper()
+                        for symbol_match in _re_dev.finditer(r'\{([^}]+)\}', mc):
+                            symbol_content = symbol_match.group(1)
+                            if any(sym in symbol_content for sym in symbols):
+                                devotion += 1
+                                # Hybrid counts once per symbol (not per matching color)
+                    # May 25 audit (F24 instrumentation): log every devotion check so
+                    # the next batch can verify whether the type-flip is consistently
+                    # applied across all call sites. The audit hypothesis was that
+                    # the Tier 3 judge prompt saw Erebos as "not a creature" while
+                    # the combat path saw him as one — instrumenting both sides lets
+                    # us diff. Only log when we're actually about to flip the result
+                    # (devotion < threshold) so noise stays bounded.
+                    is_creature_now = devotion >= threshold
+                    if not is_creature_now:
+                        print(f"[DEVOTION-CHECK] {self.name}: "
+                              f"devotion={devotion}/{threshold} ({''.join(symbols)}) "
+                              f"controller={controller.name} → NOT a creature")
+                    if devotion < threshold:
+                        return False
+        return True
+    
+    def is_land(self) -> bool:
+        return self.type_line and "land" in self.type_line.lower()
+    
+    def is_instant(self) -> bool:
+        return self.type_line and "instant" in self.type_line.lower()
+    
+    def is_sorcery(self) -> bool:
+        return self.type_line and "sorcery" in self.type_line.lower()
+    
+    def is_artifact(self) -> bool:
+        return self.type_line and "artifact" in self.type_line.lower()
+    
+    def is_enchantment(self) -> bool:
+        return self.type_line and "enchantment" in self.type_line.lower()
+    
+    def is_planeswalker(self) -> bool:
+        return self.type_line and "planeswalker" in self.type_line.lower()
+
+    def is_battle(self) -> bool:
+        return self.type_line and "battle" in self.type_line.lower()
+
+    def has_keyword(self, keyword: str, game=None) -> bool:
+        """Check if card has a keyword ability (permanent, temporary, equipment, or static effects)."""
+        keyword_lower = keyword.lower()
+        all_keywords = [k.lower() for k in self.keywords] + [k.lower() for k in self.temp_keywords]
+        # Also check keywords granted by continuous effects (layers engine)
+        granted = getattr(self, '_granted_keywords', set())
+        if granted:
+            all_keywords.extend(k.lower() for k in granted)
+        if keyword_lower in all_keywords:
+            return True
+        # Check equipment-granted keywords
+        if game and self.attachments:
+            _, _, eq_kw = self._get_equipment_bonuses(game)
+            if keyword_lower in [k.lower() for k in eq_kw]:
+                return True
+        # Check aura-granted keywords: "Enchanted creature ... has <keywords>"
+        # (Draconic Destiny grants flying + haste; Flight grants flying; etc.)
+        if game:
+            import re as _re
+            for aura in self._get_attached_auras(game):
+                aura_oracle = (aura.oracle_text or '').lower()
+                if 'enchanted creature' not in aura_oracle:
+                    continue
+                # Capture everything after "enchanted creature ... has " up to the
+                # next period or opening quote (which starts activated ability text).
+                m = _re.search(r'enchanted creature[^."]*?\bhas\s+([^."]+)', aura_oracle)
+                if not m:
+                    continue
+                grant_text = m.group(1)
+                # Normalise multi-word keyword for substring check
+                if keyword_lower in grant_text:
+                    return True
+        return False
+    
+    def has_haste(self, game=None) -> bool:
+        return self.has_keyword('Haste', game=game)
+
+    def has_vigilance(self, game=None) -> bool:
+        return self.has_keyword('Vigilance', game=game)
+
+    def has_flying(self, game=None) -> bool:
+        return self.has_keyword('Flying', game=game)
+
+    def has_reach(self, game=None) -> bool:
+        return self.has_keyword('Reach', game=game)
+
+    def has_trample(self, game=None) -> bool:
+        return self.has_keyword('Trample', game=game)
+
+    def has_deathtouch(self, game=None) -> bool:
+        return self.has_keyword('Deathtouch', game=game)
+
+    def has_first_strike(self, game=None) -> bool:
+        return self.has_keyword('First strike', game=game) or self.has_keyword('Double strike', game=game)
+
+    def has_double_strike(self, game=None) -> bool:
+        return self.has_keyword('Double strike', game=game)
+
+    def has_lifelink(self, game=None) -> bool:
+        return self.has_keyword('Lifelink', game=game)
+
+    def has_defender(self, game=None) -> bool:
+        return self.has_keyword('Defender', game=game)
+    
+    def can_attack(self, game=None) -> bool:
+        """Check if creature can legally attack."""
+        if not self.is_creature(game=game):
+            return False
+        if self.tapped:
+            return False
+        if self.has_defender():
+            return False
+        # Summoning sickness check (haste bypasses)
+        if self.summoning_sick and not self.has_haste():
+            return False
+        # Check for "can't attack" effects from attached auras (Pacifism,
+        # Arrest, Faith's Fetters, etc.). The legacy code looked at a
+        # nonexistent `attached_auras` attribute — the actual storage is
+        # `attachments` (list of IDs). When `game` is available, resolve
+        # the IDs through `_get_attached_auras(game)` so Pacifism's
+        # "can't attack or block" restriction actually enforces.
+        if game is not None:
+            try:
+                for aura in self._get_attached_auras(game):
+                    oracle = (getattr(aura, 'oracle_text', '') or '').lower()
+                    if "can't attack" in oracle:
+                        return False
+            except Exception:
+                pass
+        # Check for "can't attack" from layers/effects
+        if getattr(self, 'cant_attack_this_turn', False):
+            return False
+        return True
+
+    def can_block(self, attacker: 'Card' = None, game=None) -> bool:
+        """Check if creature can legally block (optionally a specific attacker)."""
+        # May 25 audit (F24): pass `game` through to is_creature so devotion-
+        # gated Theros gods (Erebos isn't a creature unless devotion ≥5) are
+        # correctly rejected as blockers. Without this, Erebos blocked
+        # attackers at devotion=4 in game_1508578146641907722 (CR 509.1a:
+        # blockers must be creatures).
+        if not self.is_creature(game=game):
+            return False
+        if self.tapped:
+            return False
+        # "Can't block this turn" effects (e.g. Chandra, Pyromaster +1)
+        if getattr(self, 'cant_block_this_turn', False):
+            return False
+        # Symmetric to can_attack: Pacifism etc. restrict blocking too.
+        if game is not None:
+            try:
+                for aura in self._get_attached_auras(game):
+                    oracle = (getattr(aura, 'oracle_text', '') or '').lower()
+                    if "can't block" in oracle:
+                        return False
+            except Exception:
+                pass
+        if attacker:
+            # Flying creatures can only be blocked by flying/reach
+            if attacker.has_flying() and not (self.has_flying() or self.has_reach()):
+                return False
+            # Menace requires 2+ blockers (handled elsewhere)
+            # Unblockable, fear, intimidate, etc. would go here
+        return True
+    
+    def display_name(self) -> str:
+        """Name with state indicators."""
+        # Show MDFC back face name if played as back
+        name = self.name
+        if self.played_face == "back" and self.mdfc_back_name:
+            name = self.mdfc_back_name
+        
+        indicators = []
+        if self.tapped:
+            indicators.append("(T)")
+        if self.summoning_sick and not self.has_haste() and self.is_creature():
+            indicators.append("🤢")  # Sick emoji for summoning sickness
+        if self.counters:
+            counter_str = ", ".join(f"{v} {k}" for k, v in self.counters.items())
+            indicators.append(f"[{counter_str}]")
+        if self.attacking:
+            indicators.append("⚔️")
+        if self.blocked_by:
+            indicators.append("🛡️")
+        if self.keywords:
+            # Show first 2 keywords as abbreviations
+            kw_abbrev = {'Flying': 'Fly', 'First strike': 'FS', 'Deathtouch': 'DT',
+                        'Trample': 'Trmp', 'Lifelink': 'LL', 'Haste': 'Hst',
+                        'Vigilance': 'Vig', 'Reach': 'Rch', 'Menace': 'Men'}
+            # Skip 'Equip' (shown separately as (Equ)) and keywords that equipment GRANTS vs HAS
+            skip_keywords = {'Equip', 'Haste', 'Hexproof', 'Shroud', 'Indestructible', 'Lifelink', 
+                           'First strike', 'Double strike', 'Trample', 'Vigilance', 'Flying'}
+            # Only skip for equipment - they grant these, they don't have them
+            if self.type_line and "equipment" in self.type_line.lower():
+                relevant_kws = [k for k in self.keywords[:4] if k not in skip_keywords]
+            else:
+                relevant_kws = [k for k in self.keywords[:2] if k != 'Equip']
+            kws = [kw_abbrev.get(k, k[:3]) for k in relevant_kws]
+            if kws:
+                indicators.append(f"({','.join(kws)})")
+        # Show planeswalker loyalty
+        if self.is_planeswalker() and self.loyalty_counters > 0:
+            indicators.append(f"[{self.loyalty_counters}]")
+        # Show equipment status
+        if "equipment" in self.type_line.lower() and not self.attached_to:
+            indicators.append("(Equ)")
+        
+        suffix = " " + " ".join(indicators) if indicators else ""
+        return f"{name}{suffix}"
+    
+    def to_dict(self) -> Dict:
+        """Serialize card to JSON-compatible dict."""
+        return {
+            "name": self.name,
+            "id": self.id,
+            "owner_index": self.owner_index,
+            "mana_cost": self.mana_cost,
+            "cmc": self.cmc,
+            "type_line": self.type_line,
+            "oracle_text": self.oracle_text,
+            "power": self.power,
+            "toughness": self.toughness,
+            "loyalty": self.loyalty,
+            "keywords": self.keywords,
+            "tapped": self.tapped,
+            "summoning_sick": self.summoning_sick,
+            "entered_this_turn": self.entered_this_turn,
+            "counters": self.counters,
+            "attached_to": self.attached_to,
+            "attachments": self.attachments,
+            "attacking": self.attacking,
+            "attacking_player": self.attacking_player,
+            "blocking": self.blocking,
+            "blocked_by": self.blocked_by,
+            "damage_marked": self.damage_marked,
+            "deathtouch_damage": self.deathtouch_damage,
+            "power_modifier": self.power_modifier,
+            "toughness_modifier": self.toughness_modifier,
+            "temp_keywords": self.temp_keywords,
+            "loyalty_counters": self.loyalty_counters,
+            "played_face": self.played_face,
+            "mdfc_back_name": self.mdfc_back_name,
+            "is_commander": self.is_commander,
+            "is_signature_spell": self.is_signature_spell,
+            "is_companion": self.is_companion,
+            "color_identity": self.color_identity,
+            "times_cast_from_command_zone": self.times_cast_from_command_zone,
+            "mutated_cards": [c.to_dict() for c in self.mutated_cards],
+            "mutated_under": self.mutated_under,
+            "suspended": self.suspended,
+        }
+    
+    @classmethod
+    def from_dict(cls, data: Dict) -> 'Card':
+        """Reconstruct card from dict."""
+        card = cls(
+            name=data["name"],
+            id=data.get("id", ""),
+            owner_index=data.get("owner_index", 0),
+            mana_cost=data.get("mana_cost", ""),
+            cmc=data.get("cmc", 0),
+            type_line=data.get("type_line", ""),
+            oracle_text=data.get("oracle_text", ""),
+            power=data.get("power"),
+            toughness=data.get("toughness"),
+            loyalty=data.get("loyalty"),
+            keywords=data.get("keywords", []),
+            tapped=data.get("tapped", False),
+            summoning_sick=data.get("summoning_sick", True),
+            entered_this_turn=data.get("entered_this_turn", False),
+            counters=data.get("counters", {}),
+            attached_to=data.get("attached_to"),
+            attachments=data.get("attachments", []),
+            attacking=data.get("attacking", False),
+            attacking_player=data.get("attacking_player"),
+            blocking=data.get("blocking", []),
+            blocked_by=data.get("blocked_by", []),
+            damage_marked=data.get("damage_marked", 0),
+            deathtouch_damage=data.get("deathtouch_damage", 0),
+            power_modifier=data.get("power_modifier", 0),
+            toughness_modifier=data.get("toughness_modifier", 0),
+            temp_keywords=data.get("temp_keywords", []),
+            loyalty_counters=data.get("loyalty_counters", 0),
+            played_face=data.get("played_face", ""),
+            mdfc_back_name=data.get("mdfc_back_name", ""),
+            is_commander=data.get("is_commander", False),
+            is_signature_spell=data.get("is_signature_spell", False),
+            is_companion=data.get("is_companion", False),
+            color_identity=data.get("color_identity", []),
+            times_cast_from_command_zone=data.get("times_cast_from_command_zone", 0),
+            mutated_under=data.get("mutated_under", False),
+            suspended=data.get("suspended", False),
+        )
+        # Restore mutated cards list
+        card.mutated_cards = [Card.from_dict(mc) for mc in data.get("mutated_cards", [])]
+        return card
+
+
+@dataclass
+class Player:
+    """Represents a player in the game."""
+    name: str
+    user_id: Optional[int] = None  # Discord user ID, None for Claude
+    is_claude: bool = False
+    
+    # Life and counters
+    life: int = 20
+    poison: int = 0
+    energy: int = 0
+    commander_damage: Dict[int, int] = field(default_factory=dict)  # player_index -> damage
+    
+    # Zones
+    library: List[Card] = field(default_factory=list)
+    hand: List[Card] = field(default_factory=list)
+    battlefield: List[Card] = field(default_factory=list)
+    graveyard: List[Card] = field(default_factory=list)
+    exile: List[Card] = field(default_factory=list)
+    command_zone: List[Card] = field(default_factory=list)
+    companion_zone: List[Card] = field(default_factory=list)  # Companion (outside the game)
+
+    # Deck info
+    deck_name: str = ""
+    deck_source: str = ""  # Archidekt URL or file path
+    
+    # Game state
+    lands_played_this_turn: int = 0
+    max_lands_per_turn: int = 1
+    has_drawn_for_turn: bool = False
+    mulligans_taken: int = 0
+    has_kept_hand: bool = False  # True once player keeps (can't mulligan after)
+    spells_cast_this_turn: int = 0  # For day/night and werewolf transform tracking
+    spells_cast_prev_turn: int = 0  # Spells cast during the player's previous turn
+    noncreature_spells_cast_this_turn: int = 0  # For Esper Sentinel "first noncreature spell" tracking
+    landfall_count_this_turn: int = 0  # Lands that entered under your control this turn (for Omnath, etc.)
+
+    # Cards exiled but playable this turn (Chandra 0, Outpost Siege, etc.)
+    # List of card IDs that can be played from exile until end of turn
+    playable_from_exile: List[str] = field(default_factory=list)
+
+    # Bug #28: Cards in graveyard that gained flashback (Snapcaster Mage, etc.)
+    # List of card IDs playable from graveyard until end of turn
+    playable_from_graveyard: List[str] = field(default_factory=list)
+
+    # Mana pool {color: amount} - W, U, B, R, G, C (colorless)
+    mana_pool: Dict[str, int] = field(default_factory=lambda: {'W': 0, 'U': 0, 'B': 0, 'R': 0, 'G': 0, 'C': 0})
+    
+    def get_zone(self, zone: Zone) -> List[Card]:
+        """Get cards in a specific zone."""
+        return {
+            Zone.LIBRARY: self.library,
+            Zone.HAND: self.hand,
+            Zone.BATTLEFIELD: self.battlefield,
+            Zone.GRAVEYARD: self.graveyard,
+            Zone.EXILE: self.exile,
+            Zone.COMMAND: self.command_zone,
+        }.get(zone, [])
+    
+    def find_card(self, name_or_id, zone: Zone = None) -> Optional[Card]:
+        """Find a card by name or ID, optionally in a specific zone.
+
+        Handles P/T annotations like 'Insect(1/1)' that Claude's AI sometimes
+        includes — strips trailing '(N/N)' before matching.
+
+        Coerces list-valued names (AI sometimes returns `target: [A, B]` for
+        multi-target spells) to the first element; None returns None.
+        """
+        if name_or_id is None:
+            return None
+        if isinstance(name_or_id, (list, tuple)):
+            if not name_or_id:
+                return None
+            name_or_id = name_or_id[0]
+        if not isinstance(name_or_id, str):
+            name_or_id = str(name_or_id)
+        zones = [zone] if zone else list(Zone)
+        name_lower = name_or_id.lower().strip()
+
+        # Strip trailing parenthetical: "Insect(1/1)" → "insect", "Plant(2)" → "plant"
+        # Matches P/T like (1/1) AND index annotations like (1), (2) that Claude
+        # generates to disambiguate duplicate-named tokens
+        import re as _re
+        name_lower = _re.sub(r'\s*\([^)]*\)\s*$', '', name_lower)
+
+        for z in zones:
+            for card in self.get_zone(z):
+                # Skip phased-out permanents on battlefield (they don't exist per CR 702.26)
+                if z == Zone.BATTLEFIELD and getattr(card, '_phased_out', False):
+                    continue
+                if card.id == name_or_id or card.name.lower() == name_lower:
+                    return card
+        return None
+    
+    def _is_active(self, card: Card) -> bool:
+        """Check if a permanent is active (not phased out).
+        Phased-out permanents are treated as though they don't exist per CR 702.26."""
+        return not getattr(card, '_phased_out', False)
+
+    def active_battlefield(self) -> List[Card]:
+        """Get all active (non-phased-out) permanents on battlefield."""
+        return [c for c in self.battlefield if self._is_active(c)]
+
+    def creatures(self, game=None) -> List[Card]:
+        """Get active creatures on battlefield (excludes phased-out).
+
+        May 25 audit (F24): pass `game` through to is_creature so devotion-
+        gated Theros gods (Erebos isn't a creature unless devotion ≥5) are
+        correctly excluded. Callers that have a game reference SHOULD pass
+        it; the default `game=None` keeps backward compat with call sites
+        that only want a type-line filter.
+        """
+        return [c for c in self.battlefield if c.is_creature(game=game) and self._is_active(c)]
+
+    def untapped_creatures(self, game=None) -> List[Card]:
+        """Get untapped active creatures on battlefield."""
+        return [c for c in self.creatures(game=game) if not c.tapped]
+
+    def lands(self) -> List[Card]:
+        """Get active lands on battlefield (excludes phased-out)."""
+        return [c for c in self.battlefield if c.is_land() and self._is_active(c)]
+
+    def untapped_lands(self) -> List[Card]:
+        """Get untapped active lands on battlefield."""
+        return [c for c in self.lands() if not c.tapped]
+
+    def untapped_mana_sources(self) -> List[Card]:
+        """Get all untapped active permanents that can produce mana (lands + mana rocks)."""
+        sources = []
+        for card in self.battlefield:
+            if card.tapped or not self._is_active(card):
+                continue
+            if card.is_land() or self._can_produce_mana(card):
+                sources.append(card)
+        return sources
+    
+    def _can_produce_mana(self, card: Card) -> bool:
+        """Check if a card can produce mana (based on oracle text or known cards)."""
+        # Known mana rocks
+        mana_rocks = {
+            'sol ring', 'mana crypt', 'mana vault', 'grim monolith',
+            'chrome mox', 'mox diamond', 'mox opal', 'mox amber',
+            'arcane signet', 'fellwar stone', 'mind stone', 'thought vessel',
+            'thran dynamo', 'gilded lotus', 'coalition relic', 'basalt monolith',
+            'worn powerstone', 'hedron archive', 'everflowing chalice',
+            'commander\'s sphere', 'darksteel ingot', 'cultivator\'s caravan',
+            'honor-worn shaku', 'sisay\'s ring', 'ur-golem\'s eye',
+            'fire diamond', 'sky diamond', 'moss diamond', 'charcoal diamond', 'marble diamond',
+            'talisman of creativity', 'talisman of dominance', 'talisman of progress',
+            'talisman of indulgence', 'talisman of impulse', 'talisman of unity',
+            'talisman of hierarchy', 'talisman of conviction', 'talisman of resilience', 'talisman of curiosity',
+            'signet', 'locket', 'cluestone',  # Partial matches
+        }
+        
+        name_lower = card.name.lower()
+        
+        # Check known mana rocks
+        for rock in mana_rocks:
+            if rock in name_lower:
+                return True
+        
+        # Check oracle text for mana abilities
+        if card.oracle_text:
+            text_lower = card.oracle_text.lower()
+            # Look for "{T}: Add" patterns (mana abilities)
+            if '{t}: add' in text_lower or '{t}, ' in text_lower and 'add' in text_lower:
+                return True
+            if 'add {' in text_lower and ('mana' in text_lower or '}' in text_lower):
+                return True
+        
+        return False
+    
+    def _is_fetch_land(self, card: Card) -> bool:
+        """Check if a card is a fetch land (sacrifice to search for a land).
+
+        Fetch lands don't produce mana — they sacrifice to search for a land.
+        They should NOT be counted as mana sources.
+        """
+        # Known fetch lands by name
+        fetch_names = {
+            'flooded strand', 'polluted delta', 'bloodstained mire',
+            'wooded foothills', 'windswept heath', 'marsh flats',
+            'scalding tarn', 'verdant catacombs', 'arid mesa',
+            'misty rainforest',
+            # Mirage slow fetches
+            'bad river', 'flood plain', 'grasslands', 'mountain valley', 'rocky tar pit',
+            # Panoramas
+            'bant panorama', 'esper panorama', 'grixis panorama',
+            'jund panorama', 'naya panorama',
+            # Other search-for-land cards
+            'terramorphic expanse', 'evolving wilds', 'fabled passage',
+            'prismatic vista', 'myriad landscape',
+            # Krosan Verge and similar
+            'krosan verge', 'blighted woodland',
+        }
+        name_lower = card.name.lower()
+        for fetch in fetch_names:
+            if fetch in name_lower:
+                return True
+
+        # Oracle text pattern: "sacrifice ~: search your library for a ... land"
+        if card.oracle_text:
+            text_lower = card.oracle_text.lower()
+            if ('sacrifice' in text_lower and 'search your library' in text_lower
+                    and ('land' in text_lower or 'forest' in text_lower or 'island' in text_lower
+                         or 'plains' in text_lower or 'swamp' in text_lower or 'mountain' in text_lower)):
+                # It's a fetch-style land — check it doesn't also tap for mana
+                # (Some lands like Krosan Verge both tap for mana AND sacrifice)
+                if '{t}: add' in text_lower:
+                    return False  # It's a land that taps for mana AND has a sacrifice ability
+                return True
+
+        return False
+
+    def _get_mana_production(self, card: Card) -> Dict[str, int]:
+        """
+        Get what mana a card produces when tapped.
+        Returns dict like {'C': 2} for Ancient Tomb or {'R': 1} for Mountain.
+        'any' key means can produce any color (Command Tower, etc.)
+        """
+        name_lower = card.name.lower()
+
+        # === FETCH LANDS — produce NO mana ===
+        if card.is_land() and self._is_fetch_land(card):
+            return {'C': 0}
+
+        # === SPECIAL LANDS ===
+        # Lands that produce 2+ mana
+        if 'ancient tomb' in name_lower:
+            return {'C': 2}  # Damage applied in tap_lands_for_mana via _get_mana_tap_damage
+        if 'city of traitors' in name_lower:
+            return {'C': 2}
+        if 'crystal vein' in name_lower:
+            return {'C': 2}  # Sacrifices but produces 2
+        if 'temple of the false god' in name_lower:
+            # Only works with 5+ lands
+            if len(self.lands()) >= 5:
+                return {'C': 2}
+            return {'C': 0}  # Can't tap for mana yet
+        
+        # Dynamic mana lands - count permanents!
+        if 'gaea\'s cradle' in name_lower:
+            creature_count = len(self.creatures())
+            return {'G': creature_count} if creature_count > 0 else {'G': 0}
+        if 'serra\'s sanctum' in name_lower:
+            enchantment_count = len([c for c in self.active_battlefield() if c.is_enchantment()])
+            return {'W': enchantment_count} if enchantment_count > 0 else {'W': 0}
+        if 'tolarian academy' in name_lower:
+            artifact_count = len([c for c in self.active_battlefield() if c.is_artifact()])
+            return {'U': artifact_count} if artifact_count > 0 else {'U': 0}
+        if 'cabal coffers' in name_lower:
+            swamp_count = len([c for c in self.lands() if 'swamp' in c.name.lower()])
+            return {'B': swamp_count} if swamp_count > 0 else {'B': 0}
+        if 'nykthos' in name_lower:
+            # Devotion is complex - approximate as 2 for now
+            return {'C': 2}
+        if 'itlimoc' in name_lower or 'growing rites' in name_lower:
+            creature_count = len(self.creatures())
+            return {'G': creature_count} if creature_count > 0 else {'G': 0}
+            
+        # Lands that produce any color
+        if 'command tower' in name_lower:
+            return {'any': 1}
+        if 'city of brass' in name_lower:
+            return {'any': 1}
+        if 'mana confluence' in name_lower:
+            return {'any': 1}
+        if 'reflecting pool' in name_lower:
+            return {'any': 1}
+        if 'exotic orchard' in name_lower:
+            return {'any': 1}
+        if 'forbidden orchard' in name_lower:
+            return {'any': 1}
+        if 'gemstone mine' in name_lower:
+            return {'any': 1}
+        if 'tarnished citadel' in name_lower:
+            return {'any': 1}
+        if 'undiscovered paradise' in name_lower:
+            return {'any': 1}
+        
+        # === MANA ROCKS ===
+        if 'sol ring' in name_lower:
+            return {'C': 2}
+        if 'mana crypt' in name_lower:
+            return {'C': 2}
+        if 'mana vault' in name_lower:
+            return {'C': 3}
+        if 'grim monolith' in name_lower:
+            return {'C': 3}
+        if 'thran dynamo' in name_lower:
+            return {'C': 3}
+        if 'gilded lotus' in name_lower:
+            return {'any': 3}
+        if 'basalt monolith' in name_lower:
+            return {'C': 3}
+        if 'worn powerstone' in name_lower:
+            return {'C': 2}
+        if 'hedron archive' in name_lower:
+            return {'C': 2}
+        if 'mind stone' in name_lower:
+            return {'C': 1}
+        if 'thought vessel' in name_lower:
+            return {'C': 1}
+        if 'arcane signet' in name_lower:
+            return {'any': 1}
+        if 'commander\'s sphere' in name_lower:
+            return {'any': 1}
+        if 'chromatic lantern' in name_lower:
+            return {'any': 1}
+        if 'coalition relic' in name_lower:
+            return {'any': 1}
+        if 'fellwar stone' in name_lower:
+            return {'any': 1}
+        if 'darksteel ingot' in name_lower:
+            return {'any': 1}
+        
+        # Signets produce 2 colors
+        if 'signet' in name_lower:
+            if 'azorius' in name_lower: return {'W': 1, 'U': 1}  # Filter, but approximate
+            if 'dimir' in name_lower: return {'U': 1, 'B': 1}
+            if 'rakdos' in name_lower: return {'B': 1, 'R': 1}
+            if 'gruul' in name_lower: return {'R': 1, 'G': 1}
+            if 'selesnya' in name_lower: return {'G': 1, 'W': 1}
+            if 'orzhov' in name_lower: return {'W': 1, 'B': 1}
+            if 'izzet' in name_lower: return {'U': 1, 'R': 1}
+            if 'golgari' in name_lower: return {'B': 1, 'G': 1}
+            if 'boros' in name_lower: return {'R': 1, 'W': 1}
+            if 'simic' in name_lower: return {'G': 1, 'U': 1}
+            return {'C': 1}  # Generic signet
+        
+        # Talismans (produce 2 colors with life payment)
+        if 'talisman' in name_lower:
+            return {'any': 1}  # Simplify - can produce either of 2 colors
+        
+        # Diamonds
+        if 'fire diamond' in name_lower: return {'R': 1}
+        if 'sky diamond' in name_lower: return {'U': 1}
+        if 'moss diamond' in name_lower: return {'G': 1}
+        if 'charcoal diamond' in name_lower: return {'B': 1}
+        if 'marble diamond' in name_lower: return {'W': 1}
+        
+        # Everflowing Chalice: colorless equal to charge counters
+        if 'everflowing chalice' in name_lower:
+            _ch = card.counters.get('charge', 0) if hasattr(card, 'counters') else 0
+            return {'C': max(_ch, 0)}
+        # === MANA DORKS ===
+        if name_lower in ('llanowar elves', 'elvish mystic', 'fyndhorn elves'): return {'G': 1}
+        if name_lower == 'birds of paradise': return {'any': 1}
+        if name_lower == 'noble hierarch': return {'any': 1}
+        if name_lower == 'elves of deep shadow': return {'B': 1}
+        if name_lower == "avacyn's pilgrim": return {'W': 1}
+        if name_lower == 'bloom tender': return {'any': 1}
+        if name_lower == 'deathrite shaman': return {'any': 1}
+        if name_lower == 'priest of titania':
+            _ec = len([c for c in self.creatures() if 'elf' in (c.type_line or '').lower()])
+            return {'G': max(_ec, 1)}
+        # === MDFC PATHWAY LANDS ===
+        mdfc_info = get_mdfc_info(card.name)
+        if mdfc_info:
+            if card.played_face == "back":
+                return {mdfc_info["back_produces"]: 1}
+            else:
+                # Default to front face if not tracked
+                return {mdfc_info["front_produces"]: 1}
+        
+        # === BASIC LANDS ===
+        if 'plains' in name_lower:
+            return {'W': 1}
+        if 'island' in name_lower:
+            return {'U': 1}
+        if 'swamp' in name_lower:
+            return {'B': 1}
+        if 'mountain' in name_lower:
+            return {'R': 1}
+        if 'forest' in name_lower:
+            return {'G': 1}
+        
+        # === ARTIFACT LANDS ===
+        if 'great furnace' in name_lower:
+            return {'R': 1}
+        if 'seat of the synod' in name_lower:
+            return {'U': 1}
+        if 'vault of whispers' in name_lower:
+            return {'B': 1}
+        if 'ancient den' in name_lower:
+            return {'W': 1}
+        if 'tree of tales' in name_lower:
+            return {'G': 1}
+        if 'darksteel citadel' in name_lower:
+            return {'C': 1}
+        
+        # === SAC-COST MANA LANDS ===
+        # Phyrexian Tower: {T}: Add {C}. {T}, Sacrifice a creature: Add {B}{B}.
+        # When a non-Tower creature is on the battlefield, the sac path is
+        # the strictly better option (2 black mana vs 1 colorless), so we
+        # report the upgraded total. May 16 audit: previously the oracle-text
+        # scan returned {C: 1, B: 1} for the Tower, missing the BB upgrade
+        # AND not gating on sac availability (it reported B mana even when
+        # the player had no creatures to sac, breaking mana payment).
+        if 'phyrexian tower' in name_lower:
+            sac_targets = [c for c in self.creatures()
+                            if c.id != card.id and not getattr(c, '_phased_out', False)]
+            if sac_targets:
+                return {'B': 2}  # Better option when a sac target exists
+            return {'C': 1}
+        # Diamond Valley: {T}, Sacrifice a creature: You gain life equal to
+        # the sacrificed creature's toughness. Not a mana ability — skip.
+        # (Included here as a comment so future audits don't add it as
+        # "mana from sac creatures".)
+
+        # === DUAL/FETCH/SHOCK LANDS ===
+        # Check oracle text for what colors it produces
+        # IMPORTANT: Only scan lines that contain "Add" — otherwise we pick up
+        # color symbols from activation COSTS (e.g., Academy Ruins' "{1}{U}" cost
+        # was being confused with mana production).
+        if card.oracle_text:
+            colors_found = {}
+            for line in card.oracle_text.split('\n'):
+                line_lower = line.lower()
+                # Only look at mana-production lines (contain "add")
+                if 'add' not in line_lower:
+                    continue
+                if '{w}' in line_lower or 'white' in line_lower: colors_found['W'] = 1
+                if '{u}' in line_lower or 'blue' in line_lower: colors_found['U'] = 1
+                if '{b}' in line_lower or 'black' in line_lower: colors_found['B'] = 1
+                if '{r}' in line_lower or 'red' in line_lower: colors_found['R'] = 1
+                if '{g}' in line_lower or 'green' in line_lower: colors_found['G'] = 1
+                if '{c}' in line_lower: colors_found['C'] = 1
+                if 'any color' in line_lower or 'any one color' in line_lower:
+                    colors_found['any'] = 1
+            if colors_found:
+                return colors_found
+
+        # Default: colorless
+        return {'C': 1}
+    
+    def available_mana(self) -> int:
+        """Count total available mana (untapped mana sources + mana pool)."""
+        pool_total = sum(self.mana_pool.values())
+        
+        # Count mana from all untapped mana sources
+        source_total = 0
+        for card in self.untapped_mana_sources():
+            production = self._get_mana_production(card)
+            source_total += sum(production.values())
+        
+        return pool_total + source_total
+    
+    def available_mana_detailed(self) -> Dict[str, int]:
+        """Get detailed available mana by color including 'any' for flexible sources."""
+        available = dict(self.mana_pool)  # Start with pool
+        any_mana = 0
+        
+        for card in self.untapped_mana_sources():
+            production = self._get_mana_production(card)
+            for color, amount in production.items():
+                if color == 'any':
+                    any_mana += amount
+                else:
+                    available[color] = available.get(color, 0) + amount
+        
+        available['any'] = any_mana  # Track flexible mana separately
+        return available
+    
+    def empty_mana_pool(self):
+        """Empty mana pool (happens at end of each phase)."""
+        self.mana_pool = {'W': 0, 'U': 0, 'B': 0, 'R': 0, 'G': 0, 'C': 0}
+    
+    def add_mana(self, colors: str):
+        """Add mana to pool. colors like 'WU' or 'RRR' or 'C'."""
+        for c in colors.upper():
+            if c in self.mana_pool:
+                self.mana_pool[c] += 1
+    
+    def _get_mana_tap_damage(self, card: Card) -> int:
+        """Get self-damage dealt when tapping a land for mana.
+
+        Some lands (Ancient Tomb, Mana Confluence, City of Brass) deal damage
+        to their controller as part of their mana ability.
+        Returns damage amount (0 for normal lands).
+        """
+        name_lower = card.name.lower()
+        if 'ancient tomb' in name_lower:
+            return 2
+        if 'mana confluence' in name_lower:
+            return 1
+        if 'city of brass' in name_lower:
+            return 1
+        if 'tarnished citadel' in name_lower:
+            return 3
+        return 0
+
+    def _apply_sac_cost_at_tap(self, card: Card, game=None) -> Optional[Card]:
+        """For sac-cost mana lands (Phyrexian Tower), pick a creature, move
+        it to the graveyard, and return the sacrificed card. Returns None if
+        the card isn't a sac-cost land or no valid target exists. May 16
+        audit added this to model Phyrexian Tower's {B}{B} cost properly —
+        before, the bot would happily tap the Tower for {B}{B} without ever
+        sacrificing anything.
+        """
+        if 'phyrexian tower' not in card.name.lower():
+            return None
+        # Pick the least-valuable creature: prefer tokens, then lowest CMC,
+        # then lowest power. Never sac the Tower itself or phased-out cards.
+        sac_targets = [
+            c for c in self.creatures()
+            if c.id != card.id and not getattr(c, '_phased_out', False)
+        ]
+        if not sac_targets:
+            return None
+        sac_targets.sort(key=lambda c: (
+            not getattr(c, 'is_token', False),  # tokens first (False sorts before True)
+            int(c.cmc or 0),
+            int(c.get_effective_power(game) if game and hasattr(c, 'get_effective_power') else (c.power or 0) or 0),
+        ))
+        victim = sac_targets[0]
+        # Move to graveyard. Tokens cease to exist (handled by SBA at the
+        # next check); regular creatures go to graveyard.
+        try:
+            self.battlefield.remove(victim)
+        except ValueError:
+            return None
+        if not getattr(victim, 'is_token', False):
+            self.graveyard.append(victim)
+        print(f"[PHYREXIAN-TOWER] {self.name} sacrifices {victim.name} to tap Phyrexian Tower for {{B}}{{B}}")
+        # Track for dies-trigger emission (Blood Artist, Zulaport, etc.)
+        if game is not None:
+            try:
+                rd = getattr(game, '_recently_died', None)
+                if rd is None:
+                    rd = []
+                    game._recently_died = rd
+                rd.append((victim, self))
+            except Exception:
+                pass
+
+            # May 20 audit (CRITICAL): immediately fire dies-triggers for the
+            # sacrificed creature. game_1506623303886966844:1214 sac'd Blood
+            # Artist to Phyrexian Tower without firing BA's own dies trigger.
+            # Recording to _recently_died is necessary but not sufficient —
+            # the trigger needs to actually be dispatched. Hook into the
+            # rules engine's sync dies-trigger scan if available, then
+            # surface any returned messages via the game's pending-message
+            # queue (flushed by the next display pass).
+            try:
+                rules_engine = getattr(game, '_rules_engine', None)
+                if rules_engine and hasattr(rules_engine, '_check_dies_triggers_sync'):
+                    dies_msgs, _unhandled = rules_engine._check_dies_triggers_sync(
+                        game, victim, self
+                    )
+                    if dies_msgs:
+                        pq = getattr(game, '_pending_messages', None)
+                        if pq is None:
+                            pq = []
+                            game._pending_messages = pq
+                        pq.extend(dies_msgs)
+                        print(f"[PHYREXIAN-TOWER] Fired {len(dies_msgs)} dies-trigger(s) "
+                              f"for {victim.name}")
+            except Exception as _dt_err:
+                print(f"[PHYREXIAN-TOWER] dies-trigger dispatch failed: {_dt_err}")
+        return victim
+
+    def tap_lands_for_mana(self, amount: int, preferred_colors: str = "") -> bool:
+        """
+        Tap mana sources to add mana to pool (amount-based, color-unaware).
+        Returns True if successful, False if not enough mana.
+        Now handles mana rocks and special lands!
+
+        For color-aware tapping, use tap_sources_for_cost() instead.
+        """
+        # Calculate how much mana we can produce
+        total_available = 0
+        sources_with_production = []
+
+        for card in self.untapped_mana_sources():
+            production = self._get_mana_production(card)
+            mana_amount = sum(production.values())
+            sources_with_production.append((card, production, mana_amount))
+            total_available += mana_amount
+
+        if total_available < amount:
+            return False
+
+        # Sort by mana produced (tap high-producers first for efficiency)
+        sources_with_production.sort(key=lambda x: x[2], reverse=True)
+
+        mana_tapped = 0
+        for card, production, mana_amount in sources_with_production:
+            if mana_tapped >= amount:
+                break
+
+            card.tapped = True
+
+            # Apply self-damage for painful lands (Ancient Tomb, etc.)
+            tap_damage = self._get_mana_tap_damage(card)
+            if tap_damage > 0:
+                self.life -= tap_damage
+                print(f"[MANA-DAMAGE] {card.name} deals {tap_damage} damage to {self.name} (life: {self.life})")
+
+            # Apply sac cost for sac-mana lands (Phyrexian Tower). If
+            # production reports {B: 2} but no sac target now exists, fall
+            # back to the {C: 1} ability — sac couldn't be paid.
+            if 'phyrexian tower' in card.name.lower() and production.get('B', 0) >= 2:
+                victim = self._apply_sac_cost_at_tap(card)
+                if victim is None:
+                    # Couldn't sac — degrade production to {C: 1}
+                    production = {'C': 1}
+                    mana_amount = 1
+
+            # Add mana to pool based on what the card produces
+            self._add_production_to_pool(production, preferred_colors)
+
+            mana_tapped += mana_amount
+
+        return True
+
+    def tap_sources_for_cost(self, mana_cost_str: str, additional_generic: int = 0,
+                             x_value: int = 0, pay_phyrexian_with_life: bool = False) -> bool:
+        """
+        [MANA-ENGINE] Color-aware mana tapping using ManaCost parser.
+
+        Taps the optimal set of mana sources to pay a spell's cost:
+        1. Identifies colored requirements (e.g., {1}{W}{U} needs 1W, 1U, 1 any)
+        2. Taps sources that produce needed colors FIRST
+        3. Then taps remaining sources for generic mana
+        4. Handles Phyrexian mana (pay life instead of color)
+
+        Args:
+            mana_cost_str: Scryfall mana cost string, e.g. "{2}{W}{U}"
+            additional_generic: Extra generic cost (commander tax, etc.)
+            x_value: Value chosen for X in X-cost spells
+            pay_phyrexian_with_life: If True, pay Phyrexian mana with life when possible
+
+        Returns True if payment succeeded, False if not enough mana.
+        """
+        if not mana_cost_str and additional_generic <= 0 and x_value <= 0:
+            return True  # Free spell
+
+        if not HAS_MANA_ENGINE:
+            # Fallback to amount-based tapping
+            total = additional_generic
+            if mana_cost_str:
+                symbols = re.findall(r'\{([^}]+)\}', mana_cost_str)
+                for sym in symbols:
+                    if sym.isdigit():
+                        total += int(sym)
+                    elif sym.upper() == 'X':
+                        total += x_value
+                    else:
+                        total += 1
+            return self.tap_lands_for_mana(total)
+
+        parsed = ManaCost.parse(mana_cost_str)
+
+        # Handle Phyrexian mana: pay life instead of color when requested
+        phyrexian_life_cost = 0
+        phyrexian_symbols_paid = set()
+        if pay_phyrexian_with_life:
+            for i, sym in enumerate(parsed.symbols):
+                if sym.phyrexian and sym.phyrexian_color:
+                    # Pay with life if we have enough (> 4 life threshold for safety)
+                    if self.life > 4:
+                        phyrexian_life_cost += 2
+                        phyrexian_symbols_paid.add(i)
+
+        # Build list of colors we MUST have (strict colored requirements)
+        color_needs = {}  # color_key -> amount needed
+        snow_count = 0    # number of {S} symbols — must be paid from snow sources
+        for i, sym in enumerate(parsed.symbols):
+            if i in phyrexian_symbols_paid:
+                continue  # Already paying with life
+            if sym.color and sym.color.value in ('W', 'U', 'B', 'R', 'G'):
+                key = sym.color.value
+                color_needs[key] = color_needs.get(key, 0) + 1
+            elif sym.color and sym.color.value == 'C':
+                # Strict colorless (Eldrazi) — only colorless mana works
+                color_needs['C'] = color_needs.get('C', 0) + 1
+            elif getattr(sym, 'is_snow', False):
+                # {S} — any snow mana of any color counts. Treat as generic
+                # for the total-mana check, but require N snow sources to
+                # tap below. May 13 audit: Icehide Golem ({S}) reported
+                # "Not enough snow mana" even with Snow-Covered Forest in
+                # play because this function ignored {S} symbols entirely.
+                snow_count += 1
+
+        # Calculate generic mana needed
+        # {S} symbols count toward the total mana requirement — they need
+        # 1 mana paid each, just from a snow source. Adding them to
+        # generic_needed makes the total_cost / total_available check
+        # right, and the snow-source preference loop below handles the
+        # snow-source restriction.
+        generic_needed = parsed.generic_requirement + additional_generic + snow_count
+        # Add X cost
+        generic_needed += x_value * max(parsed.x_count, 0)
+        # Hybrid symbols that aren't strict — treat as generic for now
+        # (Hybrid is flexible: {W/U} can be paid with W or U)
+        hybrid_count = 0
+        hybrid_options = []  # list of (index, option_colors)
+        for i, sym in enumerate(parsed.symbols):
+            if i in phyrexian_symbols_paid:
+                continue
+            if sym.hybrid_colors:
+                hybrid_count += 1
+                hybrid_options.append((i, [sym.hybrid_colors[0].value, sym.hybrid_colors[1].value]))
+            elif sym.hybrid_generic:
+                hybrid_count += 1
+                hybrid_options.append((i, [sym.hybrid_generic[1].value, 'generic']))
+
+        # Gather all untapped sources and their production
+        sources = []
+        for card in self.untapped_mana_sources():
+            production = self._get_mana_production(card)
+            sources.append((card, production))
+
+        # Calculate total available mana
+        total_available = sum(sum(p.values()) for _, p in sources)
+        total_cost = sum(color_needs.values()) + generic_needed + hybrid_count
+        if total_available < total_cost:
+            return False
+
+        # === PHASE 1: Assign sources to colored requirements ===
+        # Categorize sources by what colors they produce
+        colored_sources = []    # Sources that produce specific colors
+        any_sources = []        # Sources that produce 'any' color
+        colorless_sources = []  # Sources that only produce colorless
+
+        for card, production in sources:
+            produces_colors = {k for k, v in production.items() if v > 0 and k not in ('any', 'C')}
+            produces_any = production.get('any', 0) > 0
+            produces_colorless_only = not produces_colors and not produces_any
+
+            if produces_any:
+                any_sources.append((card, production))
+            elif produces_colorless_only:
+                colorless_sources.append((card, production))
+            else:
+                colored_sources.append((card, production))
+
+        tapped_cards = set()  # Track which cards we're tapping (by id)
+        mana_produced = {'W': 0, 'U': 0, 'B': 0, 'R': 0, 'G': 0, 'C': 0}
+
+        # Sort colored sources: prefer single-color sources first (don't waste dual-lands on requirements
+        # that could be filled by basics). Tap sources with fewer color options first.
+        colored_sources.sort(key=lambda x: len([k for k, v in x[1].items() if v > 0 and k not in ('any', 'C')]))
+
+        # Tap colored sources to fill colored requirements
+        remaining_needs = dict(color_needs)
+        for card, production in colored_sources:
+            if not remaining_needs:
+                break
+            produces = {k: v for k, v in production.items() if v > 0 and k not in ('any', 'C')}
+            # Check if this source produces a color we need
+            for color in list(remaining_needs.keys()):
+                if color in produces and remaining_needs[color] > 0:
+                    tapped_cards.add(id(card))
+                    # This source contributes to the color requirement
+                    for pc, pv in production.items():
+                        if pc == 'any':
+                            continue
+                        mana_produced[pc] = mana_produced.get(pc, 0) + pv
+                    break  # Source is now committed
+
+        # Check if colored requirements are met, use 'any' sources for shortfalls
+        for color, needed in list(remaining_needs.items()):
+            have = mana_produced.get(color, 0)
+            shortfall = needed - have
+            if shortfall > 0:
+                for card, production in any_sources:
+                    if id(card) in tapped_cards:
+                        continue
+                    if shortfall <= 0:
+                        break
+                    tapped_cards.add(id(card))
+                    any_amount = sum(production.values())
+                    # This 'any' source fills the color gap
+                    mana_produced[color] = mana_produced.get(color, 0) + any_amount
+                    shortfall -= any_amount
+
+        # === PHASE 2: Handle hybrid mana ===
+        for idx, options in hybrid_options:
+            # Try to pay with mana we already have excess of
+            paid = False
+            for opt_color in options:
+                if opt_color == 'generic':
+                    generic_needed += 1  # Treat as generic
+                    paid = True
+                    break
+                excess = mana_produced.get(opt_color, 0) - color_needs.get(opt_color, 0)
+                if excess > 0:
+                    # Already have excess of this color, use it
+                    color_needs[opt_color] = color_needs.get(opt_color, 0) + 1
+                    paid = True
+                    break
+            if not paid:
+                # Need to tap a new source for one of the hybrid colors
+                generic_needed += 1  # Fallback: treat as generic
+
+        # === PHASE 3: Tap remaining sources for generic ===
+        # Priority: multi-mana rocks (Sol Ring=2, Thran Dynamo=3) before single-mana
+        # sources (basic lands). This keeps colored lands untapped for future spells.
+        total_mana_committed = sum(mana_produced.values())
+        generic_still_needed = total_cost - total_mana_committed + phyrexian_life_cost  # Phyrexian reduces needed
+
+        # May 13 audit: {S} symbols require N snow sources to be tapped.
+        # Walk every untapped source, prefer those whose name/type-line marks
+        # them as snow, and tap until snow_count is satisfied. This MUST run
+        # before the regular generic tapping so we don't waste a non-snow
+        # land paying the {S} portion.
+        if snow_count > 0:
+            try:
+                from rules.mana import SNOW_LANDS as _SNOW_LANDS
+            except Exception:
+                _SNOW_LANDS = set()
+            snow_remaining = snow_count
+            snow_taps = 0
+            for card, production in sources:
+                if snow_remaining <= 0:
+                    break
+                if id(card) in tapped_cards:
+                    continue
+                is_snow_src = (
+                    (card.name and card.name in _SNOW_LANDS)
+                    or ('Snow' in (getattr(card, 'type_line', '') or ''))
+                )
+                if not is_snow_src:
+                    continue
+                tapped_cards.add(id(card))
+                snow_taps += 1
+                snow_remaining -= 1
+                for pc, pv in production.items():
+                    if pc == 'any':
+                        mana_produced['C'] = mana_produced.get('C', 0) + pv
+                    else:
+                        mana_produced[pc] = mana_produced.get(pc, 0) + pv
+                generic_still_needed -= sum(production.values())
+            if snow_remaining > 0:
+                # Not enough snow sources for the {S} requirement.
+                print(f"[MANA-ENGINE] Need {snow_count} snow source(s) for {mana_cost_str}, "
+                      f"only found {snow_taps} untapped — cannot pay")
+                return False
+
+        if generic_still_needed > 0:
+            # Sort colorless sources by output (high-producers first: Sol Ring=2, Thran Dynamo=3)
+            colorless_sources.sort(key=lambda x: sum(x[1].values()), reverse=True)
+            for card, production in colorless_sources:
+                if id(card) in tapped_cards:
+                    continue
+                if generic_still_needed <= 0:
+                    break
+                tapped_cards.add(id(card))
+                prod_amount = sum(production.values())
+                mana_produced['C'] = mana_produced.get('C', 0) + prod_amount
+                generic_still_needed -= prod_amount
+
+            # Then any-color sources (these are valuable — tap only if needed)
+            for card, production in any_sources:
+                if id(card) in tapped_cards:
+                    continue
+                if generic_still_needed <= 0:
+                    break
+                tapped_cards.add(id(card))
+                for pc, pv in production.items():
+                    if pc == 'any':
+                        mana_produced['C'] = mana_produced.get('C', 0) + pv
+                    else:
+                        mana_produced[pc] = mana_produced.get(pc, 0) + pv
+                generic_still_needed -= sum(production.values())
+
+            # Then colored sources (least preferred for generic — preserves color flexibility)
+            for card, production in colored_sources:
+                if id(card) in tapped_cards:
+                    continue
+                if generic_still_needed <= 0:
+                    break
+                tapped_cards.add(id(card))
+                for pc, pv in production.items():
+                    if pc == 'any':
+                        mana_produced['C'] = mana_produced.get('C', 0) + pv
+                    else:
+                        mana_produced[pc] = mana_produced.get(pc, 0) + pv
+                generic_still_needed -= sum(production.values())
+
+        # Verify we have enough total mana
+        if sum(mana_produced.values()) + phyrexian_life_cost < total_cost:
+            return False
+
+        # Verify all colored requirements are met
+        for color, needed in color_needs.items():
+            if mana_produced.get(color, 0) < needed:
+                # Check if 'any' mana can fill the gap
+                any_excess = sum(mana_produced.values()) - total_cost + phyrexian_life_cost
+                if any_excess < needed - mana_produced.get(color, 0):
+                    return False
+
+        # === PHASE 4: Actually tap the sources and add mana to pool ===
+        preferred = ''.join(color_needs.keys()) if color_needs else ''
+        # Track color shortfalls so 'any' mana goes to the right color
+        pool_shortfalls = dict(color_needs)  # Mutable — decremented as colors are added
+        for card, production in sources:
+            if id(card) in tapped_cards:
+                card.tapped = True
+                # Apply self-damage for painful lands
+                tap_damage = self._get_mana_tap_damage(card)
+                if tap_damage > 0:
+                    self.life -= tap_damage
+                    print(f"[MANA-DAMAGE] {card.name} deals {tap_damage} damage to {self.name} (life: {self.life})")
+                # May 16 audit: pay sac cost for Phyrexian Tower's {B}{B}
+                # ability. If we promised B mana via _get_mana_production
+                # but the player has no sac target right now, degrade to
+                # the {C: 1} ability so we don't fabricate mana.
+                if 'phyrexian tower' in card.name.lower() and production.get('B', 0) >= 2:
+                    victim = self._apply_sac_cost_at_tap(card)
+                    if victim is None:
+                        production = {'C': 1}
+                # For non-any sources, decrement shortfalls from their colored production
+                for pc, pv in production.items():
+                    if pc not in ('any', 'C') and pc in pool_shortfalls:
+                        pool_shortfalls[pc] = max(0, pool_shortfalls[pc] - pv)
+                self._add_production_to_pool(production, preferred, pool_shortfalls)
+
+        # Apply Phyrexian life payment
+        if phyrexian_life_cost > 0:
+            self.life -= phyrexian_life_cost
+            print(f"[MANA-PHYREXIAN] {self.name} pays {phyrexian_life_cost} life for Phyrexian mana (life: {self.life})")
+
+        print(f"[MANA-ENGINE] Tapped {len(tapped_cards)} sources for {mana_cost_str}"
+              f"{f' + {additional_generic} generic' if additional_generic else ''}"
+              f"{f' (X={x_value})' if x_value else ''}"
+              f"{f' ({phyrexian_life_cost} life for Phyrexian)' if phyrexian_life_cost else ''}")
+
+        return True
+
+    def _add_production_to_pool(self, production: Dict[str, int], preferred_colors: str = "",
+                               color_shortfalls: Dict[str, int] = None):
+        """Add a source's mana production to the mana pool.
+
+        Handles 'any' color mana by picking the best color based on:
+        1. color_shortfalls dict (colors still needed — pick the one with biggest deficit)
+        2. preferred_colors parameter (e.g., colors needed by spell being cast)
+        3. Commander's color identity (pick color we have least of)
+        4. Colorless as last resort
+        """
+        for color, color_amount in production.items():
+            if color == 'any':
+                # Pick the color with the biggest remaining shortfall
+                if color_shortfalls:
+                    best_color = max(color_shortfalls.keys(),
+                                     key=lambda c: color_shortfalls.get(c, 0))
+                    if color_shortfalls.get(best_color, 0) > 0:
+                        self.mana_pool[best_color] += color_amount
+                        color_shortfalls[best_color] = max(0, color_shortfalls[best_color] - color_amount)
+                        continue
+                if preferred_colors:
+                    # Pick the preferred color we have least of in the pool
+                    best = min(preferred_colors, key=lambda c: self.mana_pool.get(c.upper(), 0))
+                    self.mana_pool[best.upper()] += color_amount
+                else:
+                    cmd_colors = self._get_commander_colors()
+                    if cmd_colors:
+                        least_color = min(cmd_colors, key=lambda c: self.mana_pool.get(c, 0))
+                        self.mana_pool[least_color] += color_amount
+                    else:
+                        self.mana_pool['C'] += color_amount
+            else:
+                self.mana_pool[color] = self.mana_pool.get(color, 0) + color_amount
+
+    def _get_commander_colors(self) -> list:
+        """Get the union of every commander's color identity.
+
+        Partner / Friends Forever / Choose-a-Background / Doctor's Companion
+        and Background mechanics all give a player two commanders. CR 903.4
+        defines deck color identity as the union of every commander's
+        identity, so this needs to scan all of them — not just return the
+        first one found. Returning only the first was the source of the
+        Apr 2026 partner-deck bug where Thrasios+Tymna decks couldn't cast
+        white/black or green/blue cards across the partition.
+
+        May 14 audit: scan EVERY zone (not just command_zone + battlefield).
+        A commander in graveyard / exile / hand / library still contributes
+        to the deck's color identity for CR 903.4 purposes — the deck-build
+        constraint doesn't go away because the commander is temporarily out
+        of those two zones. The partner-deck cast rejections traced to a
+        commander dying and the scan skipping the graveyard.
+
+        Returns colors in WUBRG order so callers see a stable shape.
+        """
+        identity = set()
+        zones = [
+            list(getattr(self, 'command_zone', []) or []),
+            list(getattr(self, 'battlefield', []) or []),
+            list(getattr(self, 'graveyard', []) or []),
+            list(getattr(self, 'exile', []) or []),
+            list(getattr(self, 'hand', []) or []),
+            list(getattr(self, 'library', []) or []),
+        ]
+        seen_ids = set()
+        for zone in zones:
+            for cmd_card in zone:
+                if not getattr(cmd_card, 'is_commander', False):
+                    continue
+                # Dedupe by card identity (same Card instance could appear
+                # twice via stale references).
+                card_id = id(cmd_card)
+                if card_id in seen_ids:
+                    continue
+                seen_ids.add(card_id)
+                if cmd_card.color_identity:
+                    identity.update(cmd_card.color_identity)
+                elif cmd_card.mana_cost:
+                    for c in ['W', 'U', 'B', 'R', 'G']:
+                        if f'{{{c}}}' in cmd_card.mana_cost.upper():
+                            identity.add(c)
+        # Stable WUBRG order
+        order = ['W', 'U', 'B', 'R', 'G']
+        return [c for c in order if c in identity]
+    
+    def can_pay_mana_cost(self, mana_cost: str) -> Tuple[bool, str]:
+        """
+        Check if player can pay a mana cost (color-aware).
+        Returns (can_pay, reason).
+
+        Uses rules/mana.py ManaCost parser for proper color requirement
+        validation including hybrid and phyrexian costs.  Falls back to
+        total-mana-only check when the engine isn't available.
+
+        IMPORTANT: Checks mana from UNTAPPED SOURCES (lands + rocks), not just
+        the mana pool dict.  The pool dict is empty until tap_sources_for_cost()
+        actually taps lands — this function must look at what we COULD produce.
+        """
+        if not mana_cost:
+            return True, "No mana cost"
+
+        # Structured mana engine — proper color validation
+        if HAS_MANA_ENGINE:
+            try:
+                # Build pool from untapped sources + existing pool (not just pool dict)
+                # available_mana_detailed() already does this correctly
+                detailed = self.available_mana_detailed()
+                any_mana = detailed.get('any', 0)
+                pool = RulesManaPool()
+                pool.white = detailed.get('W', 0)
+                pool.blue = detailed.get('U', 0)
+                pool.black = detailed.get('B', 0)
+                pool.red = detailed.get('R', 0)
+                pool.green = detailed.get('G', 0)
+                pool.colorless = detailed.get('C', 0)
+                parsed = ManaCost.parse(mana_cost)
+                # May 13 audit: snow {S} payability. ManaPaymentValidator.can_pay
+                # checks `test_pool.total_snow() > 0` for any {S} symbol in the
+                # cost, but `available_mana_detailed()` returns only color totals
+                # (no snow accounting). Result: Icehide Golem ({S}) reported
+                # "Not enough snow mana" even with an untapped Snow-Covered
+                # Forest on the battlefield. Fix: when the cost requires {S},
+                # count untapped snow sources and reflect them in pool.snow_*.
+                # We don't subtract from the regular pool — the snow_* fields
+                # represent additional snow-eligible mana, and `spend()` with
+                # prefer_snow drains them first. For {S}-free casts this loop
+                # is skipped, so non-snow decks see zero overhead.
+                try:
+                    needs_snow = any(getattr(sym, 'is_snow', False) for sym in parsed.symbols)
+                except Exception:
+                    needs_snow = False
+                if needs_snow:
+                    try:
+                        from rules.mana import SNOW_LANDS as _SNOW_LANDS
+                    except Exception:
+                        _SNOW_LANDS = set()
+                    _color_to_attr = {
+                        'W': 'snow_white', 'U': 'snow_blue', 'B': 'snow_black',
+                        'R': 'snow_red', 'G': 'snow_green', 'C': 'snow_colorless',
+                        'any': 'snow_colorless',
+                    }
+                    for src in self.untapped_mana_sources():
+                        is_snow_src = (
+                            (src.name and src.name in _SNOW_LANDS)
+                            or ('Snow' in (getattr(src, 'type_line', '') or ''))
+                        )
+                        if not is_snow_src:
+                            continue
+                        try:
+                            production = self._get_mana_production(src)
+                        except Exception:
+                            production = {}
+                        for color_key, amt in (production or {}).items():
+                            attr = _color_to_attr.get(color_key)
+                            if attr and amt:
+                                setattr(pool, attr, getattr(pool, attr, 0) + amt)
+                # First try without 'any' mana
+                can, reason = ManaPaymentValidator.can_pay(pool, parsed, life_total=self.life)
+                if can:
+                    return True, reason
+                # If failed, allocate 'any' mana to fill color shortfalls
+                if any_mana > 0:
+                    # Distribute 'any' to whichever colors are short.
+                    # BUGFIX (Apr 17, 2026): ManaCost has NO .white/.black/etc
+                    # attributes — only `color_requirements` returning
+                    # Dict[ManaColor, int]. Accessing parsed.white etc. raised
+                    # AttributeError which was silently swallowed by the
+                    # `except Exception: pass` below, causing the predicate to
+                    # fall through to the inline fallback. That fallback used
+                    # `detailed.get('any', 0)` but the structured path had
+                    # consumed it to zero conceptually — so the predicate kept
+                    # rejecting valid costs (e.g. Animate Dead {1}{B} with
+                    # B=1 + any=3). Use parsed.color_requirements instead.
+                    color_fields = [('white', ManaColor.WHITE), ('blue', ManaColor.BLUE),
+                                    ('black', ManaColor.BLACK), ('red', ManaColor.RED),
+                                    ('green', ManaColor.GREEN)]
+                    color_reqs = parsed.color_requirements  # Dict[ManaColor, int]
+                    remaining_any = any_mana
+                    for field_name, color_enum in color_fields:
+                        have = getattr(pool, field_name)
+                        need = color_reqs.get(color_enum, 0)
+                        if have < need and remaining_any > 0:
+                            fill = min(need - have, remaining_any)
+                            setattr(pool, field_name, have + fill)
+                            remaining_any -= fill
+                    # Remaining 'any' can pay for generic
+                    pool.colorless += remaining_any
+                    filled = any_mana - remaining_any
+                    if filled > 0:
+                        print(f"[MANA-PAYMENT] {self.name}: distributed {filled}/{any_mana} 'any' mana to fill color gaps for {mana_cost}")
+                    return ManaPaymentValidator.can_pay(pool, parsed, life_total=self.life)
+                return can, reason
+            except Exception as e:
+                print(f"[MANA-PAYMENT] Structured predicate failed for {mana_cost}: {type(e).__name__}: {e} — falling back to inline check")
+                pass  # Fall through to inline check
+
+        # Inline fallback: parse manually, check total + colors
+        symbols = re.findall(r'\{([^}]+)\}', mana_cost)
+
+        total_needed = 0
+        colored_needed = {'W': 0, 'U': 0, 'B': 0, 'R': 0, 'G': 0}
+
+        for sym in symbols:
+            if sym.isdigit():
+                total_needed += int(sym)
+            elif sym in colored_needed:
+                colored_needed[sym] += 1
+                total_needed += 1
+            elif sym == 'X':
+                pass  # X is 0 unless specified
+            elif '/' in sym:  # Hybrid
+                total_needed += 1
+            else:
+                total_needed += 1  # Phyrexian, snow, etc.
+
+        available = self.available_mana()
+        if available < total_needed:
+            return False, f"Need {total_needed} mana, have {available} available"
+
+        # Color check using untapped sources (not just total)
+        if any(colored_needed.values()):
+            detailed = self.available_mana_detailed() if HAS_MANA_ENGINE else {}
+            any_mana = detailed.get('any', 0)
+            for color, needed in colored_needed.items():
+                if needed > 0:
+                    have = detailed.get(color, 0)
+                    if have < needed:
+                        # Try to fill shortfall with 'any' mana
+                        shortfall = needed - have
+                        if any_mana >= shortfall:
+                            any_mana -= shortfall
+                        else:
+                            return False, f"Not enough {color} mana"
+
+        return True, "Mana available"
+
+    def to_mana_pool_object(self):
+        """Convert dict mana_pool to rules/mana.py ManaPool for validation.
+
+        The game engine stores mana as a dict {'W': 3, 'U': 1, ...}.
+        ManaPaymentValidator expects a ManaPool dataclass.  This bridges
+        the two representations without changing the dict-based pool that
+        hundreds of call sites depend on.
+        """
+        if not HAS_MANA_ENGINE:
+            return None
+        pool = RulesManaPool()
+        pool.white = self.mana_pool.get('W', 0)
+        pool.blue = self.mana_pool.get('U', 0)
+        pool.black = self.mana_pool.get('B', 0)
+        pool.red = self.mana_pool.get('R', 0)
+        pool.green = self.mana_pool.get('G', 0)
+        pool.colorless = self.mana_pool.get('C', 0)
+        return pool
+
+    def to_dict(self) -> Dict:
+        """Serialize player to JSON-compatible dict."""
+        return {
+            "name": self.name,
+            "user_id": self.user_id,
+            "is_claude": self.is_claude,
+            "life": self.life,
+            "poison": self.poison,
+            "energy": self.energy,
+            "commander_damage": self.commander_damage,
+            "library": [c.to_dict() for c in self.library],
+            "hand": [c.to_dict() for c in self.hand],
+            "battlefield": [c.to_dict() for c in self.battlefield],
+            "graveyard": [c.to_dict() for c in self.graveyard],
+            "exile": [c.to_dict() for c in self.exile],
+            "command_zone": [c.to_dict() for c in self.command_zone],
+            "companion_zone": [c.to_dict() for c in self.companion_zone],
+            "deck_name": self.deck_name,
+            "deck_source": self.deck_source,
+            "lands_played_this_turn": self.lands_played_this_turn,
+            "max_lands_per_turn": self.max_lands_per_turn,
+            "has_drawn_for_turn": self.has_drawn_for_turn,
+            "mana_pool": self.mana_pool,
+            "playable_from_exile": self.playable_from_exile,
+            "playable_from_graveyard": self.playable_from_graveyard,
+            "landfall_count_this_turn": self.landfall_count_this_turn,
+        }
+    
+    @classmethod
+    def from_dict(cls, data: Dict) -> 'Player':
+        """Reconstruct player from dict."""
+        player = cls(
+            name=data["name"],
+            user_id=data.get("user_id"),
+            is_claude=data.get("is_claude", False),
+            life=data.get("life", 20),
+            poison=data.get("poison", 0),
+            energy=data.get("energy", 0),
+            commander_damage=data.get("commander_damage", {}),
+            deck_name=data.get("deck_name", ""),
+            deck_source=data.get("deck_source", ""),
+            lands_played_this_turn=data.get("lands_played_this_turn", 0),
+            max_lands_per_turn=data.get("max_lands_per_turn", 1),
+            has_drawn_for_turn=data.get("has_drawn_for_turn", False),
+            mana_pool=data.get("mana_pool", {'W': 0, 'U': 0, 'B': 0, 'R': 0, 'G': 0, 'C': 0}),
+        )
+        # Reconstruct card zones
+        player.library = [Card.from_dict(c) for c in data.get("library", [])]
+        player.hand = [Card.from_dict(c) for c in data.get("hand", [])]
+        player.battlefield = [Card.from_dict(c) for c in data.get("battlefield", [])]
+        player.graveyard = [Card.from_dict(c) for c in data.get("graveyard", [])]
+        player.exile = [Card.from_dict(c) for c in data.get("exile", [])]
+        player.command_zone = [Card.from_dict(c) for c in data.get("command_zone", [])]
+        player.companion_zone = [Card.from_dict(c) for c in data.get("companion_zone", [])]
+        player.playable_from_exile = data.get("playable_from_exile", [])
+        player.playable_from_graveyard = data.get("playable_from_graveyard", [])
+        player.landfall_count_this_turn = data.get("landfall_count_this_turn", 0)
+        return player
+
+
+@dataclass
+class StackEntry:
+    """An object on the stack (spell or triggered ability)."""
+    card: Card                              # The card being cast / source of trigger
+    controller_name: str                    # Name of the player who controls this
+    controller_index: int                   # Index in game.players
+    target: Any = None                      # Target (Card, Player, or None)
+    is_spell: bool = True                   # True = spell, False = triggered/activated ability
+    trigger_source: Optional[str] = None    # Source card name for triggered abilities
+    trigger_text: Optional[str] = None      # Oracle text of the trigger
+    countered: bool = False                 # Marked True when countered by a counterspell
+    # Per-spell resolution signal (enables stack wars — each spell waits on its own event)
+    resolution_event: Any = field(default=None, repr=False)
+    # Links this StackEntry to the corresponding StackObject.id in PrioritySystem
+    priority_id: Optional[str] = None
+
+    def to_dict(self) -> Dict:
+        return {
+            "card_name": self.card.name if self.card else "Unknown",
+            "card_id": self.card.id if self.card else "",
+            "controller_name": self.controller_name,
+            "controller_index": self.controller_index,
+            "target": str(self.target) if self.target else None,
+            "is_spell": self.is_spell,
+            "trigger_source": self.trigger_source,
+            "trigger_text": self.trigger_text,
+            "countered": self.countered,
+        }
+
+
+@dataclass
+class GameState:
+    """Full game state."""
+    thread_id: int
+    format: str
+    players: List[Player]
+
+    # Turn tracking
+    turn_number: int = 0
+    active_player_index: int = 0
+    priority_player_index: int = 0
+    phase: Phase = Phase.MAIN1
+
+    # Stack (list of StackEntry objects when stack_enabled, else empty list)
+    stack: List = field(default_factory=list)
+
+    # Stack/priority feature flag — when True, spells go on stack with priority passes
+    stack_enabled: bool = False
+
+    # PrioritySystem instance (only created when stack_enabled=True)
+    _priority_system: Any = field(default=None, repr=False)
+
+    # Async event for waiting on stack resolution (legacy fallback)
+    _stack_resolution_event: Any = field(default=None, repr=False)
+
+    # Combat priority window — set during combat priority rounds (e.g., "after_attackers")
+    combat_priority_window: Optional[str] = None
+
+    # Autoplay mode — suppress human-facing prompts (!judge, !respond, !pass, etc.)
+    is_autoplay: bool = False
+    # Track which effects have already emitted a !judge/!resolve hint (dedup in autoplay)
+    _judge_hints_emitted: set = field(default_factory=set, repr=False)
+
+    # Opt-in: put triggered abilities on the stack instead of resolving immediately
+    triggers_use_stack: bool = False
+
+    # Combat
+    attackers: List[str] = field(default_factory=list)  # Card IDs
+    blockers: Dict[str, List[str]] = field(default_factory=dict)  # attacker_id -> [blocker_ids]
+    
+    # Game state
+    started: bool = False
+    ended: bool = False
+    winner: Optional[int] = None
+    created_at: datetime = field(default_factory=datetime.now)
+    
+    # Pending confirmations
+    pending_action: Optional[Dict] = None
+
+    # Last unresolved effect (for argumentless !judge)
+    last_unresolved_effect: Optional[Dict] = None
+
+    # Pending unresolved effects the AI should know about (ETBs, triggers, etc.)
+    # Items are strings like "Mystic Sanctuary ETB — put instant/sorcery from graveyard on top of library"
+    # Cleared when the AI resolves them or at end of turn
+    pending_resolves: List[str] = field(default_factory=list)
+
+    # Sync Trigger Queue — triggers fired from sync paths (advance_phase, end_turn,
+    # _handle_etb_triggers, SBA loops) that couldn't be resolved by Tier 1/1.5 and
+    # therefore need async Tier 3 resolution. Drained by GameEngine.drain_pending_triggers()
+    # from async command handlers and the autoplay loop. Each entry:
+    #   {"source_card": Card, "trigger_text": str, "trigger_type": str,
+    #    "controller_name": str, "context": str}
+    # See CLAUDE.md "Known Limitation: Sync Trigger Gap".
+    pending_async_triggers: List[Dict] = field(default_factory=list)
+    
+    # Turn-based effects (cleared at end of turn)
+    # Format: [{"type": "on_attack_damage", "source": "Jaya", "target_id": "xyz", "calc": "num_attackers", "controller": 0}, ...]
+    turn_effects: List[Dict] = field(default_factory=list)
+
+    # Delayed triggers — fire at a future phase (end step, upkeep, etc.)
+    # Format: [{"trigger_at": "end_step"|"upkeep", "actions": [...], "source": "Card Name",
+    #           "controller": player_idx, "once": True, "turn_delay": 0}]
+    delayed_triggers: List[Dict] = field(default_factory=list)
+
+    # Combat flow: when Claude attacks a human, we pause for the human to declare blocks
+    waiting_for_human_blocks: bool = False
+
+    # Day/Night tracking (CR 726) — for daybound/nightbound transform cards
+    is_day: bool = True  # True = day, False = night (only meaningful when day_night_active)
+    day_night_active: bool = False  # Becomes True when first daybound/nightbound card enters
+
+    # Layers engine for continuous effects (static keyword grants, anthems, etc.)
+    # Not serialized — rebuilt from battlefield state on game load
+    _layers_engine: Any = field(default=None, repr=False)
+
+    # Replacement effects engine ("if would, instead" processing)
+    # Not serialized — rebuilt from battlefield state on game load
+    _replacement_engine: Any = field(default=None, repr=False)
+    
+    @property
+    def active_player(self) -> Player:
+        return self.players[self.active_player_index]
+    
+    @property
+    def non_active_player(self) -> Player:
+        return self.players[1 - self.active_player_index]
+    
+    def get_player_by_user_id(self, user_id: int) -> Optional[Player]:
+        for p in self.players:
+            if p.user_id == user_id:
+                return p
+        return None
+    
+    def get_player_index(self, user_id: int) -> Optional[int]:
+        for i, p in enumerate(self.players):
+            if p.user_id == user_id:
+                return i
+        return None
+    
+    def find_card_global(self, name_or_id: str) -> Optional[Tuple[Card, Player, Zone]]:
+        """Find a card anywhere in the game."""
+        for player in self.players:
+            for zone in Zone:
+                for card in player.get_zone(zone):
+                    if card.id == name_or_id or card.name.lower() == name_or_id.lower():
+                        return card, player, zone
+        return None
+    
+    @property
+    def layers_engine(self):
+        """Lazily create LayersEngine for continuous effects."""
+        if self._layers_engine is None and HAS_LAYERS_ENGINE:
+            self._layers_engine = LayersEngine()
+        return self._layers_engine
+
+    @property
+    def replacement_engine(self):
+        """Lazily create ReplacementEngine for 'if would, instead' effects."""
+        if self._replacement_engine is None and HAS_REPLACEMENT_ENGINE:
+            self._replacement_engine = ReplacementEngine()
+        return self._replacement_engine
+
+    def _state_fingerprint(self) -> str:
+        """Compute a lightweight fingerprint of the current game state.
+
+        Used for *local CPU cache invalidation* (avoids rebuilding the
+        Python state-description string when nothing material changed).
+        The fingerprint deliberately excludes mana pool sums and tap state,
+        which:
+          (a) change after every cast/activation, defeating the cache 35:1 in
+              the May 3 batch, and
+          (b) get rebuilt fresh in the calling code from `mana_str` and
+              `available_mana_detailed()` regardless — the cached state
+              description doesn't depend on them.
+        Counters and life totals stay in the fingerprint because they
+        DO appear in the printed state description.
+        """
+        parts = []
+        parts.append(f"t{self.turn_number}")
+        parts.append(f"p{self.phase.value}")
+        parts.append(f"a{self.active_player_index}")
+        for p in self.players:
+            parts.append(f"L{p.life}")
+            parts.append(f"H{len(p.hand)}")
+            # Battlefield names + counters (sorted for determinism).
+            # Drop tap state — calling code prints tap state from a fresh
+            # read so its cache invalidation isn't needed for that.
+            bf = sorted(
+                f"{c.name}{c.counters.get('+1/+1', 0)}"
+                for c in p.battlefield
+            )
+            parts.append(f"B{'|'.join(bf)}")
+            parts.append(f"G{len(p.graveyard)}")
+            # mana_pool intentionally excluded — see docstring above.
+        parts.append(f"S{len(self.stack)}")
+        raw = ";".join(parts)
+        return hashlib.md5(raw.encode()).hexdigest()[:12]
+
+    def register_replacement_effects(self, card: Card, controller_name: str):
+        """
+        Scan a permanent's oracle text for replacement effects
+        and register them with the engine.
+
+        Handles cards like Rest in Peace, Doubling Season, Furnace of Rath.
+        Uses named card templates first, then oracle text regex patterns.
+        """
+        if not HAS_REPLACEMENT_ENGINE:
+            return
+        oracle = getattr(card, 'oracle_text', '') or ''
+        if not oracle:
+            return
+        effects = scan_oracle_for_replacements(
+            card.id, card.name, oracle, controller_name
+        )
+        if effects:
+            engine = self.replacement_engine
+            for effect in effects:
+                engine.add_effect(effect)
+            print(f"  [REPLACEMENT] Registered {len(effects)} replacement effect(s) from {card.name}")
+
+    def register_static_keyword_grants(self, card: Card, controller_name: str):
+        """
+        Scan a permanent's oracle text for static keyword-granting abilities
+        and register them with the layers engine.
+
+        Handles patterns like:
+        - "Other creatures you control have trample and haste." (Stonehoof Chieftain)
+        - "Creatures you control have hexproof." (Archetype of Endurance)
+        - "Other creatures you control have flying." (Favorable Winds - partial)
+        """
+        if not self.layers_engine:
+            return
+
+        oracle = (card.oracle_text or "").lower()
+
+        # CR 604: only STATIC abilities grant ongoing keywords. Filter out
+        # paragraphs that start with "when/whenever/at" (triggered) or contain
+        # "until end of turn" (temporary pump). This prevents cards like
+        # "Whenever X, creatures you control gain trample until end of turn"
+        # from registering trample as a permanent static grant.
+        def _keyword_static_paragraph(para: str) -> bool:
+            p = para.strip().lower()
+            if not p:
+                return False
+            if p.startswith(("when ", "whenever ", "at the beginning", "at end")):
+                return False
+            if ":" in p:
+                cost_part = p.split(":", 1)[0]
+                if any(sym in cost_part for sym in ("{t}", "{q}", "{w}", "{u}", "{b}", "{r}", "{g}", "{c}", "{x}")) \
+                   or any(ch.isdigit() for ch in cost_part):
+                    return False
+            if "until end of turn" in p or "until your next" in p:
+                return False
+            return True
+
+        oracle = "\n".join(para for para in oracle.split("\n") if _keyword_static_paragraph(para))
+
+        # Common keyword list to scan for
+        keyword_list = ['trample', 'haste', 'flying', 'vigilance', 'lifelink',
+                        'deathtouch', 'first strike', 'double strike', 'hexproof',
+                        'indestructible', 'menace', 'reach', 'defender']
+
+        # Aura-qualified: "Auras you control have <keywords>" (Archon of Sun's Grace)
+        # Must match BEFORE generic "creatures you control" to avoid over-broadcasting.
+        auras_match = re.search(r'auras you control have (.+?)(?:\.|$)', oracle)
+        # Subtype-qualified: "<Subtype> creatures you control have <keywords>"
+        # e.g. "Pegasus creatures you control have lifelink." (Archon of Sun's Grace)
+        # Must precede the generic "creatures you control" match or the grant over-broadcasts.
+        _COLOR_WORDS = {'white', 'blue', 'black', 'red', 'green'}
+        subtype_match = re.search(r'(?<!\w)([a-z]+) creatures you control have (.+?)(?:\.|$)', oracle)
+        if subtype_match and subtype_match.group(1) in _COLOR_WORDS:
+            subtype_match = None  # colors handled by other paths / no scoping needed here
+        # Pattern: "Other creatures you control have <keywords>"
+        # Pattern: "Creatures you control have <keywords>"
+        other_match = re.search(r'other creatures you control have (.+?)(?:\.|$)', oracle)
+        # For non-"other" version, check separately (avoid negative lookbehind issues)
+        all_match = None
+        if not other_match and not subtype_match:
+            all_match = re.search(r'(?<!\w)creatures you control have (.+?)(?:\.|$)', oracle)
+        # Power-conditional: "Creatures you control with power N or greater have X"
+        # Captures threshold N for a filter_fn gate at has_granted_keyword time.
+        power_cond_match = re.search(
+            r'creatures you control with power (\d+) or greater have (.+?)(?:\.|$)',
+            oracle,
+        )
+        if power_cond_match:
+            # Override looser matches so we pick up the narrower clause.
+            all_match = power_cond_match
+            other_match = None
+            subtype_match = None
+
+        match = auras_match or subtype_match or other_match or all_match
+        is_other_only = other_match is not None and subtype_match is None
+        is_aura_only = auras_match is not None
+        is_subtype_only = subtype_match is not None and auras_match is None
+        power_threshold = int(power_cond_match.group(1)) if power_cond_match else 0
+
+        if match:
+            # subtype_match.group(2) holds the keyword text; others use group(1)
+            if is_subtype_only:
+                keyword_text = match.group(2)
+            elif power_cond_match:
+                keyword_text = power_cond_match.group(2)
+            else:
+                keyword_text = match.group(1)
+            granted = []
+            for kw in keyword_list:
+                if kw in keyword_text:
+                    # Capitalize properly for has_keyword() matching
+                    granted.append(kw.title() if ' ' not in kw else
+                                   ' '.join(w.capitalize() for w in kw.split()))
+
+            if granted:
+                if is_aura_only:
+                    applies_to = "auras you control"
+                elif is_subtype_only:
+                    # Format matches applies_to_permanent's subtype regex:
+                    # "<subtype>s? you control"
+                    applies_to = f"{subtype_match.group(1)} you control"
+                elif is_other_only:
+                    applies_to = "other creatures you control"
+                else:
+                    applies_to = "creatures you control"
+                effect_id = f"{card.id}_static_keywords"
+                # Skip if we've already registered this card's static grant —
+                # prevents ETB + flicker + save-reload from stacking duplicate
+                # effects AND suppresses repeated [LAYERS] log lines.
+                if any(e.id == effect_id for e in self.layers_engine.effects):
+                    return
+                # Build optional power-gate filter. Captured here so the closure
+                # keeps the threshold value even if the pattern match goes out
+                # of scope later.
+                filter_fn = None
+                if power_threshold > 0:
+                    _th = power_threshold
+                    def _power_gate(perm, game, _threshold=_th):
+                        try:
+                            pwr = perm.get_effective_power(game) if hasattr(perm, 'get_effective_power') else 0
+                        except Exception:
+                            pwr = 0
+                        return pwr >= _threshold
+                    filter_fn = _power_gate
+                effect = ContinuousEffect(
+                    id=effect_id,
+                    source_name=card.name,
+                    source_id=card.id,
+                    controller=controller_name,
+                    layer=Layer.ABILITY,
+                    effect_type="add_abilities",
+                    abilities_granted=granted,
+                    applies_to=applies_to,
+                    filter_fn=filter_fn,
+                )
+                self.layers_engine.add_effect(effect)
+                if is_aura_only:
+                    scope = "auras"
+                elif is_subtype_only:
+                    scope = f"{subtype_match.group(1)} creatures"
+                elif is_other_only:
+                    scope = "other creatures"
+                else:
+                    scope = "creatures"
+                print(f"[LAYERS] Registered static keyword grant: {card.name} → {granted} to {scope}")
+
+    def register_static_pt_effects(self, card: Card, controller_name: str):
+        """Scan oracle text for static P/T-affecting abilities and register with layers engine."""
+        if not self.layers_engine:
+            return
+        oracle = (card.oracle_text or "").lower()
+        humility_match = re.search(r'(?:all )?creatures (?:lose all abilities and )?(?:have base power and toughness|are) (\d+)/(\d+)', oracle)
+        if humility_match:
+            set_p, set_t = int(humility_match.group(1)), int(humility_match.group(2))
+            effects = create_humility_effect(card.name, card.id, controller_name)
+            if set_p != 1 or set_t != 1:
+                for eff in effects:
+                    if eff.sublayer == Sublayer.PT_SET:
+                        eff.set_power, eff.set_toughness = set_p, set_t
+            for eff in effects:
+                self.layers_engine.add_effect(eff)
+            print(f"[LAYERS] Registered Humility-style P/T effect: {card.name} -> all creatures {set_p}/{set_t}")
+            return
+        # Blood Moon: "Nonbasic lands are Mountains"
+        blood_moon_match = re.search(r'nonbasic lands are mountains', oracle)
+        if blood_moon_match:
+            effect = create_blood_moon_effect(card.name, card.id, controller_name)
+            self.layers_engine.add_effect(effect)
+            print(f"[LAYERS] Registered Blood Moon type-change: {card.name} -> nonbasic lands are Mountains")
+            return
+        # Painter's Servant: "All cards/spells/permanents are the chosen color"
+        # Auto-choose: pick the color most common on the opponent's permanents
+        # (Painter's Servant + Grindstone is the primary combo — Blue is the classic pick
+        # when targeting all opponent cards for Grindstone, but more generally we pick
+        # the color that names the most opponent permanents so removal/interaction is
+        # maximised).
+        #
+        # May 20 audit (CRITICAL): the substring `"chosen color" in oracle` matched
+        # ANY card whose oracle says "the chosen color" — including Coldsteel Heart's
+        # "As Coldsteel Heart enters, choose a color. {T}: Add one mana of the chosen
+        # color." (game_1506623254738112754_console.log:539 fired Painter's Servant on
+        # a Coldsteel Heart ETB, turning ALL permanents+spells White). Same bug
+        # would fire on Diamond Lion, Birds of Paradise (vintage), Cromat, etc. —
+        # any color-choose mana rock. Tighten to exact card name match.
+        if card.name.lower() == "painter's servant":
+            chosen_color = "U"  # Default: Blue is the most combo-relevant choice
+
+            # Find the controller player object so we can inspect the game state
+            controller_player = None
+            opponent_player = None
+            for p in self.players:
+                if p.name == controller_name:
+                    controller_player = p
+                else:
+                    opponent_player = p
+
+            # Count how many of each color appear on the opponent's permanents
+            COLOR_NAMES = {"W": "white", "U": "blue", "B": "black", "R": "red", "G": "green"}
+            if opponent_player:
+                color_counts: dict = {c: 0 for c in COLOR_NAMES}
+                for perm in opponent_player.battlefield:
+                    # Check color_identity, then colors field, then mana_cost
+                    perm_colors = set()
+                    if getattr(perm, 'color_identity', None):
+                        perm_colors.update(str(ci).upper() for ci in perm.color_identity)
+                    elif getattr(perm, 'colors', None):
+                        perm_colors.update(str(ci).upper() for ci in perm.colors)
+                    elif getattr(perm, 'mana_cost', None):
+                        for c in COLOR_NAMES:
+                            if f'{{{c}}}' in perm.mana_cost.upper():
+                                perm_colors.add(c)
+                    for c in perm_colors:
+                        if c in color_counts:
+                            color_counts[c] += 1
+                total_colored = sum(color_counts.values())
+                if total_colored > 0:
+                    chosen_color = max(color_counts, key=lambda c: color_counts[c])
+                    reason = f"most common opponent color ({color_counts[chosen_color]} permanents)"
+                else:
+                    # Opponent has no colored permanents — fall back to commander identity
+                    reason = "opponent has no colored permanents, using commander identity"
+                    if controller_player and hasattr(controller_player, '_get_commander_colors'):
+                        cmd_colors = controller_player._get_commander_colors()
+                        if cmd_colors:
+                            chosen_color = cmd_colors[0]
+            else:
+                reason = "default (no opponent info)"
+
+            # Store the choice on the card so other systems can reference it
+            card._painter_color = chosen_color
+
+            effect = create_color_change_effect(card.name, card.id, controller_name,
+                                                 colors_added=[chosen_color],
+                                                 applies_to="all permanents and spells")
+            self.layers_engine.add_effect(effect)
+            color_word = {"W": "White", "U": "Blue", "B": "Black", "R": "Red", "G": "Green"}.get(chosen_color, chosen_color)
+            print(f"[LAYERS] Painter's Servant: chose {color_word} ({reason}); all permanents/spells are now also {chosen_color}")
+            # Surface to Discord via the standard pending-messages channel.
+            #
+            # May 20 audit fix: previously this read `getattr(self,
+            # '_current_game', None)` — but `_current_game` is never assigned
+            # anywhere in the codebase, so `game` was always None and the
+            # color-choice announcement never reached Discord. `self` IS the
+            # GameState (register_static_pt_effects is a GameState method),
+            # so just push directly onto `self._pending_messages` — the
+            # cast_spell_async flush at spells.py:2135 will drain it.
+            painter_msg = (f"🎨 **Painter's Servant** enters — all permanents and spells "
+                           f"become **{color_word}** in addition to their other colors. "
+                           f"_(chosen because: {reason})_")
+            if not hasattr(self, '_pending_messages') or self._pending_messages is None:
+                self._pending_messages = []
+            self._pending_messages.append(painter_msg)
+            return
+        # CR 604: anthem patterns must come from STATIC abilities, not triggered
+        # ones. Split the oracle into paragraphs and filter out any paragraph that
+        # begins with "when", "whenever", or "at " (triggered abilities), OR that
+        # contains "until end of turn" / "until your next" (temporary pumps).
+        # We build a "static-only" oracle string by joining paragraphs that pass.
+        def _is_static_paragraph(para: str) -> bool:
+            p = para.strip().lower()
+            if not p:
+                return False
+            # Triggered abilities
+            if p.startswith(("when ", "whenever ", "when,", "whenever,", "at the beginning", "at end")):
+                return False
+            # Activated abilities ("cost: effect" — has a colon and the text before
+            # it is a legal cost, not a creature subtype line)
+            # Only skip if the activation cost contains a mana/tap symbol — this
+            # avoids false-positives on flavor colons.
+            if ":" in p:
+                cost_part = p.split(":", 1)[0]
+                if any(sym in cost_part for sym in ("{t}", "{q}", "{w}", "{u}", "{b}", "{r}", "{g}", "{c}", "{x}")) \
+                   or any(ch.isdigit() for ch in cost_part):
+                    return False
+            # Temporary pumps
+            if "until end of turn" in p or "until your next" in p:
+                return False
+            return True
+
+        static_oracle = "\n".join(
+            para for para in oracle.split("\n") if _is_static_paragraph(para)
+        )
+
+        # Dedup guard: don't re-register this card's anthem if it's already
+        # present (same logic the keyword-grant path added). Without this,
+        # every recalculate_power_toughness tick stacks a fresh copy, and
+        # tokens can end up with power/toughness totals like -834/-834.
+        # Cards with multi-clause anthems (Elesh Norn: +2/+2 own + -2/-2 opp)
+        # register multiple effects with IDs like "{card.id}_own_other" and
+        # "{card.id}_opp_debuff", plus legacy "_anthem" / color-qualified.
+        # Skip the entire registration if ANY layer effect from this card
+        # already exists.
+        anthem_id_prefix = f"{card.id}_"
+        if any(e.id.startswith(anthem_id_prefix) and (
+                e.id.endswith("_anthem") or e.id.endswith("_own_other")
+                or e.id.endswith("_own_all") or e.id.endswith("_opp_debuff")
+                or e.id.endswith("_all_buff") or e.id.endswith("_all_debuff")
+                or e.id.endswith("_color") or e.id.endswith("_subtype"))
+               for e in self.layers_engine.effects):
+            return
+
+        # "For each <X>" anthems (Heavenly Blademaster: +1/+1 per Aura/Equipment)
+        # have dynamic amounts that change with attachment count. Registering
+        # them as static +1/+1 is wrong (and Blademaster's double-register was
+        # the root of the 834-stack Soldier bug). Defer these to Tier 3 so
+        # they get resolved dynamically instead of over-broadcasting.
+        if re.search(r'creatures you control get \+\d+/\+\d+ for each', static_oracle):
+            print(f"[LAYERS] Skipping 'for each' anthem (dynamic amount): {card.name}")
+            return
+
+        # Token-qualified anthem patterns (Phantom General, Adriana, Captain of
+        # the Guard, etc.). Must come before color-qualified and generic so the
+        # more-specific filter wins. May 17 audit: Phantom General's "Other
+        # creature tokens you control get +1/+1" was previously caught by the
+        # generic "other creatures you control" regex and applied to non-token
+        # creatures too, leaving token strategies under-buffed.
+        token_anthem_match = re.search(
+            r'(other )?creature tokens you control get \+(\d+)/\+(\d+)', static_oracle)
+        if token_anthem_match:
+            is_other = bool(token_anthem_match.group(1))
+            p_val, t_val = int(token_anthem_match.group(2)), int(token_anthem_match.group(3))
+            applies_to = ("other " if is_other else "") + "creature tokens you control"
+            effect = create_anthem_effect(card.name, f"{card.id}_tokens", controller_name, p_val, t_val, applies_to)
+            self.layers_engine.add_effect(effect)
+            print(f"[LAYERS] Registered token anthem P/T: {card.name} -> {applies_to} +{p_val}/+{t_val}")
+            return
+
+        # Color-qualified anthem patterns (must come BEFORE generic patterns)
+        color_anthem_match = re.search(
+            r'(white|blue|black|red|green)\s+creatures you control get \+(\d+)/\+(\d+)', static_oracle)
+        if color_anthem_match:
+            color_word = color_anthem_match.group(1)
+            p_val, t_val = int(color_anthem_match.group(2)), int(color_anthem_match.group(3))
+            applies_to = f"{color_word} creatures you control"
+            effect = create_anthem_effect(card.name, f"{card.id}_color", controller_name, p_val, t_val, applies_to)
+            self.layers_engine.add_effect(effect)
+            print(f"[LAYERS] Registered color anthem P/T: {card.name} -> {applies_to} +{p_val}/+{t_val}")
+            return
+        # Subtype-restricted anthems: "Other Werewolves you control get +1/+1",
+        # "Other Wolves you control get +1/+1", etc. Also handles non-X variants
+        # ("Other non-Human creatures you control get +1/+1" — Mikaeus).
+        # The optional " creatures?" segment handles the Mikaeus form, where the
+        # subtype is followed by the word "creatures" (e.g. "non-Human creatures
+        # you control"). Must come before generic patterns so the more-specific
+        # filter wins.
+        subtype_anthem = re.search(
+            r'other (non-)?([a-z]+)(?: creatures?)? you control get \+(\d+)/\+(\d+)',
+            static_oracle,
+        )
+        # Skip subtype pathway when the match is really "other creatures" — that
+        # is a card TYPE, not a subtype, and needs the generic "other creatures
+        # you control" clause (which applies_to_permanent handles via its
+        # creature-type branch). Without this skip, Elesh Norn would register
+        # under the subtype branch, where applies_to_permanent tries to match
+        # "creatures" as a subtype on every creature, finds nothing, and
+        # silently applies to no one.
+        if subtype_anthem and subtype_anthem.group(2) in ("creature", "creatures"):
+            subtype_anthem = None
+        if subtype_anthem:
+            negation = subtype_anthem.group(1)  # "non-" or None
+            sub_word = subtype_anthem.group(2)
+            # Normalize a trailing plural "s" so the base subtype word matches
+            # what's stored on cards (case-insensitive). "wolves" has no trailing
+            # "s" after this (Wolves has irregular plural), "humans" -> "human".
+            if sub_word.endswith("s") and len(sub_word) > 1:
+                sub_word = sub_word[:-1]
+            p_val, t_val = int(subtype_anthem.group(3)), int(subtype_anthem.group(4))
+            if negation:
+                applies_to = f"other non-{sub_word} creatures you control"
+            else:
+                applies_to = f"other {sub_word}s you control"
+            effect = create_anthem_effect(card.name, f"{card.id}_subtype", controller_name, p_val, t_val, applies_to)
+            self.layers_engine.add_effect(effect)
+            print(f"[LAYERS] Registered subtype anthem P/T: {card.name} -> {applies_to} +{p_val}/+{t_val}")
+            return
+
+        # Multi-clause static anthems (Elesh Norn: "+2/+2 to your creatures
+        # AND -2/-2 to opponent creatures") need BOTH halves registered, not
+        # just the first match. Iterate patterns and register every one that
+        # matches, but skip overlapping pairs ("other creatures you control"
+        # vs "creatures you control" — the more-specific one should win).
+        anthem_patterns = [
+            ('own_other', r'other creatures you control get \+(\d+)/\+(\d+)', "other creatures you control", False),
+            ('own_all', r'creatures you control get \+(\d+)/\+(\d+)', "creatures you control", False),
+            ('opp_debuff', r'creatures (?:your opponents?|opponents?) control get -(\d+)/-(\d+)', "creatures opponents control", True),
+            ('all_buff', r'all creatures get \+(\d+)/\+(\d+)', "all creatures", False),
+            # Board-wide negative anthem: "Creatures get -1/-1" (Night of Souls' Betrayal)
+            ('all_debuff', r'(?:^|\.\s*)creatures get -(\d+)/-(\d+)', "all creatures", True),
+        ]
+        registered = set()
+        for tag, pattern, applies_to, is_negative in anthem_patterns:
+            # Skip own_all if own_other already registered (more-specific wins)
+            if tag == 'own_all' and 'own_other' in registered:
+                continue
+            match = re.search(pattern, static_oracle)
+            if match:
+                p_val, t_val = int(match.group(1)), int(match.group(2))
+                if is_negative:
+                    p_val, t_val = -p_val, -t_val
+                # Make the effect ID tag-suffixed so multiple clauses on the
+                # same card don't collide (Elesh Norn has both own_other AND
+                # opp_debuff). Without this, the second register replaces
+                # the first because they share the card's ID.
+                effect = create_anthem_effect(card.name, f"{card.id}_{tag}", controller_name, p_val, t_val, applies_to)
+                self.layers_engine.add_effect(effect)
+                registered.add(tag)
+                sp = '+' if p_val >= 0 else ''
+                st = '+' if t_val >= 0 else ''
+                print(f"[LAYERS] Registered anthem P/T: {card.name} -> {applies_to} {sp}{p_val}/{st}{t_val}")
+
+    def recalculate_power_toughness(self):
+        """Recalculate effective P/T for all creatures via layers engine (before SBAs)."""
+        if not self.layers_engine:
+            return
+        has_pt_effects = any(e.layer == Layer.POWER_TOUGHNESS for e in self.layers_engine.effects)
+        if not has_pt_effects:
+            for player in self.players:
+                for card in player.battlefield:
+                    card._layers_power_mod = 0
+                    card._layers_toughness_mod = 0
+                    # May 20 audit (CRITICAL #2): also clear the
+                    # _has_layers_pt_effect sentinel when no layer effects are
+                    # active, so the inline anthem fallback in
+                    # get_effective_power/toughness can fire normally.
+                    card._has_layers_pt_effect = False
+            return
+        # [LAYERS-PT] Log a single summary line per call, not one line per creature.
+        # Per-creature logging caused 600+ log entries in games with Massacre Wurm /
+        # Judith / Glorious Anthem because this function is called ~30 times per turn.
+        affected_summary = []
+        for player in self.players:
+            for card in player.battlefield:
+                if not card.is_creature():
+                    continue
+                try:
+                    base_p = int(card.power) if card.power and card.power != '*' else 0
+                except (ValueError, TypeError):
+                    base_p = 0
+                try:
+                    base_t = int(card.toughness) if card.toughness and card.toughness != '*' else 0
+                except (ValueError, TypeError):
+                    base_t = 0
+                # Extract card colors for color-restricted anthems (Honor of the Pure, etc.)
+                card_colors = getattr(card, 'colors', []) or []
+                if not card_colors and card.mana_cost:
+                    for c in card.mana_cost.upper():
+                        if c in 'WUBRG' and c not in card_colors:
+                            card_colors.append(c)
+                # Pull subtypes (Werewolf, Wolf, Human, Soldier, etc.) so subtype-
+                # restricted anthems (Tovolar, Mikaeus, Lord of Atlantis) filter correctly.
+                card_subtypes = list(getattr(card, 'subtypes', []) or [])
+                lp = LayeredPermanent(
+                    id=card.id, name=card.name, controller=player.name,
+                    owner=player.name, base_types=["creature"],
+                    base_subtypes=card_subtypes,
+                    base_colors=card_colors,
+                    base_power=base_p, base_toughness=base_t,
+                    plus_counters=card.counters.get('+1/+1', 0),
+                    minus_counters=card.counters.get('-1/-1', 0))
+                result = self.layers_engine.calculate_characteristics(lp, None)
+                layers_p = result.power if result.power is not None else base_p
+                layers_t = result.toughness if result.toughness is not None else base_t
+                # May 7 audit: `calculate_characteristics()` does NOT include
+                # counter contribution in its returned power/toughness — only
+                # base + layer effects (anthems, set-base, etc.). The previous
+                # formula `(layers_p - base_p) - cd` double-subtracted counters,
+                # so `get_effective_power()` (which adds counters separately)
+                # silently cancelled the counter contribution. Symptom: Rhys
+                # (base 1/1) with 3 +1/+1 counters and Glorious Anthem reported
+                # effective power 2 instead of 5; in the audit-flagged
+                # March-of-the-Multitudes + Cathar's Crusade chain, one Soldier
+                # accumulated a `(-21/-21)` modifier across ETBs.
+                #
+                # Fix: just subtract base from the layer result. Counters are
+                # already accounted for downstream by `Card.get_effective_*`.
+                card._layers_power_mod = layers_p - base_p
+                card._layers_toughness_mod = layers_t - base_t
+                # May 20 audit (CRITICAL #2): set a sentinel even when the
+                # delta is 0. Humility (Layer 7b set 1/1) + anthem (Layer 7c
+                # +1/+1) on a 2/2 creature → layers_p=2, base_p=2, delta=0.
+                # The old code in get_effective_power saw mod==0 and fell
+                # back to _get_anthem_power_bonus, which re-added the anthem,
+                # yielding 2+0+1=3 (Humility invisible).
+                # game_1506623352666853486:896-913 had Crypt Ghast/Sram/
+                # Ophiomancer/Kambal all attacking for 3 power with Humility
+                # + Ethereal Absolution active; should be 2. Fix: flag this
+                # permanent as "layers engine touched my P/T" so the fallback
+                # is skipped even when delta is 0.
+                card._has_layers_pt_effect = True
+                cd = card.counters.get('+1/+1', 0) - card.counters.get('-1/-1', 0)
+                # Suppress spurious deltas on X=0 creatures (Walking Ballista,
+                # Hangarback Walker) whose base P/T is 0/0 with no counters:
+                # the card is about to die from CREATURE_ZERO_TOUGHNESS and any
+                # tiny non-zero delta from effect-filter edge cases just
+                # confuses the log reader. Outcome is unchanged (SBA kills
+                # them on the next sweep); this is purely a display guard.
+                if base_p == 0 and base_t == 0 and cd == 0:
+                    continue
+                if card._layers_power_mod != 0 or card._layers_toughness_mod != 0:
+                    # Disambiguate same-name tokens by appending a short id
+                    # suffix — without it, March of the Multitudes producing 22
+                    # Soldiers looks like one Soldier swinging from -1/-1 to
+                    # -21/-21 across log lines (the May 7 confusion).
+                    _id_tail = (getattr(card, 'id', '') or '')[-4:]
+                    _disambig = f"#{_id_tail}" if _id_tail else ""
+                    affected_summary.append(
+                        f"{card.name}{_disambig}({card._layers_power_mod:+d}/{card._layers_toughness_mod:+d})"
+                    )
+        # Suppress identical summaries — SBA sweeps and phase transitions call
+        # this function repeatedly with unchanged board state, producing the
+        # same [LAYERS-PT] line dozens of times per turn.
+        # May 20 audit: track suppression counts so the dedup is auditable.
+        # Previously identical-summary suppression was silent — a real bug
+        # that produced an identical-looking summary by coincidence would be
+        # invisible. Now emit one `[LAYERS-PT-SUPPRESSED]` line at every
+        # 25th suppression with the count so audits can verify the dedup
+        # isn't masking unique state changes.
+        prev = getattr(self, '_layers_pt_last_summary', None)
+        summary_key = tuple(affected_summary)
+        if affected_summary and summary_key != prev:
+            print(f"[LAYERS-PT] {len(affected_summary)} creature(s) modified: {', '.join(affected_summary[:8])}"
+                  + (f" +{len(affected_summary)-8} more" if len(affected_summary) > 8 else ""))
+            self._layers_pt_last_summary = summary_key
+            self._layers_pt_suppress_count = 0
+        elif affected_summary and summary_key == prev:
+            # Same summary as last call — increment suppression counter.
+            self._layers_pt_suppress_count = getattr(self, '_layers_pt_suppress_count', 0) + 1
+            # Surface every 25th suppression so audits can confirm dedup
+            # is firing on genuinely identical state, not hiding diffs.
+            if self._layers_pt_suppress_count % 25 == 0:
+                print(f"[LAYERS-PT-SUPPRESSED] same summary x{self._layers_pt_suppress_count} "
+                      f"({len(affected_summary)} creature(s): "
+                      f"{', '.join(affected_summary[:4])}"
+                      + (f" +{len(affected_summary)-4} more" if len(affected_summary) > 4 else "") + ")")
+        elif not affected_summary:
+            self._layers_pt_last_summary = None
+            self._layers_pt_suppress_count = 0
+
+    def unregister_static_effects(self, card: Card):
+        """Remove all continuous/replacement effects from a permanent (when it leaves the battlefield)."""
+        if self.layers_engine:
+            # Only log if there were effects to remove — otherwise every
+            # creature leaving the battlefield spams an empty-removal line.
+            had_layer_effects = any(e.source_id == card.id for e in self.layers_engine.effects)
+            self.layers_engine.remove_effects_from_source(card.id)
+            if had_layer_effects:
+                print(f"[LAYERS] Removed all effects from source: {card.name}")
+        if HAS_REPLACEMENT_ENGINE and self._replacement_engine:
+            had_repl_effects = any(e.source_id == card.id for e in self._replacement_engine.effects)
+            self._replacement_engine.remove_effects_from_source(card.id)
+            if had_repl_effects:
+                print(f"[REPLACEMENT] Removed replacement effects from source: {card.name}")
+
+    def has_granted_keyword(self, card: Card, keyword: str, controller_name: str) -> bool:
+        """
+        Check if a card has been granted a keyword by a continuous effect.
+
+        This is a lightweight check that doesn't go through full layer calculation —
+        it just scans active Layer 6 effects for matching keyword grants.
+        """
+        if not self.layers_engine:
+            return False
+
+        keyword_lower = keyword.lower()
+
+        for effect in self.layers_engine.effects:
+            if effect.layer != Layer.ABILITY:
+                continue
+
+            # Check if keyword is in granted list
+            if not any(kw.lower() == keyword_lower for kw in effect.abilities_granted):
+                continue
+
+            # Paranoia: the effect's source must still be on the battlefield of
+            # the effect's recorded controller. Stale effects from flickered /
+            # exiled / copy-token sources are a common source of "Rick's
+            # creature got trample from Claude's Uprising" reports.
+            source_alive_under_controller = False
+            for _p in self.players:
+                if _p.name != effect.controller:
+                    continue
+                for _c in _p.battlefield:
+                    if getattr(_c, 'id', None) == effect.source_id and not getattr(_c, '_phased_out', False):
+                        source_alive_under_controller = True
+                        break
+                break
+            if not source_alive_under_controller:
+                continue
+
+            # Check if this effect applies to the card
+            applies_to = effect.applies_to.lower()
+
+            # Custom filter (e.g. power>=N gates for "creatures with power 4 or
+            # greater have trample"). Registered at effect creation time.
+            if getattr(effect, 'filter_fn', None):
+                try:
+                    if not effect.filter_fn(card, self):
+                        continue
+                except Exception:
+                    continue
+
+            if "creatures you control" in applies_to:
+                if not card.is_creature():
+                    continue
+                if effect.controller != controller_name:
+                    continue
+                # "Other creatures" — source can't grant to itself
+                if "other" in applies_to and card.id == effect.source_id:
+                    continue
+                return True
+
+            elif "all creatures" in applies_to or "each creature" in applies_to:
+                if card.is_creature():
+                    return True
+
+        return False
+
+    def rebuild_layers_from_battlefield(self):
+        """Rebuild all continuous/replacement effects from current battlefield state.
+        Called after loading a saved game."""
+        if self.layers_engine:
+            self.layers_engine.effects.clear()
+        if HAS_REPLACEMENT_ENGINE and self._replacement_engine:
+            self._replacement_engine.effects.clear()
+        for player in self.players:
+            for card in player.battlefield:
+                self.register_static_keyword_grants(card, player.name)
+                self.register_static_pt_effects(card, player.name)
+                self.register_replacement_effects(card, player.name)
+        self.recalculate_granted_keywords()
+        self.recalculate_power_toughness()
+
+    def recalculate_granted_keywords(self):
+        """
+        Recalculate _granted_keywords for all creatures on the battlefield
+        based on active continuous effects in the layers engine.
+
+        Call this after any permanent enters or leaves the battlefield.
+        """
+        # Clear all granted keywords first
+        for player in self.players:
+            for card in player.battlefield:
+                card._granted_keywords = set()
+
+        if not self.layers_engine:
+            return
+
+        # For each active creature on the battlefield, check what keywords are granted
+        # Phased-out creatures don't receive or benefit from granted keywords
+        for player in self.players:
+            for card in player.battlefield:
+                if not card.is_creature() or getattr(card, '_phased_out', False):
+                    continue
+                for keyword in ['Trample', 'Haste', 'Flying', 'Vigilance', 'Lifelink',
+                                'Deathtouch', 'First Strike', 'Double Strike', 'Hexproof',
+                                'Shroud',  # May 17 audit: Lightning Greaves' shroud was
+                                # missing from this list, so Greaves-equipped creatures
+                                # were targetable (its protection effect never applied).
+                                'Indestructible', 'Menace', 'Reach', 'Defender']:
+                    if self.has_granted_keyword(card, keyword, player.name):
+                        card._granted_keywords.add(keyword)
+
+        # Log what was granted — only when the set actually changed from the
+        # previous sweep. Prevents Surrak-trample-style logs repeating 6+ times
+        # per board state every SBA/layers recalculation.
+        for player in self.players:
+            for card in player.battlefield:
+                granted = getattr(card, '_granted_keywords', set())
+                prev = getattr(card, '_granted_keywords_logged', None)
+                if granted and granted != prev:
+                    print(f"[LAYERS] {card.name} ({player.name}): granted {granted}")
+                    card._granted_keywords_logged = set(granted)
+                elif not granted and prev:
+                    card._granted_keywords_logged = set()
+
+    def to_dict(self) -> Dict:
+        """Serialize game state to JSON-compatible dict."""
+        return {
+            "thread_id": self.thread_id,
+            "format": self.format,
+            "players": [p.to_dict() for p in self.players],
+            "turn_number": self.turn_number,
+            "active_player_index": self.active_player_index,
+            "priority_player_index": self.priority_player_index,
+            "phase": self.phase.value,
+            "stack": [s.to_dict() if hasattr(s, 'to_dict') else s for s in self.stack],
+            "stack_enabled": self.stack_enabled,
+            "attackers": self.attackers,
+            "blockers": self.blockers,
+            "started": self.started,
+            "ended": self.ended,
+            "winner": self.winner,
+            "created_at": self.created_at.isoformat(),
+            "pending_action": self.pending_action,
+            "turn_effects": self.turn_effects,
+            "last_unresolved_effect": self.last_unresolved_effect,
+            "pending_resolves": self.pending_resolves,
+        }
+    
+    @classmethod
+    def from_dict(cls, data: Dict) -> 'GameState':
+        """Reconstruct game state from dict."""
+        game = cls(
+            thread_id=data["thread_id"],
+            format=data["format"],
+            players=[Player.from_dict(p) for p in data["players"]],
+            turn_number=data.get("turn_number", 0),
+            active_player_index=data.get("active_player_index", 0),
+            priority_player_index=data.get("priority_player_index", 0),
+            phase=Phase(data.get("phase", "main1")),
+            stack=data.get("stack", []),  # Stack entries not reconstructed (transient)
+            stack_enabled=data.get("stack_enabled", False),
+            attackers=data.get("attackers", []),
+            blockers=data.get("blockers", {}),
+            started=data.get("started", False),
+            ended=data.get("ended", False),
+            winner=data.get("winner"),
+            created_at=datetime.fromisoformat(data["created_at"]) if "created_at" in data else datetime.now(),
+            pending_action=data.get("pending_action"),
+            turn_effects=data.get("turn_effects", []),
+            last_unresolved_effect=data.get("last_unresolved_effect"),
+            pending_resolves=data.get("pending_resolves", []),
+        )
+        # [LAYERS] Rebuild continuous effects from current battlefield state
+        game.rebuild_layers_from_battlefield()
+        return game
