@@ -1,0 +1,40 @@
+# CI: compile sweep + unit/regression test suite.
+#
+# Runs on every push and PR. The pytest step is conditional until tests/ is
+# ported from the upstream private repo (along with the May 26/30 engine
+# fixes — see the porting checklist). Once tests/ lands, it runs
+# automatically; until then the compile sweep still guards every PR against
+# syntax errors.
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt pytest
+
+      # Byte-compile the whole tree — catches syntax errors everywhere,
+      # including modules the (future) test suite doesn't import.
+      - name: Compile check
+        run: python -m compileall -q bot.py mtg_game.py cube_draft.py board_visual.py prewarm_cache.py mtg rules
+
+      - name: Run tests
+        run: |
+          if [ -d tests ]; then
+            pytest tests/ -v
+          else
+            echo "No tests/ directory yet — compile check only."
+            echo "Port tests/ from the upstream repo to activate this step."
+          fi
