@@ -27,6 +27,31 @@ import re
 from mtg.constants import MDFC_PATHWAYS, Zone
 
 
+def normalize_card_name(name) -> str:
+    """Canonical form for card-name comparison: lowercased, whitespace-trimmed.
+
+    Deliberately does NOT strip apostrophes or punctuation — "Cathars' Crusade"
+    vs "Cathar's Crusade" being different strings is the point (the May 17
+    apostrophe bug class is caught by tools/validate_card_names.py, not
+    papered over here).
+    """
+    return (name or "").strip().lower()
+
+
+def names_match(a, b) -> bool:
+    """Exact normalized card-name equality.
+
+    Use this instead of substring checks (`'painter' in card.name.lower()`)
+    when deciding whether a permanent IS a specific card — the substring
+    pattern caused the Coldsteel Heart → Painter's Servant misfire (May 17
+    audit). Substring matching remains fine for oracle-TEXT pattern scans;
+    this is for card-NAME identity only. Migration policy: convert loose
+    name checks to names_match whenever you touch the surrounding code.
+    """
+    na, nb = normalize_card_name(a), normalize_card_name(b)
+    return bool(na) and na == nb
+
+
 def format_activate_line(card_name: str, loyalty_cost, ability_text: str,
                          game=None, max_chars: int = 300) -> str:
     """Format a planeswalker activation header with oracle-text dedup.

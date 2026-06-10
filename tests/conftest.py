@@ -12,11 +12,20 @@ Design notes:
   (May 13: thirty-one counters collapsing onto one mega-Soldier).
 """
 import itertools
+import os
 import sys
 from pathlib import Path
 
 # Repo root on sys.path so `import mtg` works no matter where pytest runs from.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+# Tests run STRICT: pure-engine except-blocks converted to the maybe_reraise
+# convention (mtg/util.py) re-raise here instead of swallowing, so a latent
+# engine exception fails the suite loudly instead of corrupting state
+# silently. Production (the live bot) stays log-and-continue unless
+# MTG_STRICT=1 is exported — recommended for autoplay audit batches.
+# setdefault so `MTG_STRICT=0 pytest` can still exercise swallow behavior.
+os.environ.setdefault("MTG_STRICT", "1")
 
 import pytest
 

@@ -1,0 +1,33 @@
+# Validates every hardcoded card name (template-library keys, transforming-
+# saga table) against Scryfall bulk data. Catches the exact-name-typo bug
+# class — the May 17 "Cathars' Crusade" apostrophe bug shipped because no
+# machine ever compared the key to the real card name; this would have
+# flagged it instantly.
+#
+# Runs weekly (bulk data drifts as sets release), on changes to the files
+# that hold hardcoded names, and on demand. No pip installs: the validator's
+# import chain is stdlib-only (verified against a bare interpreter).
+name: card-names
+
+on:
+  schedule:
+    - cron: "0 6 * * 1" # Mondays 06:00 UTC
+  workflow_dispatch:
+  push:
+    paths:
+      - rules/effect_templates.py
+      - mtg/sba.py
+      - tools/validate_card_names.py
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Validate card names against Scryfall
+        run: python tools/validate_card_names.py

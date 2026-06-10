@@ -41,6 +41,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from mtg.constants import Phase, Zone, COMMAND_ZONE_FORMATS
 from mtg.models import Card, Player, GameState
+from mtg.util import maybe_reraise
 
 # Optional: 7-layer continuous effects (CR 613) — used by pump/control/copy actions
 try:
@@ -222,6 +223,7 @@ def _fire_sacrifice_triggers(rules, game: GameState, sac_player: Player, sacrifi
                 print(f"[SAC-TRIGGER] Error processing {source.name}: {e}")
     except Exception as e:
         print(f"[SAC-TRIGGER] Top-level scan failed: {e}")
+        maybe_reraise(e)
     return messages
 
 
@@ -958,6 +960,7 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                                 print(f"[LANDFALL] Fired triggers for {card.name} entering via spell")
                         except Exception as e:
                             print(f"[LANDFALL] Error firing triggers for {card.name}: {e}")
+                            maybe_reraise(e)
                 if from_zone.lower() == 'battlefield' or actual_to_zone == 'battlefield':
                     game.recalculate_granted_keywords()
                     game.recalculate_power_toughness()
@@ -1221,6 +1224,7 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                                 token_trigger_msgs.append(msg)
                     except Exception as e:
                         print(f"[TOKEN-ETB] Error firing triggers for {token_name}: {e}")
+                        maybe_reraise(e)
             if len(token_trigger_msgs) > 12:
                 token_trigger_msgs = rules._aggregate_counter_msgs(token_trigger_msgs)
 
@@ -2092,6 +2096,7 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                         dies_msgs.extend(trigger_msgs)
                 except Exception as e:
                     print(f"[DIES-TRIGGER] Error firing inline dies-triggers for {card.name}: {e}")
+                    maybe_reraise(e)
             msg = f"💀 **{card.name}** destroyed"
             if ltb_msgs:
                 msg += "\n" + "\n".join(ltb_msgs)
@@ -2584,6 +2589,7 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                             etb_msgs.extend(sync_result[0])
                     except Exception as e:
                         print(f"[FLICKER-ETB] Error firing re-entry triggers for {target_card.name}: {e}")
+                        maybe_reraise(e)
                 # May 20 audit fix: restore the outer resolution source so
                 # subsequent actions inside the flicker spell's own resolution
                 # are attributed correctly. Pair with the swap before the
@@ -3245,6 +3251,7 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                     game.register_replacement_effects(target_card, p.name)
                 except Exception as e:
                     print(f"[STEAL] Failed to re-register static effects for {target_card.name}: {e}")
+                    maybe_reraise(e)
                 # [LAYERS] Register Layer 2 control-change effect
                 if HAS_LAYERS_ENGINE and game.layers_engine:
                     _ctrl_eff = create_control_effect(
@@ -3551,8 +3558,11 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                     try:
                         if hasattr(ps, 'remove_stack_entry_by_priority_id'):
                             ps.remove_stack_entry_by_priority_id(pid)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        # Phantom-stack-entry class (May 18 audit): a failed
+                        # mirror-pop desyncs game.stack vs PrioritySystem.stack.
+                        print(f"[QUELLER-EXILE] Priority-mirror pop failed: {e}")
+                        maybe_reraise(e)
                 # Owner-aware exile zone. Stack entries track controller_name;
                 # owner may differ for stolen-then-cast spells but for the
                 # common case controller==owner this is right. Fall back to

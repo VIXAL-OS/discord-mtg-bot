@@ -309,6 +309,20 @@ class Card:
     damage_marked: int = 0
     deathtouch_damage: int = 0  # Damage from sources with deathtouch (CR 704.5h)
 
+    # ---- Transient runtime state (reset/derived during play; NOT serialized;
+    # to_dict is hand-written and skips these) ----
+    # Convention: new runtime flags become DECLARED fields with defaults here,
+    # not ad-hoc `card._x = ...` staples — tests/test_ratchets.py counts
+    # undeclared-staple sites and fails CI if the count grows. compare=False
+    # keeps equality semantics identical to pre-declaration behavior (staples
+    # never participated in ==, and `card in zone` / `.remove(card)` rely on it).
+    # Set by Tier 1/1.5/3 handlers when a cast's effect has resolved; cleared at
+    # the start of every cast (Lingering Souls re-cast bug, May 13 audit).
+    _spell_resolved: bool = field(default=False, repr=False, compare=False)
+    # Phasing (Teferi's Protection): phased-out permanents are skipped by
+    # combat / targeting / SBA sweeps (CR 702.26).
+    _phased_out: bool = field(default=False, repr=False, compare=False)
+
     # Temporary modifiers (from pump effects, etc.)
     power_modifier: int = 0
     toughness_modifier: int = 0
@@ -1369,6 +1383,20 @@ class Player:
     spells_cast_prev_turn: int = 0  # Spells cast during the player's previous turn
     noncreature_spells_cast_this_turn: int = 0  # For Esper Sentinel "first noncreature spell" tracking
     landfall_count_this_turn: int = 0  # Lands that entered under your control this turn (for Omnath, etc.)
+
+    # ---- Transient runtime state (reset/derived during play; NOT serialized) ----
+    # Same convention as Card: declare runtime flags, don't staple
+    # (tests/test_ratchets.py ratchets the undeclared-staple count).
+    # Teferi's Protection / Fog: damage prevention until expiry (checked
+    # against game.turn_number; inf = never expires until flag cleared).
+    _damage_prevented: bool = field(default=False, repr=False, compare=False)
+    _damage_prevented_expires_turn: float = field(default=float("inf"), repr=False, compare=False)
+    # Teferi's Protection: life total can't change while locked (CR 119.3-adjacent).
+    _life_total_locked: bool = field(default=False, repr=False, compare=False)
+    _life_total_locked_expires_turn: float = field(default=float("inf"), repr=False, compare=False)
+    # Card names blocked from casting this game (commander color identity,
+    # CR 903.4) — surfaced in the AI's "DO NOT CAST" prompt section.
+    _color_id_blocklist: set = field(default_factory=set, repr=False, compare=False)
 
     # Cards exiled but playable this turn (Chandra 0, Outpost Siege, etc.)
     # List of card IDs that can be played from exile until end of turn
@@ -2650,6 +2678,31 @@ class GameState:
     is_autoplay: bool = False
     # Track which effects have already emitted a !judge/!resolve hint (dedup in autoplay)
     _judge_hints_emitted: set = field(default_factory=set, repr=False)
+
+    # ---- Transient runtime state (rebuilt during play; NOT serialized —
+    # to_dict is hand-written, so save/load and !undo restore defaults and the
+    # engine repopulates). Same convention as Card/Player: declare runtime
+    # flags here, don't staple (tests/test_ratchets.py ratchets the count). ----
+    # (card, player) tuples queued for dies-trigger processing (SBA loop,
+    # board wipes, Living Death F-LD1). Drained by the trigger dispatcher.
+    _recently_died: list = field(default_factory=list, repr=False, compare=False)
+    # Spell Queller bookkeeping: source card name → [(exiled_card, owner_name)]
+    # (exile_from_stack records; release_queller_exile drains on LTB).
+    _queller_exiles: dict = field(default_factory=dict, repr=False, compare=False)
+    # Per-turn byte-identical Discord message counts (trigger-burst dedup
+    # Layer 3 in _autoplay_send). Reset at turn advance.
+    _turn_burst_counts: dict = field(default_factory=dict, repr=False, compare=False)
+    # Oracle-text dedup keys already shown this game (format_trigger_line /
+    # format_activate_line emit short form on 2nd+ fire).
+    _oracle_shown_keys: set = field(default_factory=set, repr=False, compare=False)
+    # (card_name, controller_name) of the spell/ability currently resolving —
+    # lets action handlers attribute damage / validate targets without every
+    # caller threading source metadata explicitly.
+    _current_resolution_source: Any = field(default=None, repr=False, compare=False)
+    # !undo snapshot stack (list of to_dict snapshots; depth-capped in cog).
+    _undo_stack: list = field(default_factory=list, repr=False, compare=False)
+    # Discord thread object for the running autoplay game (carried over on !undo).
+    _autoplay_thread: Any = field(default=None, repr=False, compare=False)
 
     # Opt-in: put triggered abilities on the stack instead of resolving immediately
     triggers_use_stack: bool = False

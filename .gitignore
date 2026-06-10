@@ -17,6 +17,7 @@ __pycache__/
 .Python
 venv/
 ENV/
+.pytest_cache/
 
 # IDE
 .vscode/
@@ -39,6 +40,10 @@ rules/target/
 # Audit-script artifacts (tools/audit_card_cache.py)
 data/card_data_cache.json.bak
 audit_report*.json
+
+# Scryfall bulk cache (tools/validate_card_names.py — ~170MB, re-downloadable)
+data/scryfall_oracle_cards.json
+data/scryfall_oracle_cards.part
 
 # YouTube transcripts (may contain private content from links shared in DMs/server)
 data/transcripts/

@@ -10,9 +10,44 @@ Originally lived at lines 266-394 of the monolith.
 """
 
 import contextvars
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional
+
+
+def strict_mode() -> bool:
+    """True when MTG_STRICT=1 (or true/yes) is set in the environment.
+
+    Read at call time, not import time, so the flag works regardless of
+    import order and tests can monkeypatch os.environ.
+    """
+    return os.getenv("MTG_STRICT", "").strip().lower() in ("1", "true", "yes")
+
+
+def maybe_reraise(exc: BaseException) -> None:
+    """Escalate a swallowed exception under MTG_STRICT=1; no-op otherwise.
+
+    Convention (June 10, 2026): pure-engine `except Exception` blocks — the
+    ones that convert crashes into silently-wrong game states (actions, SBA,
+    models, triggers, layers) — KEEP their existing log line (audit greps
+    depend on the tags) and add `maybe_reraise(e)` as the last statement:
+
+        except Exception as e:
+            print(f"[TAG] ...: {e}")   # unchanged
+            maybe_reraise(e)
+
+    Production behavior is unchanged (log-and-continue, Grayson's live games
+    stay crash-proof). CI and autoplay audit batches run with MTG_STRICT=1 so
+    swallowed engine exceptions surface loudly where they're cheap to catch.
+
+    Crash-barrier catches deliberately do NOT get this: LLM/network calls,
+    top-level Discord command handlers, and graceful-degradation fallbacks
+    that have a real recovery path (e.g. SBA delegation falling back to the
+    inline checker).
+    """
+    if strict_mode():
+        raise exc
 
 
 class GameLogger:
