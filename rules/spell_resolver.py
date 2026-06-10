@@ -428,27 +428,32 @@ class SpellResolver:
                     game.winner = 1 - game.players.index(target)
             
             elif hasattr(target, 'damage_marked'):
-                # It's a creature
+                # It's a creature. May 30 audit: mark damage and let SBA resolve any
+                # death so totem (Umbra) armor / undying / persist / shield counters
+                # all apply (CR 704.5g + 614.6). This path previously removed the
+                # creature inline, bypassing every death-replacement save, and used
+                # raw int(toughness) instead of effective toughness (so Spider Umbra's
+                # +1 was ignored too).
                 target.damage_marked += amount
                 messages.append(f"🔥 {ctx.source_card.name} deals {amount} damage to {target.name}")
-                
-                # Check for lethal damage
-                try:
-                    toughness = int(target.toughness) if target.toughness else 0
-                    toughness += getattr(target, 'toughness_modifier', 0)
-                    toughness += target.counters.get('+1/+1', 0) if hasattr(target, 'counters') else 0
-                    toughness -= target.counters.get('-1/-1', 0) if hasattr(target, 'counters') else 0
-                except (ValueError, TypeError):
-                    toughness = 0
-                
-                if target.damage_marked >= toughness:
-                    messages.append(f"💀 {target.name} dies from lethal damage!")
-                    # Move to graveyard
-                    for player in game.players:
-                        if target in player.battlefield:
-                            player.battlefield.remove(target)
-                            player.graveyard.append(target)
-                            break
+                if rules_engine is not None and hasattr(rules_engine, 'process_state_based_actions'):
+                    try:
+                        messages.extend(rules_engine.process_state_based_actions(game) or [])
+                    except Exception as _sba_err:
+                        print(f"[SPELL-DAMAGE] SBA after damage failed for {target.name}: {_sba_err}")
+                else:
+                    # Fallback (no engine ref): effective-toughness lethal check.
+                    try:
+                        _tuf = target.get_effective_toughness(game)
+                    except Exception:
+                        _tuf = int(target.toughness) if target.toughness else 0
+                    if target.damage_marked >= _tuf:
+                        messages.append(f"💀 {target.name} dies from lethal damage!")
+                        for player in game.players:
+                            if target in player.battlefield:
+                                player.battlefield.remove(target)
+                                player.graveyard.append(target)
+                                break
             
             elif hasattr(target, 'loyalty_counters'):
                 # It's a planeswalker

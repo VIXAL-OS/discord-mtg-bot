@@ -462,6 +462,14 @@ class ReplacementEngine:
                     and first.set_amount is None and e.set_amount is None
                     and not first.prevents and not e.prevents
                     and first.new_destination is None and e.new_destination is None):
+                # May 30 audit: two multipliers commute ONLY if they're the SAME
+                # direction. A reducer (×0.5, Gisela halve) and an amplifier (×2,
+                # Furnace) do NOT commute under integer floor-rounding — N=3 gives
+                # halve-first=2 vs double-first=3 — so the affected player must be
+                # given the choice (CR 616.1). Mixed-direction multipliers (one >1,
+                # one <1) are non-commutative.
+                if (first.multiply_amount - 1.0) * (e.multiply_amount - 1.0) < 0:
+                    return False
                 continue
             # Both purely additive?
             if (first.multiply_amount is None and e.multiply_amount is None
@@ -525,8 +533,21 @@ class ReplacementEngine:
             effects.sort(key=lambda e: e.timestamp)
             return effects[0]
 
-        # Sort: highest benefit first, timestamp as tie-breaker
-        effects.sort(key=lambda e: (-self._effect_benefit_score(e), e.timestamp))
+        # May 30 audit: the benefit score assumes a LARGER amount is good (tokens,
+        # counters, life gain) — apply amplifiers first. But for DAMAGE / LIFE_LOSS
+        # a larger amount HARMS the affected player, so the order they'd choose
+        # (CR 616.1) is the opposite: apply REDUCERS (halve/prevent) first so they
+        # feed into the amplifier and minimize the result. Invert the sort for
+        # harmful events. (Furnace ×2 + Gisela halve on damage to Gisela's
+        # controller: halve-first 3→1→2 beats double-first 3→6→3 for the victim.)
+        harmful = event.event_type in (
+            EventType.DAMAGE, EventType.COMBAT_DAMAGE, EventType.LIFE_LOSS)
+        if harmful:
+            # Ascending score → reducer (low score) applied first.
+            effects.sort(key=lambda e: (self._effect_benefit_score(e), e.timestamp))
+        else:
+            # Descending score → amplifier (high score) applied first.
+            effects.sort(key=lambda e: (-self._effect_benefit_score(e), e.timestamp))
         return effects[0]
 
 
@@ -624,12 +645,16 @@ def create_furnace_of_rath_effect(source_id: str, controller: str) -> Replacemen
         source_id=source_id,
         controller=controller,
         replaces_event=EventType.DAMAGE,
-        condition_text="damage from your sources doubled",
+        condition_text="all damage doubled",
         replacement_type="double_damage",
         multiply_amount=2.0,
-        condition=lambda ev, _ctrl=controller: (
-            bool(ev.source_controller) and ev.source_controller == _ctrl
-        ),
+        # May 30 audit: Furnace of Rath is SYMMETRIC — "If a SOURCE would deal
+        # damage..." doubles ALL damage from ANY source to ANY target, including
+        # damage dealt TO its own controller. The Apr 2026 "house rule" gating it
+        # to source_controller == controller was CR-incorrect: it stopped Furnace
+        # from doubling incoming damage, so it never co-applied with Gisela's halve
+        # and the CR-616.1 controller-chooses-order case never fired (confirmed by
+        # test_replacement_controller_order.py). No source condition — doubles all.
     )
 
 

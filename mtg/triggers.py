@@ -163,6 +163,23 @@ except ImportError:
     HAS_XMAGE_BRIDGE = False
 
 
+def _log_life_change(player, delta: int, source: str) -> None:
+    """Emit the canonical [LIFE-GAIN]/[LIFE-LOSS] console tag that audit
+    reconciliation greps for. May 30 audit: several inline trigger paths
+    (cast-trigger gains — Sythis/Herald/Soul Warden; Blood Artist / Zulaport /
+    Bastion dies-drains; Syr Konrad) applied life directly without these tags,
+    so life-math reconciliation couldn't see them (one Sythis gain logged
+    nothing at all). State was always correct; this only restores observability.
+    Mirrors the format emitted by the gain_life/lose_life actions in actions.py."""
+    try:
+        if delta > 0:
+            print(f"[LIFE-GAIN] {player.name}: +{delta} life → {player.life} ({source})")
+        elif delta < 0:
+            print(f"[LIFE-LOSS] {player.name}: {delta} life → {player.life} ({source})")
+    except Exception:
+        pass
+
+
 async def drain_pending_triggers(engine, game: GameState) -> List[str]:
     """Drain the pending async trigger queue by calling Tier 3 resolve_effect.
 
@@ -1273,6 +1290,11 @@ async def _check_cast_triggers(engine, game: GameState, caster: Player, card: Ca
                 if life_match:
                     life_amt = int(life_match.group(1))
                     caster.life += life_amt
+                    # May 30 audit: emit the canonical [LIFE-GAIN] tag the audit
+                    # reconciliation greps for — this cast-trigger path (Sythis,
+                    # Herald of the Pantheon, Soul Warden family) applied life
+                    # directly and one Sythis gain logged nothing at all.
+                    _log_life_change(caster, life_amt, f"cast trigger: {bf_card.name}")
                     messages.append(f"⚡ {bf_card.name} — {caster.name} gains {life_amt} life")
                     executed_trigger = True
 
@@ -1653,7 +1675,8 @@ def _check_dies_triggers_sync(engine, game: GameState, dying_card: Card, dying_p
     if dying_card.oracle_text and "dies" in dying_card.oracle_text.lower():
         dying_oracle = dying_card.oracle_text.lower()
         if (dying_card.name.lower() in dying_oracle and "dies" in dying_oracle) or \
-           "whenever a creature" in dying_oracle:
+           "whenever a creature" in dying_oracle or \
+           "nontoken creature" in dying_oracle:  # May 30 audit: Midnight Reaper et al.
             cards_to_scan.append((dying_card, dying_player))
 
     # May 20 audit (APNAP-1): sort by NON-active player first so dies triggers
@@ -1687,14 +1710,23 @@ def _check_dies_triggers_sync(engine, game: GameState, dying_card: Card, dying_p
 
         # Skip "whenever ANOTHER creature dies" triggers from the dying card
         # (but allow "whenever a creature dies" or engine-referencing triggers like Blood Artist)
-        if card.id == dying_card.id and "whenever another creature" in oracle_lower:
+        if card.id == dying_card.id and (
+                "whenever another creature" in oracle_lower
+                or "whenever another nontoken creature" in oracle_lower):
             continue
 
         # Check if this is a "whenever a/another creature dies" trigger
+        # May 30 audit: the "nontoken creature" branch was missing, so
+        # "Whenever a nontoken creature you control dies" (Midnight Reaper, Judith
+        # the Scourge Diva, Liliana Heretical Healer's flip) never matched — the
+        # "nontoken" qualifier defeats "whenever a creature" and modern "this
+        # creature" templating defeats the name-in-oracle check, so the trigger
+        # was silently dropped at the `continue` below.
         has_dies_trigger = (
             ("whenever a creature" in oracle_lower and "dies" in oracle_lower) or
             ("whenever another creature" in oracle_lower and "dies" in oracle_lower) or
             ("whenever a creature you control dies" in oracle_lower) or
+            ("nontoken creature" in oracle_lower and "dies" in oracle_lower) or
             (card.name.lower() in oracle_lower and "dies" in oracle_lower)
         )
 
@@ -1714,6 +1746,9 @@ def _check_dies_triggers_sync(engine, game: GameState, dying_card: Card, dying_p
             opp.life -= 1
             ctrl.life += 1
             print(f"[DIES-TRIGGER] {card.name}: {opp.name} loses 1 life (life: {opp.life}), {ctrl.name} gains 1 life (life: {ctrl.life})")
+            # May 30 audit: also emit the canonical life tags for audit greps.
+            _log_life_change(opp, -1, f"dies trigger: {card.name}")
+            _log_life_change(ctrl, 1, f"dies trigger: {card.name}")
             messages.append(f"💀 {card.name}: {opp.name} loses 1 life, {ctrl.name} gains 1 life")
             trigger_count += 1
             handled = True
@@ -1728,6 +1763,7 @@ def _check_dies_triggers_sync(engine, game: GameState, dying_card: Card, dying_p
         elif card.name.lower() == "syr konrad, the grim":
             opp.life -= 1
             print(f"[DIES-TRIGGER] Syr Konrad, the Grim: deals 1 damage to {opp.name} (life: {opp.life})")
+            _log_life_change(opp, -1, "Syr Konrad, the Grim")  # May 30 audit: canonical tag
             messages.append(f"💀 Syr Konrad: deals 1 damage to {opp.name} ({max(0, opp.life)} life)")
             trigger_count += 1
             handled = True
@@ -2479,6 +2515,7 @@ def _check_upkeep_triggers_sync(engine, game: GameState) -> Tuple[List[str], Lis
             drawn = engine.draw_cards(active, 1, game=game)
             active.life -= 1
             print(f"[UPKEEP-TRIGGER] Phyrexian Arena: {active.name} loses 1 life (life: {active.life})")
+            _log_life_change(active, -1, "Phyrexian Arena")  # May 30 audit: canonical tag
             if drawn:
                 if active.is_claude:
                     messages.append(f"📖 Phyrexian Arena: {active.name} draws a card, loses 1 life")
@@ -2687,6 +2724,66 @@ def _check_upkeep_triggers_sync(engine, game: GameState) -> Tuple[List[str], Lis
                         print(f"[UPKEEP-TEMPLATE] Error for {card.name}: {e}")
                     unhandled.append((card, trigger_text))
 
+    return messages, unhandled
+
+
+def _check_beginning_combat_triggers_sync(engine, game: GameState) -> Tuple[List[str], List[Tuple]]:
+    """Check for 'At the beginning of combat on your turn' triggers — Luminarch
+    Aspirant (+1/+1 counter), Goblin Rabblemaster (Goblin token), Hero of
+    Bladehold, etc. May 30 audit: this whole trigger class was UNWIRED — the
+    template and the effect_templates `beginning_combat` event type existed, but
+    nothing in mtg/ ever dispatched it (advance_phase's COMBAT_BEGIN branch only
+    printed a display string), so the triggers silently never fired.
+
+    "on your turn" -> only the active player's permanents trigger.
+    Returns (messages, unhandled_triggers)."""
+    messages = []
+    unhandled = []
+    active = game.active_player
+    active_idx = game.active_player_index
+    opponent = game.players[1 - active_idx]
+    lib = get_effect_library() if HAS_EFFECT_TEMPLATES else None
+
+    for card in list(active.battlefield):
+        if getattr(card, '_phased_out', False) or not card.oracle_text:
+            continue
+        oracle_lower = card.oracle_text.lower()
+        if "beginning of combat" not in oracle_lower or card.is_planeswalker():
+            continue
+        # Isolate the trigger paragraph (mirrors the end-step extraction).
+        trigger_text = ""
+        for paragraph in card.oracle_text.split('\n'):
+            if "at the beginning of combat" in paragraph.lower():
+                trigger_text = paragraph.strip()
+                break
+        if not trigger_text:
+            continue
+        handled = False
+        if lib is not None:
+            try:
+                ctx = build_game_context(game, active, opponent, card=card)
+                ctx['_trigger_source'] = card.name
+                actions, explanation = lib.resolve_etb(
+                    card_name=card.name, oracle_text=trigger_text,
+                    controller=active.name, opponent=opponent.name,
+                    game_context=ctx, event_type="beginning_combat",
+                )
+                if actions:
+                    for action in actions:
+                        if action.get("action") == "no_action":
+                            continue
+                        try:
+                            msg = engine.rules._execute_action_on_state(game, action)
+                            if msg:
+                                messages.append(msg)
+                        except Exception as e:
+                            print(f"[COMBAT-BEGIN-TEMPLATE] Action failed for {card.name}: {e}")
+                    print(f"[COMBAT-BEGIN-TRIGGER] Resolved {card.name}: {explanation}")
+                    handled = True
+            except Exception as e:
+                print(f"[COMBAT-BEGIN-TEMPLATE] Error for {card.name}: {e}")
+        if not handled:
+            unhandled.append((card, trigger_text))
     return messages, unhandled
 
 
@@ -2996,7 +3093,7 @@ def _handle_etb_triggers(engine, game: GameState, player: Player, card: Card) ->
         # Warstorm Surge: Deal damage equal to creature's power
         for perm in player.battlefield:
             if perm.name.lower() == "warstorm surge" and perm != card:
-                if card.is_creature():
+                if card.is_creature(game):  # May 30 audit: devotion-god ETB (CR 603.2a)
                     power = card.get_effective_power(game)
                     if power > 0:
                         player_idx = game.players.index(player)

@@ -1522,6 +1522,11 @@ class GameEngine:
     # END STEP TRIGGER DETECTION
     # =========================================================================
 
+    def _check_beginning_combat_triggers_sync(self, game: GameState) -> Tuple[List[str], List[Tuple]]:
+        """Delegates to mtg.triggers._check_beginning_combat_triggers_sync (May 30 audit)."""
+        from mtg.triggers import _check_beginning_combat_triggers_sync
+        return _check_beginning_combat_triggers_sync(self, game)
+
     def _check_end_step_triggers_sync(self, game: GameState) -> Tuple[List[str], List[Tuple]]:
         """Delegates to mtg.triggers._check_end_step_triggers_sync (Phase 2E)."""
         from mtg.triggers import _check_end_step_triggers_sync
@@ -1940,7 +1945,22 @@ class GameEngine:
         
         elif game.phase == Phase.COMBAT_BEGIN:
             messages.append(f"⚔️ **Beginning of Combat**")
-        
+            # May 30 audit: dispatch "at the beginning of combat on your turn"
+            # triggers (Luminarch Aspirant +1/+1 counter, Goblin Rabblemaster
+            # token, Hero of Bladehold, etc.). Previously UNWIRED — this branch
+            # only printed the display string, so the entire trigger class never
+            # fired. Templated triggers resolve here synchronously; the rest queue
+            # for async Tier 3 (drain_pending_triggers), like other sync paths.
+            try:
+                _bc_msgs, _bc_unhandled = self._check_beginning_combat_triggers_sync(game)
+                messages.extend(_bc_msgs)
+                for _bc_card, _bc_text in _bc_unhandled:
+                    self._queue_async_trigger(
+                        game, _bc_card, _bc_text, "beginning_combat",
+                        game.active_player.name, "beginning of combat on your turn")
+            except Exception as _bc_err:
+                print(f"[COMBAT-BEGIN] Error dispatching beginning-of-combat triggers: {_bc_err}")
+
         elif game.phase == Phase.DECLARE_ATTACKERS:
             messages.append(f"🗡️ **Declare Attackers Step**")
         
@@ -2034,6 +2054,20 @@ class GameEngine:
                 # Fire dies triggers for creatures that died during phase-transition SBAs
                 recently_died = getattr(game, '_recently_died', [])
                 if recently_died and not game.ended:
+                    # May 30 audit (F-LD2): apply the same APNAP sort the SBA drain
+                    # uses (engine.py ~1774) so multi-controller dies-triggers
+                    # resolve NAP-first per CR 603.3b LIFO. This drain previously
+                    # iterated in raw insertion order (player 0 first), which can
+                    # invert the ordering when a board wipe's deaths are first
+                    # drained at a phase transition rather than by check_state_based_actions.
+                    try:
+                        _active_idx = game.active_player_index
+                        recently_died = sorted(
+                            recently_died,
+                            key=lambda pair: 0 if game.players.index(pair[1]) != _active_idx else 1,
+                        )
+                    except Exception:
+                        pass
                     phase_burst: List[str] = []
                     for dead_card, dead_player in recently_died:
                         try:

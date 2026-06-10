@@ -270,6 +270,20 @@ def _compute_pt_for_sba(card, game):
     raw_t = str(card.toughness or '').strip()
     is_cda = '*' in raw_p or '*' in raw_t
 
+    # Death's Shadow-style dynamic debuff ("gets -X/-X, where X is your life
+    # total") prints integer P/T, so the '*' check misses it — but the debuff
+    # lives only in get_effective_* (the layers engine skips dynamic
+    # magnitudes). Without collapsing here, the delegated SBA checker saw a
+    # 13/13 at ANY life total and the zero-toughness death promised by
+    # mtg/models.py:_get_life_total_debuff never fired
+    # (tests/test_models.py::TestDeathsShadow caught this June 10).
+    if not is_cda and game is not None:
+        try:
+            if card._get_life_total_debuff(game) > 0:
+                is_cda = True
+        except Exception:
+            pass
+
     if is_cda and hasattr(card, 'get_effective_power') and hasattr(card, 'get_effective_toughness'):
         # CDA: fold everything into base and zero the rest to avoid double-counting
         try:

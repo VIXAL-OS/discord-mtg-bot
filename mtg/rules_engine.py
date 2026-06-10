@@ -479,7 +479,7 @@ class RulesEngine:
             if card.is_enchantment() and 'Aura' in (card.type_line or ''):
                 if card.attached_to == creature.id:
                     oracle = (card.oracle_text or '').lower()
-                    if 'totem armor' in oracle:
+                    if 'totem armor' in oracle or 'umbra armor' in oracle:
                         return True
         return False
 
@@ -489,7 +489,7 @@ class RulesEngine:
             if card.is_enchantment() and 'Aura' in (card.type_line or ''):
                 if card.attached_to == creature.id:
                     oracle = (card.oracle_text or '').lower()
-                    if 'totem armor' in oracle:
+                    if 'totem armor' in oracle or 'umbra armor' in oracle:
                         game.unregister_static_effects(card)
                         player.battlefield.remove(card)
                         player.graveyard.append(card)

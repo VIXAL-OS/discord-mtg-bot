@@ -983,6 +983,53 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                     msg += "\n" + "\n".join(ltb_trigger_msgs)
                 return msg
     
+    # ---- PROLIFERATE (Atraxa, Flux Channeler, Evolution Sage, Karn's Bastion) ----
+    # CR 701.27: choose any number of permanents and/or players with a counter,
+    # then give each another counter of a kind already there. The controller
+    # chooses, so we proliferate only what helps them: their own permanents'
+    # counters (skipping -1/-1), loyalty on their own planeswalkers, their own
+    # energy, and poison/-1/-1 on opponents. It NEVER touches life — May 26 audit:
+    # with no lower-tier handler, Atraxa's end-step proliferate escalated to Tier 3,
+    # which hallucinated a +1/-1 life swing (proliferate has no life component).
+    elif action_type == "proliferate":
+        prolif = find_player(action.get("player", ""))
+        if prolif is None:
+            prolif = game.players[game.active_player_index]
+        proliferated = []
+        for p in game.players:
+            is_own = (p is prolif)
+            for c in list(p.battlefield):
+                ctrs = getattr(c, 'counters', None)
+                if ctrs:
+                    for ctype, cnt in list(ctrs.items()):
+                        if cnt <= 0:
+                            continue
+                        beneficial = (ctype != '-1/-1')
+                        # own -> proliferate beneficial; opponent -> only detrimental
+                        if is_own != beneficial:
+                            continue
+                        ctrs[ctype] = cnt + 1
+                        proliferated.append(f"{c.name} ({ctype})")
+                # Loyalty on own planeswalkers (stored separately from counters dict)
+                if is_own and getattr(c, 'loyalty_counters', 0) and c.loyalty_counters > 0 \
+                        and 'planeswalker' in (c.type_line or '').lower():
+                    c.loyalty_counters += 1
+                    proliferated.append(f"{c.name} (loyalty)")
+            # Player-level counters: own energy (beneficial), opponents' poison
+            if is_own and getattr(p, 'energy', 0) > 0:
+                p.energy += 1
+                proliferated.append(f"{p.name} (energy)")
+            if (not is_own) and getattr(p, 'poison', 0) > 0:
+                p.poison += 1
+                proliferated.append(f"{p.name} (poison)")
+        game.recalculate_power_toughness()
+        if not proliferated:
+            print(f"[PROLIFERATE] {prolif.name}: nothing to proliferate")
+            return None
+        shown = ", ".join(proliferated[:8]) + (f" +{len(proliferated) - 8} more" if len(proliferated) > 8 else "")
+        print(f"[PROLIFERATE] {prolif.name}: {len(proliferated)} target(s) — {shown}")
+        return f"🔬 **{prolif.name}** proliferates: {shown}"
+
     # ---- COUNTERS ----
     elif action_type == "add_counters":
         counter_type = action.get("counter_type", "+1/+1")
@@ -1753,7 +1800,12 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                 t_str = f"+{pump_toughness}" if pump_toughness >= 0 else str(pump_toughness)
                 print(f"[PUMP] {pump_player.name}'s creatures get {p_str}/{t_str}{kw_str}: {pumped}")
                 return f"💪 {pump_player.name}'s creatures get {p_str}/{t_str}{kw_str} until end of turn ({len(pumped)} creatures)"
-        return f"Pump effect: no creatures found for {pump_player_name}"
+        # May 26 audit: this branch used to leak the raw scaffolding string
+        # "Pump effect: no creatures found for <name>" (trailing space when the
+        # player name was empty) to Discord — e.g. Toxic Deluge "creatures get
+        # -X/-X" cast into an empty board. Return None like the other no-op
+        # action paths (add_counters at affected==0) so nothing is emitted.
+        return None
 
     # ---- PUT BACK FROM HAND (Brainstorm, etc.) ----
     elif action_type == "put_back_from_hand":
@@ -2256,6 +2308,7 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
         # and put each player's events on their own line so the board state
         # is reconstructable from the message.
         messages_parts = []
+        ld_died_list = []  # May 30 audit (F-LD1): collect sacrificed creatures for dies-triggers
         for p in game.players:
             # Save graveyard creatures first
             gy_creatures = [c for c in p.graveyard if 'creature' in (c.type_line or '').lower()]
@@ -2265,6 +2318,7 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                 game.unregister_static_effects(c)
                 p.battlefield.remove(c)
                 p.graveyard.append(c)
+                ld_died_list.append((c, p))
             if bf_creatures:
                 bf_names = ', '.join(c.name for c in bf_creatures)
                 messages_parts.append(f"{p.name} sacrifices {len(bf_creatures)}: {bf_names}")
@@ -2284,6 +2338,18 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
             if gy_creatures:
                 gy_names = ', '.join(c.name for c in gy_creatures)
                 messages_parts.append(f"{p.name} returns {len(gy_creatures)} from graveyard: {gy_names}")
+        # May 30 audit (F-LD1): queue the SACRIFICED creatures so dies-triggers
+        # (Blood Artist, Zulaport, Bastion, Grave Pact, etc.) actually fire.
+        # Living Death previously removed creatures inline without queueing
+        # _recently_died, so every dies-trigger on a Living Death was silently
+        # dropped (Korvold's death was invisible to Bastion in
+        # game_1508810609507045508). The graveyard-RETURNED creatures are a
+        # separate "enters" event and are not queued here. Mirrors
+        # destroy_all_creatures' _recently_died handling.
+        if ld_died_list:
+            if not hasattr(game, '_recently_died'):
+                game._recently_died = []
+            game._recently_died.extend(ld_died_list)
         if messages_parts:
             # [LAYERS] Recalculate after mass creature entry
             game.recalculate_granted_keywords()
@@ -2746,11 +2812,47 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                     type_line_lower = (creature.type_line or '').lower()
                     if any(et in type_line_lower for et in exclude_types):
                         continue
+                # May 30 audit: board wipes must honor destroy-replacement saves
+                # (CR 614.6/702), not just indestructible. Mirror the SBA save order
+                # (mtg/sba.py): shield counter -> totem (Umbra) armor -> destroy, then
+                # undying/persist on the creatures that do die. Previously only
+                # indestructible was checked, so the entire death_replacement mechanic
+                # (Umbra armor, Woodfall Primus persist, undying) died permanently to
+                # any wrath.
+                if creature.counters.get('shield', 0) > 0:
+                    creature.counters['shield'] -= 1
+                    print(f"[SHIELD-COUNTER] {creature.name}: shield removed instead of destroyed (board wipe)")
+                    continue
+                if rules._has_totem_armor(creature, p):
+                    _aura = rules._remove_totem_armor(creature, p, game)
+                    print(f"[TOTEM-ARMOR] {creature.name}: {_aura.name if _aura else '?'} destroyed instead (board wipe)")
+                    continue
                 game.unregister_static_effects(creature)
                 p.battlefield.remove(creature)
                 p.graveyard.append(creature)
                 destroyed.append(creature.name)
                 died_list.append((creature, p))
+                # Undying / Persist (CR 614.6): the creature died, but returns with
+                # the appropriate counter if it qualifies. (ETB re-fire of the new
+                # object is handled by the SBA path for damage deaths; here we return
+                # the permanent so it isn't lost to the wrath.)
+                if creature.has_keyword('Undying') or rules._permanent_grants_undying(game, creature, p):
+                    if creature.counters.get('+1/+1', 0) == 0:
+                        p.graveyard.remove(creature)
+                        creature.damage_marked = 0
+                        creature.deathtouch_damage = 0
+                        creature.summoning_sick = True
+                        creature.counters['+1/+1'] = creature.counters.get('+1/+1', 0) + 1
+                        p.battlefield.append(creature)
+                        print(f"[UNDYING] {creature.name} returned to battlefield with +1/+1 counter (board wipe)")
+                elif creature.has_keyword('Persist') and creature.counters.get('-1/-1', 0) == 0:
+                    p.graveyard.remove(creature)
+                    creature.damage_marked = 0
+                    creature.deathtouch_damage = 0
+                    creature.summoning_sick = True
+                    creature.counters['-1/-1'] = creature.counters.get('-1/-1', 0) + 1
+                    p.battlefield.append(creature)
+                    print(f"[PERSIST] {creature.name} returned to battlefield with -1/-1 counter (board wipe)")
         # Fire dies triggers for all creatures that died simultaneously
         # (Blood Artist, Zulaport Cutthroat, etc.)
         if died_list:
@@ -2928,7 +3030,14 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
         if destroyed:
             game.recalculate_granted_keywords()
             game.recalculate_power_toughness()
-            return f"💥 Destroys all {perm_type}: {', '.join(destroyed[:8])}{'...' if len(destroyed) > 8 else ''}"
+            # May 30 audit: show full names (Austere Command etc.) instead of a
+            # bare "..." that hid which permanents died — only fall back to a
+            # counted "+N more" when the line would get unwieldy. Mirrors the
+            # May 17 Living Death full-names fix.
+            _dnames = ', '.join(destroyed)
+            if len(_dnames) > 300:
+                _dnames = ', '.join(destroyed[:8]) + f" +{len(destroyed) - 8} more"
+            return f"💥 Destroys all {perm_type}: {_dnames}"
         return f"💥 No {perm_type} to destroy"
 
     elif action_type == "destroy_creatures_by_cmc":

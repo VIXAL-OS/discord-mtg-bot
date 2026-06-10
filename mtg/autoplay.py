@@ -871,6 +871,14 @@ async def _autoplay_human_turn(cog, thread, game: GameState, player_idx: int):
                             if not blk_result:
                                 continue
                             blocker = blk_result[0]
+                            # May 30 audit: same can_block guard as the main block paths —
+                            # this additional-combat (Moraug) path was also missing it, so a
+                            # non-creature god or illegal blocker could slip in here too
+                            # (CR 509.1a/b). Mirror the guarded paths at ~727 and ~793.
+                            if not blocker.can_block(attacker, game=game):
+                                print(f"[BLOCK-INVALID] {blocker.name} cannot block "
+                                      f"{attacker.name} (evasion mismatch) — skipped")
+                                continue
                             blocker.blocking.append(attacker.id)
                             attacker.blocked_by.append(blocker.id)
                             if attacker.id not in game.blockers:
@@ -2300,8 +2308,8 @@ async def _run_single_autoplay(cog, channel, game_format: str, deck1_name: str, 
                         game.ended = True
                         game.winner = None
                         await cog._autoplay_send(thread,
-                            "⏸️ **[AUTOPLAY] Stagnation draw — no significant "
-                            "life change in 15 turns past turn 30 (likely flicker or "
+                            "⏸️ **Stagnation draw — no significant "
+                            "life change in 15 turns past turn 30 (likely a flicker or "
                             "soft-lock loop neither side can break)**")
                         print(f"[AUTOPLAY] [STUCK-GAME] Stagnation draw at turn "
                               f"{turn_num}; life history last 15: {recent}")
@@ -2401,12 +2409,28 @@ async def _run_single_autoplay(cog, channel, game_format: str, deck1_name: str, 
                                         if not blk_result:
                                             continue
                                         blocker = blk_result[0]
+                                        # May 30 audit: guard this path (Claude attacks, Rick
+                                        # blocks — reached after "[EXECUTE_CLAUDE] Pausing for
+                                        # human blocks") with can_block. It was the one block-
+                                        # application loop missing the check, letting non-creature
+                                        # devotion gods (Erebos at devotion<5) block and deal
+                                        # combat damage, and letting ground creatures block fliers
+                                        # (CR 509.1a/b). Mirror the guarded paths at ~727 and ~793.
+                                        if not blocker.can_block(attacker, game=game):
+                                            print(f"[BLOCK-INVALID] {blocker.name} cannot block "
+                                                  f"{attacker.name} (evasion mismatch) — skipped")
+                                            continue
                                         blocker.blocking.append(attacker.id)
                                         attacker.blocked_by.append(blocker.id)
                                         if attacker.id not in game.blockers:
                                             game.blockers[attacker.id] = []
                                         game.blockers[attacker.id].append(blocker.id)
                                         blk_names.append(_label_for2(blocker))
+                                    # May 30 audit: mirror the ~750 filter so a fully-rejected
+                                    # block doesn't emit "• blocks <Attacker>" with no blocker name.
+                                    blk_names = [n for n in blk_names if n and n.strip()]
+                                    if not blk_names:
+                                        continue
                                     block_msgs.append(f"{', '.join(blk_names)} blocks {attacker_label}")
                             if block_msgs:
                                 await cog._autoplay_send(thread,
@@ -2576,23 +2600,29 @@ async def _run_single_autoplay(cog, channel, game_format: str, deck1_name: str, 
             if 'effect_executor_client' in _original_clients:
                 cog.engine.spell_resolver.effect_executor.claude_client = _original_clients['effect_executor_client']
             # Log Deepseek stats — both per-game delta and cumulative.
-            # May 14 audit (T5): also estimate dollar cost so cost audits
-            # have something to grep. V4 pricing (subject to change):
-            # - V4-Flash (actor):     $0.27/M input miss, $0.07/M hit, $1.10/M out
-            # - V4-Pro   (strategist): $0.56/M input,                 $1.68/M out
-            # May 16 audit: previously we summed both adapters under V4-Flash
-            # rates, silently undercounting strategist spend by ~50%. Now query
-            # both adapters separately and apply per-rate pricing.
-            # DeepSeek V4 pricing (subject to change):
-            # - V4-Flash (actor):  $0.27/M input miss, $0.07/M cache hit, $1.10/M output
-            # - V4-Pro (strategist): $0.56/M input miss, $0.14/M cache hit, $1.68/M output
-            # Hit rates run 60-89% in normal play so the discount is material.
-            ACTOR_INPUT_MISS_RATE = 0.27 / 1_000_000
-            ACTOR_INPUT_HIT_RATE  = 0.07 / 1_000_000
-            ACTOR_OUTPUT_RATE     = 1.10 / 1_000_000
-            STRAT_INPUT_MISS_RATE = 0.56 / 1_000_000
-            STRAT_INPUT_HIT_RATE  = 0.14 / 1_000_000
-            STRAT_OUTPUT_RATE     = 1.68 / 1_000_000
+            # DeepSeek V4 pricing — REAL rates, verified May 30 2026 against the
+            # account's own usage export (usage_data_2026_5.zip, `price` column).
+            # These reproduce the billed cost to the cent ($3.03 for May 26).
+            # The earlier list rates (V4-Flash $0.27/$0.07/$1.10, V4-Pro
+            # $0.56/$0.14/$1.68) over-estimated ~38x — overwhelmingly because the
+            # cache-HIT price is ~25-39x lower than modeled, and hits are ~66-84%
+            # of input tokens; output is also 2-4x lower than the old list rate.
+            #   V4-Flash (actor):      hit $0.0028/M, miss $0.14/M,  out $0.28/M
+            #   V4-Pro   (strategist): hit $0.0036/M, miss $0.435/M, out $0.87/M
+            ACTOR_INPUT_MISS_RATE = 0.14   / 1_000_000
+            ACTOR_INPUT_HIT_RATE  = 0.0028 / 1_000_000
+            ACTOR_OUTPUT_RATE     = 0.28   / 1_000_000
+            STRAT_INPUT_MISS_RATE = 0.435  / 1_000_000
+            STRAT_INPUT_HIT_RATE  = 0.0036 / 1_000_000
+            STRAT_OUTPUT_RATE     = 0.87   / 1_000_000
+            # PARALLEL-MODE CAVEAT: with real rates the CUMULATIVE
+            # [STATS-CUMULATIVE] est_cost tracks the real bill. The per-game
+            # [STATS-GAME] delta is UNRELIABLE under `!autoplay-parallel` — all
+            # concurrent games share one adapter, so each game's
+            # (stats - game_start) delta sweeps up other games' tokens. Summing
+            # per-game costs over a parallel batch over-counts ~18x (that was the
+            # bogus "$115" — DeepSeek billed ~$3). Trust the cumulative line for
+            # batch cost; the per-game line is only clean in sequential autoplay.
             def _split_input(prompt_tokens: int, hit_tokens: int, miss_tokens: int):
                 """Split a prompt-token total proportionally between hit/miss
                 when the breakdown is known. Falls back to all-miss when no

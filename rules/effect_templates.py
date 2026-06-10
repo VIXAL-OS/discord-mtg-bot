@@ -425,6 +425,7 @@ class EffectTemplateLibrary:
                         ctx = game_context or {}
                         ctx['_match'] = match
                         ctx['_oracle'] = oracle_lower
+                        ctx['_event_type'] = event_type
                         actions = template.action_generator(controller, opponent, ctx)
                         if actions is not None:
                             # May 7 audit fix #4: prefer a dynamic description_fn
@@ -3124,6 +3125,25 @@ class EffectTemplateLibrary:
                 action_generator=self._gen_draw_from_match,
             )
         )
+
+        # Proliferate (Atraxa end-step, Flux Channeler cast-trigger, Evolution
+        # Sage landfall, Tezzeret's Gambit). May 26 audit: proliferate had NO
+        # lower-tier handler, so it escalated to Tier 3 — which hallucinated a
+        # +1/-1 life swing for Atraxa's proliferate (proliferate never touches
+        # life). Match only when "proliferate" is the whole effect clause
+        # (clause-final, before reminder text or end-of-string) so bundled
+        # effects ("draw a card, then proliferate") fall through rather than
+        # dropping their other half. _gen_proliferate additionally guards
+        # against firing on a creature's ETB scan when the proliferate is
+        # really a scheduled (end-step/upkeep) trigger.
+        self._add_pattern(
+            r"(?:^|[,.:—]\s*|then\s+)proliferate\b\.?\s*(?:\(|$)",
+            EffectTemplate(
+                name="Proliferate",
+                description="Proliferate (add a counter of each existing kind)",
+                action_generator=self._gen_proliferate,
+            )
+        )
         
         # "When [this] enters, scry N"
         self._add_pattern(
@@ -4688,7 +4708,7 @@ class EffectTemplateLibrary:
         # time (with +1/+1 counter from undying), at which point the trigger text is still
         # present in oracle but undying cannot apply.
         for _undying_card in [
-            "strangleroot geist", "geralf's messenger", "young wolf", "butcher ghoul",
+            "strangleroot geist", "young wolf", "butcher ghoul",
             "gravecrawler",  # (Gravecrawler has a different mechanic but similar self-death text)
             "mikaeus, the unhallowed",  # Gives undying to non-humans
         ]:
@@ -4699,6 +4719,42 @@ class EffectTemplateLibrary:
                     {"action": "no_action", "reason": "Undying is handled mechanically by the SBA engine"}
                 ],
             ))
+
+        # Geralf's Messenger: "When Geralf's Messenger enters, target opponent loses
+        # 2 life." It ALSO has undying — but undying is SBA-handled, so it must NOT be
+        # in the no-action list above (May 26 audit: that list swallowed the ETB drain
+        # on the initial cast AND every undying return). CR 603.6c: the undying-returned
+        # permanent is a new object whose ETB fires again, so this drain repeats per enter.
+        self._add_card("geralf's messenger", EffectTemplate(
+            name="Geralf's Messenger",
+            description="ETB: target opponent loses 2 life (undying still SBA-handled)",
+            action_generator=lambda ctrl, opp, ctx: [
+                {"action": "lose_life", "player": opp, "amount": 2}
+            ],
+        ))
+        # ...but on the DIES event we must NOT re-run the ETB drain. resolve_etb
+        # checks _dies_templates first (early return), so register a no-op there;
+        # this also preserves the old behavior of suppressing the spurious
+        # !resolve prompt on the second death (undying can't re-apply once a
+        # +1/+1 counter is present, but the undying text is still in the oracle).
+        self._add_dies_card("geralf's messenger", EffectTemplate(
+            name="Geralf's Messenger",
+            description="Undying handled by SBA engine; ETB drain does not re-fire on death",
+            action_generator=lambda ctrl, opp, ctx: [
+                {"action": "no_action", "reason": "Undying is handled mechanically by the SBA engine"}
+            ],
+        ))
+
+        # Finale of Devastation: {X}{G}{G} — creatures you control get +X/+X and
+        # gain trample; if X >= 10, search your library for a creature and put it
+        # onto the battlefield. May 30 audit: no template existed, so it escalated
+        # to Tier 3 (which returned no actions → the spell did nothing, bare
+        # "resolves." shown). Both halves are handled here at Tier 1.5.
+        self._add_card("finale of devastation", EffectTemplate(
+            name="Finale of Devastation",
+            description="Creatures you control get +X/+X and trample; if X>=10, tutor a creature into play",
+            action_generator=self._gen_finale_of_devastation,
+        ))
 
         # Voice of Resurgence: "whenever an opponent casts a spell during your turn OR when VoR dies"
         # → create a green and white Elemental token with P/T = # of creatures controller controls.
@@ -7489,6 +7545,43 @@ class EffectTemplateLibrary:
 
     def _add_pattern(self, pattern: str, template: EffectTemplate):
         self._pattern_templates.append((pattern, template))
+
+    def _gen_proliferate(self, ctrl: str, opp: str, ctx: Dict) -> Optional[List[Dict]]:
+        """Emit a proliferate action. Guards the enter-event case: when this is the
+        creature's ETB self-resolution (_event_type == 'etb') but the matched
+        'proliferate' belongs to a SCHEDULED trigger ('At the beginning of your
+        end step, proliferate' — Atraxa), don't fire on enter; the upkeep/end-step
+        dispatcher fires it at the right time. A genuine ETB proliferate ('When ~
+        enters, proliferate') still fires because 'enters' precedes the clause."""
+        if ctx.get('_event_type', 'etb') == 'etb':
+            m = ctx.get('_match')
+            oracle = ctx.get('_oracle', '') or ''
+            head = oracle[:m.start()] if m else oracle
+            if 'enters' not in head[-60:]:
+                return None
+        return [{"action": "proliferate", "player": ctrl}]
+
+    def _gen_finale_of_devastation(self, ctrl: str, opp: str, ctx: Dict) -> List[Dict]:
+        """Finale of Devastation ({X}{G}{G}): creatures you control get +X/+X and
+        gain trample until end of turn; if X >= 10, search your library for a
+        creature card and put it onto the battlefield, then shuffle. May 30 audit:
+        no template existed, so it escalated to Tier 3, which returned no actions —
+        the 12-mana finisher did NOTHING and the player saw a bare "resolves."""
+        x = ctx.get('x_value', 0) or ctx.get('X', 0) or ctx.get('x', 0) or 0
+        try:
+            x = int(x)
+        except (TypeError, ValueError):
+            x = 0
+        actions = [{
+            "action": "pump_all_creatures", "player": ctrl,
+            "power": x, "toughness": x, "keywords": ["Trample"],
+        }]
+        if x >= 10:
+            actions.append({
+                "action": "search_library", "player": ctrl,
+                "card_type": "Creature", "to_zone": "battlefield", "count": 1,
+            })
+        return actions
 
     @staticmethod
     def _word_to_num(w: str) -> int:

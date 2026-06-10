@@ -56,10 +56,16 @@ class BotConfig:
     sonnet_output_cost_per_million: float = 15.0
 
     # DeepSeek V4 pricing — used by the MTG actor/strategist split in autoplay.
-    deepseek_input_cost_per_million: float = 0.27
-    deepseek_output_cost_per_million: float = 1.10
-    deepseek_pro_input_cost_per_million: float = 0.56
-    deepseek_pro_output_cost_per_million: float = 1.68
+    # REAL rates verified May 30 2026 against an account usage export (the old
+    # list rates $0.27/$1.10 + $0.56/$1.68 over-estimated ~38x). This tracker
+    # has no per-call cache split, so input is priced at the cache-BLENDED
+    # effective rate (Flash ~66% hit, Pro ~84% hit); output uses exact rates.
+    # Per-category for reference: Flash hit $0.0028/M / miss $0.14/M;
+    # Pro hit $0.0036/M / miss $0.435/M.
+    deepseek_input_cost_per_million: float = 0.0497
+    deepseek_output_cost_per_million: float = 0.28
+    deepseek_pro_input_cost_per_million: float = 0.0744
+    deepseek_pro_output_cost_per_million: float = 0.87
 
     # Attachment handling
     image_types: tuple = ('.png', '.jpg', '.jpeg', '.gif', '.webp')

@@ -690,6 +690,9 @@ class Card:
             result += layers_mod
         elif game and self.is_creature():
             result += self._get_anthem_power_bonus(game)
+        # Self-referential life-total debuff (Death's Shadow). Computed on read
+        # because the amount tracks the controller's current life total.
+        result -= self._get_life_total_debuff(game)
         return result
 
     def get_effective_toughness(self, game=None) -> int:
@@ -731,6 +734,8 @@ class Card:
             result += _lt_mod
         elif game and self.is_creature():
             result += self._get_anthem_toughness_bonus(game)
+        # Self-referential life-total debuff (Death's Shadow) — see get_effective_power.
+        result -= self._get_life_total_debuff(game)
         return result
 
     def _get_attached_auras(self, game):
@@ -744,6 +749,24 @@ class Card:
                         'aura' in (getattr(perm, 'type_line', '') or '').lower()):
                     auras.append(perm)
         return auras
+
+    def _get_life_total_debuff(self, game) -> int:
+        """Death's Shadow: "Death's Shadow gets -X/-X, where X is your life total."
+        The layers engine skips it (the amount is dynamic — it tracks a player's
+        life total), so we compute on read. Without this, Death's Shadow shipped
+        as a vanilla 13/13 regardless of life (it dealt 13 at 6 life in the May 26
+        batch, and would illegally survive at 13+ life where it should die to SBA).
+        Returns the magnitude X (controller's life, floored at 0) when the oracle
+        declares the penalty, else 0."""
+        if not game or not self.oracle_text:
+            return 0
+        o = self.oracle_text.lower()
+        if 'where x is your life total' not in o or 'gets -x/-x' not in o:
+            return 0
+        for p in game.players:
+            if self in p.battlefield:
+                return max(0, int(getattr(p, 'life', 0)))
+        return 0
 
     def _get_self_for_each_bonus(self, game):
         """Return (power, toughness) bonus from "for each X attached to it"
@@ -819,6 +842,12 @@ class Card:
                 # "Other creatures you control get +N/+N" (Lord of Atlantis, etc.)
                 if perm_controller == controller:
                     import re as _re
+                    # May 26 audit: skip conditional anthems whose threshold isn't
+                    # met (Beastmaster Ascension +5/+5 only at 7+ quest counters).
+                    # This inline fallback is a SECOND anthem path parallel to the
+                    # layers engine; it needs the same gate as the registration.
+                    if game._has_conditional_static(oracle) and not game._static_condition_met(perm, oracle):
+                        continue
                     # Match "+N/+N" patterns for creatures you control
                     # Covers: "creatures you control", "creature tokens you control",
                     # "other creature tokens you control" (Intangible Virtue, Phantom General)
@@ -845,6 +874,9 @@ class Card:
                 perm_controller = perm._find_controller(game)
                 if perm_controller == controller:
                     import re as _re
+                    # May 26 audit: conditional-anthem gate (see _get_anthem_power_bonus).
+                    if game._has_conditional_static(oracle) and not game._static_condition_met(perm, oracle):
+                        continue
                     for m in _re.finditer(r'(?:other )?creature(?:\s+token)?s you control get \+(\d+)/\+(\d+)', oracle):
                         if 'other' in oracle[:oracle.index(m.group())+10] and perm.id == self.id:
                             continue
@@ -951,10 +983,26 @@ class Card:
                     # us diff. Only log when we're actually about to flip the result
                     # (devotion < threshold) so noise stays bounded.
                     is_creature_now = devotion >= threshold
+                    # May 30 audit: dedup — only log when the creature-status
+                    # CHANGES (this fired 462x identically in one game). Track the
+                    # last logged state per card on the game so transitions stay
+                    # visible for auditing; with no game to dedup against, keep the
+                    # original always-print behavior.
+                    _dc = None
+                    if game is not None:
+                        _dc = getattr(game, '_devotion_check_last', None)
+                        if _dc is None:
+                            _dc = {}
+                            game._devotion_check_last = _dc
                     if not is_creature_now:
-                        print(f"[DEVOTION-CHECK] {self.name}: "
-                              f"devotion={devotion}/{threshold} ({''.join(symbols)}) "
-                              f"controller={controller.name} → NOT a creature")
+                        if _dc is None or _dc.get(self.id) is not False:
+                            print(f"[DEVOTION-CHECK] {self.name}: "
+                                  f"devotion={devotion}/{threshold} ({''.join(symbols)}) "
+                                  f"controller={controller.name} → NOT a creature")
+                        if _dc is not None:
+                            _dc[self.id] = False
+                    elif _dc is not None:
+                        _dc[self.id] = True
                     if devotion < threshold:
                         return False
         return True
@@ -980,9 +1028,56 @@ class Card:
     def is_battle(self) -> bool:
         return self.type_line and "battle" in self.type_line.lower()
 
+    def _remove_all_abilities_active(self, game) -> bool:
+        """True if a board-wide "lose all abilities" effect (Humility) is
+        registered in the layers engine. has_keyword uses this to defer keyword
+        resolution to the engine's timestamp-ordered Layer-6 result."""
+        le = getattr(game, 'layers_engine', None)
+        if le is None:
+            return False
+        for eff in getattr(le, 'effects', []):
+            if (getattr(eff, 'remove_all_abilities', False)
+                    and 'all creature' in (getattr(eff, 'applies_to', '') or '').lower()):
+                return True
+        return False
+
     def has_keyword(self, keyword: str, game=None) -> bool:
         """Check if card has a keyword ability (permanent, temporary, equipment, or static effects)."""
         keyword_lower = keyword.lower()
+        # May 30 audit (option b — compute-on-read for keywords): under a board-
+        # wide "lose all abilities" effect (Humility, Layer 6), defer to the layers
+        # engine's resolved ability set rather than reading raw keyword lists.
+        # recalculate_power_toughness caches result.abilities onto
+        # _resolved_keywords — printed keywords + static grants, with Humility's
+        # remove-all and the grants applied in TIMESTAMP order (CR 613.7). This
+        # replaces the May-26 blanket strip, which wrongly removed abilities
+        # GRANTED AFTER Humility (e.g. Stonehoof Chieftain's trample). Equipment/
+        # aura/temp grants aren't engine-registered effects, so under remove-all
+        # the engine set is authoritative for them too (the rare equipment-granted-
+        # after-Humility case stays approximate — documented, low frequency).
+        if (game is not None and self.is_creature(game=game)
+                and self._remove_all_abilities_active(game)):
+            resolved = getattr(self, '_resolved_keywords', None)
+            if resolved is not None:
+                return keyword_lower in resolved
+            return False  # recalc hasn't run since the effect registered — strip
+        # May 30 audit: conditional self-keyword gated on life total (Serra
+        # Ascendant: "As long as you have 30 or more life, ~ gets +5/+5 and has
+        # lifelink"). The +5/+5 half is gated via the layers conditional-static
+        # path, but the keyword half is baked into self.keywords at load, so it
+        # applied unconditionally (Serra lifelinked at 25 life). If the card's own
+        # oracle grants THIS keyword only while a life threshold holds and that
+        # threshold isn't met, the keyword is off.
+        if game is not None and self.oracle_text:
+            _o = self.oracle_text.lower()
+            if keyword_lower in _o and 'as long as you have' in _o and 'or more life' in _o:
+                import re as _kre
+                _m = _kre.search(
+                    r'as long as you have (\d+) or more life[^.]*\b' + _kre.escape(keyword_lower), _o)
+                if _m:
+                    _ctrl = self._find_controller(game)
+                    if _ctrl is not None and getattr(_ctrl, 'life', 0) < int(_m.group(1)):
+                        return False
         all_keywords = [k.lower() for k in self.keywords] + [k.lower() for k in self.temp_keywords]
         # Also check keywords granted by continuous effects (layers engine)
         granted = getattr(self, '_granted_keywords', set())
@@ -1369,6 +1464,15 @@ class Player:
         sources = []
         for card in self.battlefield:
             if card.tapped or not self._is_active(card):
+                continue
+            # CR 302.6: a creature's {T} mana ability can't be activated while it's
+            # summoning sick (no haste). Lands/artifacts aren't creatures and tap
+            # the turn they enter, so this only filters creature mana dorks. May 30
+            # audit: this was the [MANA-DIVERGENCE] green-dork loop — a summoning-
+            # sick Llanowar Elves / Birds of Paradise counted as available mana, so
+            # the AI planned green spells it couldn't pay, got rejected, re-proposed,
+            # and eventually permanent-banned them (4 games last batch).
+            if card.is_creature() and card.summoning_sick and not card.has_haste():
                 continue
             if card.is_land() or self._can_produce_mana(card):
                 sources.append(card)
@@ -2705,6 +2809,63 @@ class GameState:
                 engine.add_effect(effect)
             print(f"  [REPLACEMENT] Registered {len(effects)} replacement effect(s) from {card.name}")
 
+    @staticmethod
+    def _has_conditional_static(oracle_lower: str) -> bool:
+        """True if the oracle gates a static ability on a board-wide threshold
+        ("As long as you control N or more X" / "As long as this has N or more Y
+        counters") — Beastmaster Ascension, Hallowed Haunting, etc."""
+        return (('as long as' in oracle_lower or 'if you control' in oracle_lower)
+                and 'or more' in oracle_lower)
+
+    def _static_condition_met(self, card: 'Card', oracle_lower: str) -> bool:
+        """Evaluate a conditional static's "N or more" threshold against the live
+        board. Returns True when the condition holds OR when no recognized
+        threshold is present (so unconditional statics always register). May 26
+        audit: these were registered unconditionally (Beastmaster Ascension gave
+        +5/+5 at 1 quest counter; needs 7)."""
+        import re as _re
+        word_num = {'one': 1, 'two': 2, 'three': 3, 'four': 4, 'five': 5,
+                    'six': 6, 'seven': 7, 'eight': 8, 'nine': 9, 'ten': 10}
+
+        def _num(tok):
+            tok = tok.strip()
+            return int(tok) if tok.isdigit() else word_num.get(tok)
+        # (a) the source's own counters: "has N or more <kind> counters on it"
+        m = _re.search(r'has (\w+) or more (\w+) counters? on it', oracle_lower)
+        if m:
+            need, kind = _num(m.group(1)), m.group(2)
+            if need is None:
+                return True
+            have = sum(v for k, v in (getattr(card, 'counters', {}) or {}).items()
+                       if kind in k.lower())
+            return have >= need
+        # (b) controller's permanents: "control N or more <type>"
+        m = _re.search(r'control (\w+) or more (\w+)', oracle_lower)
+        if m:
+            need, kind = _num(m.group(1)), m.group(2).rstrip('s')
+            if need is None:
+                return True
+            controller = next((p for p in self.players if card in p.battlefield), None)
+            if controller is None:
+                return True
+            have = sum(1 for perm in controller.battlefield
+                       if kind in (getattr(perm, 'type_line', '') or '').lower())
+            return have >= need
+        # Recognized "as long as"/"or more" but unparseable specifics — be
+        # conservative and register (prior behavior) rather than risk turning
+        # off a real static.
+        return True
+
+    def _remove_card_layer_effects(self, card: 'Card'):
+        """Drop every layer effect sourced from this card (used to deactivate a
+        conditional static when its threshold stops being met)."""
+        if not self.layers_engine:
+            return
+        prefix = f"{card.id}_"
+        self.layers_engine.effects = [
+            e for e in self.layers_engine.effects if not e.id.startswith(prefix)
+        ]
+
     def register_static_keyword_grants(self, card: Card, controller_name: str):
         """
         Scan a permanent's oracle text for static keyword-granting abilities
@@ -2719,6 +2880,14 @@ class GameState:
             return
 
         oracle = (card.oracle_text or "").lower()
+
+        # May 26 audit: gate conditional static grants ("As long as you control
+        # seven or more enchantments, creatures you control have flying" —
+        # Hallowed Haunting). When the threshold isn't met, drop any existing
+        # grant and skip; recalc re-runs this so it switches on when met.
+        if self._has_conditional_static(oracle) and not self._static_condition_met(card, oracle):
+            self._remove_card_layer_effects(card)
+            return
 
         # CR 604: only STATIC abilities grant ongoing keywords. Filter out
         # paragraphs that start with "when/whenever/at" (triggered) or contain
@@ -2755,8 +2924,15 @@ class GameState:
         # Must precede the generic "creatures you control" match or the grant over-broadcasts.
         _COLOR_WORDS = {'white', 'blue', 'black', 'red', 'green'}
         subtype_match = re.search(r'(?<!\w)([a-z]+) creatures you control have (.+?)(?:\.|$)', oracle)
-        if subtype_match and subtype_match.group(1) in _COLOR_WORDS:
-            subtype_match = None  # colors handled by other paths / no scoping needed here
+        if subtype_match and subtype_match.group(1) in (_COLOR_WORDS | {'other'}):
+            # May 30 audit: "other" is the CR-109.5 self-exclusion qualifier, NOT a
+            # creature subtype. Capturing it here mis-routed "Other creatures you
+            # control have X" grants to applies_to="other you control", which
+            # neither has_granted_keyword (line ~3496) nor applies_to_permanent
+            # recognizes (both require the substring "creatures you control") — so
+            # Stonehoof-style keyword grants silently never applied. Let other_match
+            # (the dedicated "other creatures you control" path) handle it.
+            subtype_match = None  # colors / "other" handled by their own paths
         # Pattern: "Other creatures you control have <keywords>"
         # Pattern: "Creatures you control have <keywords>"
         other_match = re.search(r'other creatures you control have (.+?)(?:\.|$)', oracle)
@@ -2854,6 +3030,13 @@ class GameState:
         if not self.layers_engine:
             return
         oracle = (card.oracle_text or "").lower()
+        # May 26 audit: gate conditional static anthems ("As long as this has
+        # seven or more quest counters, creatures you control get +5/+5" —
+        # Beastmaster Ascension). When the threshold isn't met, drop any existing
+        # anthem and skip; recalc re-runs this so it switches on when met.
+        if self._has_conditional_static(oracle) and not self._static_condition_met(card, oracle):
+            self._remove_card_layer_effects(card)
+            return
         humility_match = re.search(r'(?:all )?creatures (?:lose all abilities and )?(?:have base power and toughness|are) (\d+)/(\d+)', oracle)
         if humility_match:
             set_p, set_t = int(humility_match.group(1)), int(humility_match.group(2))
@@ -3089,8 +3272,12 @@ class GameState:
             ('own_all', r'creatures you control get \+(\d+)/\+(\d+)', "creatures you control", False),
             ('opp_debuff', r'creatures (?:your opponents?|opponents?) control get -(\d+)/-(\d+)', "creatures opponents control", True),
             ('all_buff', r'all creatures get \+(\d+)/\+(\d+)', "all creatures", False),
-            # Board-wide negative anthem: "Creatures get -1/-1" (Night of Souls' Betrayal)
-            ('all_debuff', r'(?:^|\.\s*)creatures get -(\d+)/-(\d+)', "all creatures", True),
+            # Board-wide negative anthem: "Creatures get -1/-1" / "All creatures get
+            # -1/-1" (Night of Souls' Betrayal). May 30 audit: the printed text is
+            # "All creatures get -1/-1." — the optional "all " was missing, so the
+            # effect never registered and every creature kept full power for the
+            # whole game.
+            ('all_debuff', r'(?:^|\.\s*)(?:all )?creatures get -(\d+)/-(\d+)', "all creatures", True),
         ]
         registered = set()
         for tag, pattern, applies_to, is_negative in anthem_patterns:
@@ -3117,6 +3304,19 @@ class GameState:
         """Recalculate effective P/T for all creatures via layers engine (before SBAs)."""
         if not self.layers_engine:
             return
+        # May 26 audit: conditional statics ("As long as you control N+ X" /
+        # "...has N+ Y counters") register only at ETB, but their condition
+        # changes as counters/permanents change. Re-evaluate them here (recalc
+        # runs ~30x/turn) so the effect switches on/off as the threshold is
+        # crossed. The register_* gates handle both add (when met) and remove
+        # (when not met); this must run BEFORE the has_pt_effects short-circuit
+        # below so a just-activated anthem isn't missed.
+        for _player in self.players:
+            for _card in list(_player.battlefield):
+                _oc = (_card.oracle_text or "").lower()
+                if self._has_conditional_static(_oc):
+                    self.register_static_pt_effects(_card, _player.name)
+                    self.register_static_keyword_grants(_card, _player.name)
         has_pt_effects = any(e.layer == Layer.POWER_TOUGHNESS for e in self.layers_engine.effects)
         if not has_pt_effects:
             for player in self.players:
@@ -3128,6 +3328,9 @@ class GameState:
                     # active, so the inline anthem fallback in
                     # get_effective_power/toughness can fire normally.
                     card._has_layers_pt_effect = False
+                    # May 30 audit (option b): no layer effects → has_keyword uses
+                    # the raw-list fast path, so drop any stale resolved set.
+                    card._resolved_keywords = None
             return
         # [LAYERS-PT] Log a single summary line per call, not one line per creature.
         # Per-creature logging caused 600+ log entries in games with Massacre Wurm /
@@ -3135,7 +3338,12 @@ class GameState:
         affected_summary = []
         for player in self.players:
             for card in player.battlefield:
-                if not card.is_creature():
+                # May 26 audit: pass game so devotion-gated gods (Erebos at
+                # devotion<5) aren't built as creatures in the layers P/T pass —
+                # consistent with the F24 is_creature(game) sites (can_attack/
+                # can_block/targeting). Without this the layers engine could
+                # anthem-buff a non-creature god's cached P/T.
+                if not card.is_creature(game=self):
                     continue
                 try:
                     base_p = int(card.power) if card.power and card.power != '*' else 0
@@ -3159,10 +3367,19 @@ class GameState:
                     owner=player.name, base_types=["creature"],
                     base_subtypes=card_subtypes,
                     base_colors=card_colors,
+                    base_abilities=list(getattr(card, 'keywords', []) or []),
                     base_power=base_p, base_toughness=base_t,
                     plus_counters=card.counters.get('+1/+1', 0),
                     minus_counters=card.counters.get('-1/-1', 0))
                 result = self.layers_engine.calculate_characteristics(lp, None)
+                # May 30 audit (option b): the engine resolves Layer-6 abilities
+                # (Humility's remove-all + static grants, applied in TIMESTAMP order
+                # per CR 613.7) into result.abilities. Cache it (lowercased) so
+                # has_keyword can defer to the engine under a "lose all abilities"
+                # effect instead of the May-26 blanket strip — this correctly keeps
+                # abilities GRANTED AFTER Humility (e.g. Stonehoof's trample).
+                card._resolved_keywords = set(
+                    a.lower() for a in (getattr(result, 'abilities', None) or []))
                 layers_p = result.power if result.power is not None else base_p
                 layers_t = result.toughness if result.toughness is not None else base_t
                 # May 7 audit: `calculate_characteristics()` does NOT include

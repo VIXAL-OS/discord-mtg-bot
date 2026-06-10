@@ -24,16 +24,14 @@ test matrix, and the post-batch bug-audit playbook. When porting engine fixes,
 the file:line references in the upstream CLAUDE.md's "May 26/30 audit sprint"
 section line up here too.
 
-## ⚠️ Known issue: UTF-8 mojibake in the engine files
+## ~~Known issue: UTF-8 mojibake in the engine files~~ — RESOLVED June 10, 2026
 
-The `mtg/` + `rules/` files were copied during the fork with a bad encoding
-round-trip (UTF-8 read as Latin-1, re-saved as UTF-8). Em-dashes render as `â€"`
-and **emoji are corrupted** (e.g. `💀` → garbage), so Discord game messages would
-show mojibake. The *content* is byte-for-byte identical to the upstream repo
-modulo this corruption. **Fix:** re-copy the engine files from the upstream repo
-(which is correctly UTF-8) — this simultaneously applies the audit fixes below AND repairs
-the encoding. Verify with: `grep -l 'â€' mtg/*.py rules/*.py` (should be empty
-after the fix).
+This warning turned out to be stale: a byte-level scan (Python `read_bytes()`
++ UTF-8 decode, not PowerShell — PS 5.1 reads BOM-less files as ANSI and
+*displays* phantom mojibake) found zero corruption in any engine file. The
+June 10 upstream sync also re-copied `mtg/` + `rules/` from the source repo
+with verified UTF-8, applying the May 26/30 + June 10 audit fixes at the same
+time. Verify anytime with: `grep -l 'â€' mtg/*.py rules/*.py` (empty = clean).
 
 ## The tiered effect resolution architecture (same as the original)
 

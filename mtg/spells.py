@@ -1870,7 +1870,11 @@ async def cast_spell_async(engine, game: GameState, player: Player, card: Card, 
                                     action_type = action.get("action", "")
                                     if action_type == "no_action":
                                         reason = action.get("reason", "")
-                                        if reason:
+                                        # May 30 audit: don't surface internal-engine
+                                        # jargon ("handled mechanically by the SBA
+                                        # engine") to players — console keeps it.
+                                        if reason and 'sba engine' not in reason.lower() \
+                                                and 'handled mechanically' not in reason.lower():
                                             effect_messages.append(f"📜 {reason}")
                                         continue
                                     # [TARGETING] Validate target for targeted ETB actions
@@ -2046,7 +2050,9 @@ async def cast_spell_async(engine, game: GameState, player: Player, card: Card, 
                                             for action in t_actions:
                                                 if action.get("action") == "no_action":
                                                     reason = action.get("reason", "")
-                                                    if reason:
+                                                    # May 30 audit: suppress internal-engine jargon.
+                                                    if reason and 'sba engine' not in reason.lower() \
+                                                            and 'handled mechanically' not in reason.lower():
                                                         effect_messages.append(f"📜 {reason}")
                                                     continue
                                                 try:
@@ -2126,7 +2132,9 @@ async def cast_spell_async(engine, game: GameState, player: Player, card: Card, 
                     )
         
         # Check for "whenever another creature enters" triggers (Terror of the Peaks, etc.)
-        if card.is_creature():
+        # May 30 audit: pass game so a devotion-gated god entering as a NON-creature
+        # (Purphoros at devotion<5) doesn't trigger creature-ETB watchers (CR 603.2a).
+        if card.is_creature(game):
             terror_triggers = await engine._check_creature_etb_triggers(game, player, card)
             effect_messages.extend(terror_triggers)
 

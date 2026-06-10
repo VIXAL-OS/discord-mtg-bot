@@ -4664,6 +4664,28 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
                 content = strip_dangling_articles(content)
             except Exception:
                 pass
+        # May 30 audit: collapse runs of identical lines WITHIN one multi-line
+        # message. The dedup below keys on the whole content string, so bursts
+        # built as a single send slipped through — Martial Coup's 8x "⭕ 1 +1/+1
+        # counter on each ...", a board-wipe's 7x "💀 Glissa triggers", or 5x
+        # "☠️ Plant dies" (the per-creature combat DAMAGE lines already collapse
+        # upstream; the death/trigger lines did not). Group consecutive
+        # byte-identical non-empty lines into "<line> _(×N)_".
+        if content and embed is None and '\n' in content:
+            _lines = content.split('\n')
+            _collapsed = []
+            _i = 0
+            while _i < len(_lines):
+                _j = _i + 1
+                while _j < len(_lines) and _lines[_j] == _lines[_i]:
+                    _j += 1
+                _run = _j - _i
+                if _run >= 2 and _lines[_i].strip():
+                    _collapsed.append(f"{_lines[_i]} _(×{_run})_")
+                else:
+                    _collapsed.append(_lines[_i])
+                _i = _j
+            content = '\n'.join(_collapsed)
         # May 14 audit: when the same trigger fires multiple times in one
         # event (Athreos firing 9× from a 9-creature board wipe, Meren's
         # oracle text printed twice on a single resolution), Discord ends up
