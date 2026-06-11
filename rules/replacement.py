@@ -915,12 +915,70 @@ _NAMED_CARD_REPLACEMENTS = {
             source_id=card_id,
             controller=controller,
             replaces_event=EventType.DAMAGE,
-            condition_text="damage from your sources doubled",
+            condition_text="all damage doubled (symmetric)",
             replacement_type="double_damage",
             multiply_amount=2.0,
-            # House rule: only double damage from your sources (Apr 2026 audit).
+            # June 10 audit (V25): the Apr-2026 "your sources only" house rule
+            # was wrong for THIS card — Dictate's printed text is fully
+            # symmetric ("If a source would deal damage to a permanent or
+            # player, it deals double that damage instead"), same wording
+            # class as Furnace of Rath, whose condition the May 30 sprint
+            # already removed. Kambal's 2 damage to Rick resolved as 1
+            # (Gisela halving, Dictate absent) when the CR-correct answer is
+            # 2 in either CR 616.1 order. Fiery Emancipation's gate below
+            # stays — its oracle really says "a source you control".
+        )
+    ],
+    # June 10 audit (V25 bonus): Curse of Bloodletting wasn't registered at
+    # all despite being added to the revised replacement_chain deck (May 30).
+    # "Enchant player. If a source would deal damage to enchanted player, it
+    # deals double that damage instead." Gated on the RECIPIENT being the
+    # enchanted player (read from the aura's attached_to / cursed-player
+    # marker at registration time via the affected_player on the event).
+    "curse of bloodletting": lambda card_id, controller: [
+        ReplacementEffect(
+            id=f"{card_id}_curse_bloodletting",
+            source_name="Curse of Bloodletting",
+            source_id=card_id,
+            controller=controller,
+            replaces_event=EventType.DAMAGE,
+            condition_text="damage to enchanted player doubled",
+            replacement_type="double_damage",
+            multiply_amount=2.0,
+            # The curse doubles damage dealt TO the enchanted player. The
+            # registration path doesn't know the attach target here, so use
+            # the controller-relative default: a curse is cast on an
+            # opponent, so double damage whose affected player is NOT the
+            # curse's controller. (Exact attach tracking can replace this
+            # when enchant-player auras carry attached_to through
+            # registration.)
             condition=lambda ev, _ctrl=controller: (
-                bool(ev.source_controller) and ev.source_controller == _ctrl
+                bool(getattr(ev, 'affected_player', None))
+                and ev.affected_player != _ctrl
+            ),
+        )
+    ],
+    # June 10 deep-dive: Twinflame Tyrant — real text is a static doubler
+    # ("If a source you control would deal damage to an opponent or a
+    # permanent an opponent controls, it deals double that damage instead").
+    # It was never registered here (four qualifying events resolved
+    # undoubled in game …069616767067), and its Tier-1.5 template was a
+    # hallucinated "deal 5 damage" (deleted same day). Both gates: source
+    # you control AND opponent-side recipient — same shape as Gisela's
+    # double_damage_opp clause.
+    "twinflame tyrant": lambda card_id, controller: [
+        ReplacementEffect(
+            id=f"{card_id}_twinflame",
+            source_name="Twinflame Tyrant",
+            source_id=card_id,
+            controller=controller,
+            replaces_event=EventType.DAMAGE,
+            condition_text="damage from your sources to opponents is doubled",
+            replacement_type="double_damage",
+            multiply_amount=2.0,
+            condition=lambda e, _ctrl=controller: (
+                bool(e.source_controller) and e.source_controller == _ctrl
+                and (e.affected_player or "") and e.affected_player != _ctrl
             ),
         )
     ],

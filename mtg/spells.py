@@ -1223,6 +1223,13 @@ async def cast_spell_async(engine, game: GameState, player: Player, card: Card, 
                 has_complex_effect = any("complex effect" in m.lower() for m in effect_messages)
             except Exception as e:
                 print(f"[SPELL_RESOLVER] Error resolving {card.name}: {e}")
+                # June 10 audit (C4): this barrier masked an UnboundLocalError
+                # in spell_resolver's damage path for weeks — the Tier 3
+                # "recovery" RE-RESOLVED the spell after state had already
+                # been mutated (one Bolt, two effects). Strict batches now see
+                # the underlying exception instead of the double-resolution.
+                from mtg.util import maybe_reraise
+                maybe_reraise(e)
                 has_complex_effect = True  # Fallback to Tier 3
         elif not effect_messages:
             has_complex_effect = True  # No resolver available, try Tier 3
@@ -1385,7 +1392,13 @@ async def cast_spell_async(engine, game: GameState, player: Player, card: Card, 
                         lib = get_effect_library()
                         opp_idx = 1 - game.players.index(player)
                         opp = game.players[opp_idx]
-                        actions, desc = lib.resolve_etb(card.name, chapter_text, player.name, opp.name)
+                        # June 10 round 3: saga chapters used to call the
+                        # library with NO game_context, so generators needing
+                        # board state (chapter II "+1/+1 counter on target
+                        # creature you control") had nothing to target with.
+                        _saga_ctx = build_game_context(game, player, opp, card=card)
+                        actions, desc = lib.resolve_etb(card.name, chapter_text, player.name, opp.name,
+                                                        game_context=_saga_ctx)
                         if actions:
                             for act in actions:
                                 result = engine.rules._execute_action_on_state(game, act)
@@ -1531,6 +1544,11 @@ async def cast_spell_async(engine, game: GameState, player: Player, card: Card, 
                     # actually being sacrificed.
                     card._bound_creature_id = target_card.id
                     target_card._reanimated_by_aura_id = card.id
+                    # June 10 audit (C8): mark the reanimation as handled so the
+                    # name-keyed ETB template doesn't run a SECOND one — one
+                    # Animate Dead cast was returning two creatures (the inline
+                    # best-power pick here + the template's best-CMC pick).
+                    card._reanimate_handled = True
                     print(f"[REANIMATE-BIND] {card.name} bound to {target_card.name}")
                     effect_messages.append(f"💀 {card.name} reanimates {target_card.name}!")
                     print(f"[REANIMATE] {card.name} brought back {target_card.name} from {target_player.name}'s graveyard")
@@ -1545,6 +1563,44 @@ async def cast_spell_async(engine, game: GameState, player: Player, card: Card, 
                     player.graveyard.append(card)
                 # Skip normal aura attachment — we handled it
                 pass
+
+            elif re.search(r'enchant (land|forest|plains|island|swamp|mountain)\b', oracle_lower):
+                # June 10 deep-dive (B8): land-auras had NO attach branch —
+                # Wild Growth resolved unattached and the AURA_INVALID SBA
+                # destroyed it on the spot (mana spent, card lost) despite
+                # the AI naming a legal target. Attach to the named land or
+                # the controller's first matching land. (The aura's
+                # extra-mana production half is not yet modeled — surviving
+                # attachment is the prerequisite.)
+                _lsub_m = re.search(r'enchant (forest|plains|island|swamp|mountain)\b', oracle_lower)
+                _lsub = _lsub_m.group(1) if _lsub_m else None
+                _named_land = target if isinstance(target, str) else None
+                _target_land = target if (isinstance(target, Card) and target.is_land()) else None
+                if _target_land is None:
+                    for _lc in player.battlefield:
+                        if not _lc.is_land():
+                            continue
+                        _ltl = (_lc.type_line or '').lower()
+                        if _lsub and _lsub not in _ltl:
+                            continue
+                        if _named_land and _named_land.lower() not in _lc.name.lower():
+                            continue
+                        _target_land = _lc
+                        break
+                    if _target_land is None and _named_land:
+                        for _lc in player.battlefield:
+                            if _lc.is_land() and (not _lsub or _lsub in (_lc.type_line or '').lower()):
+                                _target_land = _lc
+                                break
+                if _target_land is not None:
+                    card.attached_to = _target_land.id
+                    if not hasattr(_target_land, 'attachments'):
+                        _target_land.attachments = []
+                    _target_land.attachments.append(card.id)
+                    effect_messages.append(f"🌿 {card.name} enchants {_target_land.name}")
+                    print(f"[AURA-LAND] {card.name} attached to {_target_land.name}")
+                else:
+                    effect_messages.append(f"💨 {card.name} fizzles (no legal land to enchant)")
 
             elif "enchant creature" in oracle_lower or "enchant permanent" in oracle_lower:
                 # This is an Aura - attach to target
@@ -1774,7 +1830,29 @@ async def cast_spell_async(engine, game: GameState, player: Player, card: Card, 
                 if x_value > 0:
                     card.counters['+1/+1'] = card.counters.get('+1/+1', 0) + x_value
                     effect_messages.append(f"⭕ {card.name} enters with {x_value} +1/+1 counter(s)")
-        
+
+            # June 10 audit (V14): "enters with N shield counters" (Sanctuary
+            # Warden, CR 702.154). The death-side checks (SBA lethal damage,
+            # delegated checker, board-wipe save chain) all already honor
+            # shield counters — but nothing ADDED them at ETB, so the Warden
+            # died twice with zero [SHIELD-COUNTER] events in the June batch.
+            _shield_m = re.search(
+                r'enters (?:the battlefield )?(?:tapped )?with (a|an|one|two|three|four|five|\d+) shield counters?',
+                oracle_lower)
+            if _shield_m:
+                _word_num = {'a': 1, 'an': 1, 'one': 1, 'two': 2, 'three': 3,
+                             'four': 4, 'five': 5}
+                _raw = _shield_m.group(1)
+                _n = _word_num.get(_raw)
+                if _n is None:
+                    try:
+                        _n = int(_raw)
+                    except ValueError:
+                        _n = 1
+                card.counters['shield'] = card.counters.get('shield', 0) + _n
+                effect_messages.append(f"🛡️ {card.name} enters with {_n} shield counter(s)")
+                print(f"[SHIELD-COUNTER] {card.name} enters with {_n} shield counter(s)")
+
         # Initialize planeswalker loyalty
         if card.is_planeswalker():
             base_loyalty = 0
@@ -1845,9 +1923,18 @@ async def cast_spell_async(engine, game: GameState, player: Player, card: Card, 
             if etb_paragraphs:
                 # Tier 1: Check special effects (handles ramp creatures like Wood Elves)
                 effect_messages = engine.resolve_special_effects(game, player, card, target)
-                
+
+                # June 10 audit (C8): the inline reanimation-aura handler already
+                # performed this card's reanimation — running the name-keyed ETB
+                # template would reanimate a SECOND creature (one Animate Dead
+                # cast returned both Plaguecrafter and Sram). One-shot flag:
+                # cleared here so non-cast re-entries (flicker) still use the
+                # template path.
+                if not effect_messages and getattr(card, '_reanimate_handled', False):
+                    print(f"[ETB-TEMPLATE] Skipping {card.name} — reanimation already handled inline (C8)")
+                    card._reanimate_handled = False
                 # Tier 1.5: Try effect template library (data-driven, no API)
-                if not effect_messages and HAS_EFFECT_TEMPLATES:
+                elif not effect_messages and HAS_EFFECT_TEMPLATES:
                     try:
                         etb_text = "\n".join(etb_paragraphs)
                         opponent_idx = 1 - (game.players.index(player) if player in game.players else 0)
@@ -1875,7 +1962,12 @@ async def cast_spell_async(engine, game: GameState, player: Player, card: Card, 
                                         # engine") to players — console keeps it.
                                         if reason and 'sba engine' not in reason.lower() \
                                                 and 'handled mechanically' not in reason.lower():
-                                            effect_messages.append(f"📜 {reason}")
+                                            # June 10: clamp CoT-length reasons
+                                            # (Land Tax paragraph leak); console
+                                            # keeps the full text.
+                                            from mtg.helpers import clamp_noop_reason
+                                            print(f"[NO-ACTION-REASON] {card.name}: {reason}")
+                                            effect_messages.append(f"📜 {clamp_noop_reason(reason)}")
                                         continue
                                     # [TARGETING] Validate target for targeted ETB actions
                                     # (e.g., Ravenous Chupacabra targeting a hexproof creature)
@@ -2053,7 +2145,10 @@ async def cast_spell_async(engine, game: GameState, player: Player, card: Card, 
                                                     # May 30 audit: suppress internal-engine jargon.
                                                     if reason and 'sba engine' not in reason.lower() \
                                                             and 'handled mechanically' not in reason.lower():
-                                                        effect_messages.append(f"📜 {reason}")
+                                                        # June 10: clamp CoT-length reasons (see helpers).
+                                                        from mtg.helpers import clamp_noop_reason
+                                                        print(f"[NO-ACTION-REASON] {card.name}: {reason}")
+                                                        effect_messages.append(f"📜 {clamp_noop_reason(reason)}")
                                                     continue
                                                 try:
                                                     msg = engine.rules._execute_action_on_state(game, action)
@@ -2138,6 +2233,14 @@ async def cast_spell_async(engine, game: GameState, player: Player, card: Card, 
             terror_triggers = await engine._check_creature_etb_triggers(game, player, card)
             effect_messages.extend(terror_triggers)
 
+        # June 10 deep-dive (B9): constellation / "whenever an enchantment
+        # enters" watchers had no scan AT ALL — Eidolon of Blossoms drew 0 of
+        # 3 owed cards while three enchantments entered past it.
+        if card.is_enchantment():
+            from mtg.triggers import _check_enchantment_etb_watchers
+            ench_watcher_msgs = _check_enchantment_etb_watchers(engine, game, player, card)
+            effect_messages.extend(ench_watcher_msgs)
+
     # [LAYERS] Register static keyword-granting abilities and recalculate
     # [REPLACEMENT] Register replacement effects (Furnace of Rath, Rest in Peace, etc.)
     if card in player.battlefield:
@@ -2215,7 +2318,10 @@ def _advance_sagas(engine, game: GameState, player: Player) -> List[str]:
                     lib = get_effect_library()
                     opp_idx = 1 - game.players.index(player)
                     opp = game.players[opp_idx]
-                    actions, desc = lib.resolve_etb(card.name, chapter_text, player.name, opp.name)
+                    # June 10 round 3: pass real context (see chapter-I site).
+                    _saga_ctx = build_game_context(game, player, opp, card=card)
+                    actions, desc = lib.resolve_etb(card.name, chapter_text, player.name, opp.name,
+                                                    game_context=_saga_ctx)
                     if actions:
                         for act in actions:
                             result = engine.rules._execute_action_on_state(game, act)

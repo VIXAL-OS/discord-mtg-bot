@@ -91,12 +91,16 @@ EXCEPT_BASELINE = {
     "combat.py": 4,
     "coverage.py": 1,
     "deck_loader.py": 4,
-    "engine.py": 41,
+    # engine.py 41→43 (June 10 fix sprint): C2 Tier-3 activation escalation +
+    # V15 self-sac trigger dispatch — both logged + maybe_reraise per convention.
+    "engine.py": 43,
     "helpers.py": 1,
     "judge.py": 10,
     "models.py": 14,
     "rules_engine.py": 4,
-    "sba.py": 3,
+    # sba.py 3→4 (June 10 fix sprint): _finalize_death_save_return's self-ETB
+    # re-fire crash barrier — logged + maybe_reraise, per convention.
+    "sba.py": 4,
     "spells.py": 29,
     "triggers.py": 47,
     "util.py": 6,

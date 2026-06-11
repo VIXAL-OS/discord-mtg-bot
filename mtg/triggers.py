@@ -86,6 +86,12 @@ _INTERNAL_NOOP_PATTERNS = (
     # The fix in spells.py models the reorder properly, but if anything
     # else still emits the legacy text, suppress it here too.
     "library reordering is not modeled",
+    # June 10 audit (V31b): the dies-trigger no_action path leaked
+    # "Undying is handled mechanically by the SBA engine" to Discord in 4
+    # games — the May 30 suppression only covered the two spells.py sites.
+    "handled mechanically",
+    "handled by the sba engine",
+    "sba engine",
 )
 
 
@@ -1017,6 +1023,19 @@ async def _check_cast_triggers(engine, game: GameState, caster: Player, card: Ca
                     if not cascade_resolved:
                         # Fall back to Tier 2 SpellResolver (regex-based oracle parsing)
                         if engine.spell_resolver and found_card.oracle_text:
+                            # June 10 deep-dive: mirror the Tier-1.5
+                            # no-self-counter guard above — during cascade the
+                            # only stack object is the cascade source, so a
+                            # cascaded counterspell resolved at Tier 2
+                            # countered its own parent (Bloodbraid Elf
+                            # 4-for-0'd its caster via Mana Leak).
+                            if 'counter target' in (found_card.oracle_text or '').lower():
+                                print(f"[CASCADE-SPELL] Skipping Tier 2 for {found_card.name} — "
+                                      f"can't counter cascade source (no legal target)")
+                                messages.append(f"  {found_card.name} fizzles — no legal target to counter during cascade")
+                                caster.graveyard.append(found_card)
+                                cascade_resolved = True
+                        if not cascade_resolved and engine.spell_resolver and found_card.oracle_text:
                             try:
                                 sr_result = await engine.spell_resolver.cast_spell(
                                     game, caster, found_card, target=None, target_mode=TargetMode.AUTO
@@ -1298,6 +1317,34 @@ async def _check_cast_triggers(engine, game: GameState, caster: Player, card: Ca
                     messages.append(f"⚡ {bf_card.name} — {caster.name} gains {life_amt} life")
                     executed_trigger = True
 
+                # June 10 audit (V21): self-pump cast triggers (Kiln Fiend
+                # "+3/+0", Wee Dragonauts class). These were announce-only —
+                # the trigger printed oracle text and no pump ever applied
+                # (Kiln Fiend attacked at power 1 when correct power 4 was
+                # lethal). Mirrors the Prowess application below.
+                if not executed_trigger:
+                    _pump_m = re.search(
+                        r'(?:this creature|' + re.escape(bf_card.name.lower()) +
+                        r') gets \+(\d+)/\+(\d+) until end of turn',
+                        sentence_lower)
+                    if _pump_m:
+                        _sp_p, _sp_t = int(_pump_m.group(1)), int(_pump_m.group(2))
+                        if not (HAS_LAYERS_ENGINE and game.layers_engine):
+                            bf_card.power_modifier = getattr(bf_card, 'power_modifier', 0) + _sp_p
+                            bf_card.toughness_modifier = getattr(bf_card, 'toughness_modifier', 0) + _sp_t
+                        else:
+                            _sp_effs = create_pump_effect(
+                                source_name=f"{bf_card.name} (cast trigger)",
+                                source_id=f"selfpump_{bf_card.id}_{card.id}",
+                                controller=caster.name, target_id=bf_card.id,
+                                power_mod=_sp_p, toughness_mod=_sp_t,
+                                duration="end_of_turn")
+                            for _pe in _sp_effs:
+                                game.layers_engine.add_effect(_pe)
+                        messages.append(f"⚡ **{bf_card.name}** gets +{_sp_p}/+{_sp_t} until end of turn")
+                        print(f"[CAST-TRIGGER] {bf_card.name} self-pump +{_sp_p}/+{_sp_t} from casting {card.name}")
+                        executed_trigger = True
+
                 # Tier 1.5: Template library for cast triggers
                 if not executed_trigger and HAS_EFFECT_TEMPLATES:
                     try:
@@ -1343,6 +1390,16 @@ async def _check_cast_triggers(engine, game: GameState, caster: Player, card: Ca
                     messages.append(
                         format_trigger_line("⚡", bf_card.name, trigger_text, game=game, max_chars=300)
                     )
+                    # June 10 audit (V27): no inline handler + no template used
+                    # to mean the trigger was ANNOUNCED then silently dropped
+                    # (Crypt Ghast's extort was detected, pushed on the stack
+                    # per CR 603.2, then discarded unexecuted). Queue it for
+                    # Tier-3 auto-resolve like other unhandled trigger classes.
+                    if hasattr(engine, '_queue_async_trigger'):
+                        engine._queue_async_trigger(
+                            game, bf_card, trigger_text, "cast_trigger", caster.name,
+                            context=f"{caster.name} cast {card.name}")
+                        print(f"[CAST-TRIGGER-UNHANDLED] {bf_card.name} queued for Tier 3 auto-resolve")
                 # Emit resolve log at the actual moment of effect execution so
                 # post-batch console-log audits see the CR-correct order
                 # (trigger detection → trigger resolution → spell resolution).
@@ -1484,10 +1541,19 @@ async def _check_cast_triggers(engine, game: GameState, caster: Player, card: Ca
                                             # while bf_card is Blind Obedience), don't
                                             # double-attribute by prepending Blind Obedience.
                                             # The inner source attribution is the truthful one.
+                                            # June 10 audit (V29): the old value pattern (\w+)
+                                            # also matched the "(life: 37)" display suffix,
+                                            # capturing the literal word "life" as the source —
+                                            # "⚡ life: 🩸 Rick Deckard loses 2 life (life: 37)"
+                                            # hid the real source (Kambal) in 7 games. Require
+                                            # a word-shaped value (replacement ids like
+                                            # prevent_lifegain) and exclude display keys.
                                             inner_source_match = re.search(
-                                                r'\(([^():]+):\s*\w+\)',
+                                                r'\(([^():]+):\s*[a-z_]\w*\)',
                                                 msg,
                                             )
+                                            if inner_source_match and inner_source_match.group(1).strip().lower() in ('life', 'mana', 'x'):
+                                                inner_source_match = None
                                             if inner_source_match and inner_source_match.group(1).strip().lower() != bf_card.name.lower():
                                                 # Use the inner source as the prefix —
                                                 # ⚡ Erebos, God of the Dead: 🚫 Life gain
@@ -1630,6 +1696,53 @@ async def _check_creature_etb_triggers(engine, game: GameState, entering_player:
 # =========================================================================
 
 
+def _check_enchantment_etb_watchers(engine, game: GameState, controller: Player,
+                                    entered_card: Card) -> List[str]:
+    """Constellation / "whenever an enchantment enters" watchers (CR 603.2).
+
+    June 10 deep-dive (B9): this trigger class had NO scan — Eidolon of
+    Blossoms drew 0 of 3 owed cards while Banishing Light and Enchantress's
+    Presence entered past it. Scans the entering player's battlefield (these
+    are "you control"-scoped in practice), resolves the dominant draw shape
+    inline (free), and queues anything else for Tier-3 auto-resolve.
+    """
+    messages: List[str] = []
+    for bf_card in list(controller.battlefield):
+        if getattr(bf_card, '_phased_out', False):
+            continue
+        oracle = bf_card.oracle_text or ''
+        ol = oracle.lower()
+        if ('constellation' not in ol
+                and 'whenever an enchantment' not in ol
+                and 'whenever another enchantment' not in ol):
+            continue
+        if 'enchantment' in ol and 'enters' not in ol and 'constellation' not in ol:
+            continue
+        # "another enchantment" excludes the entering card itself.
+        if 'another enchantment' in ol and bf_card.id == entered_card.id:
+            continue
+        # Pull the trigger sentence for display / Tier-3 context.
+        _m = re.search(
+            r'(constellation[^.]*\.|whenever an(?:other)? enchantment[^.]*\.)',
+            ol)
+        trigger_text = _m.group(1) if _m else ol[:160]
+        if 'draw a card' in trigger_text or ('constellation' in ol and 'draw a card' in ol):
+            msg = engine.rules._execute_action_on_state(game, {
+                "action": "draw_cards", "player": controller.name, "amount": 1})
+            if msg:
+                messages.append(f"🌟 **{bf_card.name}** (constellation): {msg}")
+            print(f"[CONSTELLATION] {bf_card.name} fires for {entered_card.name} entering")
+        elif hasattr(engine, '_queue_async_trigger'):
+            engine._queue_async_trigger(
+                game, bf_card, trigger_text, "enchant_etb", controller.name,
+                context=f"{entered_card.name} (an enchantment) just entered the battlefield")
+            messages.append(
+                format_trigger_line("🌟", bf_card.name, trigger_text, game=game, max_chars=200))
+            print(f"[CONSTELLATION] {bf_card.name} queued for Tier 3 "
+                  f"({entered_card.name} entered)")
+    return messages
+
+
 def _check_dies_triggers_sync(engine, game: GameState, dying_card: Card, dying_player: Player) -> Tuple[List[str], List[Tuple]]:
     """Check for 'whenever a creature dies' and 'when THIS dies' triggers.
 
@@ -1676,20 +1789,19 @@ def _check_dies_triggers_sync(engine, game: GameState, dying_card: Card, dying_p
         dying_oracle = dying_card.oracle_text.lower()
         if (dying_card.name.lower() in dying_oracle and "dies" in dying_oracle) or \
            "whenever a creature" in dying_oracle or \
-           "nontoken creature" in dying_oracle:  # May 30 audit: Midnight Reaper et al.
+           "whenever this creature" in dying_oracle or \
+           "this creature or another creature" in dying_oracle or \
+           "nontoken creature" in dying_oracle:  # May 30 audit: Midnight Reaper et al.; June 10: 2026 "this creature" templating (Blood Artist)
             cards_to_scan.append((dying_card, dying_player))
 
     # May 20 audit (APNAP-1): sort by NON-active player first so dies triggers
     # resolve in CR 603.3b LIFO order in immediate mode. AP places his triggers
     # on the stack first (bottom), NAP places hers on top, LIFO resolves NAP
     # first. Inline resolution should therefore iterate NAP's triggers first.
-    try:
-        _active_idx = game.active_player_index
-        cards_to_scan.sort(
-            key=lambda pair: 0 if game.players.index(pair[1]) != _active_idx else 1
-        )
-    except Exception:
-        pass  # If anything goes wrong with sort, fall back to insertion order
+    # June 10: ordering extracted to helpers.apnap_order_died (CR 603.3b
+    # NAP-first), shared with the two engine.py drain sites and unit-tested.
+    from mtg.helpers import apnap_order_died
+    cards_to_scan = apnap_order_died(cards_to_scan, game)
 
     for card, player in cards_to_scan:
         if trigger_count >= MAX_DIES_TRIGGERS:
@@ -1727,14 +1839,39 @@ def _check_dies_triggers_sync(engine, game: GameState, dying_card: Card, dying_p
             ("whenever another creature" in oracle_lower and "dies" in oracle_lower) or
             ("whenever a creature you control dies" in oracle_lower) or
             ("nontoken creature" in oracle_lower and "dies" in oracle_lower) or
+            # June 10 deep-dive (B1): 2026 Oracle templating — "Whenever THIS
+            # CREATURE or another creature dies" (Blood Artist, Zulaport per
+            # the card cache). All previous branches missed it, making the
+            # hardcoded Blood Artist/Zulaport drain handler UNREACHABLE dead
+            # code (~12-life swing in game …069646262302).
+            ("whenever this creature" in oracle_lower and "dies" in oracle_lower) or
+            ("this creature or another creature" in oracle_lower and "dies" in oracle_lower) or
             (card.name.lower() in oracle_lower and "dies" in oracle_lower)
         )
 
         if not has_dies_trigger:
             continue
 
+        # June 10 deep-dive (B2, CRITICAL): "whenever a creature AN OPPONENT
+        # CONTROLS dies" (Massacre Wurm, Glissa the Traitor) had no scope
+        # gate — it fired on the trigger controller's OWN deaths too. Wurm
+        # fires only when the dying creature's controller is an opponent of
+        # the WURM's controller; three misfires on own-side deaths drained
+        # the wrong player, the last taking Claude from 1 to 0 (an illegal
+        # game loss). In 1v1 this gate also makes the "that player loses"
+        # recipient coincide with the dying creature's controller.
+        if "an opponent controls" in oracle_lower and dying_player is player:
+            continue
+
         # "whenever a creature you control dies" — only fire if dying creature is ours
         if "you control" in oracle_lower and dying_player != player:
+            continue
+
+        # June 10 audit (V16): enforce the "nontoken" qualifier against the
+        # dying card. Detection matched Midnight Reaper, but nothing checked
+        # the dying creature's token-ness — a Bitterblossom Faerie token death
+        # fired "Whenever a NONTOKEN creature you control dies".
+        if "nontoken" in oracle_lower and getattr(dying_card, 'is_token', False):
             continue
 
         handled = False
@@ -1744,12 +1881,24 @@ def _check_dies_triggers_sync(engine, game: GameState, dying_card: Card, dying_p
         # Blood Artist / Zulaport Cutthroat: drain 1
         if card.name.lower() in ("blood artist", "zulaport cutthroat", "bastion of remembrance"):
             opp.life -= 1
-            ctrl.life += 1
-            print(f"[DIES-TRIGGER] {card.name}: {opp.name} loses 1 life (life: {opp.life}), {ctrl.name} gains 1 life (life: {ctrl.life})")
-            # May 30 audit: also emit the canonical life tags for audit greps.
             _log_life_change(opp, -1, f"dies trigger: {card.name}")
-            _log_life_change(ctrl, 1, f"dies trigger: {card.name}")
-            messages.append(f"💀 {card.name}: {opp.name} loses 1 life, {ctrl.name} gains 1 life")
+            # June 10 audit (V22): route the gain through the centralized
+            # life-gain path so prevention statics (Erebos: "Your opponents
+            # can't gain life") and gain-life triggers apply. The old naked
+            # `ctrl.life += 1` bypassed the prevention that the SAME card's
+            # ETB path correctly honored — the display contradicted itself
+            # within two turns.
+            _gain_ok, _gain_amt, _gain_chain = engine.rules._apply_life_gain(
+                game, ctrl, 1, source_name=card.name)
+            _gained = bool(_gain_ok and _gain_amt)
+            print(f"[DIES-TRIGGER] {card.name}: {opp.name} loses 1 life (life: {max(0, opp.life)}), "
+                  f"{ctrl.name} {'gains 1 life' if _gained else 'gain PREVENTED'} (life: {max(0, ctrl.life)})")
+            if _gained:
+                _log_life_change(ctrl, _gain_amt, f"dies trigger: {card.name}")
+                messages.append(f"💀 {card.name}: {opp.name} loses 1 life, {ctrl.name} gains 1 life")
+            else:
+                messages.append(f"💀 {card.name}: {opp.name} loses 1 life (life gain prevented"
+                                f"{': ' + ', '.join(_gain_chain) if _gain_chain else ''})")
             trigger_count += 1
             handled = True
 
@@ -1762,7 +1911,9 @@ def _check_dies_triggers_sync(engine, game: GameState, dying_card: Card, dying_p
         # Syr Konrad, the Grim: deal 1 damage to each opponent
         elif card.name.lower() == "syr konrad, the grim":
             opp.life -= 1
-            print(f"[DIES-TRIGGER] Syr Konrad, the Grim: deals 1 damage to {opp.name} (life: {opp.life})")
+            # June 10 audit (V31a): clamp the console print like the Discord
+            # twin below — this was one of the two negative-life leak sites.
+            print(f"[DIES-TRIGGER] Syr Konrad, the Grim: deals 1 damage to {opp.name} (life: {max(0, opp.life)})")
             _log_life_change(opp, -1, "Syr Konrad, the Grim")  # May 30 audit: canonical tag
             messages.append(f"💀 Syr Konrad: deals 1 damage to {opp.name} ({max(0, opp.life)} life)")
             trigger_count += 1
@@ -2304,7 +2455,12 @@ def _check_attack_triggers_sync(engine, game: GameState, attacker_card: Card, at
         if not card.oracle_text:
             continue
         oracle_lower = card.oracle_text.lower()
-        if "attacks" not in oracle_lower:
+        # June 10 deep-dive (Karlach): the bare "attacks" pre-filter made the
+        # "whenever you attack" branch below UNREACHABLE — Karlach, Fury of
+        # Avernus's oracle says "Whenever you attack, …" (contains "attack,"
+        # but never the literal "attacks"), so her untap + first-strike +
+        # extra-combat trigger was silently skipped every combat.
+        if "attacks" not in oracle_lower and "whenever you attack" not in oracle_lower:
             continue
 
         has_attack_trigger = (

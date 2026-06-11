@@ -162,10 +162,25 @@ def convert_sba_results(rules_results, game, rules=None):
                                 'player_index': pi, 'reason': desc})
 
         elif stype == SBAType.LEGEND_RULE:
-            # CR 704.5j: controller chooses one to keep. In autoplay we keep
-            # the most-recently-added copy (assumed intent — they just cast or
-            # reanimated it). Without this, ALL copies were going to graveyard.
-            to_destroy = result.affected_objects[:-1] if len(result.affected_objects) > 1 else []
+            # CR 704.5j: controller chooses one to keep. June 10 audit: was
+            # keep-most-recent, which binned a 13-loyalty Teferi to keep a
+            # fresh 4-loyalty copy. Keep-BEST instead: highest loyalty, then
+            # most counters, then most-recently-added as the tiebreak (which
+            # preserves the old behavior for vanilla legends — any sane
+            # controller chooses the developed copy).
+            affected = list(result.affected_objects)
+            to_destroy = []
+            if len(affected) > 1:
+                def _keep_score(obj_id):
+                    for _p in game.players:
+                        for _c in _p.battlefield:
+                            if _c.id == obj_id:
+                                return (getattr(_c, 'loyalty_counters', 0) or 0,
+                                        sum((_c.counters or {}).values()),
+                                        affected.index(obj_id))
+                    return (0, 0, affected.index(obj_id))
+                keeper = max(affected, key=_keep_score)
+                to_destroy = [o for o in affected if o != keeper]
             for obj_id in to_destroy:
                 name, pi = card_lookup.get(obj_id, ('Unknown', 0))
                 actions.append({'type': 'legend_rule', 'card_id': obj_id, 'card_name': name,

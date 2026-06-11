@@ -1012,10 +1012,20 @@ class PlaneswalkerManager:
 
             # Create token cards
             from mtg_game import Card
+            # June 10 audit (V31g): derive a real NAME + subtype from the
+            # parsed descriptor. The old name was the entire phrase ("1/1
+            # White Kor Soldier Creature Token"), which then appeared
+            # verbatim in attack/damage lines; subtypes were dropped too.
+            _desc_words = re.sub(r'^\d+/\d+\s+', '', (token_desc or '').strip()).split()
+            _skip_words = {'white', 'blue', 'black', 'red', 'green', 'colorless',
+                           'and', 'creature', 'creatures', 'token', 'tokens',
+                           'tapped', 'attacking', 'a', 'an'}
+            _name_words = [w for w in _desc_words if w.lower() not in _skip_words]
+            _tok_name = ' '.join(w.capitalize() for w in _name_words) or 'Token'
             for i in range(amount):
                 token = Card(
-                    name=f"{token_desc.title()} Token",
-                    type_line="Creature — Token",
+                    name=_tok_name,
+                    type_line=f"Token Creature — {_tok_name}",
                     power=power,
                     toughness=toughness,
                     owner_index=game.players.index(player),
@@ -1025,7 +1035,7 @@ class PlaneswalkerManager:
                 token.is_token = True  # CR 110.5g: tokens cease to exist in non-battlefield zones
                 player.battlefield.append(token)
 
-            messages.append(f"✨ Created {amount}x {token_desc} token(s)")
+            messages.append(f"🪙 {player.name} creates {amount}x **{_tok_name}** ({power}/{toughness})")
         
         # === GAIN LIFE ===
         life_match = re.search(r'gains? (\d+) life', text)

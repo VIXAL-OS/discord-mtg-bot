@@ -35,6 +35,28 @@ from mtg.constants import Phase, Zone, COMMAND_ZONE_FORMATS
 from mtg.helpers import _normalize_pw_ability_idx
 from mtg.models import Card, Player, GameState
 
+# June 10 audit (V31c): failure-indicator phrases for the "Action succeeded:"
+# misclassification sniff (Bug E, May 20). Was inlined at the MAIN1 site only;
+# now shared so the MAIN2 and post-combat loops apply the same guard.
+FAILURE_RESULT_PHRASES = (
+    'cannot activate',
+    'already used its ability',
+    'already activated',
+    'no activated abilities',
+    'cannot be cast',
+    'cannot be activated',
+    'no legal target',
+    'no valid target',
+    'has no mana cost',
+)
+
+
+def _result_looks_like_failure(result) -> bool:
+    """True when an action handler returned a truthy string that is actually
+    a rejection message (Bug E class)."""
+    _rl = (result or "").lower()
+    return bool(result) and any(p in _rl for p in FAILURE_RESULT_PHRASES)
+
 try:
     from rules.mana import ManaCost
     HAS_MANA_ENGINE = True
@@ -584,6 +606,38 @@ def _validate_plan_mana(engine, game: GameState, player_idx: int, plan: list) ->
                     total_creatures = sum(len([c for c in p.battlefield if c.is_creature()]) for p in game.players)
                     if total_creatures == 0:
                         _reject("cast", card_name, "board wipe on empty board — hold for after opponent deploys threats")
+                        continue
+                    # June 10 audit (AI quality): wipes whose ONLY casualties
+                    # would be the caster's own creatures (Wrath killing own
+                    # commander vs one token; Supreme Verdict killing only own
+                    # Snapcaster). Recorded via _reject so the feedback loop
+                    # stops the re-propose.
+                    _opp_creatures = sum(
+                        len([c for c in p.battlefield if c.is_creature()])
+                        for p in game.players if p is not player)
+                    _own_creatures = total_creatures - _opp_creatures
+                    if _opp_creatures == 0 and _own_creatures > 0:
+                        _reject("cast", card_name,
+                                "board wipe would destroy ONLY your own creatures — "
+                                "hold until the opponent has a board")
+                        continue
+
+                # June 10 audit (Searing Blaze): burn that REQUIRES a creature
+                # target ("deals N damage to target creature") wastes the cast
+                # when the opponent has no creatures — the engine legally
+                # allows targeting your OWN creature (CR 601.2c), then the
+                # template refuses the friendly target and the spell fizzles
+                # AFTER mana payment. Hold it at the planner instead.
+                if (re.search(r'deals? \d+ damage to target creature', oracle_lower)
+                        and 'any target' not in oracle_lower
+                        and 'target creature or' not in oracle_lower):
+                    _opp_creats2 = sum(
+                        len([c for c in p.battlefield if c.is_creature()])
+                        for p in game.players if p is not player)
+                    if _opp_creats2 == 0:
+                        _reject("cast", card_name,
+                                "requires a creature target and opponent controls none — "
+                                "hold until a creature appears")
                         continue
                 # May 23 audit (MAJOR #9): block reanimate-shape spells when
                 # own graveyard lacks a legal target. Victimize, Reanimate,
@@ -1143,18 +1197,7 @@ async def execute_claude_turn(engine, game: GameState) -> List[str]:
         # already used its ability this turn — cannot activate again` —
         # actually an activation rejection. Sniff the result string for
         # failure-indicator phrases and reclassify as failed.
-        _result_lower = (result or "").lower()
-        _looks_like_failure = bool(result) and any(p in _result_lower for p in (
-            'cannot activate',
-            'already used its ability',
-            'already activated',
-            'no activated abilities',
-            'cannot be cast',
-            'cannot be activated',
-            'no legal target',
-            'no valid target',
-            'has no mana cost',
-        ))
+        _looks_like_failure = _result_looks_like_failure(result)
 
         if result and not _looks_like_failure:
             print(f"{engine.claude_ai.turn_tag} Action succeeded: {result}")
@@ -1263,6 +1306,11 @@ async def execute_claude_turn(engine, game: GameState) -> List[str]:
                     engine.tap_permanent(card)
                     game.attackers.append(card.id)
                     used_ids.add(card.id)
+                else:
+                    # June 10 round 3 (A10b follow-up): visibility for silent
+                    # drops — see the twin print in mtg/autoplay.py.
+                    print(f"[COMBAT] Proposed attacker '{name}' skipped — no untapped, "
+                          f"eligible, unclaimed instance on {player.name}'s battlefield")
 
             if game.attackers:
                 declared_names = []
@@ -1453,6 +1501,11 @@ async def execute_claude_turn(engine, game: GameState) -> List[str]:
 
             result = await engine._execute_action(game, claude_index, action)
 
+            # June 10 (V31c): same Bug-E failure-phrase guard as MAIN1.
+            if result and _result_looks_like_failure(result):
+                print(f"{engine.claude_ai.turn_tag} Action returned failure message: {result}")
+                last_error = result
+                result = None
             if result:
                 print(f"{engine.claude_ai.turn_tag} Action succeeded: {result}")
                 actions_taken.append(result)
@@ -1542,6 +1595,11 @@ async def continue_claude_post_combat(engine, game: GameState) -> List[str]:
 
             result = await engine._execute_action(game, claude_index, action)
 
+            # June 10 (V31c): same Bug-E failure-phrase guard as MAIN1.
+            if result and _result_looks_like_failure(result):
+                print(f"{engine.claude_ai.turn_tag} Action returned failure message: {result}")
+                last_error = result
+                result = None
             if result:
                 print(f"{engine.claude_ai.turn_tag} Action succeeded: {result}")
                 actions_taken.append(result)
@@ -1985,7 +2043,17 @@ def _get_action_error(engine, game: GameState, player_index: int, action: Dict) 
             abilities = engine.planeswalker_manager.parse_abilities(perm)
             normalized = _normalize_pw_ability_idx(ability_idx, abilities)
             if normalized is None:
-                return f"'{perm.name}' ability '{ability_idx}' is not a valid index or loyalty cost (has {len(abilities)} abilities)"
+                # June 10 audit (Ashiok retry deadlock): the AI alternated
+                # between two wrong formats for 3 retries because neither
+                # error taught the expected shape. Spell out valid indices
+                # AND the loyalty costs so either addressing mode works.
+                _costs = ", ".join(f"index {i} = [{a.loyalty_cost:+d}]"
+                                   for i, a in enumerate(abilities))
+                return (f"'{perm.name}' ability '{ability_idx}' is not a valid index or "
+                        f"loyalty cost (has {len(abilities)} abilities: {_costs}). "
+                        f"Use a 0-based \"ability\" index from that list, and if the "
+                        f"ability needs a target include \"target\": \"<player or card name>\" "
+                        f"in the SAME action.")
             ability_idx = normalized
             can_act, reason = engine.planeswalker_manager.can_activate(game, player, perm, ability_idx)
             if not can_act:
@@ -1995,7 +2063,11 @@ def _get_action_error(engine, game: GameState, player_index: int, action: Dict) 
             pw_err = getattr(game, '_last_pw_target_error', None)
             if pw_err:
                 game._last_pw_target_error = None
-                return pw_err
+                # June 10 (Ashiok): teach the retry shape — keep the SAME
+                # ability index and ADD the target field, instead of
+                # switching to a different (invalid) index.
+                return (f"{pw_err} — retry with the SAME \"ability\" index plus "
+                        f"\"target\": \"<name>\" in the same action")
             return None  # Valid
         # Non-planeswalker: check for activated abilities
         has_activated = False

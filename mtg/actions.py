@@ -741,8 +741,14 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                 player.graveyard.extend(player.hand)
                 player.hand = []
                 rules.log_event(f"{player.name} discards their hand ({hand_size} cards)")
-                preview = ', '.join(discarded_names[:6])
-                more = f" (+{hand_size - 6} more)" if hand_size > 6 else ""
+                # June 10 audit: don't hide exactly ONE name behind "+1 more" —
+                # collapse only when 2+ names are hidden.
+                if hand_size <= 7:
+                    preview = ', '.join(discarded_names)
+                    more = ""
+                else:
+                    preview = ', '.join(discarded_names[:6])
+                    more = f" (+{hand_size - 6} more)"
                 return f"🗑️ **{player.name}** discards their hand ({hand_size}): {preview}{more}"
             if card_name == "random" and player.hand:
                 import random as rng
@@ -900,6 +906,18 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                     card.deathtouch_damage = 0
                     card.summoning_sick = True if card.is_creature() else False
                     card.entered_this_turn = True
+                    # June 10 audit (V8): initialize planeswalker loyalty on
+                    # non-cast battlefield entry (Rashmi free-cast, reanimation
+                    # via move_card). The cast path does this in spells.py;
+                    # without it the PW entered at 0 loyalty and died to SBA
+                    # before any player-visible line existed (a Teferi "death"
+                    # for a card that never visibly entered).
+                    if card.is_planeswalker():
+                        try:
+                            card.loyalty_counters = int(card.loyalty)
+                        except (TypeError, ValueError):
+                            card.loyalty_counters = 0
+                        print(f"[MOVE-CARD] {card.name} enters with {card.loyalty_counters} loyalty")
                     # [AURA-ETB] Auto-attach auras entering via non-cast paths (CR 303.4f)
                     # When an Aura enters the battlefield without being cast, controller
                     # chooses a legal target to attach it to.
@@ -1743,9 +1761,17 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
         # skips a specific permanent (the trigger source itself).
         include_subtype = action.get("subtype") or action.get("include_subtype") or ""
         exclude_name = action.get("exclude", "") or action.get("exclude_name", "")
-        pump_player = find_player(pump_player_name)
-        if pump_player:
-            pumped = []
+        # June 10 audit (V23): support symmetric effects ("All creatures get
+        # -X/-X" — Toxic Deluge). The template now emits player="all"; the old
+        # single-player handler received "" → find_player(None) → silent no-op,
+        # so the -X/-X never applied while the life was still paid.
+        if (pump_player_name or '').lower() in ('all', 'each', 'both', 'everyone'):
+            pump_targets = list(game.players)
+        else:
+            _pp = find_player(pump_player_name)
+            pump_targets = [_pp] if _pp else []
+        pumped = []
+        for pump_player in pump_targets:
             for c in pump_player.battlefield:
                 if not c.is_creature():
                     continue
@@ -1798,12 +1824,23 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                                 c._granted_keywords = set(granted) if granted else set()
                             c._granted_keywords.add(kw)
                     pumped.append(c.name)
-            if pumped:
-                kw_str = f" and {', '.join(pump_keywords)}" if pump_keywords else ""
-                p_str = f"+{pump_power}" if pump_power >= 0 else str(pump_power)
-                t_str = f"+{pump_toughness}" if pump_toughness >= 0 else str(pump_toughness)
-                print(f"[PUMP] {pump_player.name}'s creatures get {p_str}/{t_str}{kw_str}: {pumped}")
-                return f"💪 {pump_player.name}'s creatures get {p_str}/{t_str}{kw_str} until end of turn ({len(pumped)} creatures)"
+        if pumped:
+            kw_str = f" and {', '.join(pump_keywords)}" if pump_keywords else ""
+            p_str = f"+{pump_power}" if pump_power >= 0 else str(pump_power)
+            t_str = f"+{pump_toughness}" if pump_toughness >= 0 else str(pump_toughness)
+            scope = "All" if len(pump_targets) > 1 else f"{pump_targets[0].name}'s"
+            print(f"[PUMP] {scope} creatures get {p_str}/{t_str}{kw_str}: {pumped}")
+            result_msg = (f"💪 {scope} creatures get {p_str}/{t_str}{kw_str} "
+                          f"until end of turn ({len(pumped)} creatures)")
+            # June 10 (V23): a negative toughness pump can be lethal — refresh
+            # P/T and run SBA now (CR 704.5g) instead of waiting for the next
+            # sweep (Toxic Deluge left 0/1s alive to block the same turn).
+            if pump_toughness < 0:
+                game.recalculate_power_toughness()
+                sba_msgs = rules.process_state_based_actions(game)
+                if sba_msgs:
+                    result_msg += "\n" + "\n".join(sba_msgs)
+            return result_msg
         # May 26 audit: this branch used to leak the raw scaffolding string
         # "Pump effect: no creatures found for <name>" (trailing space when the
         # player name was empty) to Discord — e.g. Toxic Deluge "creatures get
@@ -2071,6 +2108,22 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                     return f"🛡️ **{card.name}** can't be targeted ({reason})"
             if card.has_keyword("Indestructible"):
                 return f"🛡️ **{card.name}** is indestructible!"
+            # June 10 audit (V13): honor destroy-replacement saves on the
+            # single-target path too (CR 614.6 / 702.154) — the May 30 save
+            # chain went into destroy_all_creatures only, while this path
+            # moved the card straight to the graveyard (and the dies-template
+            # text claimed "handled by the SBA engine", which was false here).
+            # Order mirrors the SBA path: shield → totem (Umbra) armor →
+            # destroy, then undying/persist return below.
+            if card.is_creature() and card.counters.get('shield', 0) > 0:
+                card.counters['shield'] -= 1
+                print(f"[SHIELD-COUNTER] {card.name}: shield removed instead of destroyed")
+                return f"🛡️ **{card.name}**'s shield counter is removed instead!"
+            if card.is_creature() and rules._has_totem_armor(card, owner):
+                _aura = rules._remove_totem_armor(card, owner, game)
+                print(f"[TOTEM-ARMOR] {card.name}: {_aura.name if _aura else '?'} destroyed instead")
+                return (f"🛡️ **{_aura.name if _aura else 'Umbra armor'}** is destroyed "
+                        f"instead of **{card.name}** (umbra armor)!")
             # [LTB] Check for leaves-the-battlefield triggers BEFORE removal
             ltb_msgs = []
             if hasattr(rules, 'engine_ref') and rules.engine_ref:
@@ -2097,11 +2150,44 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                 except Exception as e:
                     print(f"[DIES-TRIGGER] Error firing inline dies-triggers for {card.name}: {e}")
                     maybe_reraise(e)
+            # June 10 audit (V13): undying / persist return (CR 702.92/702.77).
+            # The creature DID die (dies triggers above are correct); it
+            # returns as a new object with the appropriate counter.
+            save_msgs = []
+            if card.is_creature():
+                _ret_label = None
+                if ((card.has_keyword('Undying') or rules._permanent_grants_undying(game, card, owner))
+                        and card.counters.get('+1/+1', 0) == 0):
+                    _ret_label = 'UNDYING'
+                    _ret_counter = '+1/+1'
+                elif card.has_keyword('Persist') and card.counters.get('-1/-1', 0) == 0:
+                    _ret_label = 'PERSIST'
+                    _ret_counter = '-1/-1'
+                if _ret_label:
+                    owner.graveyard.remove(card)
+                    card.damage_marked = 0
+                    card.deathtouch_damage = 0
+                    card.summoning_sick = True
+                    card.counters[_ret_counter] = card.counters.get(_ret_counter, 0) + 1
+                    owner.battlefield.append(card)
+                    print(f"[{_ret_label}] {card.name} returned to battlefield with "
+                          f"{_ret_counter} counter (single-target destroy)")
+                    save_msgs.append(f"♻️ {card.name} returns with {_ret_label.lower()} ({_ret_counter} counter)!")
+                    # Re-register statics (they were unregistered above) and run
+                    # the new-object cleanup (combat state, enters-tapped, self-ETB).
+                    game.register_static_keyword_grants(card, owner.name)
+                    game.register_static_pt_effects(card, owner.name)
+                    from mtg.sba import _finalize_death_save_return
+                    save_msgs.extend(_finalize_death_save_return(rules, game, owner, card, _ret_label))
+                    game.recalculate_granted_keywords()
+                    game.recalculate_power_toughness()
             msg = f"💀 **{card.name}** destroyed"
             if ltb_msgs:
                 msg += "\n" + "\n".join(ltb_msgs)
             if dies_msgs:
                 msg += "\n" + "\n".join(dies_msgs)
+            if save_msgs:
+                msg += "\n" + "\n".join(save_msgs)
             return msg
 
     elif action_type == "mill":
@@ -2237,8 +2323,23 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
         player_name = action.get("player")
         card_name = action.get("card", "")
         allow_types = action.get("allow_types", ["creature"])  # Default creature-only; Daretti passes ["artifact"]
+        # June 10 audit (V7): "your graveyard"-restricted reanimation. Dread
+        # Return ("Return target creature card from YOUR graveyard") was
+        # taking the opponent's best creature because the search below always
+        # spanned every graveyard. own_graveyard=True (or from_player=<name>)
+        # restricts the pool; default stays any-graveyard (Animate Dead /
+        # Reanimate legitimately reach across).
+        own_only = bool(action.get("own_graveyard") or action.get("own_graveyard_only"))
+        from_player_name = action.get("from_player")
         p = find_player(player_name)
         if p:
+            search_pool = list(game.players)
+            if own_only:
+                search_pool = [p]
+            elif from_player_name:
+                _fp = find_player(from_player_name)
+                if _fp:
+                    search_pool = [_fp]
             # If no specific card named, find best matching card in own graveyard
             if not card_name and p.graveyard:
                 for c in sorted(p.graveyard, key=lambda c: int(c.cmc) if c.cmc else 0, reverse=True):
@@ -2247,8 +2348,8 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                         card_name = c.name
                         break
             if card_name:
-                # Search all graveyards for the card
-                for search_player in game.players:
+                # Search the (possibly restricted) graveyard pool for the card
+                for search_player in search_pool:
                     for c in list(search_player.graveyard):
                         if c.name.lower() == card_name.lower():
                             type_lower = (c.type_line or "").lower()
@@ -2315,8 +2416,17 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
         messages_parts = []
         ld_died_list = []  # May 30 audit (F-LD1): collect sacrificed creatures for dies-triggers
         for p in game.players:
-            # Save graveyard creatures first
-            gy_creatures = [c for c in p.graveyard if 'creature' in (c.type_line or '').lower()]
+            # Save graveyard creatures first.
+            # June 10 deep-dive (B5d, CR 712.4a): a card in a graveyard has
+            # FRONT-face characteristics only. Transformed sagas (Kirin-
+            # Touched Orochi) sat in the graveyard wearing their creature
+            # back face and Living Death returned them — an enchantment Saga
+            # is not a legal return. The saga-table transform path can't
+            # revert (front data overwritten), so exclude flagged cards;
+            # real TDFCs revert via Card.transform() elsewhere.
+            gy_creatures = [c for c in p.graveyard
+                            if 'creature' in (c.type_line or '').lower()
+                            and not getattr(c, '_transformed', False)]
             # Sacrifice all battlefield creatures
             bf_creatures = [c for c in p.battlefield if c.is_creature()]
             for c in bf_creatures:
@@ -2806,6 +2916,7 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
         exclude_types = [t.lower() for t in action.get("exclude_types", []) or []]
         destroyed = []
         died_list = []  # For dies triggers
+        save_return_msgs = []  # June 10 (C6): undying/persist return display lines
         for p in game.players:
             creatures_to_destroy = [c for c in p.battlefield
                                     if c.is_creature() and not getattr(c, '_phased_out', False)]
@@ -2851,6 +2962,12 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                         creature.counters['+1/+1'] = creature.counters.get('+1/+1', 0) + 1
                         p.battlefield.append(creature)
                         print(f"[UNDYING] {creature.name} returned to battlefield with +1/+1 counter (board wipe)")
+                        # June 10 (C6): re-register statics + new-object cleanup
+                        # (combat state, enters-tapped, self-ETB re-fire).
+                        game.register_static_keyword_grants(creature, p.name)
+                        game.register_static_pt_effects(creature, p.name)
+                        from mtg.sba import _finalize_death_save_return
+                        save_return_msgs.extend(_finalize_death_save_return(rules, game, p, creature, 'UNDYING'))
                 elif creature.has_keyword('Persist') and creature.counters.get('-1/-1', 0) == 0:
                     p.graveyard.remove(creature)
                     creature.damage_marked = 0
@@ -2859,6 +2976,11 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                     creature.counters['-1/-1'] = creature.counters.get('-1/-1', 0) + 1
                     p.battlefield.append(creature)
                     print(f"[PERSIST] {creature.name} returned to battlefield with -1/-1 counter (board wipe)")
+                    # June 10 (C6): same new-object cleanup as undying.
+                    game.register_static_keyword_grants(creature, p.name)
+                    game.register_static_pt_effects(creature, p.name)
+                    from mtg.sba import _finalize_death_save_return
+                    save_return_msgs.extend(_finalize_death_save_return(rules, game, p, creature, 'PERSIST'))
         # Fire dies triggers for all creatures that died simultaneously
         # (Blood Artist, Zulaport Cutthroat, etc.)
         if died_list:
@@ -2868,7 +2990,10 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
         if destroyed:
             game.recalculate_granted_keywords()
             game.recalculate_power_toughness()
-            return f"💥 Board wipe destroys {len(destroyed)} creatures: {_format_destroyed_list(destroyed)}"
+            _wipe_msg = f"💥 Board wipe destroys {len(destroyed)} creatures: {_format_destroyed_list(destroyed)}"
+            if save_return_msgs:
+                _wipe_msg += "\n" + "\n".join(save_return_msgs)
+            return _wipe_msg
         return f"💥 Board wipe (no creatures to destroy)"
 
     elif action_type == "destroy_by_power":
@@ -3479,12 +3604,16 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
             victim = candidates[0]
             game.unregister_static_effects(victim)
             p.battlefield.remove(victim)
-            # Commanders go to command zone
+            # Commanders go to command zone — the OWNER's, not the
+            # battlefield-holder's (June 10 audit C7, CR 903.9a).
             if getattr(victim, 'is_commander', False) and hasattr(game, 'format') and game.format in ('commander', 'edh', 'brawl', 'oathbreaker'):
-                if not hasattr(p, 'command_zone'):
-                    p.command_zone = []
-                p.command_zone.append(victim)
-                print(f"[SACRIFICE] {p.name} sacrifices {victim.name} → command zone ({reason})")
+                from mtg.helpers import command_zone_owner
+                _zone_owner = command_zone_owner(game, victim, p)
+                if not hasattr(_zone_owner, 'command_zone'):
+                    _zone_owner.command_zone = []
+                _zone_owner.command_zone.append(victim)
+                print(f"[SACRIFICE] {p.name} sacrifices {victim.name} → "
+                      f"{_zone_owner.name}'s command zone ({reason})")
             else:
                 p.graveyard.append(victim)
                 # Fire dies triggers if creature

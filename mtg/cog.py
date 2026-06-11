@@ -4721,26 +4721,15 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
                             or getattr(g, '_turn_burst_turn', -1) != cur_turn):
                         g._turn_burst_counts = {}
                         g._turn_burst_turn = cur_turn
-                    # May 23 audit (MAJOR #19): the dedup key was the literal
-                    # message content, but real-game trigger fires often have
-                    # minor numeric variation in trailing parentheticals
-                    # ("(life: 27)" → "(life: 25)") that break byte-identical
-                    # matching. Layer-3 sentinel emitted 0 times across the
-                    # entire May 23 batch despite known Species Specialist
-                    # patterns. Strip trailing-numeric parentheticals for the
-                    # bucket key so the dedup keys identical SOURCE messages.
-                    dedup_key = re.sub(r'\s*\([^)]*\d[^)]*\)\s*$', '', content)
-                    # May 25 audit (F8): also strip trailing bolded card names
-                    # from "draws/discards/exiles **<card>**" style messages.
-                    # Guardian Project + Avenger of Zendikar produced 31
-                    # consecutive "🃏 Guardian Project — Rick Deckard draws
-                    # **<varying>**" lines in game_1508571553489752204 because
-                    # each draw revealed a different card and the byte-key
-                    # changed every line. After stripping the trailing **X**
-                    # the key becomes the stable source-shape and the sentinel
-                    # collapses the burst. Same pattern hits Beast Whisperer
-                    # ETB cascades, Mentor of the Meek, etc.
-                    dedup_key = re.sub(r'\s*\*\*[^*]+\*\*\s*$', '', dedup_key)
+                    # May 23 (#19) numeric-paren strip + May 25 (F8) bold-name
+                    # strip, now centralized in helpers.burst_dedup_key.
+                    # June 10 audit (V19): the F8 strip is RESTRICTED to
+                    # draw/discard/exile/reveal shapes — unrestricted, every
+                    # "✨ P cast **X**" in a turn shared one key and every
+                    # 3rd+ DISTINCT cast was suppressed (44/139 games;
+                    # creatures visibly "attacked out of nowhere").
+                    from mtg.helpers import burst_dedup_key
+                    dedup_key = burst_dedup_key(content)
                     seen = g._turn_burst_counts.get(dedup_key, 0)
                     g._turn_burst_counts[dedup_key] = seen + 1
                     if seen >= 2:

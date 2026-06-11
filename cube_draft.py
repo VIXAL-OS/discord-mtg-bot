@@ -1746,7 +1746,22 @@ class CubeDraftCog(commands.Cog, name="Cube Draft"):
     # =========================================================================
 
     async def _autodraft_send(self, thread, content=None, embed=None):
-        """Send a message to the autodraft thread with rate limiting."""
+        """Send a message to the autodraft thread.
+
+        June 10 audit: delegate to the cog's _autoplay_send so autodraft
+        messages ride the SAME pipeline as regular autoplay — per-game
+        discord-LOG mirroring, dangling-article sanitizers, and all three
+        burst-dedup layers. The June 10 cube game's discord log was 31
+        lines because everything sent from here bypassed the logger; only
+        the combat / Rick-turn lines (already routed through
+        _autoplay_send) were recorded, making the game unauditable.
+        Falls back to a bare send when the cog isn't wired (standalone
+        draft tests).
+        """
+        cog = getattr(self, 'game_cog', None)
+        if cog is not None and hasattr(cog, '_autoplay_send'):
+            await cog._autoplay_send(thread, content=content, embed=embed)
+            return
         try:
             if content and embed:
                 await thread.send(content, embed=embed)
@@ -2098,14 +2113,26 @@ class CubeDraftCog(commands.Cog, name="Cube Draft"):
                         result["outcome"] = "circuit_breaker"
                         break
 
-                    # Advance through untap/upkeep/draw to main phase
-                    if game.phase == Phase.UNTAP:
-                        self.engine.advance_phase(game)  # UNTAP → UPKEEP
-                        self.engine.advance_phase(game)  # UPKEEP → DRAW
-                        self.engine.advance_phase(game)  # DRAW → MAIN1
-
+                    # June 10 audit: banner BEFORE the phase advances (same
+                    # V31h ordering fix as autoplay), and the upkeep/draw
+                    # trigger messages are now SENT instead of discarded —
+                    # advance_phase returns (phase, messages) and the old
+                    # code dropped the tuple on the floor, so Phyrexian
+                    # Arena-class upkeep triggers were invisible in cube
+                    # games.
                     await self._autodraft_send(thread,
                         f"🔄 **Turn {game.turn_number}** — **{game.active_player.name}**'s turn")
+
+                    # Advance through untap/upkeep/draw to main phase
+                    if game.phase == Phase.UNTAP:
+                        _, _p1 = self.engine.advance_phase(game)  # UNTAP → UPKEEP
+                        _, _p2 = self.engine.advance_phase(game)  # UPKEEP → DRAW (upkeep triggers)
+                        _, _p3 = self.engine.advance_phase(game)  # DRAW → MAIN1
+                        for _m in (_p1 + _p2 + _p3):
+                            await self._autodraft_send(thread, _m)
+                        # Drain sync-queued triggers via Tier 3 (same as autoplay)
+                        for _m in await self.engine.drain_pending_triggers(game):
+                            await self._autodraft_send(thread, _m)
 
                     turn_had_actions = False
 
@@ -2279,19 +2306,10 @@ class CubeDraftCog(commands.Cog, name="Cube Draft"):
                     f"⏱️ Game ended after {max_turns} turns (no winner)\n"
                     f"• Life: {game.players[0].name} {game.players[0].life} / "
                     f"{game.players[1].name} {game.players[1].life}")
-            # May 23 audit (MINOR #28): cube draft was the only game in the
-            # May 23 batch missing CALL-BREAKDOWN-FINAL (129/130 games emitted
-            # it). Add the same final-emit hook here for consistency.
-            try:
-                actor_adapter = getattr(self.engine, '_deepseek_actor_adapter', None) \
-                    or getattr(self.engine, '_openrouter_adapter', None)
-                if actor_adapter is not None and hasattr(actor_adapter, 'get_stats'):
-                    stats = actor_adapter.get_stats()
-                    print(f"[CALL-BREAKDOWN-FINAL] cube_draft: "
-                          f"calls={stats.get('calls', 0)} "
-                          f"purpose_counts={stats.get('purpose_counts', {})}")
-            except Exception as _cb_err:
-                print(f"[CALL-BREAKDOWN-FINAL] cube_draft emit failed: {_cb_err}")
+            # (June 10 audit: the stats emits moved to the `finally` block —
+            # the June 10 batch's cube game exited via a path that skipped
+            # this tail, making it the only 1 of 139 games missing both
+            # [STATS-GAME] and [CALL-BREAKDOWN-FINAL].)
 
         except Exception as e:
             import traceback
@@ -2304,6 +2322,23 @@ class CubeDraftCog(commands.Cog, name="Cube Draft"):
                 except Exception:
                     pass
         finally:
+            # June 10 audit: emit stats from `finally` so NO exit path can
+            # skip them, and before the log tee detaches below. (May 23 hook
+            # was at the try-tail; one June 10 game still missed it.)
+            try:
+                actor_adapter = getattr(self.engine, '_deepseek_actor_adapter', None) \
+                    or getattr(self.engine, '_openrouter_adapter', None)
+                if actor_adapter is not None and hasattr(actor_adapter, 'get_stats'):
+                    stats = actor_adapter.get_stats()
+                    print(f"[STATS-GAME] cube_draft: calls={stats.get('calls', 0)} "
+                          f"prompt_tokens={stats.get('prompt_tokens', 0)} "
+                          f"completion_tokens={stats.get('completion_tokens', 0)} "
+                          f"(cumulative under parallel batches — see CLAUDE.md caveat)")
+                    print(f"[CALL-BREAKDOWN-FINAL] cube_draft: "
+                          f"calls={stats.get('calls', 0)} "
+                          f"purpose_counts={stats.get('purpose_counts', {})}")
+            except Exception as _cb_err:
+                print(f"[CALL-BREAKDOWN-FINAL] cube_draft emit failed: {_cb_err}")
             # Cleanup logging and game state
             if hasattr(self.game_cog, '_stdout_tee') and self.game_cog._stdout_tee:
                 self.game_cog._stdout_tee.active_thread = None

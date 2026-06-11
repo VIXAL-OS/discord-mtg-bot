@@ -36,6 +36,7 @@ import random
 from typing import Any, Dict, List, Optional, Tuple
 
 from mtg.constants import Phase, Zone, COMMAND_ZONE_FORMATS
+from mtg.helpers import command_zone_owner
 from mtg.models import Card, Player, GameState
 
 
@@ -177,10 +178,13 @@ def check_state_based_actions(rules, game: GameState) -> List[Dict]:
                     # explicitly so auditors can grep for it and verify the
                     # loss condition fires even when zero-life doesn't.
                     print(f"[SBA-RULES] PLAYER_LOSES_COMMANDER_DAMAGE({player.name}): {damage} cmd damage from p{source_idx}")
+                    _src_name = (game.players[source_idx].name
+                                 if 0 <= source_idx < len(game.players)
+                                 else f'player {source_idx}')
                     actions.append({
                         'type': 'player_loses',
                         'player_index': i,
-                        'reason': f'received 21+ commander damage from player {source_idx}'
+                        'reason': f"received 21+ commander damage from {_src_name}"
                     })
 
         # 704.5d: Tokens in non-battlefield zones cease to exist (direct mutation)
@@ -281,6 +285,69 @@ def check_sba_inline_fallback(rules, game: GameState) -> List[Dict]:
                 for legend in legends[:-1]:
                     actions.append({'type': 'legend_rule', 'card_name': legend.name, 'card_id': getattr(legend, 'id', ''), 'player_index': i, 'reason': f'legend rule — duplicate "{name}"'})
     return actions
+
+
+def _finalize_death_save_return(rules, game: GameState, player: Player,
+                                card: Card, save_label: str) -> List[str]:
+    """Shared cleanup when a death save (undying / persist) keeps a creature
+    on the battlefield.
+
+    June 10 audit (C6): the returned permanent is a NEW object (CR 702.92a /
+    400.7) that was never declared as an attacker (CR 508.1a). The old code
+    left `attacking` + game.attackers intact, so a Geralf's Messenger that
+    died to first-strike damage "returned" and dealt regular-step combat
+    damage, killing the blocker that had already beaten it. Also applies
+    "enters tapped" and fires the card's OWN ETB — the watcher-scan helper
+    (_handle_etb_triggers) only fires OTHER permanents' creature-enters
+    triggers, so Geralf's "target opponent loses 2 life" never re-fired.
+
+    Returns extra display messages.
+    """
+    msgs: List[str] = []
+    # 1. Strip combat state — the new object is not attacking or blocking.
+    was_attacking = bool(getattr(card, 'attacking', False))
+    card.attacking = False
+    card.attacking_player = None
+    card.blocking = []
+    card.blocked_by = []
+    attackers = getattr(game, 'attackers', None)
+    if attackers and card.id in attackers:
+        attackers.remove(card.id)
+    blockers = getattr(game, 'blockers', None)
+    if isinstance(blockers, dict):
+        blockers.pop(card.id, None)
+        for _atk_id, _blk_list in blockers.items():
+            if _blk_list and card.id in _blk_list:
+                _blk_list.remove(card.id)
+    if was_attacking:
+        print(f"[{save_label}] {card.name} removed from combat — the returned "
+              f"permanent is a new object (CR 508.1a)")
+    # 2. "Enters the battlefield tapped" applies to the re-entry.
+    oracle_l = (card.oracle_text or '').lower()
+    if 'enters the battlefield tapped' in oracle_l or 'enters tapped' in oracle_l:
+        card.tapped = True
+        print(f"[{save_label}] {card.name} re-enters tapped")
+    # 3. Fire the card's own ETB via the template library (sync, free).
+    try:
+        from rules.effect_templates import get_effect_library
+        lib = get_effect_library()
+        opp = next((p for p in game.players if p is not player), None)
+        tmpl_actions, tmpl_desc = lib.resolve_etb(
+            card.name, card.oracle_text or '', player.name,
+            opp.name if opp else '')
+        if tmpl_actions:
+            for act in tmpl_actions:
+                res = rules._execute_action_on_state(game, act)
+                if res:
+                    msgs.append(res)
+            print(f"[{save_label}-ETB] Re-fired self-ETB for {card.name}: {tmpl_desc}")
+    except Exception as etb_err:
+        # Crash barrier: a bad template must not turn a death save into a
+        # game crash. Visible in strict batches via maybe_reraise.
+        print(f"[{save_label}-ETB] self-ETB re-fire failed for {card.name}: {etb_err}")
+        from mtg.util import maybe_reraise
+        maybe_reraise(etb_err)
+    return msgs
 
 
 def process_state_based_actions(rules, game: GameState) -> List[str]:
@@ -430,6 +497,11 @@ def process_state_based_actions(rules, game: GameState) -> List[str]:
                                 print(f"[UNDYING-ETB] Failed to fire ETB for {card.name}: {etb_err}")
                         else:
                             print(f"[UNDYING-ETB] No engine_ref on rules — ETB triggers skipped for {card.name}")
+                        # June 10 audit (C6): the return is a NEW object —
+                        # strip combat state, apply enters-tapped, fire its
+                        # OWN ETB (the watcher scan above doesn't).
+                        messages.extend(_finalize_death_save_return(
+                            rules, game, player, card, "UNDYING"))
                         needs_layers_recalc = True
                         continue  # Don't remove from battlefield
 
@@ -453,6 +525,9 @@ def process_state_based_actions(rules, game: GameState) -> List[str]:
                                 print(f"[PERSIST-ETB] Failed to fire ETB for {card.name}: {etb_err}")
                         else:
                             print(f"[PERSIST-ETB] No engine_ref on rules — ETB triggers skipped for {card.name}")
+                        # June 10 audit (C6): same new-object cleanup as undying.
+                        messages.extend(_finalize_death_save_return(
+                            rules, game, player, card, "PERSIST"))
                         needs_layers_recalc = True
                         continue  # Don't remove from battlefield
 
@@ -460,11 +535,17 @@ def process_state_based_actions(rules, game: GameState) -> List[str]:
                     game.unregister_static_effects(card)
                     player.battlefield.remove(card)
 
-                    # Commanders can go to command zone instead of graveyard
+                    # Commanders can go to command zone instead of graveyard.
+                    # June 10 audit (C7, CR 903.9a): the OWNER's command zone,
+                    # not the battlefield-holder's — see command_zone_owner.
                     if card.is_commander and game.format in COMMAND_ZONE_FORMATS:
                         card.reset_battlefield_state()  # Clear damage/modifiers so recast starts clean
-                        player.command_zone.append(card)
-                        messages.append(f"☠️ {card.name} dies → returns to command zone ({action['reason']})")
+                        _zone_owner = command_zone_owner(game, card, player)
+                        _zone_owner.command_zone.append(card)
+                        if _zone_owner is not player:
+                            messages.append(f"☠️ {card.name} dies → returns to {_zone_owner.name}'s command zone ({action['reason']})")
+                        else:
+                            messages.append(f"☠️ {card.name} dies → returns to command zone ({action['reason']})")
                     else:
                         # [REPLACEMENT] Check for death replacement (Rest in Peace → exile instead)
                         destination = "graveyard"
@@ -532,15 +613,24 @@ def process_state_based_actions(rules, game: GameState) -> List[str]:
                     # (Blood Artist, Zulaport, Bastion of Remembrance) must
                     # not fire. game_1506623303748550696:381-384 had Korvold
                     # exiled by Rest in Peace yet Bastion's drain still fired.
+                    # June 10 deep-dive: CR 903.9b (2020 rules change) — a
+                    # commander DIES into the graveyard (dies-triggers fire),
+                    # and the owner then moves it to the command zone as a
+                    # SUBSEQUENT state-based action. The old gate treated the
+                    # zone choice as a replacement (pre-2020 rules) and
+                    # suppressed Blood Artist-class watchers on every
+                    # commander death. RIP/Leyline exile redirects remain
+                    # correctly suppressed (true replacement — never dies).
                     actually_died = (
                         card.is_creature()
-                        and card in player.graveyard
+                        and (card in player.graveyard
+                             or any(card in p.command_zone for p in game.players))
                     )
                     if actually_died:
                         recently_died.append((card, player))
                     else:
                         print(f"[DIES-TRIGGER-SKIPPED] {card.name} did not enter graveyard "
-                              f"(commander zone / exile / undying return) — "
+                              f"(exile redirect / undying return) — "
                               f"dies-triggers suppressed per CR 700.4")
 
                     # [AURA-DEATH-TRIGGER] Check for "when enchanted creature dies" on
@@ -586,8 +676,10 @@ def process_state_based_actions(rules, game: GameState) -> List[str]:
                     # diagnostics that confused players in the Apr 28 audit.
                     if card.is_commander and game.format in COMMAND_ZONE_FORMATS:
                         card.reset_battlefield_state()
-                        player.command_zone.append(card)
-                        messages.append(f"👑 {player.name}'s **{card.name}** → command zone (legend rule)")
+                        # CR 903.9a (June 10, C7): owner's zone, not controller's.
+                        _zone_owner = command_zone_owner(game, card, player)
+                        _zone_owner.command_zone.append(card)
+                        messages.append(f"👑 {_zone_owner.name}'s **{card.name}** → command zone (legend rule)")
                     else:
                         player.graveyard.append(card)
                         messages.append(f"👑 {player.name}'s **{card.name}** → graveyard (legend rule)")
@@ -616,7 +708,9 @@ def process_state_based_actions(rules, game: GameState) -> List[str]:
                     player.battlefield.remove(card)
                     if card.is_commander and game.format in COMMAND_ZONE_FORMATS:
                         card.reset_battlefield_state()
-                        player.command_zone.append(card)
+                        # CR 903.9a (June 10, C7): owner's zone, not controller's.
+                        _zone_owner = command_zone_owner(game, card, player)
+                        _zone_owner.command_zone.append(card)
                         messages.append(f"💀 {card.name} goes to command zone (0 loyalty)")
                     else:
                         player.graveyard.append(card)
@@ -734,6 +828,11 @@ def process_state_based_actions(rules, game: GameState) -> List[str]:
                             card._transformed = True
                             card.tapped = False
                             card.entered_this_turn = True
+                            # June 10 deep-dive (B5b, CR 302.6): the flipped
+                            # face is a NEW battlefield entry — without this,
+                            # Kirin-Touched Orochi attacked the same turn it
+                            # transformed (no haste on the card).
+                            card.summoning_sick = True
                             # Reset saga-specific state
                             if hasattr(card, 'counters') and card.counters:
                                 card.counters.pop('lore', None)

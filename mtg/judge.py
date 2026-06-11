@@ -162,7 +162,7 @@ PART 2 - ACTIONS: A JSON array of game state changes to apply. Use these action 
 - {{"action": "destroy", "card": "Card Name"}}
 - {{"action": "move_card", "card": "X", "from_zone": "zone", "to_zone": "zone", "player": "name"}}
 - {{"action": "move_card", "card": "X", "from_zone": "graveyard", "to_zone": "library", "position": "top", "player": "name"}}
-- {{"action": "create_token", "player": "name", "name": "N", "power": P, "toughness": T, "types": "...", "count": N}}
+- {{"action": "create_token", "player": "name", "name": "N", "power": P, "toughness": T, "types": "...", "count": N, "keywords": ["defender", "flying"]}} — ALWAYS include the token's keywords (defender, flying, etc.); omitting them creates a token WITHOUT those abilities
 - {{"action": "add_counters", "card": "X", "counter_type": "+1/+1", "amount": N}}
 - {{"action": "pump_all_creatures", "player": "name", "power": N, "toughness": N}} — TEMPORARY +N/+N until end of turn (NOT counters)
 - {{"action": "tap", "card": "X"}}
@@ -371,10 +371,38 @@ async def resolve_effect(rules, game: GameState, effect_description: str,
                  effect_lower_guard):
         print(f"[RESOLVE-REFUSED] Combat-shaped resolve rejected: '{effect_description[:80]}' — "
               f"combat damage must happen in the combat damage step (CR 510.1)")
+        # June 10 audit: emit the player-facing hint once per source per game.
+        # The AI re-proposed combat-shaped resolves for the same card (Etali)
+        # 4× across turns and the identical ⚠️ line posted every time — the
+        # per-turn dedup can't catch cross-turn repeats.
+        _hint_key = f"combat-resolve:{source_card}"
+        _hints = getattr(game, '_judge_hints_emitted', None)
+        if _hints is None:
+            game._judge_hints_emitted = set()
+            _hints = game._judge_hints_emitted
+        if _hint_key in _hints:
+            return ([], [])
+        _hints.add(_hint_key)
         return ([
             f"⚠️ **{source_card}**: combat actions can't resolve at sorcery speed. "
             f"Use `!attack` to declare attackers in the declare-attackers step."
         ], [])
+
+    # June 10 deep-dive (CRITICAL): Tier 3 fabricated an impossible mana
+    # payment — Leyline Tyrant's "you may pay any amount of {R}" resolved as
+    # a 5-damage payout while the controller had ZERO untapped sources and an
+    # empty pool. If the effect hinges on an optional mana payment and no
+    # mana is available at all, resolve it as a decline instead of letting
+    # the model invent the payment.
+    if re.search(r'\byou may pay\b', effect_lower_guard) and controller:
+        _ctrl_p = next((p for p in game.players if p.name == controller), None)
+        if _ctrl_p is not None:
+            _pool_total = sum((getattr(_ctrl_p, 'mana_pool', {}) or {}).values())
+            _untapped_srcs = len(_ctrl_p.untapped_mana_sources() or [])
+            if _pool_total == 0 and _untapped_srcs == 0:
+                print(f"[RESOLVE-REFUSED] Optional-payment effect with zero available mana "
+                      f"for {controller}: '{effect_description[:80]}'")
+                return ([f"📜 {source_card or 'Effect'}: optional cost declined (no mana available)"], [])
 
     # May 20 audit fix: reject equip/attach descriptions that reference a
     # source not on the battlefield. game_1506623352381509733:718 had a plan
@@ -596,7 +624,7 @@ zones: hand, battlefield, graveyard, exile, library
 - {{"action": "add_counters", "card": "Card Name", "counter_type": "+1/+1", "amount": N}} — PERMANENT counters only
 - {{"action": "remove_counters", "card": "Card Name", "counter_type": "+1/+1", "amount": N}}
 - {{"action": "pump_all_creatures", "player": "name", "power": N, "toughness": N}} — TEMPORARY +N/+N until end of turn
-- {{"action": "create_token", "player": "name", "name": "Token Name", "power": N, "toughness": N, "types": "Creature — Type", "count": N}}
+- {{"action": "create_token", "player": "name", "name": "Token Name", "power": N, "toughness": N, "types": "Creature — Type", "count": N, "keywords": ["defender", "flying"]}} — ALWAYS include the token's printed keywords; a "0/4 Wall with defender" created without "keywords" can illegally attack
 - {{"action": "tap", "card": "Card Name"}}
 - {{"action": "untap", "card": "Card Name"}}
 - {{"action": "add_mana", "player": "name", "color": "R", "amount": N}} — colors: W/U/B/R/G/C

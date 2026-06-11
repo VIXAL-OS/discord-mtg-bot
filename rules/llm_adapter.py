@@ -128,6 +128,11 @@ class _StreamingResponse:
         self._log_tag = log_tag
         self._closed = False
         self._last_chunk_time = time.monotonic()
+        # June 10 audit (V30): mid-stream exception, recorded so callers can
+        # distinguish "stream exhausted" from "stream died" (usage will be
+        # None either way; the silent None previously cascaded into an
+        # AttributeError that discarded the memo 14×/batch).
+        self.stream_error = None
         # Back-reference so we can post token totals to the namespace's
         # cumulative counters once the stream emits its final-usage chunk.
         # None on tests / standalone use — accounting just gets skipped.
@@ -239,9 +244,11 @@ class _StreamingResponse:
         except StopIteration:
             return None
         except Exception as e:
-            # An error mid-stream — log and signal exhaustion so the caller
-            # can decide what to do with the partial text accumulated so far.
+            # An error mid-stream — log, RECORD (June 10, V30), and signal
+            # exhaustion so the caller can decide what to do with the partial
+            # text accumulated so far.
             print(f"[{self._log_tag}] Stream error: {e}")
+            self.stream_error = e
             return None
 
     @property

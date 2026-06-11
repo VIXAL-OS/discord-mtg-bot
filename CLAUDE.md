@@ -1,4 +1,4 @@
-# CLAUDE.md — discord-mtg-bot (OSS pure-MTG Discord bot)
+﻿# CLAUDE.md â€” discord-mtg-bot (OSS pure-MTG Discord bot)
 
 ## What this repo is
 
@@ -8,12 +8,12 @@ human `!play`/`!attack`/etc.), does Scryfall card lookups, and supports a
 configurable persona for light in-thread chat. All the mental-health / support /
 memory / tarot / YouTube machinery from the private original was stripped.
 
-- `bot.py` (~748 lines) — entry point, persona layer, cogs.
-- `mtg/` — the game engine package (Card, Player, GameState, RulesEngine,
+- `bot.py` (~748 lines) â€” entry point, persona layer, cogs.
+- `mtg/` â€” the game engine package (Card, Player, GameState, RulesEngine,
   GameEngine, Discord cog). Tiered effect resolution (see below).
-- `rules/` — rules-correctness subsystem (mana, layers, replacement effects,
+- `rules/` â€” rules-correctness subsystem (mana, layers, replacement effects,
   targeting, SBA, effect templates, spell resolver, planeswalker).
-- `persona/plain.json` + `ressapanda.json` — swappable personas.
+- `persona/plain.json` + `ressapanda.json` â€” swappable personas.
 - Cost model: Sonnet for chat + DeepSeek buckets for autoplay.
 
 ### Relationship to the upstream private repo
@@ -24,63 +24,63 @@ test matrix, and the post-batch bug-audit playbook. When porting engine fixes,
 the file:line references in the upstream CLAUDE.md's "May 26/30 audit sprint"
 section line up here too.
 
-## ~~Known issue: UTF-8 mojibake in the engine files~~ — RESOLVED June 10, 2026
+## ~~Known issue: UTF-8 mojibake in the engine files~~ â€” RESOLVED June 10, 2026
 
 This warning turned out to be stale: a byte-level scan (Python `read_bytes()`
-+ UTF-8 decode, not PowerShell — PS 5.1 reads BOM-less files as ANSI and
++ UTF-8 decode, not PowerShell â€” PS 5.1 reads BOM-less files as ANSI and
 *displays* phantom mojibake) found zero corruption in any engine file. The
 June 10 upstream sync also re-copied `mtg/` + `rules/` from the source repo
 with verified UTF-8, applying the May 26/30 + June 10 audit fixes at the same
-time. Verify anytime with: `grep -l 'â€' mtg/*.py rules/*.py` (empty = clean).
+time. Verify anytime with: `grep -l 'Ã¢â‚¬' mtg/*.py rules/*.py` (empty = clean).
 
 ## The tiered effect resolution architecture (same as the original)
 
-Effects resolve through a cascade — always prefer the LOWEST tier:
-- **Tier 1** — hardcoded handlers in `mtg/triggers.py` + `mtg/spells.py`.
-- **Tier 1.5** — `rules/effect_templates.py` (named-card + regex pattern library).
-- **Tier 2** — `rules/spell_resolver.py` (regex → EffectType → execute).
-- **Tier 2.5** — XMage bridge (`rules/xmage_*`), optional.
-- **Tier 3** — `mtg/judge.py` `resolve_effect()` (Claude API, last resort).
+Effects resolve through a cascade â€” always prefer the LOWEST tier:
+- **Tier 1** â€” hardcoded handlers in `mtg/triggers.py` + `mtg/spells.py`.
+- **Tier 1.5** â€” `rules/effect_templates.py` (named-card + regex pattern library).
+- **Tier 2** â€” `rules/spell_resolver.py` (regex â†’ EffectType â†’ execute).
+- **Tier 2.5** â€” XMage bridge (`rules/xmage_*`), optional.
+- **Tier 3** â€” `mtg/judge.py` `resolve_effect()` (Claude API, last resort).
 JSON action format consumed by `execute_action_on_state()` in `mtg/actions.py`.
 
-## Porting checklist — May 26/30, 2026 audit (~30 engine fixes)
+## Porting checklist â€” May 26/30, 2026 audit (~30 engine fixes)
 
 These are verified, source-checked fixes from the private repo's May 26/30 audit
 sprint. The cleanest way to apply them all at once is to **re-copy the listed
 files from the upstream repo at commit `c44be72` or later** (which also fixes the
 mojibake). If applying by hand, the changes per file:
 
-- **`rules/replacement.py`** — CR-616.1 controller-chooses-order trio: (a) Furnace
-  of Rath is SYMMETRIC — remove the "your sources only" house rule in
+- **`rules/replacement.py`** â€” CR-616.1 controller-chooses-order trio: (a) Furnace
+  of Rath is SYMMETRIC â€” remove the "your sources only" house rule in
   `create_furnace_of_rath_effect` so it doubles incoming damage too. (b)
-  `_are_all_commutative`: mixed-direction multipliers (×0.5 halve + ×2 double) are
+  `_are_all_commutative`: mixed-direction multipliers (Ã—0.5 halve + Ã—2 double) are
   NON-commutative under floor rounding. (c) `_choose_best_for_controller`: invert
   the benefit direction for DAMAGE/LIFE_LOSS (apply reducers first).
-- **`mtg/rules_engine.py`** — `_has_totem_armor`/`_remove_totem_armor` match
-  `'umbra armor'` (modern cards print "Umbra armor", not "totem armor") — without
+- **`mtg/rules_engine.py`** â€” `_has_totem_armor`/`_remove_totem_armor` match
+  `'umbra armor'` (modern cards print "Umbra armor", not "totem armor") â€” without
   this the entire wired SBA totem-save path is dead.
-- **`rules/spell_resolver.py`** — creature damage marks + runs
+- **`rules/spell_resolver.py`** â€” creature damage marks + runs
   `process_state_based_actions` (via `game._rules_engine`) instead of inline
-  removal, using effective toughness — so totem/undying/persist/shield apply.
-- **`mtg/actions.py`** — (1) board-wipe `destroy_all_creatures` honors shield →
-  totem → undying/persist saves (was indestructible-only). (2) `living_death`
+  removal, using effective toughness â€” so totem/undying/persist/shield apply.
+- **`mtg/actions.py`** â€” (1) board-wipe `destroy_all_creatures` honors shield â†’
+  totem â†’ undying/persist saves (was indestructible-only). (2) `living_death`
   queues `_recently_died` for sacrificed creatures (was dropping every
   dies-trigger). (3) new `proliferate` action (counters only, never life). (4)
   pump-effect no-op returns `None` (was leaking scaffolding). (5) Austere Command
   full names.
-- **`mtg/engine.py`** — (1) `_check_beginning_combat_triggers_sync` delegator +
+- **`mtg/engine.py`** â€” (1) `_check_beginning_combat_triggers_sync` delegator +
   COMBAT_BEGIN dispatch (the "at beginning of combat on your turn" class was
   unwired). (2) APNAP NAP-first sort added to the phase-transition dies-trigger
   drain.
-- **`mtg/triggers.py`** — (1) `_check_beginning_combat_triggers_sync` scanner. (2)
+- **`mtg/triggers.py`** â€” (1) `_check_beginning_combat_triggers_sync` scanner. (2)
   `has_dies_trigger` + dying-card self-inclusion recognize "nontoken creature you
   control dies" (Midnight Reaper / Judith / Liliana flip). (3) Warstorm Surge
   `is_creature(game)` (devotion-god ETB). (4) `_log_life_change` + `[LIFE-*]` tags
   on cast-trigger / Blood-Artist-Zulaport-Bastion / Syr Konrad / Phyrexian Arena.
-- **`mtg/spells.py`** — Warstorm/creature-ETB-watcher `is_creature(game)`;
-  suppress "handled mechanically by the SBA engine" jargon at the `📜 {reason}`
+- **`mtg/spells.py`** â€” Warstorm/creature-ETB-watcher `is_creature(game)`;
+  suppress "handled mechanically by the SBA engine" jargon at the `ðŸ“œ {reason}`
   no_action emit sites.
-- **`mtg/models.py`** — (1) conditional static anthems/grants gated on "as long
+- **`mtg/models.py`** â€” (1) conditional static anthems/grants gated on "as long
   as / N or more" (helpers `_has_conditional_static`/`_static_condition_met`/
   `_remove_card_layer_effects` + gates in both `register_static_*` + recalc
   refresh + inline `_get_anthem_*_bonus` gate). (2) Death's Shadow
@@ -93,22 +93,22 @@ mojibake). If applying by hand, the changes per file:
   matches the "All creatures get -1/-1" prefix. (7) summoning-sick creature mana
   dorks excluded from `untapped_mana_sources` (CR 302.6). (8) `[DEVOTION-CHECK]`
   print-on-change dedup. (9) recalc `is_creature(game=self)`.
-- **`mtg/cog.py`** — `_autoplay_send` collapses runs of identical lines within one
+- **`mtg/cog.py`** â€” `_autoplay_send` collapses runs of identical lines within one
   multi-line message.
-- **`mtg/autoplay.py`** — CRITICAL devotion-block: `can_block(attacker, game=game)`
+- **`mtg/autoplay.py`** â€” CRITICAL devotion-block: `can_block(attacker, game=game)`
   guard + empty-name skip on the two unguarded block-application loops (main
   `decide_blocks` path + Moraug additional-combat path). Also stagnation-draw
   line drops the `[AUTOPLAY]` tag.
-- **`rules/effect_templates.py`** — Geralf's Messenger ETB (lose_life 2 + dies
+- **`rules/effect_templates.py`** â€” Geralf's Messenger ETB (lose_life 2 + dies
   no-op); proliferate generator + clause-final pattern + `ctx['_event_type']`;
   Finale of Devastation generator.
-- **Cost (this repo's `bot.py` + `mtg/autoplay.py`)** — use the REAL DeepSeek V4
+- **Cost (this repo's `bot.py` + `mtg/autoplay.py`)** â€” use the REAL DeepSeek V4
   rates (verified against a real bill): Flash hit `$0.0028`/miss `$0.14`/out
   `$0.28`; Pro hit `$0.0036`/miss `$0.435`/out `$0.87` (per M). Old list rates
-  over-estimated ~38× (cache-hit rate was ~25-39× too high). NOTE: in
-  `!autoplay-parallel`, the per-game cost line over-counts ~18× (shared adapter) —
+  over-estimated ~38Ã— (cache-hit rate was ~25-39Ã— too high). NOTE: in
+  `!autoplay-parallel`, the per-game cost line over-counts ~18Ã— (shared adapter) â€”
   trust the cumulative line.
-- **`test_replacement_controller_order.py`** (new file at repo root) — a permanent
+- **`test_replacement_controller_order.py`** (new file at repo root) â€” a permanent
   scripted regression for the Furnace-vs-Gisela controller-choose-order branch.
   Copy it over and run `python test_replacement_controller_order.py`.
 
@@ -118,3 +118,53 @@ mojibake). If applying by hand, the changes per file:
 - Console logging is tagged with `[BRACKETS]` for grep-ability.
 - The bot aims to be as rules-correct as possible; when it's wrong it should be
   fixable on the fly (`!fix`, `!resolve`) rather than game-ending.
+
+## June 10, 2026 (evening) upstream sync — full audit fix sprint (~70 fixes, suite 168 tests)
+
+Synced the upstream June 10 triple-wave fix sprint (Tier-1 audit fixes, the
+verified deep-dive wave, and the round-3 closures). Engine files (`mtg/`,
+`rules/`, `cube_draft.py`, `tests/`) are byte-lockstep again; the six
+intentionally-diverged files (`mtg/spells.py`, `mtg/engine.py`,
+`mtg/autoplay.py`, `mtg/cog.py`, `rules/effect_templates.py`,
+`rules/llm_adapter.py`) took the same fixes as surgical patches with the
+fork divergences (deck names, help text, HTTP-Referer) preserved.
+
+Highlights (full detail lives in the upstream repo's June 10 sections):
+
+- **Mana engine**: colored-need decrement (a 1-mana spell tapped the whole
+  board since Apr 4), Phyrexian either/or payment, dual-land one-tap
+  accounting (underpayment direction), "Add {W} or {U}" or-choice.
+- **Combat/death**: first-strike blocker double-dip + the symmetric
+  regular-step gate, undying/persist returns as clean new objects (combat
+  state stripped, enters-tapped, self-ETB re-fires), single-target destroy
+  honors shield/totem/undying, sacrifice-as-cost fires dies triggers +
+  unregisters layer effects, CR 903.9b commander deaths fire dies triggers,
+  commanders return to the OWNER's command zone.
+- **Triggers**: 2026 "this creature" Oracle templating (Blood Artist class
+  was dead code), "an opponent controls dies" scope gate (Massacre Wurm
+  misfire ended a game illegally), gain-life trigger class wired
+  (Vito/Heliod/Pridemate), constellation watchers, cast-trigger self-pumps
+  (Kiln Fiend), unhandled cast triggers queue for Tier 3.
+- **Templates**: Marit Lage's Slumber condition-checked (the generic
+  upkeep-token pattern minted unconditional 20/20s and won a game),
+  intervening-if guard on the generic pattern, Land Tax, Drakuseth,
+  Teachings of the Kirin chapter dispatcher (+ saga resolution now passes
+  real game context), Leyline Tyrant mana-availability decline (+ a judge
+  guard against Tier-3 fabricating "you may pay" payments), Toxic Deluge
+  player="all" with real X, Reanimate real-MV life cost, named-target
+  honoring with legality gates (Krosan Grip / Abrupt Decay), Twinflame
+  Tyrant hallucinated template deleted + real doubler registered.
+- **Display/pipeline**: burst-dedup no longer suppresses distinct casts,
+  trigger source attribution fix, mid-stream LLM error salvage, turn banner
+  before upkeep lines, autodraft messages routed through the logged send
+  pipeline.
+- **New**: `mtg/events.py` — engine event bus, pub/sub migration slice 1
+  (LIFE_GAINED) live; migration plan in the module docstring.
+- **Tests**: suite is now 168 (three new test files: `test_june10_fixes.py`,
+  `test_june10_deepdive.py`, `test_events_and_sagas.py`); ratchet baselines
+  updated (sba.py 3->4, engine.py 41->43, both justified crash barriers
+  with maybe_reraise).
+
+Run autoplay batches with `MTG_STRICT=1` exported — several swallow sites
+now carry `maybe_reraise`, so strict batches detect what production
+swallows.

@@ -296,7 +296,11 @@ class ClaudePlayer:
         with actor rates in the lifetime cost summary.
         """
         self._consecutive_failures = 0  # Successful API call — reset circuit breaker
-        if self.usage_callback and hasattr(response, 'usage'):
+        # June 10 audit (V30): usage can legitimately be None (mid-stream
+        # error after partial text — the final usage chunk never arrived).
+        # Passing None into the callback raised AttributeError and the outer
+        # catch threw away the memo; skip accounting instead.
+        if self.usage_callback and getattr(response, 'usage', None) is not None:
             self.usage_callback(response.usage, model_override or self.model)
 
     async def _update_strategy(self, game: 'GameState', player_index: int):
@@ -635,6 +639,11 @@ PRIORITIZE in this order each turn:
 5. DRAW / RAMP: only if no threat or removal needed.
 6. PASS / HOLD: only if holding instant-speed interaction matters.
 
+COMMANDER DEPLOYMENT: in commander formats your commander is usually your engine or win condition — cast it when mana allows. Don't bank it in the command zone for many turns; the only good reasons to hold it are an expected board wipe or protecting a combo line. (June 10 audit: replacement_chain lost 2 of 4 games partly because Gisela was never deployed.)
+PLANESWALKER ABILITIES: read ALL loyalty modes, not just [+1]. Minus abilities are usually the removal/value mode (Teferi -3 bounces a threat). If loyalty meets the ultimate's cost and the ultimate wins or locks the game, USE IT — clicking [+1] forever with a game-winning -8 available is a misplay.
+SACRIFICE DISCIPLINE: never sacrifice more than one creature per turn to a free outlet (Viscera Seer, Carrion Feeder, Altars) unless a death-payoff permanent (Blood Artist, Zulaport Cutthroat, Korvold, Mayhem Devil, Bastion of Remembrance) is on YOUR battlefield, or you're dodging exile/theft. Sacrificing your board — especially your commander — for scry value loses games.
+EQUIPMENT: an Equipment in play but unattached does nothing. If you control unattached Equipment and a creature, equipping is usually better than casting another Equipment.
+
 THREAT EVALUATION:
 - Indestructible/hexproof/protection creatures need bounce/exile/sacrifice.
 - A creature with lifelink can race aggro.
@@ -856,6 +865,20 @@ RULES (apply to your output, not your reasoning):
                         await watchdog
                     except (asyncio.CancelledError, Exception):
                         pass
+                # June 10 audit (V30): a mid-stream error used to look like a
+                # clean exhaustion — usage=None then crashed the usage
+                # callback and the WHOLE memo (partial text included) was
+                # discarded via the outer "graceful degradation" catch,
+                # 14×/batch. Now: no text accumulated → raise so the
+                # documented non-streaming fallback at the call site actually
+                # fires; partial text → keep it (usage stays None; the
+                # null-check in _track_usage skips accounting).
+                _stream_err = getattr(stream, 'stream_error', None)
+                if _stream_err is not None and not stream.full_text and not stream.full_reasoning:
+                    raise RuntimeError(f"mid-stream error with no text accumulated: {_stream_err}")
+                if _stream_err is not None:
+                    print(f"[STRATEGIST] Mid-stream error after partial text "
+                          f"({len(stream.full_text)} chars) — using partial memo, usage unavailable")
                 return stream.full_text, stream.full_reasoning, stream.usage
 
             # Streaming path: use it when the adapter supports it (i.e. the
@@ -1022,6 +1045,21 @@ RULES (apply to your output, not your reasoning):
                     'fill each line',
                     'fill each label',
                     'to fill each',
+                    # June 10 audit: 238 of 543 ACCEPTED memos carried
+                    # scaffolding hidden BEHIND the required label — "Win
+                    # condition: We need to produce exactly 4 lines as
+                    # instructed: …" passed positive-validation (has the
+                    # label) and density (those phrases weren't markers).
+                    'we need to produce',
+                    'we need to output',
+                    'we must produce',
+                    'as instructed',
+                    'exactly 4 lines',
+                    'exactly four lines',
+                    'four lines as',
+                    'the format is',
+                    'per the format',
+                    'the required format',
                 )
                 hits = sum(1 for m in scaffolding_markers if m in lowered)
                 if hits >= 2:
@@ -3498,6 +3536,12 @@ Respond with ONLY "keep" or "mulligan"."""
         }
         stack_name_lower = (stack_card.name or '').lower()
         if stack_name_lower in LOW_EV_STACK_SPELLS:
+            # June 10 audit (A4-F13): distinct log line — the generic
+            # caller-side "no interaction-shaped instant in hand" message
+            # read as a classifier bug when the hand DID hold Counterspell.
+            # This branch is a deliberate value judgment, not a miss.
+            print(f"[STACK-AI] Auto-pass: {stack_card.name} is low-EV to counter "
+                  f"(deliberate skip, not a hand-classification miss)")
             return False  # Auto-pass — countering this is not worth it.
         # Classify the stack spell — is it a spell we'd want to counter or
         # an ETB-creature we'd want to destroy?

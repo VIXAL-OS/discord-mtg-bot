@@ -635,6 +635,15 @@ async def _autoplay_human_turn(cog, thread, game: GameState, player_idx: int):
                     game.attackers.append(card.id)
                     used_ids.add(card.id)
                     attacked.append(card.name + (" (vigilance)" if card.has_vigilance() else ""))
+                else:
+                    # June 10 round 3 (A10b follow-up): the silent drop here
+                    # made legal filtering (summoning-sick twin token, all
+                    # same-name instances already claimed) unauditable — a
+                    # deep-dive read it as a name-dedup bug. The multiset
+                    # matching above (used_ids) is correct; just say why the
+                    # name didn't land.
+                    print(f"[COMBAT] Proposed attacker '{name}' skipped — no untapped, "
+                          f"eligible, unclaimed instance on {player.name}'s battlefield")
 
             if attacked:
                 await cog._autoplay_send(thread, f"⚔️ **{player.name}** attacks with: {', '.join(attacked)}")
@@ -724,7 +733,8 @@ async def _autoplay_human_turn(cog, thread, game: GameState, player_idx: int):
                                 # Strix despite Strix's flying (CR 509.1b).
                                 if not blocker.can_block(attacker, game=game):
                                     print(f"[BLOCK-INVALID] {blocker.name} cannot block "
-                                          f"{attacker.name} (evasion mismatch) — skipped")
+                                          f"{attacker.name} (evasion / not a creature / "
+                                          f"block restriction) — skipped")
                                     continue
                                 blocker.blocking.append(attacker.id)
                                 attacker.blocked_by.append(blocker.id)
@@ -790,7 +800,8 @@ async def _autoplay_human_turn(cog, thread, game: GameState, player_idx: int):
                                 # Strix despite Strix's flying (CR 509.1b).
                                 if not blocker.can_block(attacker, game=game):
                                     print(f"[BLOCK-INVALID] {blocker.name} cannot block "
-                                          f"{attacker.name} (evasion mismatch) — skipped")
+                                          f"{attacker.name} (evasion / not a creature / "
+                                          f"block restriction) — skipped")
                                     continue
                                 blocker.blocking.append(attacker.id)
                                 attacker.blocked_by.append(blocker.id)
@@ -877,7 +888,8 @@ async def _autoplay_human_turn(cog, thread, game: GameState, player_idx: int):
                             # (CR 509.1a/b). Mirror the guarded paths at ~727 and ~793.
                             if not blocker.can_block(attacker, game=game):
                                 print(f"[BLOCK-INVALID] {blocker.name} cannot block "
-                                      f"{attacker.name} (evasion mismatch) — skipped")
+                                      f"{attacker.name} (evasion / not a creature / "
+                                      f"block restriction) — skipped")
                                 continue
                             blocker.blocking.append(attacker.id)
                             attacker.blocked_by.append(blocker.id)
@@ -1008,6 +1020,15 @@ async def _autoplay_execute_action(cog, thread, game: GameState, player_idx: int
     requiring a Discord ctx object.
     """
     player = game.players[player_idx]
+    # June 10 audit (C3/V28): positional cast→resolve pairing. Capture the
+    # previous action's cast/activate stamp, then clear; the cast/activate
+    # branches below re-stamp on entry. A `resolve` that IMMEDIATELY follows
+    # a cast/activate is always dropped — on success the cascade already
+    # resolved the effects (Austere Command's paired resolve ran a second
+    # Tier-3 wipe that destroyed LANDS; Mind Stone's mana tap yielded a free
+    # "Draw a card"), and on failure it's an orphan (May 17 rule).
+    _prev_cast_like = getattr(game, '_last_exec_cast_like', None)
+    game._last_exec_cast_like = None
     action_type = action.get("type")
 
     if action_type == "play_land":
@@ -1074,6 +1095,9 @@ async def _autoplay_execute_action(cog, thread, game: GameState, player_idx: int
         # so a misnamed key doesn't crash the command-zone lookup below
         # with NoneType.lower().
         card_name = action.get("card") or action.get("spell") or action.get("name")
+        # June 10 (C3): stamp for positional cast→resolve pairing (see top).
+        game._last_exec_cast_like = {'turn': game.turn_number, 'type': 'cast',
+                                     'card': card_name or '?'}
         if not card_name:
             print(f"[AUTOPLAY] cast action missing card name (no 'card'/'spell'/'name' field): {action}")
             return None
@@ -1317,6 +1341,9 @@ async def _autoplay_execute_action(cog, thread, game: GameState, player_idx: int
 
     elif action_type == "activate":
         perm_name = action.get("permanent")
+        # June 10 (C3): stamp for positional pairing (see function top).
+        game._last_exec_cast_like = {'turn': game.turn_number, 'type': 'activate',
+                                     'card': perm_name or '?'}
         try:
             ability_idx = int(action.get("ability", 0))
         except (ValueError, TypeError):
@@ -1574,6 +1601,17 @@ async def _autoplay_execute_action(cog, thread, game: GameState, player_idx: int
             game._last_cast_countered = False
             return None
 
+        # June 10 audit (C3/V28): positional pairing — name-matching below
+        # can't catch resolves whose description describes the EFFECT rather
+        # than the card. Any resolve immediately following a cast/activate
+        # is redundant (success) or an orphan (failure) either way.
+        if (_prev_cast_like and _prev_cast_like.get('turn') == game.turn_number
+                and _prev_cast_like.get('type') in ('cast', 'activate')):
+            print(f"[AUTOPLAY-RESOLVE] Dropped resolve positionally paired with prior "
+                  f"{_prev_cast_like.get('type')} of {_prev_cast_like.get('card', '?')} — "
+                  f"the cascade already resolves its own effects: '{description[:80]}'")
+            return None
+
         # Prevent double-resolution: if this spell/effect was already resolved
         # by the spell cascade (Tier 1/1.5/2/3), don't resolve it again
         recently_resolved = getattr(game, '_recently_resolved_spells', set())
@@ -1606,6 +1644,10 @@ async def _autoplay_execute_action(cog, thread, game: GameState, player_idx: int
         # "Attack with X to deal damage" — combat already happened).
         REDUNDANT_VERB_PREFIXES = (
             'untap your land', 'discard none', 'attack with ', 'no lands in hand',
+            # June 10 (template backlog): standalone "Scry 2, keep best on
+            # top" resolves — the scry already happened via the template
+            # during resolution; the trailing free-text re-resolve is noise.
+            'scry ',
         )
         for verb in REDUNDANT_VERB_PREFIXES:
             if desc_lower.startswith(verb):
@@ -1830,15 +1872,32 @@ async def _autoplay_resolve_pending_action(cog, thread, game: GameState):
         game.pending_action = None
 
     elif pa_type == 'permanent_ability' and pa.get('effect_type') == 'sneak_creature':
-        # Pick the biggest creature from hand to sneak in
+        # Pick the biggest creature from hand to sneak in.
+        # June 10 deep-dive: two fixes — (1) P/T are STRINGS, so the old
+        # `(c.power or 0) + (c.toughness or 0)` concatenated ("7"+"7"="77"
+        # outsorted "12"+"12"="1212"… actually sorted lexically wrong either
+        # way) and picked Drakuseth 7/7 over Kozilek 12/12; (2) the creature
+        # never got the `_sneak_attack_sac` flag (only the human !target
+        # executor at mtg/engine.py sets it), so Through the Breach /
+        # Sneak Attack creatures PERMANENTLY survived the end step. Also
+        # grant haste — that's the whole point of the sneak.
+        def _pt_int(v):
+            try:
+                return int(v)
+            except (TypeError, ValueError):
+                return 0
         creatures = [c for c in player.hand if c.is_creature()]
         if creatures:
-            best = max(creatures, key=lambda c: (c.power or 0) + (c.toughness or 0))
+            best = max(creatures, key=lambda c: _pt_int(c.power) + _pt_int(c.toughness))
             player.hand.remove(best)
             player.battlefield.append(best)
             best.entered_this_turn = True
+            best._sneak_attack_sac = True
+            if 'Haste' not in (best.temp_keywords or []):
+                best.temp_keywords.append('Haste')
             await cog._autoplay_send(thread,
-                f"🎭 {player.name} puts **{best.name}** ({best.power}/{best.toughness}) onto the battlefield")
+                f"🎭 {player.name} puts **{best.name}** ({best.power}/{best.toughness}) onto the "
+                f"battlefield (haste — sacrificed at the next end step)")
         game.pending_action = None
 
     elif pa_type == 'planeswalker_target':
@@ -1978,7 +2037,7 @@ async def _run_single_autoplay(cog, channel, game_format: str, deck1_name: str, 
         if cog._deepseek_reasoner_adapter and use_alt_adapter is cog._deepseek_adapter:
             cog.engine.claude_ai.strategist_client = cog._deepseek_reasoner_adapter
             cog.engine.claude_ai.strategist_model = "deepseek-v4-pro"
-            print("[AUTOPLAY] Phase 3 split: actor=deepseek-v4-flash (non-thinking), strategist=deepseek-v4-pro (reasoning_effort=high)")
+            print("[AUTOPLAY] Phase 3 split: actor=deepseek-v4-flash (non-thinking), strategist=deepseek-v4-pro (reasoning_effort=medium since May 23)")
         else:
             # OpenRouter or single-model path: actor and strategist share one model
             cog.engine.claude_ai.strategist_client = None
@@ -2316,6 +2375,19 @@ async def _run_single_autoplay(cog, channel, game_format: str, deck1_name: str, 
                         result["outcome"] = "stagnation_draw"
                         break
 
+                # June 10 audit (V31h): emit the turn banner BEFORE the
+                # upkeep/draw phase lines — it used to post after them, so
+                # upkeep triggers (Phyrexian Arena, Bitterblossom) visually
+                # landed in the PREVIOUS turn's block in every game. Dedup
+                # guard unchanged (see comment at the original site below).
+                _turn_key = (game.turn_number, game.active_player.name)
+                if getattr(game, '_last_emitted_turn_key', None) != _turn_key:
+                    await cog._autoplay_send(
+                        thread,
+                        "\U0001f504 **Turn {}** — **{}**'s turn".format(
+                            game.turn_number, game.active_player.name))
+                    game._last_emitted_turn_key = _turn_key
+
                 if game.phase == Phase.UNTAP:
                     _, _p1 = cog.engine.advance_phase(game)  # UNTAP → UPKEEP
                     _, _p2 = cog.engine.advance_phase(game)  # UPKEEP → DRAW (upkeep triggers here)
@@ -2333,11 +2405,8 @@ async def _run_single_autoplay(cog, channel, game_format: str, deck1_name: str, 
                 # turn 5 would be skipped if Game A had just emitted (5, X).
                 # Move the key to the game state itself so each game tracks
                 # its own emission status independently.
-                _turn_key = (game.turn_number, game.active_player.name)
-                if getattr(game, '_last_emitted_turn_key', None) != _turn_key:
-                    await cog._autoplay_send(thread,
-                        f"\U0001f504 **Turn {game.turn_number}** \u2014 **{game.active_player.name}**'s turn")
-                    game._last_emitted_turn_key = _turn_key
+                # (June 10, V31h: the banner emit itself moved ABOVE the
+                # UNTAP phase-advance block so it precedes upkeep/draw lines.)
 
                 turn_had_actions = False
                 if game.active_player.is_claude:

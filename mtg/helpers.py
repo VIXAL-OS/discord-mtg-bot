@@ -475,3 +475,92 @@ def _should_emit_resolve_hint(game, effect_key: str) -> bool:
         return False
     hints.add(effect_key)
     return True
+
+
+def command_zone_owner(game, card, fallback):
+    """Resolve which player's command zone a commander belongs in.
+
+    CR 903.9a: a commander leaving the battlefield goes to its OWNER's
+    command zone — never the controller's. June 10 audit (C7): Animate Dead
+    stole Tymna; when she died under the thief's control she landed in the
+    THIEF's command zone and showed up in their castable list with command
+    tax, permanently locking the owner out of his own commander. Falls back
+    to the supplied player when owner_index is missing/invalid (un-stolen
+    commanders: owner == controller, so behavior is unchanged).
+    """
+    idx = getattr(card, 'owner_index', None)
+    try:
+        if idx is not None and 0 <= int(idx) < len(game.players):
+            return game.players[int(idx)]
+    except (TypeError, ValueError):
+        pass
+    return fallback
+
+
+def clamp_noop_reason(reason: str, max_len: int = 160) -> str:
+    """Clamp Tier-3 no_action reasons for player display.
+
+    June 10 audit: a Land Tax no_action came back as a full chain-of-thought
+    paragraph (with a rules error in it — it counted the Land Tax enchantment
+    itself as a land) and was posted verbatim to Discord. Long or
+    multi-sentence reasons read as leaked model internals; show a neutral
+    line instead. The caller's console print keeps the full text for audits.
+    """
+    r = (reason or "").strip()
+    if not r:
+        return r
+    sentence_count = r.count(". ") + (1 if r.endswith(".") else 0)
+    if len(r) > max_len or sentence_count >= 3:
+        return "condition not met — no effect"
+    return r
+
+
+def burst_dedup_key(content: str) -> str:
+    """Bucket key for the per-turn identical-message burst dedup (Layer 3,
+    mtg/cog.py:_autoplay_send).
+
+    Two normalizations:
+    1. Strip trailing numeric parentheticals ("(life: 27)") so running-total
+       variation doesn't defeat the dedup (May 23).
+    2. Strip a trailing bolded card name ONLY for draw/discard/exile/reveal
+       shapes ("Guardian Project - Rick draws **<varying>**", May 25 F8).
+       June 10 audit (V19): the unrestricted strip made every
+       "(sparkles) P cast **X**" line in a turn share one key, so every 3rd+
+       DISTINCT cast was silently suppressed (44/139 games - creatures
+       visibly "attacked out of nowhere"). Announcement shapes now keep
+       their card-name keys.
+    """
+    import re as _re
+    key = _re.sub(r"\s*\([^)]*\d[^)]*\)\s*$", "", content or "")
+    if _re.search(r"\b(draws?|discards?|exiles?|reveals?)\b[^*]*\*\*[^*]+\*\*\s*$", key):
+        key = _re.sub(r"\s*\*\*[^*]+\*\*\s*$", "", key)
+    return key
+
+
+def apnap_order_died(died_pairs, game):
+    """Order simultaneous deaths NAP-first for immediate-mode dies-trigger
+    resolution.
+
+    CR 603.3b: the Active Player puts their triggers on the stack first
+    (bottom), the Non-Active Player second (top); LIFO resolution means the
+    NAP's triggers RESOLVE first. Immediate mode emulates that by scanning
+    the NAP's dead creatures first. Python's sort is stable, so insertion
+    order is preserved within each player's group (standing in for the
+    controller's chosen relative order of their own triggers).
+
+    June 10: extracted from the three drain sites (mtg/triggers.py dies
+    scan, mtg/engine.py phase-transition drain + SBA-sibling drain) so the
+    ordering is unit-testable - the autoplay matrix has never produced a
+    both-sides simultaneous board wipe with dies-triggers on both sides
+    (known-open coverage gap since May 30). Falls back to insertion order
+    on any error, matching the previous inline behavior.
+    """
+    try:
+        active_idx = game.active_player_index
+        return sorted(
+            died_pairs,
+            key=lambda pair: 0 if game.players.index(pair[1]) != active_idx else 1,
+        )
+    except (ValueError, AttributeError, TypeError, IndexError):
+        # Player not in game.players / malformed pair — insertion order.
+        return list(died_pairs)

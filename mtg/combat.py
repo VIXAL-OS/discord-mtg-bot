@@ -54,6 +54,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from mtg.constants import Phase, Zone, COMMAND_ZONE_FORMATS
 from mtg.models import Card, Player, GameState
+from mtg import events
 
 # Optional: replacement effects (lifelink, prevention, conversion)
 try:
@@ -142,7 +143,7 @@ def resolve_combat_damage(rules, game: GameState) -> List[str]:
                     game, game.players[idx], heal, source_name="Lifelink"
                 )
                 if ok:
-                    messages.append(f"💚 {game.players[idx].name} gains {actual_heal} life (lifelink)")
+                    messages.append(f"💚 {game.players[idx].name} gains {actual_heal} life (lifelink) (life: {game.players[idx].life})")
                     print(f"[LIFELINK] {game.players[idx].name}: +{actual_heal} life → {game.players[idx].life}")
                 else:
                     messages.append(f"🚫 Lifelink prevented for {game.players[idx].name} ({', '.join(chain)})")
@@ -173,7 +174,7 @@ def resolve_combat_damage(rules, game: GameState) -> List[str]:
                     game, game.players[idx], heal, source_name="Lifelink"
                 )
                 if ok:
-                    messages.append(f"💚 {game.players[idx].name} gains {actual_heal} life (lifelink)")
+                    messages.append(f"💚 {game.players[idx].name} gains {actual_heal} life (lifelink) (life: {game.players[idx].life})")
                     print(f"[LIFELINK] {game.players[idx].name}: +{actual_heal} life → {game.players[idx].life}")
         return messages
 
@@ -182,8 +183,10 @@ def resolve_combat_damage(rules, game: GameState) -> List[str]:
     # even when blocking first-strikers that already dealt damage in the FS step.
     if regular_attackers or first_strikers:
         print(f"[COMBAT-STEP] REGULAR step: {len(regular_attackers)} regular attacker(s)")
+        _reg_header_idx = None
         if first_strikers:
             messages.append("**Regular Combat Damage:**")
+            _reg_header_idx = len(messages) - 1
         # Regular attackers deal their damage normally (attackers + their blockers)
         if regular_attackers:
             reg_messages, reg_healing = rules._deal_combat_damage(game, regular_attackers)
@@ -213,6 +216,10 @@ def resolve_combat_damage(rules, game: GameState) -> List[str]:
             messages.extend(ret_messages)
             for idx, heal in ret_healing.items():
                 lifelink_healing[idx] += heal
+        # June 10 audit: drop the "**Regular Combat Damage:**" header when no
+        # regular-step line followed it (all damage landed in the FS step).
+        if _reg_header_idx is not None and len(messages) == _reg_header_idx + 1:
+            messages.pop(_reg_header_idx)
 
     # Apply lifelink from regular step BEFORE the post-damage SBA check
     # (CR 119.3d / 702.15b — see note in FS step above). May 14 audit found
@@ -224,7 +231,7 @@ def resolve_combat_damage(rules, game: GameState) -> List[str]:
                 game, game.players[idx], heal, source_name="Lifelink"
             )
             if ok:
-                messages.append(f"💚 {game.players[idx].name} gains {actual_heal} life (lifelink)")
+                messages.append(f"💚 {game.players[idx].name} gains {actual_heal} life (lifelink) (life: {game.players[idx].life})")
                 print(f"[LIFELINK] {game.players[idx].name}: +{actual_heal} life → {game.players[idx].life}")
             else:
                 messages.append(f"🚫 Lifelink prevented for {game.players[idx].name} ({', '.join(chain)})")
@@ -288,7 +295,7 @@ def resolve_combat_damage(rules, game: GameState) -> List[str]:
                 # Apr 30 audit: console mirror for log-based reconciliation.
                 print(f"[LIFELINK-PREVENTED] {game.players[idx].name}: heal={heal} chain={','.join(chain)}")
                 continue
-            messages.append(f"💚 {game.players[idx].name} gains {actual_heal} life (lifelink)")
+            messages.append(f"💚 {game.players[idx].name} gains {actual_heal} life (lifelink) (life: {game.players[idx].life})")
             # Apr 30 audit: console mirror so post-batch life-total reconciliation
             # doesn't go missing in the per-game console log (Discord-only events
             # broke the audit's math three times).
@@ -304,9 +311,10 @@ def apply_life_gain(rules, game: GameState, player: 'PlayerState', amount: int,
     replacement effects (Erebos, Sulfuric Vortex, Rhox Faithmender, etc.).
     Returns (applied, final_amount, replacement_chain). Applied=False means
     the gain was prevented and no life was added.
-    Centralizing this makes the life-gain hook the single place to wire
-    "whenever you gain life" triggers (Soul Warden, Ajani's Pridemate, etc.)
-    when that subsystem comes online.
+    This is the single place "whenever you gain life" triggers fire (wired
+    June 10 — see _fire_gain_life_triggers below). Any life-gain path that
+    bypasses this function also bypasses Vito / Heliod / Pridemate triggers
+    AND gain-prevention statics (Erebos), so route gains through here.
     """
     if amount <= 0:
         return True, 0, []
@@ -331,7 +339,92 @@ def apply_life_gain(rules, game: GameState, player: 'PlayerState', amount: int,
     player.life += final_amount
     # Record the most recent life-gain amount for trigger scanners to consume.
     player._last_life_gain = final_amount
+    # June 10 audit (V26): fire "whenever you gain life" triggers (CR 603.2).
+    # June 10 round 3: routed through the event bus (mtg/events.py) as
+    # pub/sub migration slice 1 — the gain-life scan is now a SUBSCRIBER,
+    # so future gain-adjacent triggers register instead of editing here.
+    if game is not None:
+        events.emit(events.LIFE_GAINED, game, rules=rules, player=player,
+                    amount=final_amount, source_name=source_name)
     return True, final_amount, chain
+
+
+def _fire_gain_life_triggers(rules, game: GameState, player: 'PlayerState',
+                             amount: int, source_name: str = "") -> None:
+    """Resolve "whenever you gain life" triggered abilities for one gain event.
+
+    June 10 audit (V26): this trigger class had no implementation anywhere.
+    Handles the common shapes inline (free, sync):
+      - "...each/target opponent loses that much life"  (Vito, Sanguine Bond)
+      - "...put a +1/+1 counter on it/this creature"     (Ajani's Pridemate)
+      - "...put a +1/+1 counter on target creature or enchantment you control"
+                                                          (Heliod, Sun-Crowned)
+    Display lines surface via game._pending_messages (same channel as the
+    Phyrexian Tower dies-trigger fix) so every apply_life_gain caller gets
+    them without a signature change. Unhandled shapes print a
+    [GAIN-TRIGGER-UNHANDLED] breadcrumb instead of silently dropping.
+    """
+    if amount <= 0:
+        return
+    # Re-entrancy guard: a gain trigger that itself gains life must not recurse.
+    if getattr(game, '_in_gain_life_triggers', False):
+        return
+    game._in_gain_life_triggers = True
+    try:
+        import re as _re
+        pq = getattr(game, '_pending_messages', None)
+        if pq is None:
+            pq = []
+            game._pending_messages = pq
+        for perm in list(player.battlefield):
+            oracle = (perm.oracle_text or '').lower()
+            if 'whenever you gain life' not in oracle:
+                continue
+            m = _re.search(r'whenever you gain life[^.]*\.', oracle)
+            clause = m.group(0) if m else oracle
+            if 'first time each turn' in clause:
+                # Frequency-limited variants need per-turn tracking; under-fire
+                # (skip) is safer than firing on every event.
+                print(f"[GAIN-TRIGGER-UNHANDLED] {perm.name}: first-time-each-turn variant skipped")
+                continue
+            if 'loses that much life' in clause or 'lose that much life' in clause:
+                for opp in game.players:
+                    if opp is player:
+                        continue
+                    opp.life -= amount
+                    print(f"[GAIN-TRIGGER] {perm.name}: {opp.name} loses {amount} life → {opp.life}")
+                    pq.append(f"🩸 **{perm.name}**: {opp.name} loses {amount} life (life: {max(0, opp.life)})")
+            elif _re.search(r'put a \+1/\+1 counter on (?:it|this creature)', clause) \
+                    or _re.search(r'put a \+1/\+1 counter on ' + _re.escape(perm.name.lower()), clause):
+                perm.counters['+1/+1'] = perm.counters.get('+1/+1', 0) + 1
+                print(f"[GAIN-TRIGGER] {perm.name}: +1/+1 counter ({perm.counters['+1/+1']} total)")
+                pq.append(f"💪 **{perm.name}** gets a +1/+1 counter (life gain trigger)")
+            elif 'put a +1/+1 counter on target creature' in clause:
+                # Heliod, Sun-Crowned — put it on the controller's biggest creature.
+                candidates = [c for c in player.battlefield if c.is_creature(game=game)]
+                if candidates:
+                    tgt = max(candidates, key=lambda c: c.get_effective_power(game))
+                    tgt.counters['+1/+1'] = tgt.counters.get('+1/+1', 0) + 1
+                    print(f"[GAIN-TRIGGER] {perm.name}: +1/+1 counter on {tgt.name}")
+                    pq.append(f"💪 **{perm.name}**: +1/+1 counter on **{tgt.name}**")
+            else:
+                print(f"[GAIN-TRIGGER-UNHANDLED] {perm.name}: {clause[:100]}")
+    finally:
+        game._in_gain_life_triggers = False
+
+
+def _on_life_gained(game, rules=None, player=None, amount=0, source_name=""):
+    """Bus adapter: LIFE_GAINED → the gain-life trigger scan.
+
+    Pub/sub migration slice 1 (June 10) — see mtg/events.py for the plan.
+    The scan itself is unchanged; it's now reached by subscription instead
+    of a direct call, so future gain-watchers register instead of editing
+    apply_life_gain.
+    """
+    _fire_gain_life_triggers(rules, game, player, amount, source_name)
+
+
+events.subscribe(events.LIFE_GAINED, _on_life_gained)
 
 
 def apply_combat_damage_to_player(rules, game: GameState, player: 'PlayerState',
@@ -835,23 +928,39 @@ def deal_combat_damage(rules, game: GameState, attackers: List[Tuple[Card, Playe
                         remaining_damage -= damage_to_blocker  # Use original for trample math
                         # Display attacker's full power (not clamped amount) for clarity
                         display_dmg = min(attacker_power, remaining_damage + damage_to_blocker) if len(blocker_ids) == 1 else actual_dmg
-                        messages.append(f"⚔️ {_dispname(attacker)} deals {display_dmg} damage to {_dispname(blocker)}")
+                        # CR 120.8: zero damage isn't dealt — skip the noise line
+                        # (June 10 audit: 36 "deals 0 damage" lines per batch).
+                        if display_dmg > 0:
+                            messages.append(f"⚔️ {_dispname(attacker)} deals {display_dmg} damage to {_dispname(blocker)}")
                 
                 # Blocker damages attacker (with replacement effect processing)
                 # In first strike step, blockers without first strike/double strike don't deal damage
                 blocker_deals_damage = blocker_power > 0
                 if is_first_strike_step and not (blocker.has_first_strike(game=game) or blocker.has_double_strike(game=game)):
                     blocker_deals_damage = False
+                # June 10 audit (C5, CR 510.5): the INVERSE gate was missing —
+                # a first-strike (non-double-strike) blocker already dealt its
+                # damage in the FS step and must not deal again in the regular
+                # step (including the blockers-retaliation pass). Danitha
+                # (2/2 FS lifelink) was killing 3/3 attackers with 2+2 and
+                # getting lifelink credited twice.
+                if (not is_first_strike_step
+                        and blocker.has_first_strike(game=game)
+                        and not blocker.has_double_strike(game=game)):
+                    blocker_deals_damage = False
                 if blocker_deals_damage:
                     actual_blocker_dmg = rules._apply_combat_damage_to_creature(
                         game, attacker, blocker_power, blocker,
                         source_has_deathtouch=blocker.has_deathtouch(game=game)
                     )
-                    if blocker.has_deathtouch(game=game):
+                    # CR 120.8: skip the display line when nothing was dealt
+                    # (zero power or fully prevented — prevention details are
+                    # already logged by the replacement engine).
+                    if actual_blocker_dmg > 0 and blocker.has_deathtouch(game=game):
                         # deathtouch_damage is set by _apply_combat_damage_to_creature;
                         # SBA checks deathtouch_damage > 0 separately
                         messages.append(f"☠️ {_dispname(blocker)} deals {actual_blocker_dmg} deathtouch damage to {_dispname(attacker)}")
-                    else:
+                    elif actual_blocker_dmg > 0:
                         messages.append(f"🛡️ {_dispname(blocker)} deals {actual_blocker_dmg} damage to {_dispname(attacker)}")
 
                     if blocker.has_lifelink(game=game) and actual_blocker_dmg > 0:

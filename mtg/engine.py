@@ -1770,14 +1770,11 @@ class GameEngine:
                 # in SBA insertion order (player 0 first), inverting LIFO.
                 # game_1506618543322693684:861-863 showed Syr Konrad (AP)
                 # firing before Meren (NAP) — should have been reverse.
-                try:
-                    _active_idx = game.active_player_index
-                    recently_died = sorted(
-                        recently_died,
-                        key=lambda pair: 0 if game.players.index(pair[1]) != _active_idx else 1,
-                    )
-                except Exception:
-                    pass  # If anything goes wrong with sort, fall back to insertion order
+                # June 10: ordering extracted to helpers.apnap_order_died so
+                # the CR 603.3b NAP-first rule is unit-tested (the matrix has
+                # never reached a both-sides wipe with both-sides triggers).
+                from mtg.helpers import apnap_order_died
+                recently_died = apnap_order_died(recently_died, game)
                 burst_msgs: List[str] = []
                 for dead_card, dead_player in recently_died:
                     try:
@@ -2060,14 +2057,9 @@ class GameEngine:
                     # iterated in raw insertion order (player 0 first), which can
                     # invert the ordering when a board wipe's deaths are first
                     # drained at a phase transition rather than by check_state_based_actions.
-                    try:
-                        _active_idx = game.active_player_index
-                        recently_died = sorted(
-                            recently_died,
-                            key=lambda pair: 0 if game.players.index(pair[1]) != _active_idx else 1,
-                        )
-                    except Exception:
-                        pass
+                    # June 10: shared CR 603.3b ordering helper (see above).
+                    from mtg.helpers import apnap_order_died
+                    recently_died = apnap_order_died(recently_died, game)
                     phase_burst: List[str] = []
                     for dead_card, dead_player in recently_died:
                         try:
@@ -2330,6 +2322,11 @@ class GameEngine:
         """Execute a player action."""
         player = game.players[player_index]
         action_type = action.get("type")
+        # June 10 audit (C3/V28): positional cast→resolve pairing — see the
+        # twin logic in mtg/autoplay.py:_autoplay_execute_action. Capture the
+        # previous action's stamp, clear it; cast/activate branches re-stamp.
+        _prev_cast_like = getattr(game, '_last_exec_cast_like', None)
+        game._last_exec_cast_like = None
         
         if action_type == "play_land":
             card_name = action.get("card")
@@ -2394,6 +2391,9 @@ class GameEngine:
             if not card_name:
                 print(f"[EXECUTE] cast action missing 'card' field: {action}")
                 return None
+            # June 10 (C3): stamp for positional cast→resolve pairing.
+            game._last_exec_cast_like = {'turn': game.turn_number, 'type': 'cast',
+                                         'card': card_name}
             target_name = _normalize_action_target(action)  # May be None
             adventure_name = action.get("adventure")  # Adventure half name
             card = player.find_card(card_name, Zone.HAND)
@@ -2699,6 +2699,9 @@ class GameEngine:
             if not perm_name:
                 print(f"[EXECUTE] activate action missing 'permanent' field: {action}")
                 return None
+            # June 10 (C3): stamp for positional cast→resolve pairing.
+            game._last_exec_cast_like = {'turn': game.turn_number, 'type': 'activate',
+                                         'card': perm_name}
             try:
                 ability_idx = int(action.get("ability", 0))
             except (ValueError, TypeError):
@@ -2977,6 +2980,11 @@ class GameEngine:
                 perm_name_lower = perm.name.lower()
                 sacrificed_self = False
                 exiled_self = False
+                # June 10 (C2): power-referencing effects (Altar of Dementia
+                # mill, Greater Good draw) read the sacrificed creature —
+                # capture it and its power BEFORE it leaves the battlefield.
+                sacrificed_cost_card = None
+                sac_power_snapshot = 0
 
                 if 'sacrifice' in cost_lower and (perm_name_lower in cost_lower or 'sacrifice this' in cost_lower or f'sacrifice {perm_name_lower}' in cost_lower):
                     if perm in player.battlefield:
@@ -2985,6 +2993,23 @@ class GameEngine:
                         player.graveyard.append(perm)
                         sacrificed_self = True
                         print(f"[ACTIVATE-CLAUDE] Sacrificed {perm.name} as cost")
+                        # June 10 audit (V15, CR 700.4): self-sacrifice IS a
+                        # death — this branch fired NEITHER sacrifice nor dies
+                        # triggers before.
+                        if perm.is_creature():
+                            try:
+                                from mtg.actions import _fire_sacrifice_triggers
+                                _st_msgs = _fire_sacrifice_triggers(self.rules, game, player, perm) or []
+                                game._recently_died.append((perm, player))
+                                dies_msgs, _unh = self._check_dies_triggers_sync(game, perm, player)
+                                _all = _st_msgs + (dies_msgs or [])
+                                if _all:
+                                    game._pending_messages.extend(_all)
+                                    print(f"[ACTIVATE-CLAUDE] Fired {len(_all)} trigger(s) for self-sac of {perm.name}")
+                            except Exception as e:
+                                print(f"[ACTIVATE-CLAUDE] self-sac trigger dispatch failed: {e}")
+                                from mtg.util import maybe_reraise
+                                maybe_reraise(e)
                     else:
                         return None  # Can't pay sacrifice cost
                 elif 'sacrifice a creature' in cost_lower or 'sacrifice a permanent' in cost_lower:
@@ -3006,6 +3031,13 @@ class GameEngine:
                         else:
                             sac_target = min(creatures, key=lambda c: c.get_effective_power(game) if hasattr(c, 'get_effective_power') else (int(c.power) if c.power and str(c.power).lstrip('-').isdigit() else 0))
                     if sac_target and sac_target in player.battlefield:
+                        # June 10 (C2): snapshot BEFORE removal — anthems and
+                        # equipment stop applying once it leaves play.
+                        sacrificed_cost_card = sac_target
+                        try:
+                            sac_power_snapshot = sac_target.get_effective_power(game)
+                        except (ValueError, TypeError):
+                            sac_power_snapshot = 0
                         game.unregister_static_effects(sac_target)
                         player.battlefield.remove(sac_target)
                         player.graveyard.append(sac_target)
@@ -3021,8 +3053,20 @@ class GameEngine:
                                 if not hasattr(game, '_pending_messages'):
                                     game._pending_messages = []
                                 game._pending_messages.extend(sac_trig_msgs)
+                            # June 10 audit (V15, CR 700.4): sacrifice IS a
+                            # death — fire dies triggers too (Bastion of
+                            # Remembrance never fired on Altar of Dementia
+                            # sacs while every combat death fired it).
+                            if sac_target.is_creature():
+                                game._recently_died.append((sac_target, player))
+                                dies_msgs, _unh = self._check_dies_triggers_sync(game, sac_target, player)
+                                if dies_msgs:
+                                    game._pending_messages.extend(dies_msgs)
+                                    print(f"[ACTIVATE-CLAUDE] Fired {len(dies_msgs)} dies-trigger(s) for {sac_target.name} (sac cost)")
                         except Exception as e:
-                            print(f"[SAC-TRIGGER] fetchland sac-cost scan failed: {e}")
+                            print(f"[SAC-TRIGGER] sac-cost trigger scan failed: {e}")
+                            from mtg.util import maybe_reraise
+                            maybe_reraise(e)
                     else:
                         return None  # Can't pay sacrifice cost
                 elif 'exile' in cost_lower and (perm_name_lower in cost_lower or 'exile this' in cost_lower or f'exile {perm_name_lower}' in cost_lower):
@@ -3092,6 +3136,20 @@ class GameEngine:
                     color_map = {'W': 'W', 'U': 'U', 'B': 'B', 'R': 'R', 'G': 'G', 'C': 'C'}
                     mana_pattern = re.findall(r'\{([WUBRGC])\}', ability['effect'], re.IGNORECASE)
                     if mana_pattern:
+                        # June 10 audit: "Add {W} or {U}" is a CHOICE, not both.
+                        # The old loop added every symbol found, so a Celestial
+                        # Colonnade tap yielded {W}{U} — two mana from one land.
+                        # When the add clause contains an or-list, keep ONE
+                        # symbol (the color the pool currently has least of).
+                        _add_clause = ability['effect']
+                        _m_add = re.search(r'add [^.\n]*', _add_clause, re.IGNORECASE)
+                        if _m_add:
+                            _add_clause = _m_add.group(0)
+                        if re.search(r'\}\s*(?:,\s*)?or\s*\{', _add_clause, re.IGNORECASE):
+                            _chosen = min((cc.upper() for cc in mana_pattern),
+                                          key=lambda cc: player.mana_pool.get(cc, 0))
+                            print(f"[ACTIVATE-MANA] {perm.name}: or-choice → {{{_chosen}}}")
+                            mana_pattern = [_chosen]
                         added_colors = []
                         for color_char in mana_pattern:
                             c = color_char.upper()
@@ -3428,6 +3486,12 @@ class GameEngine:
                                 tmpl_msgs.append(f"💀 **{perm.name}** sacrificed (cost)")
                             if exiled_self:
                                 tmpl_msgs.append(f"📤 **{perm.name}** exiled (cost)")
+                            # June 10 audit: sacrifice-as-cost was invisible in
+                            # Discord (142 events, zero lines — creatures just
+                            # vanished from the board).
+                            if sacrificed_cost_card is not None:
+                                tmpl_msgs.append(f"💀 **{sacrificed_cost_card.name}** sacrificed "
+                                                 f"(cost for {perm.name})")
                             for act in tmpl_actions:
                                 if act.get("action") != "no_action":
                                     try:
@@ -3449,6 +3513,115 @@ class GameEngine:
                     cost_msgs.append(f"💀 **{perm.name}** sacrificed")
                 if exiled_self:
                     cost_msgs.append(f"📤 **{perm.name}** exiled")
+                # June 10 audit: sacrifice-as-cost visibility (see template
+                # branch above — same gap).
+                if sacrificed_cost_card is not None:
+                    cost_msgs.append(f"💀 **{sacrificed_cost_card.name}** sacrificed "
+                                     f"(cost for {perm.name})")
+
+                # === June 10 audit (C2): execute the effect before announcing ===
+                # Costs are paid above (mana/tap/sacrifice/life), but the old
+                # code fell through to an announce-only return — Rhys made no
+                # Elves, Greater Good drew nothing, Altar of Dementia milled
+                # nothing, Hidetsugu dealt nothing. One-sided cost payment is
+                # state corruption. Inline imperative parsers first (free),
+                # then Tier-3 escalation; the announce remains as last resort.
+                effect_text2 = ability['effect'] or ''
+                effect_lower2 = effect_text2.lower()
+                inline_msgs = []
+
+                # (a) "Create N P/T <desc> creature token(s)" — Rhys class.
+                _tok_m = re.search(
+                    r'create (a|an|one|two|three|four|five|x|\d+) (\d+)/(\d+) '
+                    r'([a-z\' ]+?) creature tokens?((?: with [a-z ,]+)?)',
+                    effect_lower2)
+                if _tok_m:
+                    _wordnum = {'a': 1, 'an': 1, 'one': 1, 'two': 2, 'three': 3,
+                                'four': 4, 'five': 5}
+                    _cnt = _wordnum.get(_tok_m.group(1))
+                    if _cnt is None:
+                        _cnt = int(_tok_m.group(1)) if _tok_m.group(1).isdigit() else 1
+                    _tok_desc = _tok_m.group(4).strip()
+                    _color_words = {'white', 'blue', 'black', 'red', 'green', 'colorless'}
+                    _name_words = [w for w in _tok_desc.split()
+                                   if w not in _color_words and w != 'and']
+                    _tok_name = ' '.join(w.capitalize() for w in _name_words) or 'Token'
+                    _kw_part = (_tok_m.group(5) or '').replace(' with ', '').strip()
+                    _kws = [k.strip() for k in re.split(r',| and ', _kw_part) if k.strip()]
+                    _tok_act = {"action": "create_token", "player": player.name,
+                                "name": _tok_name, "power": int(_tok_m.group(2)),
+                                "toughness": int(_tok_m.group(3)),
+                                "types": f"Creature — {_tok_name}", "count": _cnt}
+                    if _kws:
+                        _tok_act["keywords"] = _kws
+                    _tm = self.rules._execute_action_on_state(game, _tok_act)
+                    if _tm:
+                        inline_msgs.append(_tm)
+                    print(f"[ACTIVATE-CLAUDE-INLINE] {perm.name}: token imperative parsed")
+
+                # (b) Mill — fixed N, or "equal to the sacrificed creature's
+                # power" (Altar of Dementia). Default target: opponent.
+                elif 'mill' in effect_lower2:
+                    _mill_n = 0
+                    _mn = re.search(r'mills? (a|one|two|three|x|\d+) cards?', effect_lower2)
+                    if _mn:
+                        _wordnum = {'a': 1, 'one': 1, 'two': 2, 'three': 3}
+                        _mill_n = _wordnum.get(_mn.group(1)) or (
+                            int(_mn.group(1)) if _mn.group(1).isdigit() else 0)
+                    elif ("equal to the sacrificed creature's power" in effect_lower2
+                          or 'equal to its power' in effect_lower2):
+                        _mill_n = sac_power_snapshot
+                    if _mill_n > 0:
+                        _mill_target = game.players[1 - player_index].name
+                        _mm = self.rules._execute_action_on_state(game, {
+                            "action": "mill", "player": _mill_target, "amount": _mill_n})
+                        if _mm:
+                            inline_msgs.append(_mm)
+                        print(f"[ACTIVATE-CLAUDE-INLINE] {perm.name}: mill {_mill_n} → {_mill_target}")
+
+                # (c) "Draw cards equal to its power" (Greater Good) + discard rider.
+                elif 'draw cards equal to' in effect_lower2 and sac_power_snapshot > 0:
+                    _dm = self.rules._execute_action_on_state(game, {
+                        "action": "draw_cards", "player": player.name,
+                        "amount": sac_power_snapshot})
+                    if _dm:
+                        inline_msgs.append(_dm)
+                    _disc_m = re.search(r'discards? (a|one|two|three|\d+) cards?', effect_lower2)
+                    if _disc_m:
+                        _wordnum = {'a': 1, 'one': 1, 'two': 2, 'three': 3}
+                        _dn = _wordnum.get(_disc_m.group(1)) or (
+                            int(_disc_m.group(1)) if _disc_m.group(1).isdigit() else 0)
+                        for _ in range(_dn):
+                            _dmsg = self.rules._execute_action_on_state(game, {
+                                "action": "discard", "player": player.name,
+                                "card": "random"})
+                            if _dmsg:
+                                inline_msgs.append(_dmsg)
+                    print(f"[ACTIVATE-CLAUDE-INLINE] {perm.name}: drew {sac_power_snapshot} (sac power)")
+
+                if inline_msgs:
+                    return "\n".join(cost_msgs + inline_msgs)
+
+                # Tier 3: same cascade the manual !activate path has. Heartless
+                # Hidetsugu rides the [RESOLVE-HIDETSUGU] short-circuit inside
+                # resolve_effect, so it never actually hits the LLM.
+                try:
+                    _t3_desc = f"{player.name} activated {perm.name}'s ability: {effect_text2}"
+                    if sacrificed_cost_card is not None:
+                        _t3_desc += (f" (the sacrificed creature was "
+                                     f"{sacrificed_cost_card.name}, power {sac_power_snapshot})")
+                    t3_msgs, t3_actions = await self.rules.resolve_effect(
+                        game, _t3_desc, source_card=perm.name, controller=player.name)
+                    if t3_msgs or t3_actions:
+                        print(f"[ACTIVATE-CLAUDE-TIER3] {perm.name}: resolved via judge "
+                              f"({len(t3_actions or [])} action(s))")
+                        _body = t3_msgs or [f"{player.name} activates {perm.name}"]
+                        return "\n".join(cost_msgs + _body)
+                    print(f"[ACTIVATE-CLAUDE-TIER3] {perm.name}: judge returned no actions — falling to announce")
+                except Exception as e:
+                    print(f"[ACTIVATE-CLAUDE-TIER3] resolve_effect failed for {perm.name}: {e}")
+                    from mtg.util import maybe_reraise
+                    maybe_reraise(e)
 
                 # May 14 audit (D6): the old `[:200] + '...'` cut mid-sentence
                 # for Cauldron of Souls, Avalanche Caller, etc., hiding the
@@ -3479,6 +3652,20 @@ class GameEngine:
             # Same escalation as !judge: try resolve_effect → ask_judge_with_fix
             description = action.get("description", "")
             if not description:
+                return None
+
+            # June 10 audit (C3/V28): a resolve IMMEDIATELY following a
+            # cast/activate is redundant (the cascade resolved the effects)
+            # or an orphan (the cast failed) — either way it must not reach
+            # Tier 3, which re-applies/invents effects (Austere Command's
+            # paired resolve hallucinated "Supreme Verdict" and destroyed
+            # lands). Plan-validate catches plans; this covers the inline
+            # decide_action path.
+            if (_prev_cast_like and _prev_cast_like.get('turn') == game.turn_number
+                    and _prev_cast_like.get('type') in ('cast', 'activate')):
+                print(f"[EXECUTE] Dropped resolve positionally paired with prior "
+                      f"{_prev_cast_like.get('type')} of {_prev_cast_like.get('card', '?')}: "
+                      f"'{description[:80]}'")
                 return None
 
             # Find source card from the description for better context

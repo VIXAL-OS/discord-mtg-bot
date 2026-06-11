@@ -322,6 +322,11 @@ class Card:
     # Phasing (Teferi's Protection): phased-out permanents are skipped by
     # combat / targeting / SBA sweeps (CR 702.26).
     _phased_out: bool = field(default=False, repr=False, compare=False)
+    # June 10 audit (C8): set on a reanimation aura (Animate Dead) when the
+    # inline cast-time handler already performed the reanimation, so the
+    # name-keyed ETB template doesn't run a SECOND one (one cast was
+    # returning two creatures).
+    _reanimate_handled: bool = field(default=False, repr=False, compare=False)
 
     # Temporary modifiers (from pump effects, etc.)
     power_modifier: int = 0
@@ -425,6 +430,16 @@ class Card:
         self.entered_this_turn = False
         self.attached_to = None
         self.attachments = []
+        # June 10 deep-dive (B4): clear counters and the reanimation binding.
+        # A commander that died carrying a +1/+1 counter kept it through the
+        # command zone and attacked over-statted after the re-cast (Sythis
+        # logged 6/21 commander damage instead of 3/21); worse, Glissa kept
+        # `_reanimated_by_aura_id` from an earlier Animate Dead, so the SBA
+        # sweep INSTANTLY sacrificed her brand-new re-cast ("binding aura
+        # gone") with no player-visible explanation. A new object has none
+        # of its old state (CR 400.7).
+        self.counters = {}
+        self._reanimated_by_aura_id = None
         # Reset transform state — cards re-enter on their front face (CR 712.10a)
         if self.is_transformed and self.has_transform:
             self.transform()
@@ -610,8 +625,11 @@ class Card:
             if 'equipment' not in (equip_card.type_line or '').lower():
                 continue
             oracle = equip_card.oracle_text.lower()
-            # Parse "+X/+Y" from "equipped creature gets +X/+Y"
-            pt_match = re.search(r'(?:gets?|has)\s*\+(\d+)/\+(\d+)', oracle)
+            # Parse "±X/±Y" from "equipped creature gets ±X/±Y". June 10 audit:
+            # the old r'\+(\d+)/\+(\d+)' silently dropped mixed-sign bonuses —
+            # Skullclamp's +1/-1 contributed nothing (Bruna attacked at 5
+            # instead of 6, and the -1 toughness never reached SBA).
+            pt_match = re.search(r'(?:gets?|has)\s*([+-]\d+)/([+-]\d+)', oracle)
             if pt_match:
                 p_bonus += int(pt_match.group(1))
                 t_bonus += int(pt_match.group(2))
@@ -707,6 +725,10 @@ class Card:
         # Self-referential life-total debuff (Death's Shadow). Computed on read
         # because the amount tracks the controller's current life total.
         result -= self._get_life_total_debuff(game)
+        # Conditional self-buff gated on the controller's life total (Serra
+        # Ascendant) — dynamic like the debuff above, computed on read.
+        lt_p, _ = self._get_life_threshold_bonus(game)
+        result += lt_p
         return result
 
     def get_effective_toughness(self, game=None) -> int:
@@ -750,6 +772,9 @@ class Card:
             result += self._get_anthem_toughness_bonus(game)
         # Self-referential life-total debuff (Death's Shadow) — see get_effective_power.
         result -= self._get_life_total_debuff(game)
+        # Conditional self-buff gated on controller's life (Serra Ascendant).
+        _, lt_t = self._get_life_threshold_bonus(game)
+        result += lt_t
         return result
 
     def _get_attached_auras(self, game):
@@ -781,6 +806,28 @@ class Card:
             if self in p.battlefield:
                 return max(0, int(getattr(p, 'life', 0)))
         return 0
+
+    def _get_life_threshold_bonus(self, game):
+        """Serra Ascendant: "As long as you have 30 or more life, this creature
+        gets +5/+5 and has flying." The bonus tracks the controller's live life
+        total, so it's computed on read (same pattern as the Death's Shadow
+        debuff above). June 10 audit (V24): this conditional self-buff had no
+        implementation anywhere — Serra attacked at power 1 with her controller
+        at 37 life. Returns (power_bonus, toughness_bonus)."""
+        if not game or not self.oracle_text:
+            return (0, 0)
+        o = self.oracle_text.lower()
+        m = re.search(
+            r'as long as you have (\d+) or more life,?[^.]*? gets \+(\d+)/\+(\d+)', o)
+        if not m:
+            return (0, 0)
+        threshold = int(m.group(1))
+        for p in game.players:
+            if self in p.battlefield:
+                if int(getattr(p, 'life', 0)) >= threshold:
+                    return (int(m.group(2)), int(m.group(3)))
+                return (0, 0)
+        return (0, 0)
 
     def _get_self_for_each_bonus(self, game):
         """Return (power, toughness) bonus from "for each X attached to it"
@@ -832,12 +879,28 @@ class Card:
         import re as _re
         for aura in self._get_attached_auras(game):
             oracle = (aura.oracle_text or '').lower()
-            for m in _re.finditer(r'enchanted creature gets \+(\d+)/\+(\d+)', oracle):
-                p_bonus += int(m.group(1))
-                t_bonus += int(m.group(2))
-            for m in _re.finditer(r'enchanted creature gets -(\d+)/-(\d+)', oracle):
-                p_bonus -= int(m.group(1))
-                t_bonus -= int(m.group(2))
+            # Signed pattern covers +N/+M, -N/-M, and mixed-sign (+N/-M) auras
+            # in one pass (June 10 audit, same class as the Skullclamp fix).
+            # June 10 deep-dive (B7): the optional "for each <type> you
+            # control" multiplier (Ethereal Armor) was silently discarded —
+            # the flat +1/+1 applied while 4-6 enchantments were in play.
+            for m in _re.finditer(
+                    r'enchanted creature gets ([+-]\d+)/([+-]\d+)'
+                    r'( for each (enchantment|artifact|creature|land) you control)?',
+                    oracle):
+                step_p, step_t = int(m.group(1)), int(m.group(2))
+                if m.group(3):
+                    kind = m.group(4)
+                    aura_ctrl = aura._find_controller(game)
+                    count = 0
+                    if aura_ctrl is not None:
+                        count = sum(1 for perm in aura_ctrl.battlefield
+                                    if kind in (getattr(perm, 'type_line', '') or '').lower())
+                    p_bonus += step_p * count
+                    t_bonus += step_t * count
+                else:
+                    p_bonus += step_p
+                    t_bonus += step_t
         return (p_bonus, t_bonus)
 
     def _get_anthem_power_bonus(self, game) -> int:
@@ -862,17 +925,53 @@ class Card:
                     # layers engine; it needs the same gate as the registration.
                     if game._has_conditional_static(oracle) and not game._static_condition_met(perm, oracle):
                         continue
-                    # Match "+N/+N" patterns for creatures you control
-                    # Covers: "creatures you control", "creature tokens you control",
-                    # "other creature tokens you control" (Intangible Virtue, Phantom General)
-                    for m in _re.finditer(r'(?:other )?creature(?:\s+token)?s you control get \+(\d+)/\+(\d+)', oracle):
-                        if 'other' in oracle[:oracle.index(m.group())+10] and perm.id == self.id:
-                            continue
-                        # "creature tokens" only applies to tokens
-                        if 'creature token' in m.group() and not getattr(self, 'is_token', False):
-                            continue
-                        bonus += int(m.group(1))
+                    # June 10 audit (V18): scan only static sentences. The
+                    # raw-oracle scan matched Castle Embereth's ACTIVATED
+                    # ability ("{1}{R}{R}, {T}: Creatures you control get
+                    # +1/+0 until end of turn") as an always-on anthem —
+                    # every creature read +1/+0 with zero activations.
+                    for sent in self._anthem_static_sentences(oracle):
+                        # Match "+N/+N" patterns for creatures you control
+                        # Covers: "creatures you control", "creature tokens you
+                        # control", "other creature tokens you control"
+                        # (Intangible Virtue, Phantom General)
+                        for m in _re.finditer(r'(?:other )?creature(?:\s+token)?s you control get \+(\d+)/\+(\d+)', sent):
+                            # "creature tokens" only applies to tokens
+                            if 'creature token' in m.group() and not getattr(self, 'is_token', False):
+                                continue
+                            bonus += int(m.group(1))
         return bonus
+
+    def _anthem_static_sentences(self, oracle: str):
+        """Yield the sentences eligible for inline anthem scanning.
+
+        June 10 audit (V18): the inline anthem fallback scanned RAW oracle
+        text, so activated abilities ("{1}{R}{R}, {T}: Creatures you control
+        get +1/+0 until end of turn" — Castle Embereth) and triggered pumps
+        read as permanent anthems. Filtering is SENTENCE-level (not
+        paragraph-level) because single-line oracles like Beastmaster
+        Ascension carry a trigger sentence AND the "As long as … get +5/+5"
+        static in one paragraph — rejecting the whole paragraph for the
+        leading trigger word killed the legitimate anthem (caught by
+        tests/test_models.py on the first suite run).
+        """
+        for para in (oracle or '').split('\n'):
+            p = para.strip()
+            if not p:
+                continue
+            if ':' in p:
+                cost_part = p.split(':', 1)[0].lower()
+                if any(sym in cost_part for sym in ('{t}', '{q}', '{w}', '{u}', '{b}',
+                                                    '{r}', '{g}', '{c}', '{x}', '{s}')) \
+                   or any(ch.isdigit() for ch in cost_part):
+                    continue  # activated ability — skip the whole paragraph
+            for sent in p.split('. '):
+                s = sent.strip().lower()
+                if not s or 'until end of turn' in s:
+                    continue
+                if s.startswith(('when ', 'whenever ', 'at the beginning', 'at end')):
+                    continue
+                yield s
 
     def _get_anthem_toughness_bonus(self, game) -> int:
         """Calculate total toughness bonus from anthem-style continuous effects."""
@@ -891,12 +990,13 @@ class Card:
                     # May 26 audit: conditional-anthem gate (see _get_anthem_power_bonus).
                     if game._has_conditional_static(oracle) and not game._static_condition_met(perm, oracle):
                         continue
-                    for m in _re.finditer(r'(?:other )?creature(?:\s+token)?s you control get \+(\d+)/\+(\d+)', oracle):
-                        if 'other' in oracle[:oracle.index(m.group())+10] and perm.id == self.id:
-                            continue
-                        if 'creature token' in m.group() and not getattr(self, 'is_token', False):
-                            continue
-                        bonus += int(m.group(2))
+                    # June 10 audit (V18): static-sentence filter — see
+                    # _get_anthem_power_bonus for rationale (Castle Embereth).
+                    for sent in self._anthem_static_sentences(oracle):
+                        for m in _re.finditer(r'(?:other )?creature(?:\s+token)?s you control get \+(\d+)/\+(\d+)', sent):
+                            if 'creature token' in m.group() and not getattr(self, 'is_token', False):
+                                continue
+                            bonus += int(m.group(2))
         return bonus
 
     def _resolve_star_power(self, game) -> int:
@@ -1121,8 +1221,23 @@ class Card:
                 # Normalise multi-word keyword for substring check
                 if keyword_lower in grant_text:
                     return True
+        # June 10 audit (V24): conditional self-GRANT. The life-threshold gate
+        # near the top of this function only DENIES a printed keyword while
+        # the threshold is unmet; a keyword that exists ONLY inside the
+        # conditional sentence ("...and has flying" — Serra Ascendant) was
+        # never granted at all. Grant it while the threshold holds.
+        if game is not None and self.oracle_text:
+            import re as _gre
+            _gm = _gre.search(
+                r'as long as you have (\d+) or more life[^.]*\bha(?:s|ve)\b[^.]*\b'
+                + _gre.escape(keyword_lower),
+                self.oracle_text.lower())
+            if _gm:
+                _gctrl = self._find_controller(game)
+                if _gctrl is not None and getattr(_gctrl, 'life', 0) >= int(_gm.group(1)):
+                    return True
         return False
-    
+
     def has_haste(self, game=None) -> bool:
         return self.has_keyword('Haste', game=game)
 
@@ -1397,6 +1512,10 @@ class Player:
     # Card names blocked from casting this game (commander color identity,
     # CR 903.4) — surfaced in the AI's "DO NOT CAST" prompt section.
     _color_id_blocklist: set = field(default_factory=set, repr=False, compare=False)
+    # June 10 audit (V3): deck color identity cached at first computation.
+    # CR 903.4 — identity is a deck-construction constant; recomputing from
+    # live card locations broke partner decks when a commander was stolen.
+    _commander_identity_cache: Any = field(default=None, repr=False, compare=False)
 
     # Cards exiled but playable this turn (Chandra 0, Outpost Siege, etc.)
     # List of card IDs that can be played from exile until end of turn
@@ -1903,6 +2022,20 @@ class Player:
                     rd = []
                     game._recently_died = rd
                 rd.append((victim, self))
+                # June 10 audit: surface the sacrifice to players — 43 Tower
+                # sacs in the June batch had zero Discord lines (Savra, Judith,
+                # Syr Konrad just vanished from the board).
+                game._pending_messages.append(
+                    f"💀 **{self.name}** sacrifices **{victim.name}** to Phyrexian Tower")
+                # June 10 audit: unregister the victim's layer/static effects.
+                # Judith was Tower-sacrificed and her +1/+0 anthem stayed
+                # registered, applying 32 more times across the rest of the
+                # game. Mirror the normal death path's cleanup.
+                game._remove_card_layer_effects(victim)
+                if hasattr(game, 'unregister_static_effects'):
+                    game.unregister_static_effects(victim)
+                if hasattr(game, 'recalculate_power_toughness'):
+                    game.recalculate_power_toughness()
             except Exception:
                 pass
 
@@ -2084,8 +2217,24 @@ class Player:
             production = self._get_mana_production(card)
             sources.append((card, production))
 
+        # June 10 deep-dive (dual-land underpay): a source's ONE-TAP output is
+        # the MAX over its color options, not the sum — "Add {W} or {U}" duals
+        # were counted as 2 available mana, and the commitment accounting below
+        # credited both colors from one tap, so spells resolved UNDERPAID by
+        # (colors-1) per dual (CR 601.2g; three spells in game …069616767067).
+        # Single-key sources (basics, Sol Ring {'C':2}) are unchanged; rare
+        # both-at-once multi-color producers ("Add {B}{R}") are
+        # indistinguishable in this production model and now under-count by 1
+        # (a slight over-tap — the safe direction).
+        def _one_tap_output(production):
+            if not production:
+                return 0
+            if len(production) == 1:
+                return next(iter(production.values()))
+            return max(production.values())
+
         # Calculate total available mana
-        total_available = sum(sum(p.values()) for _, p in sources)
+        total_available = sum(_one_tap_output(p) for _, p in sources)
         total_cost = sum(color_needs.values()) + generic_needed + hybrid_count
         if total_available < total_cost:
             return False
@@ -2109,6 +2258,10 @@ class Player:
                 colored_sources.append((card, production))
 
         tapped_cards = set()  # Track which cards we're tapping (by id)
+        # June 10: which single color each tapped source is committed to —
+        # Phase 4 adds ONLY that color to the pool (a dual previously added
+        # both colors: 2 pool mana from one land).
+        committed_color = {}
         mana_produced = {'W': 0, 'U': 0, 'B': 0, 'R': 0, 'G': 0, 'C': 0}
 
         # Sort colored sources: prefer single-color sources first (don't waste dual-lands on requirements
@@ -2125,11 +2278,19 @@ class Player:
             for color in list(remaining_needs.keys()):
                 if color in produces and remaining_needs[color] > 0:
                     tapped_cards.add(id(card))
-                    # This source contributes to the color requirement
-                    for pc, pv in production.items():
-                        if pc == 'any':
-                            continue
-                        mana_produced[pc] = mana_produced.get(pc, 0) + pv
+                    # June 10 deep-dive: credit ONLY the committed color. The
+                    # old loop credited every color the source COULD produce,
+                    # counting one dual land as 2 toward the total and letting
+                    # Phase 3 under-tap (underpaid casts).
+                    committed_color[id(card)] = color
+                    mana_produced[color] = mana_produced.get(color, 0) + produces[color]
+                    # June 10 audit (C1): decrement the satisfied need. Without
+                    # this, the `if not remaining_needs: break` guard above was
+                    # dead code and EVERY source producing a needed color got
+                    # tapped — a 1-mana Bolt tapped the whole board (since Apr 4).
+                    remaining_needs[color] -= produces[color]
+                    if remaining_needs[color] <= 0:
+                        del remaining_needs[color]
                     break  # Source is now committed
 
         # Check if colored requirements are met, use 'any' sources for shortfalls
@@ -2171,7 +2332,12 @@ class Player:
         # Priority: multi-mana rocks (Sol Ring=2, Thran Dynamo=3) before single-mana
         # sources (basic lands). This keeps colored lands untapped for future spells.
         total_mana_committed = sum(mana_produced.values())
-        generic_still_needed = total_cost - total_mana_committed + phyrexian_life_cost  # Phyrexian reduces needed
+        # June 10 audit (V5): life-paid Phyrexian symbols are already EXCLUDED
+        # from color_needs/total_cost (see phyrexian_symbols_paid skip above),
+        # so no adjustment belongs here. The old `+ phyrexian_life_cost` term
+        # conjured 2 phantom generic mana per symbol — Gitaxian Probe paid
+        # 2 life AND tapped 2 Islands (CR 107.4f is either/or).
+        generic_still_needed = total_cost - total_mana_committed
 
         # May 13 audit: {S} symbols require N snow sources to be tapped.
         # Walk every untapped source, prefer those whose name/type-line marks
@@ -2199,12 +2365,14 @@ class Player:
                 tapped_cards.add(id(card))
                 snow_taps += 1
                 snow_remaining -= 1
-                for pc, pv in production.items():
-                    if pc == 'any':
-                        mana_produced['C'] = mana_produced.get('C', 0) + pv
-                    else:
-                        mana_produced[pc] = mana_produced.get(pc, 0) + pv
-                generic_still_needed -= sum(production.values())
+                # June 10: one-tap output + single committed color (snow duals
+                # like Highland Forest are or-choices too).
+                _snow_keys = [k for k in production if k != 'any'] or ['C']
+                _snow_color = max(_snow_keys, key=lambda k: production.get(k, 0))
+                _snow_amt = _one_tap_output(production)
+                mana_produced[_snow_color] = mana_produced.get(_snow_color, 0) + _snow_amt
+                committed_color[id(card)] = _snow_color
+                generic_still_needed -= _snow_amt
             if snow_remaining > 0:
                 # Not enough snow sources for the {S} requirement.
                 print(f"[MANA-ENGINE] Need {snow_count} snow source(s) for {mana_cost_str}, "
@@ -2231,12 +2399,11 @@ class Player:
                 if generic_still_needed <= 0:
                     break
                 tapped_cards.add(id(card))
-                for pc, pv in production.items():
-                    if pc == 'any':
-                        mana_produced['C'] = mana_produced.get('C', 0) + pv
-                    else:
-                        mana_produced[pc] = mana_produced.get(pc, 0) + pv
-                generic_still_needed -= sum(production.values())
+                # June 10: one tap = one output ('any' sources are single-key,
+                # so behavior is unchanged for them; guards future shapes).
+                _any_amt = _one_tap_output(production)
+                mana_produced['C'] = mana_produced.get('C', 0) + _any_amt
+                generic_still_needed -= _any_amt
 
             # Then colored sources (least preferred for generic — preserves color flexibility)
             for card, production in colored_sources:
@@ -2245,22 +2412,26 @@ class Player:
                 if generic_still_needed <= 0:
                     break
                 tapped_cards.add(id(card))
-                for pc, pv in production.items():
-                    if pc == 'any':
-                        mana_produced['C'] = mana_produced.get('C', 0) + pv
-                    else:
-                        mana_produced[pc] = mana_produced.get(pc, 0) + pv
-                generic_still_needed -= sum(production.values())
+                # June 10: a dual tapped for generic contributes ONE mana of
+                # one color, not one of each (was over-crediting and
+                # under-tapping the rest of the generic requirement).
+                _gen_keys = [k for k in production if k != 'any'] or ['C']
+                _gen_color = max(_gen_keys, key=lambda k: production.get(k, 0))
+                _gen_amt = _one_tap_output(production)
+                mana_produced[_gen_color] = mana_produced.get(_gen_color, 0) + _gen_amt
+                committed_color[id(card)] = _gen_color
+                generic_still_needed -= _gen_amt
 
-        # Verify we have enough total mana
-        if sum(mana_produced.values()) + phyrexian_life_cost < total_cost:
+        # Verify we have enough total mana (life-paid Phyrexian symbols are
+        # excluded from total_cost, so produced mana alone must cover it)
+        if sum(mana_produced.values()) < total_cost:
             return False
 
         # Verify all colored requirements are met
         for color, needed in color_needs.items():
             if mana_produced.get(color, 0) < needed:
                 # Check if 'any' mana can fill the gap
-                any_excess = sum(mana_produced.values()) - total_cost + phyrexian_life_cost
+                any_excess = sum(mana_produced.values()) - total_cost
                 if any_excess < needed - mana_produced.get(color, 0):
                     return False
 
@@ -2284,6 +2455,12 @@ class Player:
                     victim = self._apply_sac_cost_at_tap(card)
                     if victim is None:
                         production = {'C': 1}
+                # June 10 deep-dive: a Phase-1/3-committed source adds ONLY its
+                # committed color to the pool — adding full production gave the
+                # pool 2 mana from one dual-land tap.
+                _cc = committed_color.get(id(card))
+                if _cc is not None and _cc in production:
+                    production = {_cc: production[_cc]}
                 # For non-any sources, decrement shortfalls from their colored production
                 for pc, pv in production.items():
                     if pc not in ('any', 'C') and pc in pool_shortfalls:
@@ -2355,7 +2532,17 @@ class Player:
         commander dying and the scan skipping the graveyard.
 
         Returns colors in WUBRG order so callers see a stable shape.
+
+        June 10 audit (V3): the result is CACHED after the first non-empty
+        computation. CR 903.4 makes color identity a deck-construction
+        constant — recomputing from live card locations meant a commander
+        stolen onto the OPPONENT's battlefield (Animate Dead on Tymna)
+        vanished from the scan and the player's identity collapsed to the
+        remaining partner, blocking 23 legal casts in one June 10 game.
         """
+        cached = getattr(self, '_commander_identity_cache', None)
+        if cached is not None:
+            return list(cached)
         identity = set()
         zones = [
             list(getattr(self, 'command_zone', []) or []),
@@ -2384,7 +2571,14 @@ class Player:
                             identity.add(c)
         # Stable WUBRG order
         order = ['W', 'U', 'B', 'R', 'G']
-        return [c for c in order if c in identity]
+        result = [c for c in order if c in identity]
+        if result:
+            # Cache only a non-empty identity: at game init the commanders sit
+            # in the command zone so the first call is authoritative; an empty
+            # result (60-card formats) stays cheap to recompute and avoids
+            # caching a pre-deck-load transient.
+            self._commander_identity_cache = result
+        return result
     
     def can_pay_mana_cost(self, mana_cost: str) -> Tuple[bool, str]:
         """
@@ -2686,6 +2880,17 @@ class GameState:
     # (card, player) tuples queued for dies-trigger processing (SBA loop,
     # board wipes, Living Death F-LD1). Drained by the trigger dispatcher.
     _recently_died: list = field(default_factory=list, repr=False, compare=False)
+    # Cross-system display queue: trigger messages produced by sync helpers
+    # (Phyrexian Tower dies-triggers, gain-life triggers) — flushed by the
+    # next display pass.
+    _pending_messages: list = field(default_factory=list, repr=False, compare=False)
+    # Re-entrancy guard for "whenever you gain life" trigger resolution
+    # (June 10, V26).
+    _in_gain_life_triggers: bool = field(default=False, repr=False, compare=False)
+    # June 10 (C3/V28): positional cast→resolve pairing stamp — set by the
+    # cast/activate branches of the two action executors, consumed by their
+    # resolve branches to drop redundant/orphan free-text resolves.
+    _last_exec_cast_like: Any = field(default=None, repr=False, compare=False)
     # Spell Queller bookkeeping: source card name → [(exiled_card, owner_name)]
     # (exile_from_stack records; release_queller_exile drains on LTB).
     _queller_exiles: dict = field(default_factory=dict, repr=False, compare=False)

@@ -123,14 +123,39 @@ class SpellResolver:
         legal = []
         player_idx = game.players.index(player) if player in game.players else 0
         
-        # Check creatures/permanents on battlefield
-        if restriction.target_types & {TargetType.CREATURE, TargetType.PERMANENT, TargetType.ANY}:
+        # Check battlefield permanents. June 10 deep-dive (Berg Strider):
+        # this branch only knew CREATURE/PERMANENT/ANY — an ARTIFACT,
+        # ENCHANTMENT, LAND, or NONLAND_PERMANENT restriction fell through
+        # every block and returned [], so "tap target artifact or creature
+        # an opponent controls" fizzled "No legal targets" with three legal
+        # targets on the board (and any mandatory trigger in this class was
+        # dropped, CR 603.3d).
+        _bf_types = {TargetType.CREATURE, TargetType.PERMANENT, TargetType.ANY,
+                     TargetType.ARTIFACT, TargetType.ENCHANTMENT, TargetType.LAND,
+                     TargetType.NONLAND_PERMANENT}
+        if restriction.target_types & _bf_types:
             for p in game.players:
                 for card in p.battlefield:
-                    if TargetType.CREATURE in restriction.target_types or TargetType.ANY in restriction.target_types:
-                        if not card.is_creature():
-                            continue
-                    
+                    _matches_type = False
+                    # ANY = creature/player/planeswalker (enum comment) — on
+                    # the battlefield scan that means creatures only, same as
+                    # the old behavior.
+                    if (TargetType.CREATURE in restriction.target_types
+                            or TargetType.ANY in restriction.target_types):
+                        _matches_type = _matches_type or card.is_creature()
+                    if TargetType.PERMANENT in restriction.target_types:
+                        _matches_type = True
+                    if TargetType.NONLAND_PERMANENT in restriction.target_types:
+                        _matches_type = _matches_type or not card.is_land()
+                    if TargetType.ARTIFACT in restriction.target_types:
+                        _matches_type = _matches_type or card.is_artifact()
+                    if TargetType.ENCHANTMENT in restriction.target_types:
+                        _matches_type = _matches_type or card.is_enchantment()
+                    if TargetType.LAND in restriction.target_types:
+                        _matches_type = _matches_type or card.is_land()
+                    if not _matches_type:
+                        continue
+
                     # Check controller restriction
                     card_controller_idx = game.players.index(p)
                     if restriction.controller.name == "YOU" and card_controller_idx != player_idx:
@@ -395,6 +420,14 @@ class SpellResolver:
                 messages.append(f"⚠️ No creature to deal damage with")
                 return messages
         
+        # June 10 audit (C4): bind the engine ref BEFORE the target loop. It was
+        # previously assigned only inside the player-target branch, so a
+        # creature-first target list hit an UnboundLocalError at the SBA call in
+        # the creature branch — AFTER damage_marked was mutated — and the catch
+        # in mtg/spells.py escalated to Tier 3, which re-resolved the spell from
+        # scratch (one Lightning Bolt: 3 to a player AND a creature killed by
+        # the phantom marked damage; 8 games in the June 10 batch).
+        rules_engine = getattr(game, '_rules_engine', None)
         for target in ctx.targets:
             if hasattr(target, 'life') and hasattr(target, 'hand'):
                 # It's a player. Route through the engine's centralized damage
@@ -402,7 +435,6 @@ class SpellResolver:
                 # Fog), damage prevention, and the [NONCOMBAT-LIFE] audit trail
                 # all fire — without it, life totals get reduced silently and
                 # damage-doubling/halving (Furnace of Rath, Gisela) is bypassed.
-                rules_engine = getattr(game, '_rules_engine', None)
                 if rules_engine and hasattr(rules_engine, '_apply_noncombat_damage_to_player'):
                     actual = rules_engine._apply_noncombat_damage_to_player(
                         game, target, amount, ctx.source_card.name

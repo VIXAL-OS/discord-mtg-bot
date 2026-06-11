@@ -1227,17 +1227,34 @@ class EffectTemplateLibrary:
             ],
         ))
 
-        # Abrupt Decay: destroy target nonland permanent with mana value 3 or less
+        # Abrupt Decay: destroy target nonland permanent with mana value 3 or less.
+        # June 10 deep-dive (B10b): honor the named target when LEGAL, and
+        # DECLINE when the AI names an illegal one (MV 4 Abyss) instead of
+        # silently retargeting — the substitute kill (a token) fed an illegal
+        # game-ending Massacre Wurm misfire in the audit game (CR 601.2c).
+        def _gen_abrupt_decay(ctrl, opp, ctx):
+            explicit = (ctx.get('explicit_target_name') or '').strip()
+            opp_player = ctx.get('_opponent_player')
+            if explicit and opp_player is not None:
+                for c in opp_player.battlefield:
+                    if (c.name or '').lower() == explicit.lower():
+                        if c.is_land() or (getattr(c, 'cmc', 0) or 0) > 3:
+                            return [{"action": "no_action",
+                                     "reason": f"Abrupt Decay: {c.name} is not a legal target "
+                                               f"(needs nonland permanent with mana value 3 or less)"}]
+                        return [{"action": "destroy", "card": c.name,
+                                 "target_controller": opp,
+                                 "reason": "Abrupt Decay (CMC ≤ 3, uncounterable)"}]
+            if ctx.get('best_opponent_nonland_le3'):
+                return [{"action": "destroy", "card": ctx['best_opponent_nonland_le3'],
+                         "target_controller": opp,
+                         "reason": "Abrupt Decay (CMC ≤ 3, uncounterable)"}]
+            return [{"action": "no_action", "reason": "Abrupt Decay: no legal target (CMC ≤ 3)"}]
+
         self._add_card("abrupt decay", EffectTemplate(
             name="Abrupt Decay",
             description="Destroy target nonland permanent with mana value 3 or less",
-            action_generator=lambda ctrl, opp, ctx: (
-                [{"action": "destroy", "card": ctx['best_opponent_nonland_le3'],
-                  "target_controller": opp,
-                  "reason": "Abrupt Decay (CMC ≤ 3, uncounterable)"}]
-                if ctx.get('best_opponent_nonland_le3')
-                else [{"action": "no_action", "reason": "Abrupt Decay: no legal target (CMC ≤ 3)"}]
-            ),
+            action_generator=_gen_abrupt_decay,
         ))
 
         # Faithless Looting: draw 2, then discard 2
@@ -1794,11 +1811,17 @@ class EffectTemplateLibrary:
             ],
             needs_target=True,
         ))
+        # June 10 deep-dive: lands ARE legal "destroy target permanent"
+        # targets — on a land-only board the old nonland-only selector
+        # destroyed NOTHING while the unconditional token rider still handed
+        # the opponent a free 3/3. Fall back to the any-permanent ctx key.
         self._add_card("beast within", EffectTemplate(
             name="Beast Within",
             description="Destroy target permanent. Its controller creates a 3/3 Beast",
             action_generator=lambda ctrl, opp, ctx: [
-                {"action": "destroy", "card": ctx.get('explicit_target_name') or ctx.get('best_opponent_nonland', 'target')},
+                {"action": "destroy", "card": (ctx.get('explicit_target_name')
+                                               or ctx.get('best_opponent_nonland')
+                                               or ctx.get('best_opponent_any_permanent', 'target'))},
                 {"action": "create_token", "player": ctx.get('explicit_target_owner') or opp, "name": "Beast",
                  "power": 3, "toughness": 3, "types": "Creature - Beast", "count": 1},
             ],
@@ -1808,7 +1831,9 @@ class EffectTemplateLibrary:
             name="Generous Gift",
             description="Destroy target permanent. Its controller creates a 3/3 Elephant",
             action_generator=lambda ctrl, opp, ctx: [
-                {"action": "destroy", "card": ctx.get('explicit_target_name') or ctx.get('best_opponent_nonland', 'target')},
+                {"action": "destroy", "card": (ctx.get('explicit_target_name')
+                                               or ctx.get('best_opponent_nonland')
+                                               or ctx.get('best_opponent_any_permanent', 'target'))},
                 {"action": "create_token", "player": ctx.get('explicit_target_owner') or opp, "name": "Elephant",
                  "power": 3, "toughness": 3, "types": "Creature - Elephant", "count": 1},
             ],
@@ -2034,14 +2059,20 @@ class EffectTemplateLibrary:
         # X defaults to 4 in autoplay (kills most commander creatures, costs
         # 4 life — usually affordable). game_1506623303765463040:500 had this
         # in the generic destroy-all list before the May 20 audit caught it.
+        # June 10 audit (V23): three stacked defects fixed — (1) the pump
+        # action had no "player" key → find_player("") → silent no-op (the
+        # -X/-X never applied while the life was still paid); (2) the effect
+        # hits BOTH sides → player="all" (handler support added June 10);
+        # (3) X was hardcoded 4 — now reads the cast's chosen X from ctx.
         self._add_card("toxic deluge", EffectTemplate(
             name="Toxic Deluge",
             description="Pay X life. Each creature gets -X/-X until end of turn",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "lose_life", "player": ctrl, "amount": 4},
-                {"action": "pump_all_creatures", "power": -4, "toughness": -4,
-                 "duration": "end_of_turn"},
-            ],
+            action_generator=lambda ctrl, opp, ctx: (lambda _x: [
+                {"action": "lose_life", "player": ctrl, "amount": _x},
+                {"action": "pump_all_creatures", "player": "all",
+                 "power": -_x, "toughness": -_x,
+                 "duration": "end_of_turn", "source": "Toxic Deluge"},
+            ])(max(1, int(ctx.get('x_value') or 4))),
         ))
 
         # --- Dread Return: single-target reanimate from graveyard. The
@@ -2049,14 +2080,19 @@ class EffectTemplateLibrary:
         # for flashback, not part of the main spell effect. Previously the AI
         # confused the two and Tier 3 resolved it as "return 3 creatures with
         # no sacrifice", producing a 3-for-0 (game_1506623303765463040:867).
+        # June 10 audit (V7): "from YOUR graveyard" — the cross-player
+        # best_graveyard_creature key let Claude's Dread Return take Rick's
+        # best creature. Now uses the own-graveyard key + the handler-side
+        # own_graveyard restriction.
         self._add_card("dread return", EffectTemplate(
             name="Dread Return",
             description="Return target creature card from your graveyard to the battlefield",
             action_generator=lambda ctrl, opp, ctx: [
                 {"action": "reanimate", "player": ctrl,
-                 "card": ctx.get('best_graveyard_creature', ''),
+                 "card": ctx.get('best_own_graveyard_creature', ''),
+                 "own_graveyard": True,
                  "reason": "Dread Return single-target reanimate"},
-            ] if ctx.get('best_graveyard_creature') else [
+            ] if ctx.get('best_own_graveyard_creature') else [
                 {"action": "no_action", "reason": "No creature cards in your graveyard"}
             ],
         ))
@@ -2070,6 +2106,154 @@ class EffectTemplateLibrary:
         # May 20). NOTE: `pump_subtype` was a typo in an earlier draft — the
         # action handler doesn't exist; pump_all_creatures with `subtype` is
         # the correct path.
+        # June 10 audit (V31f): Drakuseth — the generic attack pattern only
+        # captured the FIRST number of "deals 4 damage to any target and 3
+        # damage to each of up to two other targets" (4 of up to 10) and
+        # threaded no source (all 15 "(unknown source)" lines in the batch).
+        # Targeting heuristic: 4 → biggest opponent creature, 3 → second
+        # creature, 3 → opponent's face; face-first when no creatures (one 4 —
+        # the "other targets" must be DIFFERENT objects per CR 601.2c).
+        def _gen_drakuseth(ctrl, opp, ctx):
+            src = "Drakuseth, Maw of Flames"
+            creatures = sorted(ctx.get('_opponent_creatures') or [],
+                               key=lambda c: c.get('power', 0), reverse=True)
+            acts = []
+            if creatures:
+                acts.append({"action": "deal_damage", "amount": 4,
+                             "target_card": creatures[0]['name'],
+                             "target_controller": opp, "source": src})
+                if len(creatures) > 1:
+                    acts.append({"action": "deal_damage", "amount": 3,
+                                 "target_card": creatures[1]['name'],
+                                 "target_controller": opp, "source": src})
+                acts.append({"action": "deal_damage", "amount": 3,
+                             "target_player": opp, "source": src})
+            else:
+                acts.append({"action": "deal_damage", "amount": 4,
+                             "target_player": opp, "source": src})
+            return acts
+
+        self._add_attack_card("drakuseth, maw of flames", EffectTemplate(
+            name="Drakuseth, Maw of Flames (attack)",
+            description="Deals 4 damage to any target and 3 damage to each of up to two other targets",
+            action_generator=_gen_drakuseth,
+        ))
+
+        # June 10 deep-dive: Karlach, Fury of Avernus — "Whenever you attack"
+        # was unreachable behind the bare-"attacks" pre-filter in
+        # mtg/triggers.py (now relaxed). Model the untap + first-strike
+        # grant; the ADDITIONAL combat phase isn't modeled — breadcrumb in
+        # console keeps that honest instead of letting Tier 3 hallucinate it.
+        def _gen_karlach_attack(ctrl, opp, ctx):
+            print("[ATTACK-TEMPLATE] Karlach: additional combat phase not modeled — "
+                  "applying untap + first strike only")
+            acts = [{"action": "grant_keywords", "player": ctrl,
+                     "target": "all_own_creatures", "keywords": ["first strike"]}]
+            g = ctx.get('_game')
+            if g is not None:
+                for _atk_id in list(getattr(g, 'attackers', []) or []):
+                    _res = g.find_card_global(_atk_id)
+                    if _res:
+                        acts.append({"action": "untap", "card": _res[0].name})
+            return acts
+
+        self._add_attack_card("karlach, fury of avernus", EffectTemplate(
+            name="Karlach, Fury of Avernus (attack)",
+            description="Whenever you attack: untap attacking creatures, they gain first strike (additional combat phase not modeled)",
+            action_generator=_gen_karlach_attack,
+        ))
+
+        # June 10 deep-dive: Lightning Reaver's combat-damage half — the
+        # combat-damage-to-player dispatcher (mtg/combat.py) resolves via
+        # this registry; without a template the charge counter never landed
+        # (3 hits, 0 counters, end-step X stayed 0 all game).
+        self._add_attack_card("lightning reaver", EffectTemplate(
+            name="Lightning Reaver (combat damage)",
+            description="Whenever this creature deals combat damage to a player, put a charge counter on it",
+            action_generator=lambda ctrl, opp, ctx: [
+                {"action": "add_counters", "card": "Lightning Reaver",
+                 "counter_type": "charge", "amount": 1},
+            ],
+        ))
+
+        # June 10 round 3: Teachings of the Kirin — chapter-dispatching
+        # name-keyed template. The saga resolver passes ONLY the chapter
+        # text as oracle (now with real game_context — see mtg/spells.py),
+        # and the name-key path injects it as ctx['_oracle'], so one
+        # generator can dispatch per chapter. Pre-fix, chapter I went
+        # through a generic mill pattern (one-pattern-wins) and the Spirit
+        # token sentence was silently dropped. Chapter III (the transform)
+        # is intercepted upstream by looks_like_transform_chapter and never
+        # reaches the library; the branch here is defensive.
+        def _gen_teachings_of_the_kirin(ctrl, opp, ctx):
+            text = (ctx.get('_oracle') or '')
+            acts = []
+            if 'mill' in text:
+                acts.append({"action": "mill", "player": ctrl, "amount": 3})
+            if 'spirit creature token' in text:
+                acts.append({"action": "create_token", "player": ctrl,
+                             "name": "Spirit", "power": 1, "toughness": 1,
+                             "types": "Creature — Spirit", "count": 1})
+            if acts:
+                return acts  # Chapter I: mill three + Spirit
+            if '+1/+1 counter on target creature' in text:
+                # Chapter II — biggest own creature.
+                best, best_p = None, -1
+                for info in (ctx.get('_controller_creatures') or []):
+                    if isinstance(info, dict) and info.get('power', 0) > best_p:
+                        best, best_p = info.get('name'), info.get('power', 0)
+                if best:
+                    return [{"action": "add_counters", "card": best,
+                             "counter_type": "+1/+1", "amount": 1}]
+                return [{"action": "no_action",
+                         "reason": "Teachings of the Kirin II: no creature to put the counter on"}]
+            if 'exile this saga' in text:
+                return [{"action": "no_action",
+                         "reason": "transform chapter — handled by the SAGA_COMPLETE engine path"}]
+            return [{"action": "no_action",
+                     "reason": "Teachings of the Kirin: unrecognized chapter text"}]
+
+        self._add_card("teachings of the kirin", EffectTemplate(
+            name="Teachings of the Kirin",
+            description="Saga chapters: I mill three + create a 1/1 Spirit; II +1/+1 counter on target creature you control; III transform (engine)",
+            action_generator=_gen_teachings_of_the_kirin,
+        ))
+
+        # June 10 deep-dive (B5c): Kirin-Touched Orochi's attack trigger is
+        # reflexive — the Spirit token REQUIRES exiling a creature card from
+        # a graveyard ("When you do, create…"). The generic pattern was
+        # minting free Spirits with no exile, 4× in one game.
+        def _gen_kirin_orochi_attack(ctrl, opp, ctx):
+            ctrl_player = ctx.get('_controller_player')
+            opp_player = ctx.get('_opponent_player')
+            victim = None
+            victim_owner = None
+            for pl in (opp_player, ctrl_player):
+                if pl is None:
+                    continue
+                for c in pl.graveyard:
+                    if 'creature' in ((getattr(c, 'type_line', '') or '').lower()):
+                        victim, victim_owner = c, pl
+                        break
+                if victim is not None:
+                    break
+            if victim is None:
+                return [{"action": "no_action",
+                         "reason": "Kirin-Touched Orochi: no creature card in any graveyard to exile — no Spirit (reflexive cost)"}]
+            return [
+                {"action": "move_card", "card": victim.name, "from_zone": "graveyard",
+                 "to_zone": "exile", "player": victim_owner.name,
+                 "reason": "exiled by Kirin-Touched Orochi"},
+                {"action": "create_token", "player": ctrl, "name": "Spirit",
+                 "power": 1, "toughness": 1, "types": "Creature — Spirit", "count": 1},
+            ]
+
+        self._add_attack_card("kirin-touched orochi", EffectTemplate(
+            name="Kirin-Touched Orochi (attack)",
+            description="Whenever this creature attacks, you may exile a creature card from a graveyard; if you do, create a 1/1 colorless Spirit creature token",
+            action_generator=_gen_kirin_orochi_attack,
+        ))
+
         self._add_attack_card("goblin rabblemaster", EffectTemplate(
             name="Goblin Rabblemaster (attack)",
             description="Create a 1/1 red Goblin tapped attacking; other Goblins get +1/+1 until EOT",
@@ -2327,6 +2511,73 @@ class EffectTemplateLibrary:
             ],
         ))
 
+        # June 10 deep-dive (B6): Meren — her name-keyed END-STEP template was
+        # ALSO firing as a dies trigger (the relaxed Bug-B gate falls through
+        # to name keys), so every death of one of Claude's creatures returned
+        # a creature immediately, mid-opponent-turn, on top of the legitimate
+        # end-step fire. Same collision class as Geralf's Messenger (May 26);
+        # same fix: an explicit dies-event no-op (the dies half only grants
+        # an experience counter, which the engine tracks separately).
+        self._add_dies_card("meren of clan nel toth", EffectTemplate(
+            name="Meren of Clan Nel Toth (dies guard)",
+            description="Experience counter tracked by the engine; the graveyard return fires at end step only",
+            action_generator=lambda ctrl, opp, ctx: [
+                {"action": "no_action",
+                 "reason": "Meren: experience counter tracked by engine; return resolves at end step"}
+            ],
+        ))
+
+        # June 10 deep-dive (CRITICAL — Tier 3 fabricated a mana payment):
+        # Leyline Tyrant's death trigger ("you may pay any amount of {R}…")
+        # resolved via Tier 3, which invented a 5-mana payment with ZERO
+        # untapped sources and an empty pool. Free template: count actual
+        # available red, tap it, deal that much; decline at 0.
+        def _gen_leyline_tyrant_dies(ctrl, opp, ctx):
+            ctrl_player = ctx.get('_controller_player')
+            if ctrl_player is None:
+                return [{"action": "no_action",
+                         "reason": "Leyline Tyrant: controller object unavailable"}]
+            pool = getattr(ctrl_player, 'mana_pool', {}) or {}
+            red = pool.get('R', 0)
+            red_sources = []
+            for c in ctrl_player.battlefield:
+                if getattr(c, 'tapped', False):
+                    continue
+                try:
+                    prod = ctrl_player._get_mana_production(c)
+                except (AttributeError, TypeError):
+                    prod = {}
+                if (prod or {}).get('R', 0) > 0:
+                    red_sources.append((c, prod.get('R', 0)))
+            red += sum(v for _c, v in red_sources)
+            if red <= 0:
+                return [{"action": "no_action",
+                         "reason": "Leyline Tyrant: no red mana available — optional payment declined"}]
+            for c, _v in red_sources:
+                c.tapped = True
+            return [{"action": "deal_damage", "amount": red, "target_player": opp,
+                     "source": "Leyline Tyrant"}]
+
+        self._add_dies_card("leyline tyrant", EffectTemplate(
+            name="Leyline Tyrant (dies)",
+            description="When this creature dies, you may pay any amount of red mana; it deals that much damage to any target",
+            action_generator=_gen_leyline_tyrant_dies,
+        ))
+
+        # June 10 audit (V16): Midnight Reaper — the generic dies pattern
+        # resolved only the draw and dropped the "deals 1 damage to you"
+        # half. (The token-death over-fire is fixed at the trigger gate in
+        # mtg/triggers.py.)
+        self._add_dies_card("midnight reaper", EffectTemplate(
+            name="Midnight Reaper",
+            description="Whenever a nontoken creature you control dies, Midnight Reaper deals 1 damage to you and you draw a card",
+            action_generator=lambda ctrl, opp, ctx: [
+                {"action": "draw_cards", "player": ctrl, "amount": 1},
+                {"action": "lose_life", "player": ctrl, "amount": 1,
+                 "source": "Midnight Reaper"},
+            ],
+        ))
+
         # --- Upkeep triggers ---
         self._add_card("phyrexian arena", EffectTemplate(
             name="Phyrexian Arena",
@@ -2344,6 +2595,72 @@ class EffectTemplateLibrary:
                 {"action": "lose_life", "player": ctrl, "amount": 1},
                 make_token_action(ctrl, "faerie_rogue_1_1", 1),
             ],
+        ))
+
+        # June 10 audit: Land Tax was the batch's #1 Tier-3 money pit (53
+        # escalations, 9 in one game — one per upkeep). Free upkeep template:
+        # check the land-count condition, then move up to 3 basics to hand.
+        def _land_tax_gen(ctrl, opp, ctx):
+            ctrl_player = ctx.get('_controller_player')
+            opp_player = ctx.get('_opponent_player')
+            if ctrl_player is None or opp_player is None:
+                return [{"action": "no_action",
+                         "reason": "Land Tax: player objects unavailable"}]
+            my_lands = sum(1 for c in ctrl_player.battlefield if c.is_land())
+            opp_lands = sum(1 for c in opp_player.battlefield if c.is_land())
+            if my_lands >= opp_lands:
+                return [{"action": "no_action",
+                         "reason": f"Land Tax: not fewer lands ({my_lands} vs {opp_lands})"}]
+            basics = []
+            for c in ctrl_player.library:
+                tl = (getattr(c, 'type_line', '') or '').lower()
+                if 'basic' in tl and 'land' in tl:
+                    basics.append(c.name)
+                    if len(basics) >= 3:
+                        break
+            if not basics:
+                return [{"action": "no_action",
+                         "reason": "Land Tax: no basic lands left in library"}]
+            return [{"action": "move_card", "card": n, "from_zone": "library",
+                     "to_zone": "hand", "player": ctrl,
+                     "reason": "Land Tax fetches a basic land"} for n in basics]
+
+        self._add_card("land tax", EffectTemplate(
+            name="Land Tax",
+            description="At the beginning of your upkeep, if an opponent controls more lands than you, search your library for up to three basic land cards and put them into your hand",
+            action_generator=_land_tax_gen,
+        ))
+
+        # June 10 deep-dive (CRITICAL): Marit Lage's Slumber — dedicated
+        # condition-checked template. The generic upkeep-token pattern was
+        # creating an unconditional vanilla 20/20 "Black Avatar" every upkeep
+        # (no 10-snow gate, no sacrifice, no flying/indestructible/legendary)
+        # and won game …069662904551 with three of them.
+        def _gen_marit_lage_slumber(ctrl, opp, ctx):
+            ctrl_player = ctx.get('_controller_player')
+            if ctrl_player is None:
+                return [{"action": "no_action",
+                         "reason": "Marit Lage's Slumber: controller object unavailable"}]
+            snow_count = sum(
+                1 for c in ctrl_player.battlefield
+                if 'snow' in ((getattr(c, 'type_line', '') or '').lower()))
+            if snow_count < 10:
+                return [{"action": "no_action",
+                         "reason": f"Marit Lage's Slumber: {snow_count} of 10 snow permanents — trigger doesn't fire (intervening if, CR 603.4)"}]
+            return [
+                {"action": "move_card", "card": "Marit Lage's Slumber",
+                 "from_zone": "battlefield", "to_zone": "graveyard", "player": ctrl,
+                 "reason": "sacrificed (Marit Lage awakens)"},
+                {"action": "create_token", "player": ctrl, "name": "Marit Lage",
+                 "power": 20, "toughness": 20,
+                 "types": "Legendary Creature — Avatar", "count": 1,
+                 "keywords": ["Flying", "Indestructible"]},
+            ]
+
+        self._add_card("marit lage's slumber", EffectTemplate(
+            name="Marit Lage's Slumber",
+            description="At the beginning of your upkeep, if you control ten or more snow permanents, sacrifice this enchantment and create Marit Lage, a legendary 20/20 black Avatar creature token with flying and indestructible",
+            action_generator=_gen_marit_lage_slumber,
         ))
 
         # Mana Vault — "At the beginning of your upkeep, if Mana Vault is
@@ -2522,13 +2839,11 @@ class EffectTemplateLibrary:
         # NEW TEMPLATES — March 22 log audit
         # ===========================================================
 
-        self._add_card("twinflame tyrant", EffectTemplate(
-            name="Twinflame Tyrant",
-            description="Deal 5 damage to any target",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "deal_damage", "amount": 5, "target_player": opp}
-            ],
-        ))
+        # June 10 deep-dive: the old Twinflame Tyrant template here was a
+        # March-22 HALLUCINATION ("Deal 5 damage to any target" — matching
+        # nothing printed on the card). The real card is a static damage
+        # doubler, now registered in rules/replacement.py. A normal cast
+        # would have dealt 5 phantom damage; deleted.
 
         self._add_card("skyshroud claim", EffectTemplate(
             name="Skyshroud Claim",
@@ -3644,8 +3959,14 @@ class EffectTemplateLibrary:
             EffectTemplate(
                 name="Attack Deal Damage",
                 description="Deal damage when attacking",
+                # June 10 audit (V31f): thread the source so the damage line
+                # isn't "(unknown source)" — 15 such lines in the June batch,
+                # 9 of them Drakuseth (who also has a dedicated template now;
+                # this generic pattern only captures the FIRST number).
                 action_generator=lambda ctrl, opp, ctx: [
-                    {"action": "deal_damage", "amount": int(ctx['_match'].group(1)), "target_player": opp}
+                    {"action": "deal_damage", "amount": int(ctx['_match'].group(1)),
+                     "target_player": opp,
+                     "source": ctx.get('_source_card_name', 'attack trigger')}
                 ]
             )
         )
@@ -6307,6 +6628,38 @@ class EffectTemplateLibrary:
             action_generator=_extort_gen,
         ))
 
+        # June 10 audit (template backlog): "look at the top N cards … put
+        # them back in any order" reorder family (Thassa's Oracle ETB,
+        # Sphinx variants) — these escalated to Tier 3, burned tokens, and
+        # came back with no state change. Library order IS the current
+        # order; resolve as an explicit no-op whose reason stays console-only
+        # (matches the _INTERNAL_NOOP_PATTERNS suppression list).
+        self._add_pattern(
+            r"look at the top \w+ cards? of your library.*?"
+            r"(?:put (?:them|the rest|it)|in any order)",
+            EffectTemplate(
+                name="Library Look / Reorder",
+                description="Look at top cards and reorder",
+                action_generator=lambda ctrl, opp, ctx: [
+                    {"action": "no_action",
+                     "reason": "library order not modeled — keeping current order"}
+                ]
+            )
+        )
+
+        # June 10 audit (V27): extort as a KEYWORD pattern. It was registered
+        # only under "blind obedience", so Crypt Ghast's extort was announced,
+        # pushed on the stack per CR 603.2, then discarded unexecuted. Any
+        # extort card now routes to the same payment-checking generator.
+        self._add_pattern(
+            r"\bextort\b",
+            EffectTemplate(
+                name="Extort (keyword)",
+                description="Extort: pay {W/B} to drain 1 from each opponent",
+                action_generator=_extort_gen,
+            )
+        )
+
         # Fix 15: Charming Prince — modal ETB
         self._add_card("charming prince", EffectTemplate(
             name="Charming Prince",
@@ -6931,33 +7284,50 @@ class EffectTemplateLibrary:
 
         # Reanimate — put target creature from any graveyard onto battlefield; lose life = MV
         def _reanimate_gen(ctrl, opp, ctx):
-            # Find best creature in any graveyard
-            all_gy = ctx.get('all_graveyards', [])
-            target = ctx.get('explicit_target_name')
-            if not target:
-                # Auto-pick: look through graveyard lists for creatures
-                for gy_entry in all_gy:
-                    cards = gy_entry.get('cards', []) if isinstance(gy_entry, dict) else []
-                    for card in cards:
-                        if isinstance(card, dict) and 'creature' in card.get('type_line', '').lower():
-                            target = card.get('name', '')
-                            break
-                    if target:
+            # June 10 deep-dive (B10a): resolve the ACTUAL card object so the
+            # life payment equals its real mana value — the old path charged
+            # a fallback constant 5 (one {B} + 5 life for a 2-MV Sakura) and
+            # its raw move_card half could silently no-op on an owner
+            # mismatch, returning nothing for the cost. Uses the `reanimate`
+            # action (searches every graveyard, resets battlefield state).
+            ctrl_player = ctx.get('_controller_player')
+            opp_player = ctx.get('_opponent_player')
+            explicit = (ctx.get('explicit_target_name') or '').strip().lower()
+            chosen = None
+            for _want_explicit in ((True, False) if explicit else (False,)):
+                for pl in (ctrl_player, opp_player):
+                    if pl is None:
+                        continue
+                    for c in pl.graveyard:
+                        tl = (getattr(c, 'type_line', '') or '').lower()
+                        if 'creature' not in tl:
+                            continue
+                        if _want_explicit:
+                            if (c.name or '').lower() == explicit:
+                                chosen = c
+                                break
+                        elif chosen is None or (getattr(c, 'cmc', 0) or 0) > (getattr(chosen, 'cmc', 0) or 0):
+                            chosen = c
+                    if _want_explicit and chosen is not None:
                         break
-            if not target:
-                # Fall back to explicit context keys
-                target = ctx.get('best_graveyard_creature', '')
-            if not target:
+                if chosen is not None:
+                    break
+            if chosen is None:
+                _name_fallback = ctx.get('best_graveyard_creature', '')
+                if _name_fallback:
+                    return [
+                        {"action": "reanimate", "player": ctrl, "card": _name_fallback},
+                        {"action": "lose_life", "player": ctrl, "amount": 1,
+                         "source": "Reanimate"},
+                    ]
                 return [{"action": "no_action",
                          "reason": "Reanimate: no creature card found in any graveyard"}]
-            # Use MV from context if available, else approximate 5 (reasonable average)
-            mv = ctx.get('target_cmc', ctx.get('reanimation_target_cmc', 5))
-            target_owner = ctx.get('explicit_target_owner', opp)
+            mv = int(getattr(chosen, 'cmc', 0) or 0)
             return [
-                {"action": "move_card", "card": target,
-                 "from_zone": "graveyard", "to_zone": "battlefield",
-                 "player": ctrl},
-                {"action": "lose_life", "player": ctrl, "amount": max(1, mv)},
+                {"action": "reanimate", "player": ctrl, "card": chosen.name,
+                 "reason": "Reanimate returns it under your control"},
+                {"action": "lose_life", "player": ctrl, "amount": max(1, mv),
+                 "source": "Reanimate"},
             ]
 
         self._add_card("reanimate", EffectTemplate(
@@ -7733,6 +8103,20 @@ class EffectTemplateLibrary:
         return [{"action": "no_action", "reason": "No valid non-creature target"}]
     
     def _destroy_best_artifact_enchantment(self, ctrl, opp, ctx) -> List[Dict]:
+        # June 10 deep-dive (B10b): honor the AI/player's NAMED target when it
+        # is a legal artifact/enchantment — Krosan Grip with a captured legal
+        # target (The Abyss) was destroying an unrelated heuristic pick
+        # (Orzhov Signet) instead.
+        explicit = (ctx.get('explicit_target_name') or '').strip()
+        opp_player = ctx.get('_opponent_player')
+        if explicit and opp_player is not None:
+            for c in opp_player.battlefield:
+                if (c.name or '').lower() == explicit.lower():
+                    tl = (getattr(c, 'type_line', '') or '').lower()
+                    if 'artifact' in tl or 'enchantment' in tl:
+                        return [{"action": "destroy", "card": c.name,
+                                 "target_controller": opp}]
+                    break  # named target exists but wrong type — fall through
         target = ctx.get('best_opponent_artifact_enchantment')
         if target:
             return [{"action": "destroy", "card": target}]
@@ -8039,6 +8423,17 @@ class EffectTemplateLibrary:
     def _gen_upkeep_token_from_match(self, ctrl, opp, ctx) -> List[Dict]:
         """Generic upkeep token creation from oracle text pattern."""
         oracle = ctx.get('_oracle', '')
+        # June 10 deep-dive (CRITICAL — Marit Lage's Slumber): the generic
+        # upkeep-token pattern regexed straight across an intervening-if
+        # condition (CR 603.4) — "if you control ten or more snow permanents,
+        # sacrifice … create Marit Lage" became an UNCONDITIONAL vanilla
+        # 20/20 named "Black Avatar" (no flying/indestructible/legendary, no
+        # sacrifice) every single upkeep, and won a game with three of them.
+        # Conditional upkeep triggers need a dedicated name-keyed template;
+        # the generic generator refuses them.
+        if re.search(r'at the beginning of (?:your|each) upkeep,\s*if\b', oracle.lower()):
+            return [{"action": "no_action",
+                     "reason": "conditional upkeep trigger (intervening if, CR 603.4) — needs a dedicated template"}]
         # Try to extract token stats from oracle text
         token_match = re.search(r'(\d+)/(\d+)\s+(\w[\w\s]*?)(?:\s+creature)?\s+tokens?', oracle)
         if token_match:
@@ -8936,6 +9331,7 @@ def build_game_context(game, player, opponent, card=None, entering_creature=None
     # affordability like Extort's "you may pay {W/B}"). Avoid mutating through
     # this in templates — use it for read-only mana / state checks.
     ctx['_controller_player'] = player
+    ctx['_opponent_player'] = opponent  # June 10: Land Tax land-count check
     ctx['_game'] = game
 
     # Experience counters on the controller (Meren, Ezuri). Tracked as a plain
@@ -9057,6 +9453,18 @@ def build_game_context(game, player, opponent, card=None, entering_creature=None
     ctx['_controller_creatures'] = [
         _creature_info(c) for c in player.battlefield if c.is_creature()
     ]
+
+    # June 10 deep-dive: any-permanent fallback for "destroy target
+    # permanent" spells — lands ARE legal targets (Beast Within fizzled its
+    # destroy half on a land-only board while still granting the 3/3).
+    # Highest MV wins, so lands (MV 0) are chosen only as a last resort.
+    _bo_any = None
+    _bo_any_mv = -1
+    for c in opponent.battlefield:
+        _mv = getattr(c, 'cmc', 0) or 0
+        if _mv > _bo_any_mv:
+            _bo_any, _bo_any_mv = c.name, _mv
+    ctx['best_opponent_any_permanent'] = _bo_any or ''
     
     # Best opponent noncreature permanent (skips untargetable)
     best_noncreature = None
@@ -9136,6 +9544,22 @@ def build_game_context(game, player, opponent, card=None, entering_creature=None
                     best_gy_creature_cmc = mv
     ctx['best_graveyard_creature'] = best_gy_creature or ''
     ctx['best_graveyard_creature_cmc'] = best_gy_creature_cmc
+
+    # June 10 audit (V7): own-graveyard-only variant for "your graveyard"-
+    # restricted reanimation (Dread Return). The cross-player key above let
+    # Dread Return take the OPPONENT's best creature.
+    best_own_gy_creature = None
+    best_own_gy_cmc = -1
+    for c in player.graveyard:
+        if getattr(c, 'is_token', False):
+            continue
+        type_line = (c.type_line or "").lower() if hasattr(c, 'type_line') else ""
+        if "creature" in type_line:
+            mv = getattr(c, 'cmc', 0) or 0
+            if mv > best_own_gy_cmc:
+                best_own_gy_creature = c.name
+                best_own_gy_cmc = mv
+    ctx['best_own_graveyard_creature'] = best_own_gy_creature or ''
     
     # Source card name and X value (for self-referencing effects and X-cost spells)
     if card:
