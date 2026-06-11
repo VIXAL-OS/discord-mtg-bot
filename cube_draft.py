@@ -2054,10 +2054,13 @@ class CubeDraftCog(commands.Cog, name="Cube Draft"):
             # checks were undercounting the autodraft path entirely.
             try:
                 fp_name = game.players[first_player].name
+                # June 11: strict= stamp — see the autoplay [GAME-INIT] twin.
+                from mtg.util import strict_mode
                 print(
                     f"[GAME-INIT] format=cube life=20/20 "
                     f"deck0=draft(40) deck1=draft(40) "
-                    f"first_player={fp_name}"
+                    f"first_player={fp_name} "
+                    f"strict={1 if strict_mode() else 0}"
                 )
             except Exception as _init_err:
                 print(f"[AUTO-DRAFT] GAME-INIT emit failed: {_init_err}")

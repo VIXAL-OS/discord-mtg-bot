@@ -2150,12 +2150,18 @@ async def _run_single_autoplay(cog, channel, game_format: str, deck1_name: str, 
         # / deck info instead of scraping the discord log.
         try:
             p0, p1 = game.players[0], game.players[1]
+            # June 11: strict= stamps every per-game console log with the
+            # MTG_STRICT status, so "was the batch actually strict?" is a
+            # grep instead of a memory test (the June 10 batch's strict
+            # status was never confirmable after the fact).
+            from mtg.util import strict_mode
             print(
                 f"[GAME-INIT] format={game_format} "
                 f"life={p0.life}/{p1.life} "
                 f"deck0={deck1_name}({len(p0.library) + len(p0.hand) + len(getattr(p0, 'command_zone', []))}) "
                 f"deck1={deck2_name}({len(p1.library) + len(p1.hand) + len(getattr(p1, 'command_zone', []))}) "
-                f"first_player={game.players[first_player].name}"
+                f"first_player={game.players[first_player].name} "
+                f"strict={1 if strict_mode() else 0}"
             )
         except Exception as e:
             print(f"[GAME-INIT] log emission failed: {e}")
