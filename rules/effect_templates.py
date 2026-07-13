@@ -875,7 +875,13 @@ class EffectTemplateLibrary:
             cmc = ctx.get('countered_cmc', 0) or ctx.get('stack_top_cmc', 0) or 3
             return [
                 {"action": "counter_spell", "player": ctrl, "target": "stack_top"},
-                {"action": "add_mana", "player": ctrl, "color": "C", "amount": cmc},
+                # June 11 audit: Mana Drain creates mana at the beginning of
+                # its caster's next main phase, not during counter resolution.
+                {"action": "schedule_delayed_trigger",
+                 "trigger_at": "main_phase", "phase_of": ctrl,
+                 "source": "Mana Drain", "turn_delay": 0,
+                 "actions": [{"action": "add_mana", "player": ctrl,
+                              "color": "C", "amount": cmc}]},
             ]
 
         def _counter_and_token(ctrl, opp, ctx):
@@ -890,14 +896,59 @@ class EffectTemplateLibrary:
             'neutralize', 'absorb', 'undermine',
             'scatter to the winds',
             'sinister sabotage', "didn't say please",
-            'force of will', 'force of negation',
-            "dovin's veto", 'flusterstorm',
+            'force of will', 'flusterstorm',
         ]
         for name in COUNTERSPELLS:
             self._add_card(name, EffectTemplate(
                 name=name.title(), description="Counter target spell",
                 action_generator=_counter_action,
             ))
+
+        # Delay: counter → exile with three time counters (suspend). June 11
+        # audit: resolved via the generic pattern as counter-to-graveyard,
+        # letting Bloodghast landfall-return two turns later.
+        self._add_card("delay", EffectTemplate(
+            name="Delay",
+            description="Counter target spell; exile it with three time counters (suspended)",
+            action_generator=lambda ctrl, opp, ctx: [
+                {"action": "counter_spell", "player": ctrl, "target": "stack_top",
+                 "countered_to": "exile_suspend"},
+            ],
+        ))
+
+        # Conditional counters — "unless its controller pays {N}". June 11
+        # audit: these resolved as hard counters with no payment offered
+        # (Mana Leak beat a caster with the {3} floating). Autoplay pays
+        # automatically when able via the counter_unless_pays action.
+        def _counter_unless(cost):
+            def _gen(ctrl, opp, ctx):
+                return [{"action": "counter_unless_pays", "player": ctrl,
+                         "target": "stack_top", "cost": cost}]
+            return _gen
+        CONDITIONAL_COUNTERS = {
+            'mana leak': '{3}',
+            'daze': '{1}',
+            'miscalculation': '{2}',
+            'mana tithe': '{1}',
+            'censor': '{1}',
+        }
+        for _cc_name, _cc_cost in CONDITIONAL_COUNTERS.items():
+            self._add_card(_cc_name, EffectTemplate(
+                name=_cc_name.title(),
+                description=f"Counter target spell unless its controller pays {_cc_cost}",
+                action_generator=_counter_unless(_cc_cost),
+            ))
+        # Spell Pierce: noncreature-only AND conditional
+        def _spell_pierce(ctrl, opp, ctx):
+            if ctx.get('stack_top_is_creature', False):
+                return [{"action": "no_action", "reason": "Fizzle — target is a creature spell (Spell Pierce)"}]
+            return [{"action": "counter_unless_pays", "player": ctrl,
+                     "target": "stack_top", "cost": "{2}"}]
+        self._add_card('spell pierce', EffectTemplate(
+            name="Spell Pierce",
+            description="Counter target noncreature spell unless its controller pays {2}",
+            action_generator=_spell_pierce,
+        ))
 
         # Noncreature-only counterspells — fizzle if target is a creature spell
         # Bug fix: Negate/Stubborn Denial were countering creature spells during cascade
@@ -906,12 +957,29 @@ class EffectTemplateLibrary:
                 return [{"action": "no_action", "reason": "Fizzle — target is a creature spell (noncreature counter)"}]
             return [{"action": "counter_spell", "player": ctrl, "target": "stack_top"}]
 
-        NONCREATURE_COUNTERS = ['negate', 'stubborn denial']
+        NONCREATURE_COUNTERS = ['negate', 'stubborn denial', 'force of negation', "dovin's veto"]
         for name in NONCREATURE_COUNTERS:
             self._add_card(name, EffectTemplate(
                 name=name.title(), description="Counter target noncreature spell",
                 action_generator=_noncreature_counter,
             ))
+
+        self._add_card('dispel', EffectTemplate(
+            name="Dispel", description="Counter target instant spell",
+            action_generator=_counter_action,
+        ))
+        self._add_card('wash away', EffectTemplate(
+            name="Wash Away", description="Counter target spell not cast from its owner's hand",
+            action_generator=_counter_action,
+        ))
+        self._add_card('memory lapse', EffectTemplate(
+            name="Memory Lapse",
+            description="Counter target spell; put it on top of its owner's library",
+            action_generator=lambda ctrl, opp, ctx: [
+                {"action": "counter_spell", "player": ctrl,
+                 "target": "stack_top", "countered_to": "library_top"},
+            ],
+        ))
 
         # Creature-only counterspells
         def _creature_counter(ctrl, opp, ctx):
@@ -939,17 +1007,19 @@ class EffectTemplateLibrary:
             action_generator=_counter_and_token,
         ))
 
-        # Pact of Negation: counter + delayed trigger (lose the game next upkeep if you can't pay)
+        # Pact of Negation: counter + delayed trigger at the CASTER'S next
+        # upkeep — pay {3}{U}{U} or lose the game.
+        # June 11 audit: the old shape (turn_delay=1, no upkeep_of, unconditional
+        # lose_the_game) fired on the OPPONENT'S upkeep one turn late, after the
+        # caster had tapped out on their own turn, and never attempted payment.
+        # That decided 6 of 139 games in the June 11 batch.
         def _pact_of_negation(ctrl, opp, ctx):
             return [
                 {"action": "counter_spell", "player": ctrl, "target": "stack_top"},
-                # Schedule delayed trigger: at next upkeep, lose the game
-                # (simplified for autoplay — actual card says "pay {3}{U}{U} or lose").
-                # `lose_the_game` is the dedicated SBA-clean shortcut; the
-                # earlier 999-life-loss hack produced "(life: -970)" Discord
-                # messages instead of an honest "loses the game" line.
-                {"action": "schedule_delayed_trigger", "trigger_at": "upkeep", "turn_delay": 1,
-                 "actions": [{"action": "lose_the_game", "player": ctrl,
+                {"action": "schedule_delayed_trigger", "trigger_at": "upkeep",
+                 "turn_delay": 0, "upkeep_of": ctrl,
+                 "actions": [{"action": "pay_or_lose", "player": ctrl,
+                              "cost": "{3}{U}{U}", "source": "Pact of Negation",
                               "reason": "failed to pay Pact of Negation cost"}],
                  "source": "Pact of Negation"},
             ]
@@ -1061,6 +1131,15 @@ class EffectTemplateLibrary:
                 needs_target=True,
             ))
 
+        # Nature's Claim has a mandatory rider: the destroyed permanent's
+        # controller gains 4 life. Keep the target owner captured in context.
+        self._add_card("nature's claim", EffectTemplate(
+            name="Nature's Claim",
+            description="Destroy target artifact or enchantment; its controller gains 4 life",
+            action_generator=self._gen_natures_claim,
+            needs_target=True,
+        ))
+
         self._add_card("flametongue kavu", EffectTemplate(
             name="Flametongue Kavu",
             description="Deal 4 damage to target creature",
@@ -1084,7 +1163,7 @@ class EffectTemplateLibrary:
 
         self._add_card("frost titan", EffectTemplate(
             name="Frost Titan",
-            description="Tap target permanent, it doesn't untap next untap step",
+            description="On ETB or attack, tap target permanent; it doesn't untap next untap step",
             action_generator=lambda ctrl, opp, ctx: self._tap_best_permanent(ctrl, opp, ctx),
             needs_target=True,
         ))
@@ -1142,13 +1221,19 @@ class EffectTemplateLibrary:
 
         self._add_card("agent of treachery", EffectTemplate(
             name="Agent of Treachery",
-            description="Gain control of target permanent (returns when Agent leaves)",
+            description="Gain control of target permanent",
             action_generator=lambda ctrl, opp, ctx: [
                 {"action": "steal_permanent", "player": ctrl, "from_player": opp,
                  "card": ctx.get('explicit_target_name') or ctx.get('best_opponent_nonland', 'target'),
                  "source": "Agent of Treachery"},
             ],
             needs_target=True,
+        ))
+
+        self._add_card("the abyss upkeep", EffectTemplate(
+            name="The Abyss",
+            description="At the beginning of each player's upkeep, that player destroys a nonartifact creature they control",
+            action_generator=self._gen_the_abyss_upkeep,
         ))
 
         # Etali, Primal Storm — attack trigger template is registered below (line ~1251)
@@ -1309,11 +1394,7 @@ class EffectTemplateLibrary:
         self._add_card("unbreakable formation", EffectTemplate(
             name="Unbreakable Formation",
             description="Creatures you control gain indestructible until EOT",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "grant_keywords", "player": ctrl,
-                 "keywords": ["Indestructible"], "duration": "end_of_turn",
-                 "reason": "Unbreakable Formation: indestructible until EOT"},
-            ],
+            action_generator=self._gen_unbreakable_formation,
         ))
 
         # Past in Flames: target instant/sorcery in your graveyard gains flashback
@@ -1754,6 +1835,11 @@ class EffectTemplateLibrary:
         self._add_card("sun titan", EffectTemplate(
             name="Sun Titan",
             description="Return target permanent with MV 3 or less from graveyard to battlefield",
+            action_generator=self._gen_sun_titan,
+        ))
+        self._add_attack_card("sun titan", EffectTemplate(
+            name="Sun Titan",
+            description="Whenever Sun Titan attacks, return a permanent with MV 3 or less from graveyard",
             action_generator=self._gen_sun_titan,
         ))
 
@@ -2834,6 +2920,18 @@ class EffectTemplateLibrary:
             description="Look at top 4 cards, put a creature into your hand, rest on bottom",
             action_generator=self._gen_growing_rites,
         ))
+        self._add_card("growing rites of itlimoc endstep", EffectTemplate(
+            name="Growing Rites of Itlimoc",
+            description="At the beginning of your end step, transform if you control four or more creatures",
+            action_generator=lambda ctrl, opp, ctx: (
+                [{"action": "transform_permanent", "player": ctrl,
+                  "card": "Growing Rites of Itlimoc"}]
+                if sum(1 for c in ctx.get('controller_battlefield', [])
+                       if c.is_creature() and not getattr(c, '_phased_out', False)) >= 4
+                else [{"action": "no_action",
+                       "reason": "Growing Rites: fewer than four creatures"}]
+            ),
+        ))
 
         # ===========================================================
         # NEW TEMPLATES — March 22 log audit
@@ -3005,6 +3103,14 @@ class EffectTemplateLibrary:
         # library second from the top." Engine doesn't model second-from-top
         # exactly, so we approximate as bounce-to-library.
         def _gen_commit(ctrl, opp, ctx):
+            # June 11 audit: Commit has two modes — target SPELL or target
+            # nonland permanent. The spell mode was missing entirely, so
+            # "Commit resolves" printed while the targeted spell resolved
+            # anyway (Greater Good survived and drew 6). Prefer the spell
+            # mode when there's an opposing spell on the stack.
+            if ctx.get('stack_top_spell'):
+                return [{"action": "counter_spell", "player": ctrl,
+                         "target": "stack_top", "countered_to": "library"}]
             target = ctx.get('best_opponent_threat') or ctx.get('best_opponent_creature')
             if not target:
                 return [{"action": "no_action",
@@ -3027,6 +3133,74 @@ class EffectTemplateLibrary:
             name="Commit",
             description="Bounce target nonland permanent to library (second from top)",
             action_generator=_gen_commit,
+        ))
+
+        # --- Curse of the Swine ---
+        # June 11 audit: with no template, this charged X=7 for one chosen
+        # target, exiled nothing, and printed a Boar for the WRONG player
+        # (which then never existed). "Exile X target creatures. For each
+        # creature exiled this way, its controller creates a 2/2 green Boar."
+        def _curse_of_swine(ctrl, opp, ctx):
+            x = max(1, int(ctx.get('x_value') or 1))
+            victims = sorted(ctx.get('_opponent_creatures') or [],
+                             key=lambda c: -(c.get('power') or 0))[:x]
+            if not victims:
+                return [{"action": "no_action",
+                         "reason": "Curse of the Swine: no creatures to exile"}]
+            actions = [{"action": "move_card", "card": v['name'],
+                        "from_zone": "battlefield", "to_zone": "exile",
+                        "player": opp}
+                       for v in victims]
+            actions.append({"action": "create_token", "player": opp,
+                            "name": "Boar", "power": "2", "toughness": "2",
+                            "types": "Creature Token — Boar", "colors": "G",
+                            "count": len(victims)})
+            return actions
+        self._add_card("curse of the swine", EffectTemplate(
+            name="Curse of the Swine",
+            description="Exile X target creatures; their controller gets that many 2/2 Boars",
+            action_generator=_curse_of_swine,
+        ))
+
+        # --- Cruel Ultimatum ---
+        # June 11 audit: with no template this fell to Tier 3, which resolved
+        # it as caster-gains-5/caster-loses-5 and nothing else (a 7-mana
+        # no-op with the life loss on the wrong player). Full text: "Target
+        # opponent sacrifices a creature, discards three cards, then loses 5
+        # life. You return a creature card from your graveyard to your hand,
+        # draw three cards, then gain 5 life."
+        def _cruel_ultimatum(ctrl, opp, ctx):
+            actions = [
+                {"action": "sacrifice_permanent", "player": opp,
+                 "type_filter": "creature",
+                 "reason": "Cruel Ultimatum: target opponent sacrifices a creature"},
+                {"action": "discard", "player": opp, "card": "worst"},
+                {"action": "discard", "player": opp, "card": "worst"},
+                {"action": "discard", "player": opp, "card": "worst"},
+                {"action": "lose_life", "player": opp, "amount": 5,
+                 "source": "Cruel Ultimatum"},
+            ]
+            gy = ctx.get('controller_graveyard') or []
+            best_creature = None
+            for c in gy:
+                try:
+                    if c.is_creature() and (best_creature is None
+                                            or (c.cmc or 0) > (best_creature.cmc or 0)):
+                        best_creature = c
+                except AttributeError:
+                    continue
+            if best_creature is not None:
+                actions.append({"action": "move_card", "card": best_creature.name,
+                                "from_zone": "graveyard", "to_zone": "hand",
+                                "player": ctrl})
+            actions.append({"action": "draw_cards", "player": ctrl, "amount": 3})
+            actions.append({"action": "gain_life", "player": ctrl, "amount": 5,
+                            "source": "Cruel Ultimatum"})
+            return actions
+        self._add_card("cruel ultimatum", EffectTemplate(
+            name="Cruel Ultimatum",
+            description="Opponent sacrifices a creature, discards 3, loses 5; you return a creature to hand, draw 3, gain 5",
+            action_generator=_cruel_ultimatum,
         ))
 
         # --- Inferno Titan / Bogardan Hellkite: divided damage ETB ---
@@ -3068,22 +3242,24 @@ class EffectTemplateLibrary:
             ],
         ))
 
-        self._add_card("etali, primal storm", EffectTemplate(
+        self._add_attack_card("etali, primal storm", EffectTemplate(
             name="Etali, Primal Storm",
-            description="Exile top card of each library, cast nonland cards for free",
+            description="Whenever Etali attacks, exile top card of each library and cast nonlands for free",
             action_generator=lambda ctrl, opp, ctx: [
                 {"action": "etali_trigger", "player": ctrl,
                  "reason": "Exile top of each library, may cast nonland cards without paying mana costs"}
             ],
         ))
 
-        self._add_card("robber of the rich", EffectTemplate(
+        self._add_attack_card("robber of the rich", EffectTemplate(
             name="Robber of the Rich",
-            description="Exile top card of defending player's library",
+            description="Whenever Robber attacks, conditionally exile the defending player's top card",
             action_generator=lambda ctrl, opp, ctx: [
                 {"action": "move_card", "card": "top_of_library", "from_zone": "library",
                  "to_zone": "exile", "player": opp,
                  "reason": "Robber of the Rich: exile top card"}
+            ] if len(ctx.get('opponent_hand', [])) > len(ctx.get('controller_hand', [])) else [
+                {"action": "no_action", "reason": "Robber of the Rich: defending player does not have more cards in hand"}
             ],
         ))
 
@@ -3201,14 +3377,39 @@ class EffectTemplateLibrary:
             ],
         ))
 
-        # --- Species Specialist: choose a creature type (no game action) ---
+        # --- Species Specialist: choose and persist a creature type ---
         self._add_card("species specialist", EffectTemplate(
             name="Species Specialist",
             description="As Species Specialist enters, choose a creature type",
             action_generator=lambda ctrl, opp, ctx: [
-                {"action": "no_action",
-                 "reason": "Species Specialist: creature type chosen (draw trigger active for that type dying)"}
+                {"action": "choose_creature_type", "player": ctrl,
+                 "card": "Species Specialist"}
             ],
+        ))
+
+        def _shared_animosity_gen(ctrl, opp, ctx):
+            attacker = ctx.get('_attacking_creature')
+            game = ctx.get('_game')
+            battlefield = ctx.get('controller_battlefield', []) or []
+            if attacker is None:
+                return [{"action": "no_action", "reason": "Shared Animosity: attacking creature unavailable"}]
+            attacker_types = set(attacker.get_creature_types())
+            amount = sum(
+                1 for creature in battlefield
+                if creature.id != attacker.id
+                and getattr(creature, 'attacking', False)
+                and attacker_types.intersection(creature.get_creature_types())
+            )
+            return [{
+                "action": "pump_all_creatures", "player": ctrl,
+                "card_id": attacker.id, "power": amount, "toughness": 0,
+                "source": "Shared Animosity",
+            }]
+
+        self._add_attack_card("shared animosity", EffectTemplate(
+            name="Shared Animosity",
+            description="Whenever a creature you control attacks, it gets +1/+0 for each other attacking creature sharing a type",
+            action_generator=_shared_animosity_gen,
         ))
 
     def _gen_grisly_salvage(self, ctrl, opp, ctx) -> List[Dict]:
@@ -3314,26 +3515,11 @@ class EffectTemplateLibrary:
         For autoplay, we find the first creature in the top 4 and move it to hand.
         The rest go to the bottom of the library.
         """
-        import random
         library = ctx.get('controller_library', [])
         if not library:
             return [{"action": "no_action", "reason": "Growing Rites: library is empty"}]
-
-        look_count = min(4, len(library))
-        found_creature = None
-
-        for i in range(look_count):
-            card = library[i]
-            type_line = (card.type_line or '').lower() if hasattr(card, 'type_line') else ''
-            if 'creature' in type_line:
-                found_creature = card.name if hasattr(card, 'name') else str(card)
-                break
-
-        if found_creature:
-            return [{"action": "move_card", "card": found_creature,
-                     "from_zone": "library", "to_zone": "hand", "player": ctrl}]
-        return [{"action": "no_action",
-                 "reason": "Growing Rites of Itlimoc: no creature found in top 4 cards"}]
+        return [{"action": "select_from_top", "player": ctrl, "amount": 4,
+                 "card_type": "creature", "rest_to": "library_bottom"}]
 
     def _gen_rishkars_expertise(self, ctrl, opp, ctx) -> List[Dict]:
         """Rishkar's Expertise: draw = greatest power, then free cast MV ≤ 5."""
@@ -3483,6 +3669,53 @@ class EffectTemplateLibrary:
                 action_generator=lambda ctrl, opp, ctx: [
                     {"action": "surveil", "player": ctrl, "amount": int(ctx['_match'].group(1))}
                 ]
+            )
+        )
+
+        # Cast-trigger surveil (Dragon's Rage Channeler family). The ETB-only
+        # pattern above cannot match this trigger paragraph, so it previously
+        # escalated to Tier 3 and was deliberately shortcut to a no-op.
+        self._add_pattern(
+            r"whenever you cast a noncreature spell,?\s*surveil (\d+)",
+            EffectTemplate(
+                name="Cast-trigger Surveil",
+                description="Surveil after casting a noncreature spell",
+                action_generator=lambda ctrl, opp, ctx: [
+                    {"action": "surveil", "player": ctrl,
+                     "amount": int(ctx['_match'].group(1))}
+                ],
+            )
+        )
+
+        # Hallowed Haunting's token uses a characteristic-defining ability;
+        # preserve */* and the oracle text so effective P/T updates with the
+        # controller's live Spirit count.
+        self._add_pattern(
+            r"whenever you cast an enchantment spell,?\s*create a white spirit cleric creature token",
+            EffectTemplate(
+                name="Hallowed Haunting cast trigger",
+                description="Create a dynamic */* white Spirit Cleric token",
+                action_generator=lambda ctrl, opp, ctx: [{
+                    "action": "create_token", "player": ctrl,
+                    "name": "Spirit Cleric", "power": "*", "toughness": "*",
+                    "types": "Creature — Spirit Cleric", "colors": "W", "count": 1,
+                    "oracle_text": "This token's power and toughness are each equal to the number of Spirits you control.",
+                    "source": "Hallowed Haunting",
+                }],
+            )
+        )
+
+        # Saga chapter text is passed independently to the template library.
+        # Keep this scoped to the whole chapter clause so later Fall of the
+        # Thran chapters cannot re-run the wipe.
+        self._add_pattern(
+            r"^destroy all lands\.?$",
+            EffectTemplate(
+                name="Destroy all lands",
+                description="Destroy all lands",
+                action_generator=lambda ctrl, opp, ctx: [
+                    {"action": "destroy_all_by_type", "type": "lands"}
+                ],
             )
         )
 
@@ -4255,15 +4488,26 @@ class EffectTemplateLibrary:
         # Bounce-self ETB: "When X enters, return a permanent/creature you control to"
         # Catches Dream Stalker variants, Kor Skyfisher, Invasive Species, etc.
         # Returns self by default since it's the safest auto-resolution
+        # June 11 audit: the old single-template dispatch let "return a
+        # CREATURE you control" cards (Whitemane Lion) bounce a land, and the
+        # unconditional self-exclusion was wrong for "a" (vs "another")
+        # wordings — Whitemane Lion may legally return itself.
+        def _etb_bounce_own(ctrl, opp, ctx):
+            m = ctx.get('_match')
+            article = (m.group(1) if m else 'a').lower()
+            perm_word = (m.group(2) if m else 'permanent').lower()
+            action = {"action": "bounce_own_permanent", "player": ctrl}
+            if article == 'another':
+                action["exclude"] = ctx.get('_source_card_name', '')
+            if perm_word == 'creature':
+                action["type_filter"] = "creature"
+            return [action]
         self._add_pattern(
-            r"when .+? enters.*?return (?:a|another) (?:permanent|creature) you control to",
+            r"when .+? enters.*?return (a|another) (permanent|creature) you control to",
             EffectTemplate(
                 name="ETB Bounce Own Permanent",
                 description="Return a permanent you control to its owner's hand",
-                action_generator=lambda ctrl, opp, ctx: [
-                    {"action": "bounce_own_permanent", "player": ctrl,
-                     "exclude": ctx.get('_source_card_name', '')}
-                ]
+                action_generator=_etb_bounce_own,
             )
         )
 
@@ -5108,9 +5352,9 @@ class EffectTemplateLibrary:
 
         # Goblin Guide: attack trigger — defending player reveals top card,
         # if it's a land, they put it into their hand
-        self._add_card("goblin guide", EffectTemplate(
+        self._add_attack_card("goblin guide", EffectTemplate(
             name="Goblin Guide",
-            description="Defending player reveals top card; if land, put into their hand",
+            description="Whenever Goblin Guide attacks, defending player reveals top card; if land, put it into hand",
             action_generator=self._gen_goblin_guide_attack,
         ))
 
@@ -5128,10 +5372,9 @@ class EffectTemplateLibrary:
             name="Blue Sun's Zenith",
             description="Draw X cards (default X=3), shuffle Blue Sun's Zenith into library",
             action_generator=lambda ctrl, opp, ctx: [
-                {"action": "draw_cards", "player": ctrl,
+                {"action": "draw_cards",
+                 "player": ctx.get('explicit_target_name') or ctrl,
                  "amount": max(1, ctx.get('x_value', 3))},
-                {"action": "move_card", "card": "Blue Sun's Zenith",
-                 "from_zone": "graveyard", "to_zone": "library", "player": ctrl},
             ],
         ))
 
@@ -5476,6 +5719,13 @@ class EffectTemplateLibrary:
                 make_token_action(ctrl, "soldier_1_1", 3)
             ],
         )
+        self._pw_ability_templates[("elspeth, sun's champion", "power 4 or greater")] = EffectTemplate(
+            name="Elspeth SC -3 selective wipe",
+            description="Destroy all creatures with power 4 or greater",
+            action_generator=lambda ctrl, opp, ctx: [
+                {"action": "destroy_by_power", "min_power": 4}
+            ],
+        )
 
         # Garruk, Primal Hunter -3: "Draw cards equal to greatest power among creatures you control."
         self._pw_ability_templates[("garruk", "draw cards equal to the greatest power")] = EffectTemplate(
@@ -5534,20 +5784,15 @@ class EffectTemplateLibrary:
             ],
         )
 
-        # Aminatou, the Fateshifter +1: "The top card of each player's library
-        # becomes that player's library bottom card." May 20 audit found this
-        # template was implementing the WRONG ability (draw-a-card-stack-top,
-        # which is Jace-flavored) for the entire history of the bot. The
-        # card_data_cache.json oracle_text was also wrong and has been corrected.
-        self._pw_ability_templates[("aminatou", "becomes that player's library bottom card")] = EffectTemplate(
+        # Aminatou, the Fateshifter +1: draw one, then put one from hand on top.
+        self._pw_ability_templates[("aminatou", "draw a card, then put a card")] = EffectTemplate(
             name="Aminatou +1",
-            description="Top card of each player's library becomes that player's bottom card",
+            description="Draw a card, then put a card from hand on top of your library",
             action_generator=lambda ctrl, opp, ctx: self._gen_aminatou_plus1(ctrl, opp, ctx),
         )
-        # Looser match in case future oracle reprints reword the snippet
-        self._pw_ability_templates[("aminatou", "library bottom card")] = EffectTemplate(
+        self._pw_ability_templates[("aminatou", "from your hand on top of your library")] = EffectTemplate(
             name="Aminatou +1",
-            description="Top card of each player's library becomes that player's bottom card",
+            description="Draw a card, then put a card from hand on top of your library",
             action_generator=lambda ctrl, opp, ctx: self._gen_aminatou_plus1(ctrl, opp, ctx),
         )
 
@@ -5637,48 +5882,36 @@ class EffectTemplateLibrary:
             ],
         )
 
-        # Teferi, Time Raveler +1: "Until your next turn, you may cast sorcery spells
-        # as though they had flash." + "Draw a card."
-        self._pw_ability_templates[("teferi, time raveler", "draw a card")] = EffectTemplate(
-            name="Teferi T3 +1",
-            description="Draw a card (sorcery flash is a continuous effect, handled by layers)",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "draw_cards", "player": ctrl, "amount": 1},
-            ],
-        )
+        # Teferi, Time Raveler +1 is handled by PlaneswalkerManager's inline
+        # sorcery_flash turn-effect path. Do not key it on "draw a card": that
+        # text belongs to the -3 and caused the bounce rider to be skipped.
 
         # Teferi, Time Raveler -3: "Return up to one target artifact, creature, or
         # enchantment to its owner's hand. Draw a card."
         self._pw_ability_templates[("teferi, time raveler", "return up to one")] = EffectTemplate(
             name="Teferi T3 -3",
             description="Bounce a nonland permanent, then draw a card",
-            action_generator=lambda ctrl, opp, ctx: (
-                [
-                    {"action": "move_card",
-                     "card": ctx.get('best_opponent_nonland', ''),
-                     "from_zone": "battlefield", "to_zone": "hand",
-                     "player": opp},
-                    {"action": "draw_cards", "player": ctrl, "amount": 1},
-                ] if ctx.get('best_opponent_nonland') else [
-                    {"action": "draw_cards", "player": ctrl, "amount": 1},
-                ]
-            ),
+            action_generator=self._gen_teferi_time_raveler_minus3,
         )
         # Also match "return up to one target"
         self._pw_ability_templates[("teferi, time raveler", "return up to one target")] = EffectTemplate(
             name="Teferi T3 -3",
             description="Bounce a nonland permanent, then draw a card",
-            action_generator=lambda ctrl, opp, ctx: (
-                [
-                    {"action": "move_card",
-                     "card": ctx.get('best_opponent_nonland', ''),
-                     "from_zone": "battlefield", "to_zone": "hand",
-                     "player": opp},
-                    {"action": "draw_cards", "player": ctrl, "amount": 1},
-                ] if ctx.get('best_opponent_nonland') else [
-                    {"action": "draw_cards", "player": ctrl, "amount": 1},
-                ]
-            ),
+            action_generator=self._gen_teferi_time_raveler_minus3,
+        )
+
+        self._pw_ability_templates[("calix, destiny's hand", "look at the top four")] = EffectTemplate(
+            name="Calix +1",
+            description="Look at the top four; put an enchantment into hand and the rest on bottom",
+            action_generator=lambda ctrl, opp, ctx: [
+                {"action": "select_from_top", "player": ctrl, "amount": 4,
+                 "card_type": "enchantment", "rest_to": "library_bottom"},
+            ],
+        )
+        self._pw_ability_templates[("calix, destiny's hand", "exile target creature or enchantment")] = EffectTemplate(
+            name="Calix -3",
+            description="Exile an opposing creature or enchantment until your target enchantment leaves",
+            action_generator=self._gen_calix_minus3,
         )
 
         # Teferi, Hero of Dominaria +1: "Draw a card. At the beginning of the next
@@ -6502,12 +6735,22 @@ class EffectTemplateLibrary:
 
         # --- Ophiomancer: at the beginning of each upkeep, if you control no Snakes,
         # create a 1/1 black Snake creature token with deathtouch ---
+        def _ophiomancer_gen(ctrl, opp, ctx):
+            battlefield = ctx.get('controller_battlefield', []) or []
+            has_snake = any(
+                permanent.is_creature(game=ctx.get('_game'))
+                and 'snake' in {t.lower() for t in permanent.get_creature_types()}
+                for permanent in battlefield
+            )
+            if has_snake:
+                return [{"action": "no_action",
+                         "reason": "Ophiomancer: controller already controls a Snake"}]
+            return [make_token_action(ctrl, "snake_1_1_dt", 1)]
+
         self._add_card("ophiomancer", EffectTemplate(
             name="Ophiomancer",
             description="At the beginning of each upkeep, if you control no Snakes, create a 1/1 black Snake token with deathtouch",
-            action_generator=lambda ctrl, opp, ctx: [
-                make_token_action(ctrl, "snake_1_1_dt", 1),
-            ],
+            action_generator=_ophiomancer_gen,
         ))
 
         # --- Eidolon of Blossoms: constellation — whenever this or another enchantment
@@ -6590,6 +6833,14 @@ class EffectTemplateLibrary:
             ctrl_player = ctx.get('_controller_player')
             if ctrl_player is None:
                 return [{"action": "no_action", "reason": "Extort: no controller in ctx"}]
+            can_pay, _ = ctrl_player.can_pay_mana_cost('{W/B}')
+            if can_pay and ctrl_player.tap_sources_for_cost('{W/B}'):
+                return [{"action": "extort_drain", "player": ctrl,
+                         "opponent": opp, "amount": 1, "source": "Extort"}]
+            return [{"action": "no_action",
+                     "reason": "Extort: no untapped W or B source to pay optional cost"}]
+            # Legacy source-by-source payment code remains below unreachable;
+            # all live payment now uses the color-aware mana engine above.
             # Check mana pool first (already-floating mana)
             pool = getattr(ctrl_player, 'mana_pool', {}) or {}
             pool_wb = pool.get('W', 0) + pool.get('B', 0)
@@ -6678,23 +6929,37 @@ class EffectTemplateLibrary:
             ],
         ))
 
-        # Fix 17: Hammer of Nazahn — auto-equip when equipment enters
+        # June 11 audit: Hammer's former no_action claimed auto-equip was
+        # "handled by equipment system", but no such watcher existed and the
+        # internal sentence leaked to Discord. Its own ETB is resolved here;
+        # later Equipment entries are handled by
+        # mtg.triggers._check_equipment_etb_watchers.
+        def _gen_hammer_of_nazahn(ctrl, opp, ctx):
+            creature = ctx.get('best_own_creature', '')
+            if not creature:
+                return [{"action": "no_action",
+                         "reason": "Hammer of Nazahn enters, but there is no creature you control to attach it to"}]
+            return [{"action": "equip", "equipment": "Hammer of Nazahn",
+                     "creature": creature, "player": ctrl}]
+
         self._add_card("hammer of nazahn", EffectTemplate(
             name="Hammer of Nazahn",
-            description="Whenever an Equipment enters under your control, you may attach it to a creature you control",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "no_action",
-                 "reason": "Hammer of Nazahn: auto-equip handled by equipment system"},
-            ],
+            description="Whenever Hammer of Nazahn or another Equipment you control enters, you may attach that Equipment to target creature you control",
+            action_generator=_gen_hammer_of_nazahn,
         ))
 
-        # Fix 18: Bloodchief Ascension — end step drain
+        # Fix 18: Bloodchief Ascension end-step condition
+        # June 11 audit: the old template conflated Bloodchief's two separate
+        # abilities and drained 2 at end step. Oracle says the end-step trigger
+        # adds a quest counter; the drain belongs to an opponent-graveyard
+        # event and is not conditional on life lost that turn.
         self._add_card("bloodchief ascension", EffectTemplate(
             name="Bloodchief Ascension",
-            description="At end step, if an opponent lost 2+ life this turn and has 3+ quest counters, each opponent loses 2 life and you gain 2 life",
+            description="At the beginning of each end step, if an opponent lost 2 or more life this turn, put a quest counter on Bloodchief Ascension",
             action_generator=lambda ctrl, opp, ctx: [
-                {"action": "lose_life", "player": opp, "amount": 2},
-                {"action": "gain_life", "player": ctrl, "amount": 2},
+                {"action": "add_counters", "card": "Bloodchief Ascension",
+                 "player": ctrl, "counter_type": "quest", "amount": 1,
+                 "source": "Bloodchief Ascension"},
             ] if ctx.get('opponent_life_lost_this_turn', 0) >= 2 else [
                 {"action": "no_action", "reason": "Bloodchief Ascension: opponent didn't lose 2+ life this turn"},
             ],
@@ -6780,7 +7045,7 @@ class EffectTemplateLibrary:
             action_generator=lambda ctrl, opp, ctx: [
                 {"action": "steal_permanent", "player": ctrl, "from_player": opp,
                  "card": ctx.get('best_opponent_creature', ''),
-                 "source": "Roil Elemental"},
+                 "source": "Roil Elemental", "until_source_leaves": True},
             ],
             needs_target=True,
         ))
@@ -7259,9 +7524,23 @@ class EffectTemplateLibrary:
         # {2}, Tap activation are handled by the human/AI activation paths.
         self._add_card("isochron scepter", EffectTemplate(
             name="Isochron Scepter",
-            description="Imprint is handled at activation time; ETB is a no-op",
-            action_generator=lambda ctrl, opp, ctx: [],
+            description="Imprint an instant card with mana value 2 or less from hand",
+            action_generator=lambda ctrl, opp, ctx: [
+                {"action": "imprint_isochron", "player": ctrl,
+                 "source": "Isochron Scepter"},
+            ],
         ))
+
+        self._add_pattern(
+            r"for each creature token you control, create a token that's a copy of that creature",
+            EffectTemplate(
+                name="Double creature tokens",
+                description="Create a copy of each creature token you control",
+                action_generator=lambda ctrl, opp, ctx: [
+                    {"action": "double_creature_tokens", "player": ctrl},
+                ],
+            ),
+        )
 
         # Beastmaster Ascension — combat (attack) trigger.
         # Oracle: "Whenever a creature you control attacks, put a quest counter on
@@ -8037,13 +8316,10 @@ class EffectTemplateLibrary:
 
     def _force_sacrifice_creature(self, ctrl, opp, ctx) -> List[Dict]:
         """Force opponent to sacrifice their weakest creature (Grave Pact, Dictate of Erebos)."""
-        worst = ctx.get('worst_opponent_creature')
-        if worst:
-            return [{"action": "destroy", "card": worst}]
-        # Fallback: try best_opponent_creature (destroy strongest if worst not available)
-        target = ctx.get('best_opponent_creature')
-        if target:
-            return [{"action": "destroy", "card": target}]
+        if ctx.get('worst_opponent_creature') or ctx.get('best_opponent_creature'):
+            return [{"action": "sacrifice_permanent", "player": opp,
+                     "type_filter": "creature",
+                     "reason": "Grave Pact / Dictate / Butcher dies trigger"}]
         return [{"action": "no_action", "reason": f"{opp} has no creatures to sacrifice"}]
 
     def _avenger_tokens(self, ctrl, opp, ctx) -> List[Dict]:
@@ -8158,7 +8434,9 @@ class EffectTemplateLibrary:
         return [{"action": "no_action", "reason": "No valid small permanent to exile"}]
     
     def _tap_best_permanent(self, ctrl, opp, ctx) -> List[Dict]:
-        target = ctx.get('best_opponent_creature')
+        # Frost Titan says target permanent, not target creature. Prefer the
+        # general threat chosen by context and retain the creature fallback.
+        target = ctx.get('best_opponent_threat') or ctx.get('best_opponent_creature')
         if target:
             return [{"action": "tap", "card": target}]
         return [{"action": "no_action", "reason": "No valid permanent to tap"}]
@@ -8542,12 +8820,19 @@ class EffectTemplateLibrary:
         """
         oracle = (ctx.get('_oracle') or '').lower()
         is_upkeep = 'beginning of your upkeep' in oracle and 'sacrifice' in oracle
-        # Use destroy for self-sacrifice — the action interpreter has no plain
-        # "sacrifice" action type, so the original {"action": "sacrifice"} got
-        # silently dropped, and Kroxa never sacrificed himself when not escaped.
-        # destroy on a commander correctly routes to command zone via CR 903.9.
-        sac_action = {"action": "destroy", "card": "Kroxa, Titan of Death's Hunger",
-                      "target_controller": ctrl}
+        # June 11 audit: `destroy` put commander Kroxa in the graveyard and
+        # also incorrectly made the sacrifice vulnerable to indestructible
+        # (game 1514629178413154325). Use the real sacrifice path and require
+        # the named permanent so another creature can never pay Kroxa's cost.
+        sac_action = {
+            "action": "sacrifice_permanent",
+            "player": ctrl,
+            "type_filter": "creature",
+            "preferred_card": "Kroxa, Titan of Death's Hunger",
+            "only_preferred": True,
+            "allow_commander": True,
+            "reason": "Kroxa entered without escaping",
+        }
         if is_upkeep:
             if ctx.get('was_escaped', False):
                 return [{"action": "no_action", "reason": "Kroxa was escaped — survives upkeep"}]
@@ -8770,12 +9055,23 @@ class EffectTemplateLibrary:
         return [{"action": "flicker", "player": ctrl, "target": target}]
 
     def _gen_oath_of_teferi(self, ctrl, opp, ctx) -> List[Dict]:
-        """Oath of Teferi: exile another permanent you control, return immediately."""
+        """Oath of Teferi: exile another permanent, return it next end step."""
         source = (ctx.get('_source_card_name') or '').lower()
-        target = ctx.get('best_own_etb_creature', '') or ctx.get('best_own_noncreature', '')
+        target = (ctx.get('explicit_target_name', '')
+                  or ctx.get('best_own_etb_creature', '')
+                  or ctx.get('best_own_noncreature', ''))
         if not target or target.lower() == source:
             return [{"action": "no_action", "reason": "No other permanent to flicker"}]
-        return [{"action": "flicker", "player": ctrl, "target": target}]
+        return [
+            {"action": "move_card", "card": target,
+             "from_zone": "battlefield", "to_zone": "exile", "player": ctrl},
+            {"action": "schedule_delayed_trigger",
+             "trigger_at": "end_step", "source": "Oath of Teferi",
+             "actions": [{"action": "move_card", "card": target,
+                          "from_zone": "exile", "to_zone": "battlefield",
+                          "player": ctrl}],
+             "once": True},
+        ]
 
     def _gen_tooth_and_nail(self, ctrl, opp, ctx) -> List[Dict]:
         """Tooth and Nail (entwined): search 2 creatures + put 2 from hand onto battlefield."""
@@ -8902,16 +9198,18 @@ class EffectTemplateLibrary:
     def _gen_ghostly_flicker(self, ctrl, opp, ctx) -> List[Dict]:
         """Ghostly Flicker: exile TWO target artifacts, creatures, or lands you control, return them.
         Only artifacts, creatures, or lands are legal targets — NOT enchantments."""
-        target1 = ctx.get('best_own_etb_creature', '')
+        explicit = ctx.get('explicit_target_names', [])
+        target1 = explicit[0] if len(explicit) == 2 else ctx.get('best_own_etb_creature', '')
         # Second target must be an artifact, creature, or land — NOT enchantment
-        target2 = ctx.get('best_own_flickerable', '') or ctx.get('best_own_noncreature', '')
+        target2 = (explicit[1] if len(explicit) == 2
+                   else ctx.get('best_own_flickerable', ''))
         actions = []
         if target1:
             actions.append({"action": "flicker", "player": ctrl, "target": target1})
         if target2 and target2 != target1:
             actions.append({"action": "flicker", "player": ctrl, "target": target2})
-        if not actions:
-            return [{"action": "no_action", "reason": "No valid targets for Ghostly Flicker"}]
+        if len(actions) != 2:
+            return [{"action": "no_action", "reason": "Ghostly Flicker requires two distinct legal targets"}]
         return actions
 
     def _gen_restoration_angel(self, ctrl, opp, ctx) -> List[Dict]:
@@ -8997,20 +9295,31 @@ class EffectTemplateLibrary:
 
     def _gen_victimize(self, ctrl, opp, ctx) -> List[Dict]:
         """Victimize: sacrifice a creature you control, return two creatures from your graveyard."""
-        actions = []
-        # Sacrifice the controller's worst creature (lowest CMC non-commander)
-        # Use "destroy" action since there's no "sacrifice" action type in the engine
         worst = ctx.get('controller_worst_creature')
-        if worst:
-            actions.append({"action": "destroy", "card": worst})
-        # Reanimate two best creatures from controller's graveyard
         gy_creatures = ctx.get('controller_graveyard_creatures', [])
-        for creature_name in gy_creatures[:2]:
-            actions.append({"action": "move_card", "card": creature_name,
-                            "from_zone": "graveyard", "to_zone": "battlefield", "player": ctrl})
         if not gy_creatures:
             return [{"action": "no_action", "reason": "No creature cards in controller's graveyard"}]
-        return actions
+        if not worst:
+            return [{"action": "no_action", "reason": "No creature available to sacrifice for Victimize"}]
+
+        # June 11 audit (game 1514621888587108423): the former template
+        # destroyed the fodder, then returned both targets unconditionally
+        # and untapped. Keep the returns nested under the sacrifice action
+        # so Victimize's "If you do" clause is enforced by the interpreter.
+        returns = [
+            {"action": "move_card", "card": creature_name,
+             "from_zone": "graveyard", "to_zone": "battlefield",
+             "player": ctrl, "tapped": True}
+            for creature_name in gy_creatures[:2]
+        ]
+        return [{
+            "action": "sacrifice_permanent",
+            "player": ctrl,
+            "type_filter": "creature",
+            "preferred_card": worst,
+            "reason": "Victimize",
+            "then_actions": returns,
+        }]
 
     def _gen_goblin_guide_attack(self, ctrl, opp, ctx) -> List[Dict]:
         """Goblin Guide: defending player reveals top card. If land, put into their hand.
@@ -9057,15 +9366,87 @@ class EffectTemplateLibrary:
         ]
 
     def _gen_aminatou_plus1(self, ctrl, opp, ctx) -> List[Dict]:
-        """Aminatou +1: 'The top card of each player's library becomes that
-        player's library bottom card.' (Fateshift, the namesake mechanic.)
+        """Aminatou +1: draw a card, then put one from hand on top."""
+        return [
+            {"action": "draw_cards", "player": ctrl, "amount": 1},
+            {"action": "put_back_from_hand", "player": ctrl, "count": 1,
+             "reason": "Aminatou +1: put a card from hand on top of library"},
+        ]
 
-        May 20 audit corrected this generator. The previous implementation
-        was a Jace-style 'draw 1, put one back on top' — a fundamentally
-        different (and much stronger) effect that gave Rick ~16 free cards
-        per Aminatou game in the May 19 batch.
-        """
-        return [{"action": "fateshift"}]
+    def _gen_natures_claim(self, ctrl, opp, ctx) -> List[Dict]:
+        target = ctx.get('explicit_target_name') or ctx.get('best_opponent_artifact_enchantment', '')
+        owner = ctx.get('explicit_target_owner') or opp
+        if not target:
+            return [{"action": "no_action", "reason": "Nature's Claim has no legal target"}]
+        return [
+            {"action": "destroy", "card": target},
+            {"action": "gain_life", "player": owner, "amount": 4},
+        ]
+
+    def _gen_unbreakable_formation(self, ctrl, opp, ctx) -> List[Dict]:
+        actions = [{"action": "grant_keywords", "player": ctrl,
+                    "target": "all_own_creatures", "keywords": ["Indestructible"],
+                    "duration": "end_of_turn"}]
+        phase = str(ctx.get('phase', '')).lower()
+        if phase in ('main1', 'main2', 'precombat_main', 'postcombat_main'):
+            actions.extend([
+                {"action": "add_counters", "player": ctrl,
+                 "target": "all_own_creatures", "counter_type": "+1/+1", "amount": 1},
+                {"action": "grant_keywords", "player": ctrl,
+                 "target": "all_own_creatures", "keywords": ["Vigilance"],
+                 "duration": "end_of_turn"},
+            ])
+        return actions
+
+    def _gen_teferi_time_raveler_minus3(self, ctrl, opp, ctx) -> List[Dict]:
+        target = ctx.get('explicit_target_name') or ctx.get('best_opponent_nonland', '')
+        owner = ctx.get('explicit_target_owner') or opp
+        actions = []
+        if target:
+            actions.append({"action": "move_card", "card": target,
+                            "from_zone": "battlefield", "to_zone": "hand",
+                            "player": owner})
+        actions.append({"action": "draw_cards", "player": ctrl, "amount": 1})
+        return actions
+
+    def _gen_calix_minus3(self, ctrl, opp, ctx) -> List[Dict]:
+        targets = list(ctx.get('_pw_targets') or [])
+        exile_target = targets[0] if targets else None
+        source_enchantment = targets[1] if len(targets) > 1 else None
+        exile_name = getattr(exile_target, 'name', exile_target) or ctx.get('explicit_target_name', '')
+        exile_owner = ctx.get('explicit_target_owner') or opp
+        if source_enchantment is None:
+            for permanent in ctx.get('controller_battlefield', []):
+                if 'enchantment' in (getattr(permanent, 'type_line', '') or '').lower():
+                    source_enchantment = permanent
+                    break
+        source_name = getattr(source_enchantment, 'name', source_enchantment) or ''
+        if not exile_name or not source_name:
+            return [{"action": "no_action", "reason": "Calix -3 requires both legal targets"}]
+        return [
+            {"action": "move_card", "card": exile_name, "player": exile_owner,
+             "from_zone": "battlefield", "to_zone": "exile"},
+            {"action": "track_exiled_by", "source": source_name,
+             "card": exile_name, "owner": exile_owner},
+        ]
+
+    def _gen_the_abyss_upkeep(self, ctrl, opp, ctx) -> List[Dict]:
+        game = ctx.get('_game')
+        active = getattr(game, 'active_player', None)
+        if active is None:
+            return [{"action": "no_action", "reason": "The Abyss: no active player"}]
+        candidates = [c for c in active.battlefield
+                      if c.is_creature()
+                      and 'artifact' not in (c.type_line or '').lower()
+                      and not getattr(c, '_phased_out', False)]
+        if not candidates:
+            return [{"action": "no_action",
+                     "reason": f"The Abyss: {active.name} controls no nonartifact creature"}]
+        # The affected player chooses; autoplay preserves their highest-value
+        # creature and destroys their lowest-MV legal choice.
+        chosen = min(candidates, key=lambda c: getattr(c, 'cmc', 0) or 0)
+        return [{"action": "destroy", "card": chosen.name,
+                 "target_controller": active.name}]
 
     def _gen_aura_shards(self, ctrl, opp, ctx) -> List[Dict]:
         """Aura Shards: you may destroy target artifact or enchantment when a creature enters."""
@@ -9326,6 +9707,7 @@ def build_game_context(game, player, opponent, card=None, entering_creature=None
     ctx['controller_graveyard'] = player.graveyard
     ctx['controller_hand'] = player.hand
     ctx['controller_battlefield'] = player.battlefield
+    ctx['opponent_hand'] = opponent.hand
 
     # Player object reference (for templates that need to check optional-cost
     # affordability like Extort's "you may pay {W/B}"). Avoid mutating through
@@ -9333,6 +9715,9 @@ def build_game_context(game, player, opponent, card=None, entering_creature=None
     ctx['_controller_player'] = player
     ctx['_opponent_player'] = opponent  # June 10: Land Tax land-count check
     ctx['_game'] = game
+    ctx['phase'] = getattr(getattr(game, 'phase', ''), 'value', getattr(game, 'phase', ''))
+    ctx['opponent_life_lost_this_turn'] = int(
+        getattr(opponent, 'life_lost_this_turn', 0) or 0)
 
     # Experience counters on the controller (Meren, Ezuri). Tracked as a plain
     # attribute on the player object — incremented by the "dies" trigger in
@@ -9605,6 +9990,7 @@ def build_game_context(game, player, opponent, card=None, entering_creature=None
 
     # Attacking creature info (for attack triggers)
     if attacking_creature:
+        ctx['_attacking_creature'] = attacking_creature
         ctx['attacking_name'] = attacking_creature.name if hasattr(attacking_creature, 'name') else str(attacking_creature)
         try:
             ctx['attacking_power'] = int(attacking_creature.power) if hasattr(attacking_creature, 'power') and attacking_creature.power else 0
@@ -9738,7 +10124,12 @@ def build_game_context(game, player, opponent, card=None, entering_creature=None
     # Explicit target (from AI cast decision or !play command)
     # Overrides auto-targeting in templates when present
     if explicit_target:
-        if hasattr(explicit_target, 'name'):
+        if isinstance(explicit_target, (list, tuple)):
+            target_names = [getattr(item, 'name', str(item)) for item in explicit_target]
+            ctx['explicit_target_names'] = target_names
+            if target_names:
+                ctx['explicit_target_name'] = target_names[0]
+        elif hasattr(explicit_target, 'name'):
             # It's a Card object — find which player owns it
             ctx['explicit_target_name'] = explicit_target.name
             for p in game.players:
@@ -9747,6 +10138,13 @@ def build_game_context(game, player, opponent, card=None, entering_creature=None
                     break
         elif isinstance(explicit_target, str):
             ctx['explicit_target_name'] = explicit_target
+            for p in game.players:
+                for c in p.battlefield:
+                    if c.name.lower() == explicit_target.lower():
+                        ctx['explicit_target_owner'] = p.name
+                        break
+                if ctx.get('explicit_target_owner'):
+                    break
 
     # Stack info (for counterspells: Arcane Denial, Archmage's Charm, etc.)
     if hasattr(game, 'stack') and game.stack:
@@ -9760,6 +10158,13 @@ def build_game_context(game, player, opponent, card=None, entering_creature=None
             top_name = top_entry.get('card_name')
         if top_name:
             ctx['stack_top_spell'] = top_name
+        top_card = getattr(top_entry, 'card', None)
+        if top_card:
+            top_types = (getattr(top_card, 'type_line', '') or '').lower()
+            ctx['stack_top_type_known'] = bool(top_types)
+            ctx['stack_top_is_creature'] = 'creature' in top_types
+            ctx['stack_top_type_line'] = top_types
+            ctx['stack_top_cast_origin'] = getattr(top_card, '_cast_origin', 'hand')
         # Get the CMC of the top spell for Mana Drain
         top_cmc = 0
         if hasattr(top_entry, 'card') and top_entry.card:

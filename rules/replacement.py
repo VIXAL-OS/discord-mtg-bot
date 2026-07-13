@@ -128,6 +128,7 @@ class GameEvent:
             from_zone=self.from_zone,
             to_zone=self.to_zone,
             enters_tapped=self.enters_tapped,
+            entering_type_line=self.entering_type_line,
             applied_replacements=set(self.applied_replacements),
             was_replaced=self.was_replaced,
             replacement_chain=list(self.replacement_chain),

@@ -160,6 +160,43 @@ try:
 except ImportError:
     HAS_PLANESWALKER = False
 
+
+def _is_self_etb_trigger_paragraph(card: Card, paragraph: str) -> bool:
+    """Return whether *paragraph* is this permanent's own enter trigger.
+
+    Scryfall's 2025 wording update changed many printed-name subjects to
+    "this creature" (for example, Inferno/Frost Titan now say "Whenever
+    this creature enters or attacks"). Keep this deliberately narrower
+    than a generic "enters" test so ongoing Soul Warden/landfall triggers
+    remain in their dedicated scanners.
+    """
+    text = (paragraph or "").lower().strip()
+    if not text or "enters" not in text:
+        return False
+    if text.startswith("when ") and not text.startswith("whenever "):
+        return True
+    if not text.startswith("whenever "):
+        return False
+
+    full_name = re.escape((card.name or "").lower())
+    short_name = re.escape((card.name or "").split(",", 1)[0].lower())
+    subject = rf"(?:this (?:creature|permanent)|{full_name}|{short_name})"
+    return bool(re.match(rf"whenever\s+{subject}\s+enters\b", text))
+
+
+def _is_self_attack_trigger_paragraph(card: Card, paragraph: str) -> bool:
+    """Return whether *paragraph* triggers when this card attacks."""
+    text = (paragraph or "").lower().strip()
+    if not text.startswith("whenever ") or "attack" not in text:
+        return False
+    full_name = re.escape((card.name or "").lower())
+    short_name = re.escape((card.name or "").split(",", 1)[0].lower())
+    subject = rf"(?:this (?:creature|permanent)|{full_name}|{short_name})"
+    return bool(re.match(
+        rf"whenever\s+{subject}\s+(?:enters(?: the battlefield)?\s+or\s+)?attacks\b",
+        text,
+    ))
+
 # Optional: XMage bridge types (used in trigger discovery)
 try:
     from rules.xmage_bridge import Permanent as XMagePermanent
@@ -273,6 +310,8 @@ def _check_creature_etb_triggers_sync(engine, game: GameState, entering_player: 
         a list of (card, trigger_text) tuples that need async auto-resolution.
     """
     messages = []
+    messages.extend(_check_permanent_etb_watchers(
+        engine, game, entering_player, entering_creature))
     unhandled = []
     entering_player_idx = game.players.index(entering_player) if entering_player in game.players else 0
 
@@ -431,10 +470,7 @@ def _check_creature_etb_triggers_sync(engine, game: GameState, entering_player: 
             if is_greatest and enter_power > 0:
                 drawn_cards = engine.draw_cards(_ctrl_player, 1, game=game)
                 if drawn_cards:
-                    if _ctrl_player.is_claude:
-                        messages.append(f"🃏 {card.name} — {_ctrl_player.name} draws a card")
-                    else:
-                        messages.append(f"🃏 {card.name} — {_ctrl_player.name} draws **{drawn_cards[0].name}**")
+                    messages.append(f"🃏 {card.name} — {_ctrl_player.name} draws a card")
             handled = True
 
         # Soul of the Harvest / Beast Whisperer / Garruk's Packleader / Garruk's Uprising: draw a card
@@ -451,10 +487,7 @@ def _check_creature_etb_triggers_sync(engine, game: GameState, entering_player: 
                     continue  # Skip to next trigger card
             drawn_cards = engine.draw_cards(_ctrl_player, 1, game=game)
             if drawn_cards:
-                if _ctrl_player.is_claude:
-                    messages.append(f"🃏 {card.name} — {_ctrl_player.name} draws a card")
-                else:
-                    messages.append(f"🃏 {card.name} — {_ctrl_player.name} draws **{drawn_cards[0].name}**")
+                messages.append(f"🃏 {card.name} — {_ctrl_player.name} draws a card")
             handled = True
 
         # Gruul Ragebeast / similar: "that creature fights target creature an opponent controls"
@@ -632,6 +665,17 @@ def _spell_matches_cast_trigger(engine, sentence_lower: str, card: Card,
     # "creature spell" (without "noncreature") — skip non-creatures
     if 'creature spell' in sentence_lower and 'noncreature' not in sentence_lower and not is_creature_spell:
         return False
+    # "Adventure instant or sorcery spell" (Lucky Clover) / "creature spell
+    # that has an Adventure" (Edgewall Innkeeper). June 11 audit: the word
+    # "adventure" was never tested, so Lucky Clover fired on 10 of 13 plain
+    # instant/sorcery casts in game 1514629231433351168 and the Tier-3 judge
+    # then invented "Farseek, an Adventure instant" to justify illegal copies.
+    if 'adventure' in sentence_lower and 'spell' in sentence_lower:
+        _is_adventure_spell = (is_adventure_cast
+                               or 'adventure' in (card.type_line or '').lower()
+                               or bool(getattr(card, 'adventure_name', None)))
+        if not _is_adventure_spell:
+            return False
     # "instant or sorcery spell" / "an instant or sorcery"
     if re.search(r'\b(?:instant|sorcery)\b.*\b(?:instant|sorcery)\b', sentence_lower):
         if not (card.is_instant() or card.is_sorcery()):
@@ -1279,10 +1323,7 @@ async def _check_cast_triggers(engine, game: GameState, caster: Player, card: Ca
                     if 'draw a card' in sentence_lower and 'discard' not in sentence_lower:
                         drawn = engine.draw_cards(caster, 1, game=game)
                         if drawn:
-                            if caster.is_claude:
-                                messages.append(f"⚡ {bf_card.name} — {caster.name} draws a card")
-                            else:
-                                messages.append(f"⚡ {bf_card.name} — {caster.name} draws **{drawn[0].name}**")
+                            messages.append(f"⚡ {bf_card.name} — {caster.name} draws a card")
                         executed_trigger = True
 
                 # Damage: "deals N damage to each opponent/that player/any target"
@@ -1322,7 +1363,7 @@ async def _check_cast_triggers(engine, game: GameState, caster: Player, card: Ca
                 # the trigger printed oracle text and no pump ever applied
                 # (Kiln Fiend attacked at power 1 when correct power 4 was
                 # lethal). Mirrors the Prowess application below.
-                if not executed_trigger:
+                if not executed_trigger and 'Prowess' not in (bf_card.keywords or []):
                     _pump_m = re.search(
                         r'(?:this creature|' + re.escape(bf_card.name.lower()) +
                         r') gets \+(\d+)/\+(\d+) until end of turn',
@@ -1422,6 +1463,7 @@ async def _check_cast_triggers(engine, game: GameState, caster: Player, card: Ca
                 break
 
     # === PROWESS (keyword trigger: whenever you cast a noncreature spell, +1/+1 until EOT) ===
+    prowess_applied = False
     if not card.is_creature():
         for bf_card in list(caster.battlefield):
             if bf_card.is_creature() and 'Prowess' in (bf_card.keywords or []):
@@ -1439,6 +1481,12 @@ async def _check_cast_triggers(engine, game: GameState, caster: Player, card: Ca
                         game.layers_engine.add_effect(_pe)
                 messages.append(f"⚡ **{bf_card.name}** prowess triggers (+1/+1 until end of turn)")
                 print(f"[PROWESS] {bf_card.name} gets +1/+1 from casting {card.name}")
+                prowess_applied = True
+    if prowess_applied:
+        # June 11 audit: layer effects were registered but their cached P/T
+        # was not refreshed, so readers between cast-trigger resolution and
+        # the next unrelated state change still saw printed stats.
+        game.recalculate_power_toughness()
 
     # === OPPONENT CAST TRIGGERS (e.g. Rhystic Study, Esper Sentinel) ===
     # Scan OPPONENT's battlefield for "whenever an opponent casts a spell" triggers
@@ -1743,6 +1791,44 @@ def _check_enchantment_etb_watchers(engine, game: GameState, controller: Player,
     return messages
 
 
+def _check_equipment_etb_watchers(engine, game: GameState, controller: Player,
+                                  entered_card: Card) -> List[str]:
+    """Resolve Hammer of Nazahn for Equipment entering after the Hammer.
+
+    Hammer entering itself is handled by its name-keyed Tier 1.5 template.
+    This watcher covers every later Equipment entering under the same
+    controller, without charging an equip cost (the triggered ability says
+    "attach", not "equip").
+    """
+    if 'equipment' not in (entered_card.type_line or '').lower():
+        return []
+
+    hammer = next((c for c in controller.battlefield
+                   if c.name.lower() == 'hammer of nazahn'
+                   and c.id != entered_card.id
+                   and not getattr(c, '_phased_out', False)), None)
+    if hammer is None:
+        return []
+
+    target = next((c for c in controller.battlefield
+                   if c.id not in (hammer.id, entered_card.id)
+                   and not getattr(c, '_phased_out', False)
+                   and c.is_creature(game)), None)
+    if target is None:
+        print(f"[EQUIPMENT-ETB] Hammer of Nazahn: no creature for {entered_card.name}")
+        return []
+
+    msg = engine.rules._execute_action_on_state(game, {
+        "action": "equip", "equipment": entered_card.name,
+        "creature": target.name, "player": controller.name,
+    })
+    if msg:
+        print(f"[EQUIPMENT-ETB] Hammer of Nazahn attaches {entered_card.name} "
+              f"to {target.name}")
+        return [f"🔨 **Hammer of Nazahn**: {msg}"]
+    return []
+
+
 def _check_dies_triggers_sync(engine, game: GameState, dying_card: Card, dying_player: Player) -> Tuple[List[str], List[Tuple]]:
     """Check for 'whenever a creature dies' and 'when THIS dies' triggers.
 
@@ -1757,6 +1843,7 @@ def _check_dies_triggers_sync(engine, game: GameState, dying_card: Card, dying_p
     opponent = game.players[opponent_idx]
     trigger_count = 0
     MAX_DIES_TRIGGERS = 20  # Depth guard: prevent Blood Artist infinite loops
+    allowed_source_ids = game._dies_source_ids_by_dead_id.get(dying_card.id)
 
     # Calculate dying creature's power/toughness for context (last-known info)
     dying_power = 0
@@ -1776,12 +1863,15 @@ def _check_dies_triggers_sync(engine, game: GameState, dying_card: Card, dying_p
     cards_to_scan = []
     for player in game.players:
         for card in player.battlefield:
-            if not getattr(card, '_phased_out', False):
+            if (not getattr(card, '_phased_out', False)
+                    and (allowed_source_ids is None or card.id in allowed_source_ids)):
                 cards_to_scan.append((card, player))
     # Include recently-died creatures (they see each other die simultaneously)
-    recently_died = getattr(game, '_recently_died', [])
+    recently_died = (game._active_dies_batch
+                     if game._active_dies_batch else game._recently_died)
     for dead_card, dead_player in recently_died:
-        if dead_card.id != dying_card.id:  # Don't double-count the current dying card
+        if (dead_card.id != dying_card.id
+                and (allowed_source_ids is None or dead_card.id in allowed_source_ids)):
             cards_to_scan.append((dead_card, dead_player))
     # Also include the dying card itself if it has "Blood Artist" style engine-trigger
     # ("Whenever Blood Artist or another creature dies" — sees its own death)
@@ -1874,6 +1964,19 @@ def _check_dies_triggers_sync(engine, game: GameState, dying_card: Card, dying_p
         if "nontoken" in oracle_lower and getattr(dying_card, 'is_token', False):
             continue
 
+        # Species Specialist only watches the type chosen as it entered. The
+        # old name template drew for every death because no choice was stored
+        # and no subtype gate existed (7 draws from 4 initial Living Death
+        # deaths plus secondary sacrifices in game 1514636909593497602).
+        if card.name.lower() == "species specialist":
+            chosen_type = (card._chosen_creature_type or "").lower()
+            dying_types = {
+                creature_type.lower()
+                for creature_type in dying_card.get_creature_types()
+            }
+            if not chosen_type or chosen_type not in dying_types:
+                continue
+
         handled = False
 
         # ---- HARDCODED HANDLERS ----
@@ -1881,6 +1984,7 @@ def _check_dies_triggers_sync(engine, game: GameState, dying_card: Card, dying_p
         # Blood Artist / Zulaport Cutthroat: drain 1
         if card.name.lower() in ("blood artist", "zulaport cutthroat", "bastion of remembrance"):
             opp.life -= 1
+            opp.record_life_loss(1)
             _log_life_change(opp, -1, f"dies trigger: {card.name}")
             # June 10 audit (V22): route the gain through the centralized
             # life-gain path so prevention statics (Erebos: "Your opponents
@@ -1904,13 +2008,20 @@ def _check_dies_triggers_sync(engine, game: GameState, dying_card: Card, dying_p
 
         # Grave Pact / Dictate of Erebos: opponents sacrifice
         elif card.name.lower() in ("grave pact", "dictate of erebos"):
-            messages.append(f"💀 {card.name}: {opp.name} must sacrifice a creature!")
+            sacrifice_msg = engine.rules._execute_action_on_state(game, {
+                "action": "sacrifice_permanent", "player": opp.name,
+                "type_filter": "creature",
+                "reason": f"{card.name}: a creature its controller controlled died",
+            })
+            if sacrifice_msg:
+                messages.append(f"💀 {card.name}: {sacrifice_msg}")
             trigger_count += 1
             handled = True
 
         # Syr Konrad, the Grim: deal 1 damage to each opponent
         elif card.name.lower() == "syr konrad, the grim":
             opp.life -= 1
+            opp.record_life_loss(1)
             # June 10 audit (V31a): clamp the console print like the Discord
             # twin below — this was one of the two negative-life leak sites.
             print(f"[DIES-TRIGGER] Syr Konrad, the Grim: deals 1 damage to {opp.name} (life: {max(0, opp.life)})")
@@ -2086,7 +2197,38 @@ def _check_dies_triggers_sync(engine, game: GameState, dying_card: Card, dying_p
                             print(f"[DEATH-WATCHER] Action failed: {e}")
                     game._death_watchers.remove(watcher)
 
+    game._dies_source_ids_by_dead_id.pop(dying_card.id, None)
     return messages, unhandled
+
+
+def _check_permanent_etb_watchers(engine, game: GameState,
+                                  entering_player: Player,
+                                  entering_card: Card) -> List[str]:
+    """Resolve mandatory watchers for any permanent entering the battlefield.
+
+    Creature, token, land, and noncreature cast paths converge here for Altar
+    of the Brood. Previously each path only scanned type-specific watchers,
+    so Altar printed its oracle text but milled zero cards.
+    """
+    messages = []
+    for watcher in list(entering_player.battlefield):
+        if watcher.id == entering_card.id or getattr(watcher, '_phased_out', False):
+            continue
+        oracle = (watcher.oracle_text or '').lower()
+        if (watcher.name.lower() == 'altar of the brood'
+                or ('whenever another permanent you control enters' in oracle
+                    and 'each opponent mills a card' in oracle)):
+            for opponent in game.players:
+                if opponent is entering_player:
+                    continue
+                msg = engine.rules._execute_action_on_state(game, {
+                    'action': 'mill', 'player': opponent.name, 'amount': 1,
+                    'source': watcher.name,
+                })
+                if msg:
+                    messages.append(f"⚙️ {watcher.name}: {msg}")
+            print(f"[PERMANENT-ETB-TRIGGER] {watcher.name} fires for {entering_card.name}")
+    return messages
 
 
 # ---------------------------------------------------------------------------
@@ -2200,6 +2342,28 @@ def _check_ltb_triggers_sync(engine, game: GameState, leaving_card: Card, leavin
     oracle_lower = oracle.lower()
     card_name_lower = leaving_card.name.lower()
 
+    # Linked exile is keyed to the source permanent, regardless of whether
+    # that source itself has printed LTB text (Calix links the return to an
+    # arbitrary enchantment). Return tracked cards before self-LTB parsing.
+    exiled_by_key = f"_exiled_by_{leaving_card.id}"
+    exiled_cards = getattr(game, exiled_by_key, [])
+    if exiled_cards:
+        returned = []
+        for exiled_info in exiled_cards:
+            owner_idx = exiled_info.get('owner', 0)
+            owner = game.players[owner_idx] if owner_idx < len(game.players) else leaving_player
+            for exiled_card in list(owner.exile):
+                if exiled_card.name == exiled_info.get('name', ''):
+                    owner.exile.remove(exiled_card)
+                    exiled_card.summoning_sick = True
+                    exiled_card.entered_this_turn = True
+                    owner.battlefield.append(exiled_card)
+                    returned.append(exiled_card.name)
+                    break
+        delattr(game, exiled_by_key)
+        if returned:
+            messages.append(f"↩️ {leaving_card.name} left: returned {', '.join(returned)} from exile")
+
     # ---- Self-LTB triggers ----
     # Pattern: "When [this] leaves the battlefield, ..."
     has_ltb = False
@@ -2236,7 +2400,6 @@ def _check_ltb_triggers_sync(engine, game: GameState, leaving_card: Card, leavin
         # ---- Return exiled cards (Worldgorger Dragon, Oblivion Ring, etc.) ----
         if 'return' in ltb_text.lower() and ('exiled' in ltb_text.lower() or 'exile' in oracle_lower):
             # Find cards that were exiled by this permanent
-            exiled_by_key = f"_exiled_by_{leaving_card.id}"
             exiled_cards = getattr(game, exiled_by_key, [])
             if exiled_cards:
                 returned = []
@@ -2384,23 +2547,18 @@ def _check_attack_triggers_sync(engine, game: GameState, attacker_card: Card, at
 
     # 1. Check the attacker itself for "whenever [this] attacks" oracle text
     if attacker_card.oracle_text:
-        oracle_lower = attacker_card.oracle_text.lower()
-        attacker_name_lower = attacker_card.name.lower()
-        # "whenever {name} attacks" or "whenever this creature attacks"
-        if (f"whenever {attacker_name_lower} attacks" in oracle_lower or
-            f"whenever {attacker_name_lower.split(',')[0]} attacks" in oracle_lower or
-            "whenever this creature attacks" in oracle_lower):
+        self_attack_text = next(
+            (paragraph.strip() for paragraph in attacker_card.oracle_text.split('\n')
+             if _is_self_attack_trigger_paragraph(attacker_card, paragraph)),
+            "",
+        )
+        if self_attack_text:
 
             handled = False
 
             # ---- TIER 1.5: Template library ----
             if HAS_EFFECT_TEMPLATES:
-                trigger_text = ""
-                for paragraph in attacker_card.oracle_text.split('\n'):
-                    p_lower = paragraph.lower().strip()
-                    if "attacks" in p_lower and "whenever" in p_lower:
-                        trigger_text = paragraph.strip()
-                        break
+                trigger_text = self_attack_text
 
                 if trigger_text:
                     try:
@@ -2437,12 +2595,7 @@ def _check_attack_triggers_sync(engine, game: GameState, attacker_card: Card, at
                         print(f"[ATTACK-TEMPLATE] Error for {attacker_card.name}: {e}")
 
             if not handled:
-                trigger_text = ""
-                for paragraph in attacker_card.oracle_text.split('\n'):
-                    p_lower = paragraph.lower().strip()
-                    if "attacks" in p_lower and "whenever" in p_lower:
-                        trigger_text = paragraph.strip()
-                        break
+                trigger_text = self_attack_text
                 if trigger_text:
                     unhandled.append((attacker_card, trigger_text))
 
@@ -2501,7 +2654,7 @@ def _check_attack_triggers_sync(engine, game: GameState, attacker_card: Card, at
             trigger_text = ""
             for paragraph in card.oracle_text.split('\n'):
                 p_lower = paragraph.lower().strip()
-                if "attacks" in p_lower and "whenever" in p_lower:
+                if "attack" in p_lower and "whenever" in p_lower:
                     trigger_text = paragraph.strip()
                     break
 
@@ -2544,7 +2697,7 @@ def _check_attack_triggers_sync(engine, game: GameState, attacker_card: Card, at
             trigger_text = ""
             for paragraph in card.oracle_text.split('\n'):
                 p_lower = paragraph.lower().strip()
-                if "attacks" in p_lower and "whenever" in p_lower:
+                if "attack" in p_lower and "whenever" in p_lower:
                     trigger_text = paragraph.strip()
                     break
             if trigger_text:
@@ -2670,13 +2823,11 @@ def _check_upkeep_triggers_sync(engine, game: GameState) -> Tuple[List[str], Lis
         if card.name.lower() == "phyrexian arena":
             drawn = engine.draw_cards(active, 1, game=game)
             active.life -= 1
+            active.record_life_loss(1)
             print(f"[UPKEEP-TRIGGER] Phyrexian Arena: {active.name} loses 1 life (life: {active.life})")
             _log_life_change(active, -1, "Phyrexian Arena")  # May 30 audit: canonical tag
             if drawn:
-                if active.is_claude:
-                    messages.append(f"📖 Phyrexian Arena: {active.name} draws a card, loses 1 life")
-                else:
-                    messages.append(f"📖 Phyrexian Arena: {active.name} draws **{drawn[0].name}**, loses 1 life")
+                messages.append(f"📖 Phyrexian Arena: {active.name} draws a card, loses 1 life")
             handled = True
 
         # Cumulative upkeep: increment age counter, pay or sacrifice
@@ -3207,6 +3358,9 @@ def _handle_etb_triggers(engine, game: GameState, player: Player, card: Card) ->
             messages.append(
                 format_trigger_line("⚡", trigger_card.name, trigger_text, game=game, max_chars=300)
             )
+    else:
+        messages.extend(_check_permanent_etb_watchers(
+            engine, game, player, card))
 
     # Check for engine-ETB triggers on the card itself
     if card.oracle_text:
@@ -3465,17 +3619,74 @@ def _handle_land_etb(engine, game: GameState, player: Player, card: Card) -> Lis
             "whenever a land enters" in perm_oracle and "add" in perm_oracle
         ):
             messages.append(f"🐍 {perm.name}: Landfall! Add one mana of any color.")
+
+        # Quest-counter landfall (Khalni Heart Expedition): "you may put a
+        # quest counter on this enchantment" — autoplay always says yes.
+        # June 11 audit: this trigger only printed oracle text plus
+        # "(Use `!judge` to resolve if needed.)" and no counter was ever
+        # placed (game 1514633271047225385 — the sac ability then resolved
+        # cost-free with 0 counters).
+        elif ("quest counter" in perm_oracle
+              and ("whenever a land" in perm_oracle or "landfall" in perm_oracle)):
+            _q_add = 1
+            _rep = getattr(game, '_replacement_engine', None)
+            if _rep is not None and getattr(_rep, 'effects', None):
+                try:
+                    from rules.replacement import GameEvent, EventType
+                    _qev = GameEvent(
+                        event_type=EventType.COUNTER_PLACED,
+                        affected_object=perm.id,
+                        affected_object_name=perm.name,
+                        affected_player=player.name,
+                        amount=1,
+                        counter_type='quest',
+                        source_name=perm.name,
+                    )
+                    _q_add = _rep.process_event_sync(_qev).amount
+                except (ImportError, ValueError, KeyError, AttributeError, TypeError) as _q_err:
+                    print(f"[LANDFALL] quest-counter replacement check failed: {_q_err}")
+            perm.counters['quest'] = perm.counters.get('quest', 0) + _q_add
+            messages.append(f"🗺️ {perm.name}: Landfall! Quest counter added "
+                            f"(total: {perm.counters['quest']})")
+            print(f"[LANDFALL] {perm.name}: +{_q_add} quest counter "
+                  f"(total {perm.counters['quest']})")
         
         # Avenger of Zendikar: "Whenever a land enters... put a +1/+1 counter on each Plant"
         elif "avenger of zendikar" in perm.name.lower() and "plant" in perm_oracle:
             plant_count = sum(1 for c in player.battlefield
                             if c.type_line and "plant" in c.type_line.lower())
             if plant_count > 0:
+                # June 11 audit: route each placement through the replacement
+                # engine — this path incremented dicts directly, so Doubling
+                # Season doubled token creation and quest counters but NOT
+                # landfall counters (game 1514626038192144445: Plants attacked
+                # at half strength, delaying a won game two turns).
+                _per_plant_total = 0
                 for c in player.battlefield:
                     if c.type_line and "plant" in c.type_line.lower():
-                        c.counters['+1/+1'] = c.counters.get('+1/+1', 0) + 1
-                messages.append(f"🌱 Avenger of Zendikar: {plant_count} Plant(s) each get a +1/+1 counter!")
-                print(f"[LANDFALL] Avenger of Zendikar: +1/+1 counter on {plant_count} Plants")
+                        _add = 1
+                        _rep = getattr(game, '_replacement_engine', None)
+                        if _rep is not None and getattr(_rep, 'effects', None):
+                            try:
+                                from rules.replacement import GameEvent, EventType
+                                _ev = GameEvent(
+                                    event_type=EventType.COUNTER_PLACED,
+                                    affected_object=c.id,
+                                    affected_object_name=c.name,
+                                    affected_player=player.name,
+                                    amount=1,
+                                    counter_type='+1/+1',
+                                    source_name=perm.name,
+                                )
+                                _add = _rep.process_event_sync(_ev).amount
+                            except (ImportError, ValueError, KeyError, AttributeError, TypeError) as _rep_err:
+                                print(f"[LANDFALL] Avenger replacement check failed: {_rep_err}")
+                        c.counters['+1/+1'] = c.counters.get('+1/+1', 0) + _add
+                        _per_plant_total = _add
+                game.recalculate_power_toughness()
+                _each = f"{_per_plant_total} +1/+1 counter(s)" if _per_plant_total != 1 else "a +1/+1 counter"
+                messages.append(f"🌱 Avenger of Zendikar: {plant_count} Plant(s) each get {_each}!")
+                print(f"[LANDFALL] Avenger of Zendikar: +{_per_plant_total} counter on {plant_count} Plants")
         
         # Rampaging Baloths: create a 4/4 green Beast creature token
         elif "rampaging baloths" in perm.name.lower() or (
@@ -3526,6 +3737,7 @@ def _handle_land_etb(engine, game: GameState, player: Player, card: Card) -> Lis
                 for opp_idx, opp in enumerate(game.players):
                     if opp_idx != player_idx:
                         opp.life -= 4
+                        opp.record_life_loss(4)
                         messages.append(f"🌊 {perm.name}: Landfall #3! Deals 4 damage to {opp.name}. (life: {max(0, opp.life)})")
                         # May 23 audit (MAJOR #14): emit symmetric [SPELL-DAMAGE]
                         # tag for ledger reconciliation.

@@ -2077,11 +2077,47 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
                 return
         
         # Validate activation: mana cost, sorcery speed, XMage bridge cross-check
-        is_legal, reason = await self._validate_activation(
+        is_legal, reason = await self.engine._validate_activation(
             game, player, card, ability_cost=ability['cost']
         )
         if not is_legal:
             await ctx.send(f"❌ Cannot activate **{card.name}**: {reason}")
+            return
+
+        # June 11 live retest: the post-refactor manual path called the
+        # nonexistent `self._validate_activation`, never paid Equip's mana,
+        # then sent its attach prose to Tier 3. Resolve this deterministic
+        # keyword action locally, mirroring the autoplay path.
+        is_equip = ability['cost'].lower().startswith('equip')
+        if is_equip:
+            equip_target = (player.find_card(target_name, Zone.BATTLEFIELD)
+                            if target_name else None)
+            if equip_target is None:
+                candidates = [c for c in player.battlefield
+                              if c.is_creature() and c.id != card.id]
+                if candidates:
+                    equip_target = max(
+                        candidates,
+                        key=lambda c: c.get_effective_power(game))
+            if equip_target is None or not equip_target.is_creature(game):
+                await ctx.send(f"❌ **{card.name}** needs a creature you control to equip.")
+                return
+            mana_cost = ability.get('mana_cost', '')
+            if mana_cost and not player.tap_sources_for_cost(mana_cost):
+                await ctx.send(f"❌ Cannot pay {mana_cost} to equip **{card.name}**.")
+                return
+            msg = self.engine.rules._execute_action_on_state(game, {
+                "action": "equip",
+                "equipment": card.name,
+                "creature": equip_target.name,
+                "player": player.name,
+            })
+            if msg:
+                await ctx.send(msg)
+            events = self.engine.check_state_based_actions(game)
+            if events:
+                await ctx.send("\n".join(f"⚡ {event}" for event in events))
+            self.engine.save_game(game)
             return
 
         # Parse X value from command args (supports "!activate Card 1 X=3" syntax)
@@ -2104,6 +2140,22 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
                 # Cap at reasonable value
                 x_value = min(x_value, 20)
 
+        counter_cost_match = re.search(
+            r'remove (?:a|one|1) ([\w +/\-]+) counter from (?:this|'
+            + re.escape(card.name.lower()) + r')', cost_text.lower())
+        if counter_cost_match:
+            counter_type = counter_cost_match.group(1).strip()
+            if card.counters.get(counter_type, 0) < 1:
+                await ctx.send(f"❌ **{card.name}** has no {counter_type} counter to remove.")
+                return
+
+        # Validation only proved the cost was affordable; actually tap the
+        # sources here for every non-Equip activated ability.
+        mana_cost = ability.get('mana_cost', '')
+        if mana_cost and not player.tap_sources_for_cost(mana_cost):
+            await ctx.send(f"❌ Cannot pay {mana_cost} to activate **{card.name}**.")
+            return
+
         # Parse "Pay N life" additional cost (e.g. Inventors' Fair).
         life_cost_match = re.search(r'pay\s+(\d+)\s+life', cost_text, re.IGNORECASE)
         if life_cost_match:
@@ -2112,11 +2164,15 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
                 await ctx.send(f"❌ Cannot pay {life_cost} life for **{card.name}** (you have {player.life}).")
                 return
             player.life -= life_cost
+            player.record_life_loss(life_cost)
             print(f"[ACTIVATE] {card.name}: {player.name} paid {life_cost} life (life now {player.life})")
 
         # Tap the card if needed
         if ability['needs_tap']:
             card.tapped = True
+        if counter_cost_match:
+            counter_type = counter_cost_match.group(1).strip()
+            card.counters[counter_type] -= 1
 
         # Process exile/sacrifice costs BEFORE effect execution
         cost_lower = cost_text.lower()
@@ -2230,6 +2286,22 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
 
         # Try to parse common effects
         effect_resolved = False
+
+        if card.name.lower() == 'wishclaw talisman':
+            msg = self.engine.rules._execute_action_on_state(game, {
+                "action": "wishclaw_tutor_transfer", "player": player.name,
+                "source": card.name})
+            if msg:
+                messages.append(msg)
+            effect_resolved = True
+
+        if card.name.lower() == 'isochron scepter':
+            msg = self.engine.rules._execute_action_on_state(game, {
+                "action": "isochron_copy", "player": player.name,
+                "source": card.name, "target": target_name or ""})
+            if msg:
+                messages.append(msg)
+            effect_resolved = True
 
         # === DELAYED TRIGGER: "draw a card at the beginning of the next turn's upkeep" ===
         # Mishra's Bauble, Urza's Bauble. Uses the existing delayed_triggers
@@ -2819,6 +2891,7 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
                 return
 
             player.life -= life_to_pay
+            player.record_life_loss(life_to_pay)
             # Store the paid amount on the card for later (token creation ability uses it)
             for c in player.battlefield:
                 if c.id == card_id:
@@ -3140,7 +3213,11 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
         for card in potential_attackers:
             can_attack, reason = self.engine.rules.can_attack_with(game, player, card)
             if can_attack:
-                attackers.append(card)
+                paid, tax_reason = self.engine.rules.pay_attack_tax(game, player, card)
+                if paid:
+                    attackers.append(card)
+                else:
+                    warnings.append(f"⚠️ {card.name}: {tax_reason}")
             else:
                 warnings.append(f"⚠️ {card.name}: {reason}")
         
@@ -4575,6 +4652,7 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
                 
                 if target:
                     target.life -= damage
+                    target.record_life_loss(damage)
                     result_msg = f"✅ Dealt {damage} damage to **{target.name}** (now at {target.life} life)"
                 else:
                     result_msg = f"❌ Couldn't find player '{target_name}'"
@@ -4648,6 +4726,11 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
         events = self.engine.check_state_based_actions(game)
         if events:
             await self._autoplay_send(thread, "\n".join(events))
+
+        # June 11 audit: resolve combat-queued dies triggers at the combat
+        # priority boundary, before the autoplay planner sees MAIN2.
+        for msg in await self.engine.drain_pending_triggers(game):
+            await self._autoplay_send(thread, msg)
 
         if not game.ended:
             game.phase = Phase.MAIN2

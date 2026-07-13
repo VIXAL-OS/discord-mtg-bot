@@ -46,11 +46,11 @@ from mtg.models import Card, Player, GameState
 # in exile.
 _TRANSFORMING_SAGA_BACK_FACES: Dict[str, Dict[str, str]] = {
     "the restoration of eiganjo": {
-        "name": "Eiganjo, Seat of the Empire",
-        "type_line": "Legendary Land — Plains",
-        "oracle_text": "(Tap: Add {W}.)\nChannel — {2}{W}, Discard Eiganjo, Seat of the Empire: Tap target nonland permanent an opponent controls. It doesn't untap during its controller's next untap step.",
-        "power": "",
-        "toughness": "",
+        "name": "Architect of Restoration",
+        "type_line": "Enchantment Creature — Fox Monk",
+        "oracle_text": "Vigilance\nWhenever this creature attacks or blocks, create a 1/1 colorless Spirit creature token.",
+        "power": "3",
+        "toughness": "4",
     },
     "the elder dragon war": {
         "name": "The Elder Dragon War",
@@ -808,6 +808,14 @@ def process_state_based_actions(rules, game: GameState) -> List[str]:
                         player.exile.append(card)
                         # Try to flip the DFC face
                         back_face = getattr(card, 'back_face', None) or getattr(card, 'transform_to', None)
+                        if not back_face and getattr(card, 'back_face_name', ''):
+                            back_face = {
+                                'name': card.back_face_name,
+                                'type_line': card.back_face_type_line,
+                                'oracle_text': card.back_face_oracle_text,
+                                'power': card.back_face_power,
+                                'toughness': card.back_face_toughness,
+                            }
                         # Scryfall card data routinely loads the front face only
                         # for sagas. Fall back to a small lookup table of common
                         # transforming sagas so they actually come back instead

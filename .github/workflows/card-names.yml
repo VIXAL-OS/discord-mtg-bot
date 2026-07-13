@@ -1,5 +1,5 @@
-# Validates every hardcoded card name (template-library keys, transforming-
-# saga table) against Scryfall bulk data. Catches the exact-name-typo bug
+# Validates every hardcoded card name and cached oracle text against Scryfall
+# bulk data. Catches the exact-name-typo and stale-cache bug classes.
 # class — the May 17 "Cathars' Crusade" apostrophe bug shipped because no
 # machine ever compared the key to the real card name; this would have
 # flagged it instantly.
@@ -17,6 +17,7 @@ on:
     paths:
       - rules/effect_templates.py
       - mtg/sba.py
+      - data/card_data_cache.json
       - tools/validate_card_names.py
 
 jobs:
@@ -29,5 +30,5 @@ jobs:
         with:
           python-version: "3.13"
 
-      - name: Validate card names against Scryfall
+      - name: Validate card names and oracle cache against Scryfall
         run: python tools/validate_card_names.py

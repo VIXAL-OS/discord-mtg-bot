@@ -327,6 +327,22 @@ class Card:
     # name-keyed ETB template doesn't run a SECOND one (one cast was
     # returning two creatures).
     _reanimate_handled: bool = field(default=False, repr=False, compare=False)
+    # Cast/linked-effect bookkeeping used while the card is on the stack or
+    # exiled by a specific source.
+    _cast_origin: str = field(default="", repr=False, compare=False)
+    _declared_graveyard_target_id: Optional[str] = field(default=None, repr=False, compare=False)
+    _declared_graveyard_target_owner: str = field(default="", repr=False, compare=False)
+    _imprinted_card_id: Optional[str] = field(default=None, repr=False, compare=False)
+    _imprinted_card_name: str = field(default="", repr=False, compare=False)
+    _imprinted_owner_index: Optional[int] = field(default=None, repr=False, compare=False)
+    # Copy-effect bookkeeping. The snapshot restores printed characteristics
+    # when the permanent changes zones (CR 707.8); the other fields describe
+    # the battlefield-only copy state.
+    _pre_copy_snapshot: Any = field(default=None, repr=False, compare=False)
+    _is_copy: bool = field(default=False, repr=False, compare=False)
+    _copy_of: Optional[str] = field(default=None, repr=False, compare=False)
+    _original_name: str = field(default="", repr=False, compare=False)
+    _chosen_creature_type: str = field(default="", repr=False, compare=False)
 
     # Temporary modifiers (from pump effects, etc.)
     power_modifier: int = 0
@@ -440,6 +456,11 @@ class Card:
         # of its old state (CR 400.7).
         self.counters = {}
         self._reanimated_by_aura_id = None
+        # Linked exile belongs to this specific battlefield object. A Scepter
+        # that leaves and later returns is a new object with no imprint link.
+        self._imprinted_card_id = None
+        self._imprinted_card_name = ""
+        self._imprinted_owner_index = None
         # Reset transform state — cards re-enter on their front face (CR 712.10a)
         if self.is_transformed and self.has_transform:
             self.transform()
@@ -693,8 +714,13 @@ class Card:
             if base > 0:
                 self.power_modifier = 0  # CDA recalculates each call; don't accumulate pump
         result = base + self.power_modifier
-        # Debug: catch impossible CDA power (Tarmogoyf should max at 8)
-        if self.power == '*' and result > 15:
+        # Debug: catch impossible CDA power. June 11 audit: the old >15
+        # threshold assumed Tarmogoyf-style counts, but lands-you-control
+        # CDAs (Beanstalk Giant) routinely exceed 15 legitimately in EDH —
+        # one game printed ~90 spam lines. 25+ is still suspicious for any
+        # real CDA; log once per creature per game instead of every call.
+        if self.power == '*' and result > 25 and not getattr(self, '_cda_debug_logged', False):
+            self._cda_debug_logged = True
             eq_p_dbg, _, _ = self._get_equipment_bonuses(game)
             print(f"[CDA-DEBUG] {self.name}: base={base}, power_mod={self.power_modifier}, "
                   f"counters_11={self.counters.get('+1/+1', 0)}, equip={eq_p_dbg}, "
@@ -884,18 +910,28 @@ class Card:
             # June 10 deep-dive (B7): the optional "for each <type> you
             # control" multiplier (Ethereal Armor) was silently discarded —
             # the flat +1/+1 applied while 4-6 enchantments were in play.
+            # June 11 audit: compound kinds ("for each artifact and/or
+            # enchantment you control" — All That Glitters) didn't match the
+            # single-kind pattern, so the multiplier was silently discarded
+            # and the aura applied a flat +1/+1 — the enchanted commander's
+            # power froze while the artifact count grew, shifting the kill
+            # turn by two in games 1514626038486007948 / 1514621744143667220.
             for m in _re.finditer(
                     r'enchanted creature gets ([+-]\d+)/([+-]\d+)'
-                    r'( for each (enchantment|artifact|creature|land) you control)?',
+                    r'( for each ((?:enchantment|artifact|creature|land)'
+                    r'(?:\s+(?:and/or|and|or)\s+(?:enchantment|artifact|creature|land))*)'
+                    r' you control)?',
                     oracle):
                 step_p, step_t = int(m.group(1)), int(m.group(2))
                 if m.group(3):
-                    kind = m.group(4)
+                    kinds = _re.findall(r'enchantment|artifact|creature|land', m.group(4))
                     aura_ctrl = aura._find_controller(game)
                     count = 0
                     if aura_ctrl is not None:
-                        count = sum(1 for perm in aura_ctrl.battlefield
-                                    if kind in (getattr(perm, 'type_line', '') or '').lower())
+                        count = sum(
+                            1 for perm in aura_ctrl.battlefield
+                            if any(k in (getattr(perm, 'type_line', '') or '').lower()
+                                   for k in kinds))
                     p_bonus += step_p * count
                     t_bonus += step_t * count
                 else:
@@ -1009,6 +1045,12 @@ class Card:
             return len(owner.lands())
         if 'number of creatures you control' in oracle:
             return len(owner.creatures())
+        if 'number of spirits you control' in oracle:
+            return sum(
+                1 for permanent in owner.battlefield
+                if permanent.is_creature(game=game)
+                and 'spirit' in {t.lower() for t in permanent.get_creature_types()}
+            )
         if 'number of cards in your hand' in oracle:
             return len(owner.hand)
         if 'equal to your life total' in oracle:
@@ -1120,6 +1162,16 @@ class Card:
                     if devotion < threshold:
                         return False
         return True
+
+    def get_creature_types(self) -> List[str]:
+        """Return creature subtypes from the text after the type-line dash."""
+        type_line = self.type_line or ""
+        if "creature" not in type_line.lower():
+            return []
+        parts = re.split(r"\s+[—-]\s+", type_line, maxsplit=1)
+        if len(parts) != 2:
+            return []
+        return [part for part in re.split(r"[\s/]+", parts[1].strip()) if part]
     
     def is_land(self) -> bool:
         return self.type_line and "land" in self.type_line.lower()
@@ -1474,6 +1526,9 @@ class Player:
     poison: int = 0
     energy: int = 0
     commander_damage: Dict[int, int] = field(default_factory=dict)  # player_index -> damage
+    # Bloodchief Ascension and similar "lost N life this turn" conditions.
+    # Reset for every player when a new turn begins in GameEngine.end_turn.
+    life_lost_this_turn: int = 0
     
     # Zones
     library: List[Card] = field(default_factory=list)
@@ -1527,6 +1582,13 @@ class Player:
 
     # Mana pool {color: amount} - W, U, B, R, G, C (colorless)
     mana_pool: Dict[str, int] = field(default_factory=lambda: {'W': 0, 'U': 0, 'B': 0, 'R': 0, 'G': 0, 'C': 0})
+
+    def record_life_loss(self, amount: int) -> None:
+        """Record positive life loss for turn-scoped trigger conditions."""
+        try:
+            self.life_lost_this_turn += max(0, int(amount))
+        except (TypeError, ValueError):
+            return
     
     def get_zone(self, zone: Zone) -> List[Card]:
         """Get cards in a specific zone."""
@@ -2025,8 +2087,27 @@ class Player:
                 # June 10 audit: surface the sacrifice to players — 43 Tower
                 # sacs in the June batch had zero Discord lines (Savra, Judith,
                 # Syr Konrad just vanished from the board).
+                # June 11 audit: initialize the queue if missing — an
+                # AttributeError here was swallowed by this try/except and the
+                # message never showed (5 invisible Tower sacs incl. Meren in
+                # game 1514621789555265558).
+                if not hasattr(game, '_pending_messages') or game._pending_messages is None:
+                    game._pending_messages = []
                 game._pending_messages.append(
                     f"💀 **{self.name}** sacrifices **{victim.name}** to Phyrexian Tower")
+                # CR 903.9: a sacrificed commander may go to the command zone
+                # instead of the graveyard; autoplay always chooses it. June 11
+                # audit: Meren was Tower-sacrificed into the graveyard and
+                # vanished for the rest of the game.
+                if (getattr(victim, 'is_commander', False)
+                        and victim in self.graveyard):
+                    self.graveyard.remove(victim)
+                    if not hasattr(self, 'command_zone') or self.command_zone is None:
+                        self.command_zone = []
+                    self.command_zone.append(victim)
+                    print(f"[CR-903.9] {victim.name} (commander) redirected graveyard → command zone after Tower sacrifice")
+                    game._pending_messages.append(
+                        f"👑 **{victim.name}** returns to the command zone (CR 903.9)")
                 # June 10 audit: unregister the victim's layer/static effects.
                 # Judith was Tower-sacrificed and her +1/+0 anthem stayed
                 # registered, applying 32 more times across the rest of the
@@ -2100,6 +2181,7 @@ class Player:
             tap_damage = self._get_mana_tap_damage(card)
             if tap_damage > 0:
                 self.life -= tap_damage
+                self.record_life_loss(tap_damage)
                 print(f"[MANA-DAMAGE] {card.name} deals {tap_damage} damage to {self.name} (life: {self.life})")
 
             # Apply sac cost for sac-mana lands (Phyrexian Tower). If
@@ -2446,6 +2528,7 @@ class Player:
                 tap_damage = self._get_mana_tap_damage(card)
                 if tap_damage > 0:
                     self.life -= tap_damage
+                    self.record_life_loss(tap_damage)
                     print(f"[MANA-DAMAGE] {card.name} deals {tap_damage} damage to {self.name} (life: {self.life})")
                 # May 16 audit: pay sac cost for Phyrexian Tower's {B}{B}
                 # ability. If we promised B mana via _get_mana_production
@@ -2470,6 +2553,7 @@ class Player:
         # Apply Phyrexian life payment
         if phyrexian_life_cost > 0:
             self.life -= phyrexian_life_cost
+            self.record_life_loss(phyrexian_life_cost)
             print(f"[MANA-PHYREXIAN] {self.name} pays {phyrexian_life_cost} life for Phyrexian mana (life: {self.life})")
 
         print(f"[MANA-ENGINE] Tapped {len(tapped_cards)} sources for {mana_cost_str}"
@@ -2880,6 +2964,20 @@ class GameState:
     # (card, player) tuples queued for dies-trigger processing (SBA loop,
     # board wipes, Living Death F-LD1). Drained by the trigger dispatcher.
     _recently_died: list = field(default_factory=list, repr=False, compare=False)
+    # Snapshot currently being dispatched. Deaths caused by those triggers go
+    # into _recently_died as a separate wave, so a source that died in wave 1
+    # cannot incorrectly see later wave-2 deaths.
+    _active_dies_batch: list = field(default_factory=list, repr=False, compare=False)
+    # Some effects (Living Death) return new permanents before queued dies
+    # triggers dispatch. Record which permanents actually existed when each
+    # death happened so returned cards do not trigger retroactively.
+    _dies_source_ids_by_dead_id: dict = field(default_factory=dict, repr=False, compare=False)
+    # Strategist rejection backoff is per game: 25 concurrent autoplay games
+    # share one ClaudePlayer, so these counters must never live on the client.
+    _strategy_rejection_streak: int = field(default=0, repr=False, compare=False)
+    _strategy_backoff_turns: int = field(default=0, repr=False, compare=False)
+    _strategy_task: Any = field(default=None, repr=False, compare=False)
+    _strategy_memo: str = field(default="", repr=False, compare=False)
     # Cross-system display queue: trigger messages produced by sync helpers
     # (Phyrexian Tower dies-triggers, gain-life triggers) — flushed by the
     # next display pass.
@@ -2908,6 +3006,7 @@ class GameState:
     _undo_stack: list = field(default_factory=list, repr=False, compare=False)
     # Discord thread object for the running autoplay game (carried over on !undo).
     _autoplay_thread: Any = field(default=None, repr=False, compare=False)
+    _panharmonicon_repeat_active: bool = field(default=False, repr=False, compare=False)
 
     # Opt-in: put triggered abilities on the stack instead of resolving immediately
     triggers_use_stack: bool = False
@@ -3628,7 +3727,13 @@ class GameState:
                     base_abilities=list(getattr(card, 'keywords', []) or []),
                     base_power=base_p, base_toughness=base_t,
                     plus_counters=card.counters.get('+1/+1', 0),
-                    minus_counters=card.counters.get('-1/-1', 0))
+                    minus_counters=card.counters.get('-1/-1', 0),
+                    # June 11 audit: without this, token-qualified anthems
+                    # (Intangible Virtue) registered fine but never applied —
+                    # the filter read is_token from a dict that never had it
+                    # (game 1514621737994551457: 1/1 Humans fought as 1/1s
+                    # for 9 turns under an active Virtue).
+                    is_token=bool(getattr(card, 'is_token', False)))
                 result = self.layers_engine.calculate_characteristics(lp, None)
                 # May 30 audit (option b): the engine resolves Layer-6 abilities
                 # (Humility's remove-all + static grants, applied in TIMESTAMP order

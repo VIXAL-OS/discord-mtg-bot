@@ -409,20 +409,30 @@ class PlaneswalkerManager:
         if game.stack:
             return False, "Stack must be empty to activate loyalty abilities"
         
-        # Check if already activated this turn
+        # Check if already activated this turn (CR 606.3). June 11 audit: the
+        # manager-level dict is shared across all concurrent autoplay games
+        # and cleared by end_turn — under `!autoplay-parallel` another game's
+        # turn boundary could wipe a live game's record (Ashiok activated
+        # twice in one turn, game 1514621737994551457). The card-stamped
+        # counter below is immune to cross-game interference; the manager
+        # dict remains as a secondary source.
         game_id = game.thread_id
+        activation_count = 0
         if game_id in self._activations_this_turn:
             activation_count = self._activations_this_turn[game_id].get(card.id, 0)
-            if activation_count > 0:
-                # Oath of Teferi: "You may activate loyalty abilities of planeswalkers
-                # you control twice each turn rather than only once."
-                max_activations = 1
-                for p_card in player.battlefield:
-                    if (p_card.name or '').lower() == 'oath of teferi':
-                        max_activations = 2
-                        break
-                if activation_count >= max_activations:
-                    return False, f"{card.name} already activated an ability this turn"
+        if getattr(card, '_pw_activated_turn', None) == getattr(game, 'turn_number', None):
+            activation_count = max(activation_count,
+                                   getattr(card, '_pw_activations_this_turn', 0))
+        if activation_count > 0:
+            # Oath of Teferi: "You may activate loyalty abilities of planeswalkers
+            # you control twice each turn rather than only once."
+            max_activations = 1
+            for p_card in player.battlefield:
+                if (p_card.name or '').lower() == 'oath of teferi':
+                    max_activations = 2
+                    break
+            if activation_count >= max_activations:
+                return False, f"{card.name} already activated an ability this turn"
         
         # Parse abilities and check index
         abilities = self.parse_abilities(card)
@@ -499,6 +509,14 @@ class PlaneswalkerManager:
         if game_id not in self._activations_this_turn:
             self._activations_this_turn[game_id] = {}
         self._activations_this_turn[game_id][card.id] = self._activations_this_turn[game_id].get(card.id, 0) + 1
+        # June 11 audit: card-stamped mirror of the count (see can_activate) —
+        # survives cross-game clears of the shared manager dict.
+        _turn_now = getattr(game, 'turn_number', None)
+        if getattr(card, '_pw_activated_turn', None) == _turn_now:
+            card._pw_activations_this_turn = getattr(card, '_pw_activations_this_turn', 0) + 1
+        else:
+            card._pw_activated_turn = _turn_now
+            card._pw_activations_this_turn = 1
 
         # Inline the ability text so the user sees what [+1] actually does.
         # Outer callers used to prepend their own header with oracle text; now
@@ -641,14 +659,20 @@ class PlaneswalkerManager:
                 }
             pw_ctx['controller_hand_size'] = len(player.hand)
             pw_ctx['controller_life'] = player.life
+            pw_ctx['_pw_targets'] = list(targets or [])
+            if targets:
+                first_target = targets[0]
+                pw_ctx['explicit_target_name'] = getattr(first_target, 'name', first_target)
+                for target_player in game.players:
+                    if first_target in target_player.battlefield:
+                        pw_ctx['explicit_target_owner'] = target_player.name
+                        break
             # Greatest power among creatures (for Garruk -3, etc.)
             greatest_power = 0
             for c in player.battlefield:
                 if c.is_creature() if hasattr(c, 'is_creature') else False:
                     try:
-                        p_val = int(c.power) if c.power and c.power != '*' else 0
-                        p_val += getattr(c, 'power_modifier', 0)
-                        p_val += c.counters.get('+1/+1', 0) if hasattr(c, 'counters') else 0
+                        p_val = c.get_effective_power(game)
                     except (ValueError, TypeError):
                         p_val = 0
                     greatest_power = max(greatest_power, p_val)
@@ -871,6 +895,41 @@ class PlaneswalkerManager:
             else:
                 messages.append("📚 Library is empty!")
         
+        # === MILL (Jace, Wielder of Mysteries +1, Ashiok, etc.) ===
+        # June 11 audit: "Target player mills two cards. Draw a card." matched
+        # only the unconditional-draw branch below; the mill sentence was
+        # silently dropped across every activation (4x in game
+        # 1514621789555265558 — 8 cards that never left the library).
+        mill_match = re.search(r'(target player|target opponent|each player|each opponent|you)?\s*mills? (\d+|a|one|two|three|four|five) cards?', text)
+        if mill_match:
+            _who = (mill_match.group(1) or 'target player').strip()
+            _num_str = mill_match.group(2)
+            _mill_n = {'a': 1, 'one': 1, 'two': 2, 'three': 3, 'four': 4,
+                       'five': 5}.get(_num_str, int(_num_str) if _num_str.isdigit() else 1)
+            if _who == 'you':
+                _mill_players = [player]
+            elif _who == 'each player':
+                _mill_players = list(game.players)
+            elif _who == 'each opponent':
+                _mill_players = [p for p in game.players if p is not player]
+            else:
+                # target player/opponent: prefer the resolved activation target,
+                # else default to the opponent (the overwhelmingly common pick)
+                _tp = next((t for t in (targets or [])
+                            if hasattr(t, 'life') and hasattr(t, 'hand')), None)
+                if _tp is None:
+                    _tp = next((p for p in game.players if p is not player), player)
+                _mill_players = [_tp]
+            for _mp in _mill_players:
+                _milled = []
+                for _ in range(_mill_n):
+                    if _mp.library:
+                        _mc = _mp.library.pop(0)
+                        _mp.graveyard.append(_mc)
+                        _milled.append(_mc.name)
+                if _milled:
+                    messages.append(f"🪦 {_mp.name} mills {len(_milled)}: {' · '.join(_milled)}")
+
         # === MAY DISCARD → CONDITIONAL DRAW (Sarkhan, Fireblood +1, etc.) ===
         # Must check BEFORE unconditional draw to avoid false matches
         if 'you may discard a card' in text and 'if you do' in text and 'draw' in text:

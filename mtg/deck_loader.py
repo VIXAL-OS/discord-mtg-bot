@@ -34,6 +34,7 @@ class DeckLoader:
     _scryfall_lock = None       # asyncio.Lock — serialize all requests
     _scryfall_last_req = 0.0    # time.monotonic() of last request
     _scryfall_session = None
+    _disk_cache_lock = None
     
     # NOTE: __file__ is mtg/deck_loader.py after the Phase 1 OSS-readability
     # split, so we go up TWO levels (mtg/deck_loader.py -> mtg/ -> project root)
@@ -69,6 +70,26 @@ class DeckLoader:
             print(f"[SCRYFALL] Saved {len(self.card_cache)} cards to disk cache")
         except Exception as e:
             print(f"[SCRYFALL] Disk cache save error: {e}")
+
+    @classmethod
+    def _write_disk_cache_snapshot(cls, snapshot: Dict[str, Dict]):
+        """Blocking JSON write used only behind ``asyncio.to_thread``."""
+        import json as _json
+        os.makedirs(os.path.dirname(cls.CARD_DATA_CACHE_PATH), exist_ok=True)
+        with open(cls.CARD_DATA_CACHE_PATH, 'w', encoding='utf-8') as f:
+            _json.dump(snapshot, f, ensure_ascii=False, indent=1)
+
+    async def _save_disk_cache_async(self):
+        """Serialize cache writes without blocking the Discord event loop."""
+        if DeckLoader._disk_cache_lock is None:
+            DeckLoader._disk_cache_lock = asyncio.Lock()
+        async with DeckLoader._disk_cache_lock:
+            snapshot = dict(self.card_cache)
+            try:
+                await asyncio.to_thread(self._write_disk_cache_snapshot, snapshot)
+                print(f"[SCRYFALL] Saved {len(snapshot)} cards to disk cache")
+            except (OSError, TypeError, ValueError) as e:
+                print(f"[SCRYFALL] Disk cache save error: {e}")
     
     async def load_from_archidekt(self, deck_id: str) -> Tuple[List[Card], str, Optional[Card], Optional[Card]]:
         """
@@ -251,7 +272,7 @@ class DeckLoader:
                 print(f"[OATHBREAKER] WARNING: Could not fetch '{signature_spell_name}' from Scryfall!")
 
         # Save disk cache after loading a deck (catches any new fetches)
-        self._save_disk_cache()
+        await self._save_disk_cache_async()
 
         return cards, deck_name, commander, signature_spell
 
@@ -511,7 +532,7 @@ class DeckLoader:
                         self.card_cache[cache_key] = data
                         # Periodically save to disk (every 50 new fetches)
                         if len(self.card_cache) % 50 == 0:
-                            self._save_disk_cache()
+                            await self._save_disk_cache_async()
                         return data
                     elif status == 429 or (status is not None and status >= 500):
                         pass  # Will retry after releasing lock
@@ -643,7 +664,7 @@ class DeckLoader:
 
         # Save cache to disk after bulk load
         if fetched > 0:
-            self._save_disk_cache()
+            await self._save_disk_cache_async()
             print(f"[SCRYFALL-BULK] Saved {len(self.card_cache)} cards to disk cache")
 
         return fetched

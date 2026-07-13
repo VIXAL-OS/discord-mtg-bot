@@ -37,7 +37,7 @@ def maybe_reraise(exc: BaseException) -> None:
             print(f"[TAG] ...: {e}")   # unchanged
             maybe_reraise(e)
 
-    Production behavior is unchanged (log-and-continue, Grayson's live games
+    Production behavior is unchanged (log-and-continue, live games
     stay crash-proof). CI and autoplay audit batches run with MTG_STRICT=1 so
     swallowed engine exceptions surface loudly where they're cheap to catch.
 

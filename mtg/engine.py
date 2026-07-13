@@ -229,6 +229,22 @@ def _should_emit_resolve_hint(game, effect_key: str) -> bool:
     return True
 
 
+def _satisfies_sacrifice_cost(card, cost_text: str, game=None) -> bool:
+    """Return whether *card* can pay the typed sacrifice activation cost."""
+    if card is None:
+        return False
+    if 'sacrifice a creature' in (cost_text or '').lower():
+        return card.is_creature(game)
+    return True
+
+
+def _activation_mana_cost(cost_text: str) -> str:
+    """Extract the mana-symbol portion of an activated ability cost."""
+    symbols = re.findall(r'\{([^}]+)\}', cost_text or '', re.IGNORECASE)
+    return ''.join(f'{{{symbol.upper()}}}' for symbol in symbols
+                   if symbol.upper() not in ('T', 'Q'))
+
+
 class GameEngine:
     """Core game logic with rules enforcement and persistence."""
     
@@ -1116,7 +1132,10 @@ class GameEngine:
                     if not hasattr(game, '_library_loss'):
                         game._library_loss = set()
                     game._library_loss.add(player.name)
-                    player.life = 0  # SBA will detect this and set game.ended on next pass
+                    # Keep the loss condition separate from life. Life gain
+                    # later in the same resolving effect cannot undo an
+                    # attempted draw from an empty library (CR 704.5b).
+                    player.attempted_draw_from_empty = True
                     game.loss_reason = f"{player.name} drew from an empty library"
                 break
             # [REPLACEMENT] Process draw replacement effects (Narset, Spirit of the Labyrinth)
@@ -1148,18 +1167,18 @@ class GameEngine:
                     if 'smothering tithe' in bf_card.name.lower() or (
                         'whenever an opponent draws' in oracle_lower and 'treasure' in oracle_lower
                     ):
-                        for _ in drawn:
-                            # In autoplay, opponent doesn't pay; create a Treasure
-                            treasure = Card(
-                                name="Treasure",
-                                type_line="Token Artifact — Treasure",
-                                owner_index=opp_idx,
-                                oracle_text="{T}, Sacrifice this artifact: Add one mana of any color.",
-                            )
-                            treasure.summoning_sick = False
-                            treasure.is_token = True
-                            opp.battlefield.append(treasure)
-                        msg = f"💰 **Smothering Tithe** — {opp.name} creates {len(drawn)} Treasure token(s)"
+                        # Route through the shared action interpreter so token
+                        # replacement effects see the creation event.
+                        before = len(opp.battlefield)
+                        self.rules._execute_action_on_state(game, {
+                            "action": "create_token", "player": opp.name,
+                            "name": "Treasure", "count": len(drawn),
+                            "types": "Token Artifact — Treasure",
+                            "oracle_text": "{T}, Sacrifice this artifact: Add one mana of any color.",
+                            "source": "Smothering Tithe",
+                        })
+                        created_count = len(opp.battlefield) - before
+                        msg = f"💰 **Smothering Tithe** — {opp.name} creates {created_count} Treasure token(s)"
                         print(f"[DRAW-TRIGGER] {msg}")
                         if not hasattr(game, '_pending_messages'):
                             game._pending_messages = []
@@ -1701,6 +1720,7 @@ class GameEngine:
             actual = self.rules._apply_noncombat_damage_to_player(game, target_player, amount, source_name, source_id)
         else:
             target_player.life -= amount
+            target_player.record_life_loss(amount)
             actual = amount
 
         if is_commander and source and actual > 0:
@@ -1720,8 +1740,13 @@ class GameEngine:
         messages = self.rules.process_state_based_actions(game)
 
         # [DIES-TRIGGER] Fire dies triggers for creatures that died during SBAs
-        recently_died = getattr(game, '_recently_died', [])
+        recently_died = list(getattr(game, '_recently_died', []))
         if recently_died and not game.ended:
+            # June 11 audit: freeze one simultaneous-death wave before
+            # resolving it. Trigger actions may cause more deaths; those form
+            # a later wave and must not be visible to sources that died here.
+            game._recently_died = []
+            game._active_dies_batch = recently_died
             if game.triggers_use_stack and game.stack_enabled:
                 # Stack mode: collect all triggers and place on stack via APNAP ordering
                 all_trigger_infos = []
@@ -1792,26 +1817,32 @@ class GameEngine:
                                 ctrl_player.name,
                                 context=f"{dead_card.name} just died (went to graveyard)",
                             )
-                            # May 25 audit (F21): route through format_trigger_line
-                            # so `_oracle_shown_keys` dedups subsequent emissions
-                            # of the same (source, trigger_text) pair. Athreos
-                            # oracle printed 4× per game before this fix; each
-                            # creature death re-emitted the full paragraph even
-                            # when the previous emit was identical.
-                            from mtg.helpers import format_trigger_line
-                            burst_msgs.append(
-                                format_trigger_line(
-                                    "💀", trigger_card.name, trigger_text,
-                                    game=game, max_chars=300,
+                            # June 11 audit: when Tier 3 is available, its
+                            # drain emits the resolution line. The old queue
+                            # placeholder announced Judith once here and once
+                            # again at resolution (game 1514621840440561704).
+                            # Keep the oracle hint only for no-client games,
+                            # matching upkeep/end-step placeholder policy.
+                            if not self.rules.client:
+                                from mtg.helpers import format_trigger_line
+                                burst_msgs.append(
+                                    format_trigger_line(
+                                        "💀", trigger_card.name, trigger_text,
+                                        game=game, max_chars=300,
+                                    )
                                 )
-                            )
+                            else:
+                                print(f"[DIES-PLACEHOLDER-SUPPRESSED] "
+                                      f"{trigger_card.name}: queued for Tier 3 drain")
                     except Exception as e:
                         print(f"[DIES-TRIGGER] Error processing dies triggers for {dead_card.name}: {e}")
                 # Collapse N consecutive same-source trigger messages from the
                 # burst (Athreos × 9 → one line with "×9 fires" suffix).
                 from mtg.triggers import collapse_trigger_burst
                 messages.extend(collapse_trigger_burst(burst_msgs))
-            game._recently_died = []  # Clear after processing
+            game._active_dies_batch = []
+            if game._recently_died and not game.ended:
+                messages.extend(self.check_state_based_actions(game))
 
         return messages
     
@@ -1939,6 +1970,10 @@ class GameEngine:
         
         elif game.phase == Phase.MAIN1:
             messages.append(f"1️⃣ **Main Phase 1**")
+            # Mana Drain-style "your next main phase" triggers fire after
+            # on_phase_change has emptied old mana, so the new mana remains
+            # available throughout this phase.
+            messages.extend(self._process_delayed_triggers(game, "main_phase"))
         
         elif game.phase == Phase.COMBAT_BEGIN:
             messages.append(f"⚔️ **Beginning of Combat**")
@@ -1983,6 +2018,7 @@ class GameEngine:
         
         elif game.phase == Phase.MAIN2:
             messages.append(f"2️⃣ **Main Phase 2**")
+            messages.extend(self._process_delayed_triggers(game, "main_phase"))
         
         elif game.phase == Phase.END:
             messages.append(f"📍 **End Step**")
@@ -2049,8 +2085,10 @@ class GameEngine:
                 sba_msgs = self.rules.process_state_based_actions(game)
                 messages.extend(sba_msgs)
                 # Fire dies triggers for creatures that died during phase-transition SBAs
-                recently_died = getattr(game, '_recently_died', [])
+                recently_died = list(getattr(game, '_recently_died', []))
                 if recently_died and not game.ended:
+                    game._recently_died = []
+                    game._active_dies_batch = recently_died
                     # May 30 audit (F-LD2): apply the same APNAP sort the SBA drain
                     # uses (engine.py ~1774) so multi-controller dies-triggers
                     # resolve NAP-first per CR 603.3b LIFO. This drain previously
@@ -2070,7 +2108,9 @@ class GameEngine:
                     # Collapse same-source bursts before extending messages.
                     from mtg.triggers import collapse_trigger_burst
                     messages.extend(collapse_trigger_burst(phase_burst))
-                    game._recently_died = []
+                    game._active_dies_batch = []
+                    if game._recently_died and not game.ended:
+                        messages.extend(self.check_state_based_actions(game))
             except Exception as e:
                 print(f"[SBA] Error in phase-transition SBA check: {e}")
 
@@ -2139,6 +2179,25 @@ class GameEngine:
         remaining_delayed = []
         for dt in game.delayed_triggers:
             if dt.get('trigger_at') == phase_name:
+                # "your next upkeep" triggers (Pact of Negation, rebound) fire
+                # only on their owner's upkeep. Without this gate they fired on
+                # whichever upkeep came next — the opponent's, one turn late
+                # for the caster, after the caster's lands were tapped again
+                # (June 11 audit: decided 6 games). Non-matching upkeeps also
+                # must not consume turn_delay.
+                upkeep_of = dt.get('upkeep_of')
+                phase_of = dt.get('phase_of', upkeep_of)
+                owner_gate = (upkeep_of if phase_name == 'upkeep'
+                              else phase_of if phase_name == 'main_phase'
+                              else None)
+                if owner_gate is not None:
+                    try:
+                        active_idx = game.players.index(game.active_player)
+                    except (ValueError, AttributeError):
+                        active_idx = getattr(game, 'active_player_index', 0)
+                    if active_idx != owner_gate:
+                        remaining_delayed.append(dt)
+                        continue
                 delay = dt.get('turn_delay', 0)
                 if delay <= 0:
                     source = dt.get('source', 'Unknown')
@@ -2245,6 +2304,11 @@ class GameEngine:
         game.priority_player_index = game.active_player_index
         game.turn_number += 1
         game.phase = Phase.UNTAP
+        # Bloodchief Ascension's each-end-step condition reads life lost
+        # during the current turn. Clear every player's ledger only after the
+        # old turn's end-step triggers have resolved.
+        for _player in game.players:
+            _player.life_lost_this_turn = 0
 
         # Clear the per-turn resolve_effect dedupe cache (keyed on turn number
         # in the dict itself, but pruning keeps the dict from growing unbounded
@@ -2873,7 +2937,11 @@ class GameEngine:
                         print(f"[ACTIVATE-CLAUDE] Skipping hand-only ability on {perm.name}: {line_stripped}")
                         continue
                     # Keyword abilities with no colon: Equip {N}, Cycling {N}, etc.
-                    equip_match = re.match(r'^Equip\s*(?:—\s*)?(.+?)(?:\s*\(.*\))?$', line_stripped, re.IGNORECASE)
+                    # June 11 live retest: require a word boundary. `^Equip\s*`
+                    # also matched "Equipped creature gets..." because `\s*`
+                    # may consume zero characters, creating a fake free equip
+                    # ability before the real `Equip {N}` line.
+                    equip_match = re.match(r'^Equip\b\s*(?:—\s*)?(.+?)(?:\s*\(.*\))?$', line_stripped, re.IGNORECASE)
                     if equip_match:
                         abilities.append({
                             'cost': equip_match.group(1).strip(),
@@ -2925,45 +2993,28 @@ class GameEngine:
                     if perm.entered_this_turn and not perm.has_haste():
                         return None  # Summoning sickness
 
+                counter_cost_match = re.search(
+                    r'remove (?:a|one|1) ([\w +/\-]+) counter from (?:this|'
+                    + re.escape(perm.name.lower()) + r')', ability['cost'].lower())
+                if counter_cost_match:
+                    counter_type = counter_cost_match.group(1).strip()
+                    if perm.counters.get(counter_type, 0) < 1:
+                        print(f"[ACTIVATE-CLAUDE] {perm.name}: no {counter_type} counter to remove")
+                        return None
+
                 # Deduct mana costs from the ability cost string
                 # Parses costs like "{1}", "{2}{G}", "{W}{U}", etc.
                 cost_str = ability['cost']
-                mana_cost_match = re.findall(r'\{(\d+|[WUBRGC])\}', cost_str)
-                if mana_cost_match:
-                    total_generic = 0
-                    colored_needed = []
-                    for m in mana_cost_match:
-                        if m == 'T' or m == 'Q':
-                            continue  # Tap/untap symbols, not mana
-                        if m.isdigit():
-                            total_generic += int(m)
-                        elif m in 'WUBRGC':
-                            colored_needed.append(m)
-                    total_needed = total_generic + len(colored_needed)
-                    if total_needed > 0:
-                        # Check if player can pay
-                        available = player.available_mana_detailed()
-                        total_available = sum(available.values())
-                        if total_available < total_needed:
-                            print(f"[ACTIVATE-CLAUDE] {perm.name}: Need {total_needed} mana, have {total_available}")
-                            return None
-                        # Deduct mana (simple: tap lands to pay)
-                        mana_to_pay = total_needed
-                        for land in player.battlefield:
-                            if mana_to_pay <= 0:
-                                break
-                            if land.is_land() and not land.tapped:
-                                land.tapped = True
-                                mana_to_pay -= 1
-                        if mana_to_pay > 0:
-                            # Try mana rocks
-                            for rock in player.battlefield:
-                                if mana_to_pay <= 0:
-                                    break
-                                if not rock.is_land() and not rock.tapped and player._can_produce_mana(rock):
-                                    rock.tapped = True
-                                    mana_to_pay -= 1
-                        print(f"[ACTIVATE-CLAUDE] Paid {total_needed} mana for {perm.name} ability")
+                mana_cost = _activation_mana_cost(cost_str)
+                if mana_cost:
+                    # June 11 live retest: equip used an amount-only loop that
+                    # ignored colored requirements and multi-mana rocks. Route
+                    # activation payment through the same color-aware engine as
+                    # spell casting instead.
+                    if not player.tap_sources_for_cost(mana_cost):
+                        print(f"[ACTIVATE-CLAUDE] {perm.name}: can't pay {mana_cost}")
+                        return None
+                    print(f"[ACTIVATE-CLAUDE] Paid {mana_cost} for {perm.name} ability")
 
                 # NOTE: "Pay N life" cost is handled below at the [ACTIVATE-COST]
                 # block, AFTER tap/sacrifice. Don't deduct life here — doing so
@@ -2974,6 +3025,10 @@ class GameEngine:
                 # Tap if needed
                 if ability['needs_tap']:
                     perm.tapped = True
+                if counter_cost_match:
+                    counter_type = counter_cost_match.group(1).strip()
+                    perm.counters[counter_type] -= 1
+                    print(f"[ACTIVATE-COST] {perm.name} removes a {counter_type} counter")
 
                 # Process sacrifice/exile costs BEFORE effect execution
                 cost_lower = ability['cost'].lower()
@@ -3018,6 +3073,14 @@ class GameEngine:
                     sac_target = None
                     if target_name:
                         sac_target = player.find_card(target_name, Zone.BATTLEFIELD)
+                        # June 11 audit (game 1514621888587108423): Greater
+                        # Good accepted an explicitly named Pernicious Deed
+                        # even though its cost requires a creature.
+                        if not _satisfies_sacrifice_cost(
+                                sac_target, cost_lower, game):
+                            print(f"[ACTIVATE-COST] {getattr(sac_target, 'name', target_name)} "
+                                  f"cannot pay {perm.name}'s sacrifice cost")
+                            sac_target = None
                     if not sac_target:
                         # Auto-select: weakest creature (or a token)
                         creatures = [c for c in player.battlefield if c.is_creature() and c.id != perm.id]
@@ -3087,6 +3150,7 @@ class GameEngine:
                     life_cost = int(life_match.group(1))
                     if player.life >= life_cost:  # CR 119.4: can pay as long as life >= cost
                         player.life -= life_cost
+                        player.record_life_loss(life_cost)
                         life_paid = life_cost
                         print(f"[ACTIVATE-COST] {player.name} pays {life_cost} life for {perm.name} (life: {player.life})")
                     else:
@@ -3130,6 +3194,14 @@ class GameEngine:
 
                 # For mana abilities: signets, talismans, Sol Ring, mana dorks, etc.
                 effect_lower = ability['effect'].lower()
+                if perm.name.lower() == 'wishclaw talisman':
+                    return self.rules._execute_action_on_state(game, {
+                        "action": "wishclaw_tutor_transfer", "player": player.name,
+                        "source": perm.name})
+                if perm.name.lower() == 'isochron scepter':
+                    return self.rules._execute_action_on_state(game, {
+                        "action": "isochron_copy", "player": player.name,
+                        "source": perm.name, "target": target_name or ""})
                 if 'add' in effect_lower and ('mana' in effect_lower or '{' in effect_lower):
                     # Try to parse specific colors from oracle text
                     # Signets: "Add {R}{G}" / Talismans: "Add {C}{C}" / Sol Ring: "Add {C}{C}"

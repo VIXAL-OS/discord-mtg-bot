@@ -392,7 +392,36 @@ class SpellResolver:
     # ==========================================================================
     # Effect Execution Methods
     # ==========================================================================
-    
+
+    def _handle_player_death(self, game, target, messages: List[str]) -> None:
+        """Route a life<=0 player through SBA instead of a custom game-over.
+
+        July 12 audit (game #84, burn vs jund): the old inline
+        "💀 X has been defeated!" (a) didn't match the standard SBA loss line
+        every other kill path produces ("💀 **X** loses the game! (X has 0
+        life)"), (b) bypassed can't-lose effects (Platinum Angel), and (c) was
+        posted as its own Discord send by the stack-resolution task, which
+        races the autoplay main loop's 🏆 summary — the trophy landed between
+        the damage line and an orphaned defeat line. Folding the loss into the
+        previous message makes the send atomic.
+        """
+        if target.life > 0 or game.ended:
+            return
+        rules_engine = getattr(game, '_rules_engine', None)
+        if rules_engine is not None and hasattr(rules_engine, 'process_state_based_actions'):
+            sba_messages = rules_engine.process_state_based_actions(game)
+        else:
+            # Standalone fallback (no rules engine wired) — same wording SBA
+            # produces, so the discord log stays grep-consistent.
+            sba_messages = [f"💀 **{target.name}** loses the game! ({target.name} has 0 life)"]
+            game.ended = True
+            game.winner = 1 - game.players.index(target)
+        if sba_messages:
+            if messages:
+                messages[-1] += "\n" + "\n".join(sba_messages)
+            else:
+                messages.extend(sba_messages)
+
     async def _exec_damage(self, effect: Effect, ctx: ExecutionContext, game) -> List[str]:
         """Execute damage effect."""
         messages = []
@@ -453,12 +482,39 @@ class SpellResolver:
                           f"from {ctx.source_card.name} (life: {max(0, target.life)})")
                 messages.append(f"🔥 {ctx.source_card.name} deals {actual} damage to {target.name} (life: {max(0, target.life)})")
 
-                # Check for death
-                if target.life <= 0:
-                    messages.append(f"💀 {target.name} has been defeated!")
-                    game.ended = True
-                    game.winner = 1 - game.players.index(target)
+                # Check for death — routed through SBA (see _handle_player_death)
+                self._handle_player_death(game, target, messages)
             
+            elif (hasattr(target, 'loyalty_counters') and hasattr(target, 'is_planeswalker')
+                  and target.is_planeswalker()):
+                # It's a planeswalker. June 11 audit: this check MUST come before
+                # the damage_marked branch — every Card has damage_marked, so
+                # planeswalkers fell into the creature path, compared damage to
+                # toughness 0, and "died from lethal damage" at any loyalty
+                # (game 1514633271047225385: Daretti at 13 loyalty destroyed by a
+                # 3-damage Bolt). CR 120.3c: damage removes that many loyalty
+                # counters. If it's ALSO a creature (animated), damage is marked
+                # too (CR 120.3). Death is left to SBA (CR 704.5i) so command-zone
+                # replacement applies to commander planeswalkers.
+                target.loyalty_counters -= amount
+                if target.is_creature():
+                    target.damage_marked += amount
+                messages.append(
+                    f"🔥 {ctx.source_card.name} deals {amount} damage to {target.name} "
+                    f"({max(0, target.loyalty_counters)} loyalty)")
+                if rules_engine is not None and hasattr(rules_engine, 'process_state_based_actions'):
+                    try:
+                        messages.extend(rules_engine.process_state_based_actions(game) or [])
+                    except Exception as _sba_err:
+                        print(f"[SPELL-DAMAGE] SBA after PW damage failed for {target.name}: {_sba_err}")
+                elif target.loyalty_counters <= 0:
+                    messages.append(f"💀 {target.name} is destroyed!")
+                    for player in game.players:
+                        if target in player.battlefield:
+                            player.battlefield.remove(target)
+                            player.graveyard.append(target)
+                            break
+
             elif hasattr(target, 'damage_marked'):
                 # It's a creature. May 30 audit: mark damage and let SBA resolve any
                 # death so totem (Umbra) armor / undying / persist / shield counters
@@ -615,11 +671,9 @@ class SpellResolver:
         print(f"[LIFE-LOSS] {player.name}: -{amount} life → {player.life} ({src_name})")
         messages.append(f"🖤 {player.name} loses {amount} life (life: {player.life})")
         
-        if player.life <= 0:
-            messages.append(f"💀 {player.name} has been defeated!")
-            game.ended = True
-            game.winner = 1 - game.players.index(player)
-        
+        # Death check routed through SBA (see _handle_player_death)
+        self._handle_player_death(game, player, messages)
+
         return messages
     
     async def _exec_exile(self, effect: Effect, ctx: ExecutionContext, game) -> List[str]:

@@ -86,7 +86,12 @@ def format_activate_line(card_name: str, loyalty_cost, ability_text: str,
         # full-text print, but a re-fire of the same ability dedups.
         key = (card_name, bracket, sanitized[:60])
         if key in shown:
-            return f"⚡ **{card_name}** activates {bracket} ability"
+            # Repeat activation: show a short reminder instead of nothing.
+            # June 11 audit: 192/313 PW activations displayed as a bare
+            # "[+2] ability" — players read that as an ability with no text.
+            if len(sanitized) > 72:
+                return f"⚡ **{card_name}** activates {bracket} ability: _{sanitized[:69]}…_"
+            return f"⚡ **{card_name}** activates {bracket} ability: _{sanitized}_"
         shown.add(key)
     if sanitized:
         return f"⚡ **{card_name}** activates {bracket} ability: _{sanitized}_"
@@ -371,6 +376,35 @@ def _normalize_pw_ability_idx(ability_idx, abilities):
     return parsed
 
 
+def coerce_ai_string(value, _depth=0):
+    """Best-effort coercion of an AI-provided value to a plain string.
+
+    The LLM occasionally returns structured values where the action schema
+    expects a bare string — e.g. {"name": "Shriekmaw"}, ["opponent"], or a
+    bare int. Never raise; return '' when nothing string-like can be found.
+    """
+    if value is None or _depth > 3:
+        return ''
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        for key in ('name', 'card', 'target', 'player', 'permanent', 'value'):
+            if key in value:
+                coerced = coerce_ai_string(value[key], _depth + 1)
+                if coerced:
+                    return coerced
+        return ''
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            coerced = coerce_ai_string(item, _depth + 1)
+            if coerced:
+                return coerced
+        return ''
+    if isinstance(value, (int, float, bool)):
+        return str(value)
+    return ''
+
+
 def _resolve_player_or_card_target(game, activating_player, target_name):
     """Resolve an AI-provided target string to a Player or Card object.
 
@@ -382,6 +416,7 @@ def _resolve_player_or_card_target(game, activating_player, target_name):
 
     Returns the resolved object, or None if unresolvable.
     """
+    target_name = coerce_ai_string(target_name)
     if not target_name:
         return None
     t = target_name.strip().lower()

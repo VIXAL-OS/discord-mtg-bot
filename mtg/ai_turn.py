@@ -516,7 +516,16 @@ def _validate_plan_mana(engine, game: GameState, player_idx: int, plan: list) ->
                 # Exclude spells targeting own graveyard (Victimize, Reanimate, etc.)
                 # and spells targeting own creatures (pump spells, etc.)
                 targets_own_gy = 'graveyard' in oracle_lower and 'your graveyard' in oracle_lower
-                targets_own_creatures = 'you control' in oracle_lower and 'target creature' in oracle_lower and 'destroy' not in oracle_lower and 'exile' not in oracle_lower
+                # June 11 audit: self-flicker spells ("Exile target creature
+                # you control, then return it" — Ephemerate, Momentary Blink)
+                # contain 'exile' and were classified as removal, then
+                # rejected for "no opponent creatures" 4x in one game.
+                _is_self_flicker = ('target creature you control' in oracle_lower
+                                    and 'return' in oracle_lower)
+                targets_own_creatures = (
+                    'you control' in oracle_lower and 'target creature' in oracle_lower
+                    and (('destroy' not in oracle_lower and 'exile' not in oracle_lower)
+                         or _is_self_flicker))
 
                 # "Destroy target creature. Its controller creates an X/X" spells
                 # (Rapid Hybridization, Pongify, Beast Within). Reject casting
@@ -953,10 +962,17 @@ async def execute_claude_turn(engine, game: GameState) -> List[str]:
     import asyncio
     if not engine.claude_ai._api_disabled:
         try:
-            # Store task on game state (not ClaudePlayer) for parallel-game safety
-            game._strategy_task = asyncio.create_task(
-                engine.claude_ai._update_strategy(game, claude_index)
-            )
+            from mtg.claude_player import _strategy_call_due
+            previous_task = getattr(game, '_strategy_task', None)
+            if previous_task is not None and not previous_task.done():
+                print("[STRATEGIST] Previous per-game strategy task still running; "
+                      "not launching another")
+            elif _strategy_call_due(game):
+                # Store task on game state (not ClaudePlayer) for
+                # parallel-game safety.
+                game._strategy_task = asyncio.create_task(
+                    engine.claude_ai._update_strategy(game, claude_index)
+                )
         except Exception as e:
             print(f"[STRATEGIST] Failed to launch background task: {e}")
     
@@ -1293,13 +1309,13 @@ async def execute_claude_turn(engine, game: GameState) -> List[str]:
                         card = c
                         break
                 if card:
-                    # Validate: creatures with Defender can't attack (CR 508.1d)
-                    if card.has_defender():
-                        print(f"[COMBAT] Rejected attacker {card.name}: has Defender")
+                    can_attack, reason = engine.rules.can_attack_with(game, player, card)
+                    if not can_attack:
+                        print(f"[COMBAT] Rejected attacker {card.name}: {reason}")
                         continue
-                    # Validate: summoning sickness (no haste)
-                    if card.summoning_sick and not card.has_haste():
-                        print(f"[COMBAT] Rejected attacker {card.name}: summoning sickness")
+                    paid, tax_reason = engine.rules.pay_attack_tax(game, player, card)
+                    if not paid:
+                        print(f"[COMBAT] Rejected attacker {card.name}: {tax_reason}")
                         continue
                     card.attacking = True
                     card.attacking_player = 1 - claude_index
@@ -2112,17 +2128,12 @@ async def _validate_activation(engine, game: GameState, player: 'Player',
 
     # --- Python-side mana cost check (from ability cost text) ---
     if ability_cost:
-        cost_upper = ability_cost.upper()
-        # Count mana symbols in cost part (before any tap/sacrifice symbols)
-        mana_needed = 0
-        for m in re.findall(r'\{(\d+)\}', cost_upper):
-            mana_needed += int(m)
-        for color in ['W', 'U', 'B', 'R', 'G']:
-            mana_needed += cost_upper.count(f'{{{color}}}')
-        if mana_needed > 0:
-            available = player.available_mana()
-            if available < mana_needed:
-                return False, f"Not enough mana (need {mana_needed}, have {available})"
+        from mtg.engine import _activation_mana_cost
+        mana_cost = _activation_mana_cost(ability_cost)
+        if mana_cost:
+            can_pay, reason = player.can_pay_mana_cost(mana_cost)
+            if not can_pay:
+                return False, reason
 
     # --- XMage bridge cross-check (when available) ---
     if engine._xmage_available and engine.xmage_bridge:

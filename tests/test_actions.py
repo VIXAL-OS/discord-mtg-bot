@@ -81,8 +81,10 @@ class TestDrawCards:
         msg = run(rules, game, {"action": "draw_cards", "player": "Rick", "amount": 2})
         assert [c.name for c in rick.hand] == ["Alpha", "Beta"]
         assert [c.name for c in rick.library] == ["Gamma"]
-        # Rick is the human-path player: drawn names are shown to him.
-        assert "Alpha" in msg and "Beta" in msg
+        # Discord output is shared by both players, so private hand contents
+        # stay hidden even for the non-Claude/autoplay-human player.
+        assert "draws 2 card(s)" in msg
+        assert "Alpha" not in msg and "Beta" not in msg
 
     def test_empty_library_reports_instead_of_crashing(self, rules, game):
         msg = run(rules, game, {"action": "draw_cards", "player": "Rick", "amount": 2})

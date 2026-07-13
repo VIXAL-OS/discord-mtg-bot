@@ -300,9 +300,13 @@ class LayeredPermanent:
     
     # For copy tracking
     copy_of: Optional[str] = None
-    
+
     # For control tracking
     original_controller: str = ""
+
+    # Token flag — consumed by token-qualified anthem filters
+    # (Intangible Virtue, Phantom General). June 11 audit.
+    is_token: bool = False
     
     # Counters (applied in 7c)
     plus_counters: int = 0
@@ -333,6 +337,7 @@ class LayeredPermanent:
             'power': self.power,
             'toughness': self.toughness,
             'abilities': self.abilities,
+            'is_token': self.is_token,
         }
 
 

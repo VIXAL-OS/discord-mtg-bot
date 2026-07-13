@@ -41,6 +41,36 @@ except ImportError:
     HAS_MANA_ENGINE = False
 
 
+STRATEGY_REJECTION_THRESHOLD = 2
+STRATEGY_BACKOFF_TURNS = 3
+
+
+def _strategy_call_due(game: GameState) -> bool:
+    """Consume one per-game backoff turn and report whether to call strategist."""
+    remaining = max(0, getattr(game, '_strategy_backoff_turns', 0))
+    if not remaining:
+        return True
+    game._strategy_backoff_turns = remaining - 1
+    print(f"[STRATEGIST-BACKOFF] Skipping strategist call "
+          f"({game._strategy_backoff_turns} skipped turn(s) remain)")
+    return False
+
+
+def _record_strategy_memo_result(game: GameState, accepted: bool) -> None:
+    """Update the per-game rejection circuit after memo validation."""
+    if accepted:
+        game._strategy_rejection_streak = 0
+        game._strategy_backoff_turns = 0
+        return
+    game._strategy_rejection_streak = (
+        getattr(game, '_strategy_rejection_streak', 0) + 1)
+    if game._strategy_rejection_streak >= STRATEGY_REJECTION_THRESHOLD:
+        game._strategy_backoff_turns = STRATEGY_BACKOFF_TURNS
+        print(f"[STRATEGIST-BACKOFF] {game._strategy_rejection_streak} "
+              f"consecutive memo rejections; skipping next "
+              f"{STRATEGY_BACKOFF_TURNS} strategist turns")
+
+
 def _check_color_castable(mana_cost_str: str, mana_by_color: dict,
                           any_color_mana: int, total_mana: int) -> bool:
     """Check if a spell with the given mana cost is castable given available mana.
@@ -129,6 +159,19 @@ def _card_legality_note(card, game, opp_player) -> str:
     type_line = (getattr(card, 'type_line', '') or '').lower()
     is_instant_or_sorcery = 'instant' in type_line or 'sorcery' in type_line
 
+    # June 11 audit: the prompt advertised untapped Chainer as a target for
+    # Murderous Compulsion ("target tapped creature"), inducing repeated
+    # illegal casts in game 1514629178413154325. Ask the same full validator
+    # used by the cast path before adding card-specific heuristics below.
+    if is_instant_or_sorcery and opp_player is not None:
+        caster = next((p for p in game.players if p is not opp_player), None)
+        if caster is not None:
+            from rules.targeting_helpers import (
+                _find_any_valid_target, _spell_requires_targets)
+            if (_spell_requires_targets(card)
+                    and not _find_any_valid_target(game, card, caster.name)):
+                return "no legal targets"
+
     # Counterspell detection — only an issue when the stack is empty.
     # Counters on creatures (Mystic Snake, Frilled Mystic) and modal spells
     # with non-counter modes are excluded — they still have value on empty stack.
@@ -194,7 +237,16 @@ def _card_target_hint(card, game, opp_player) -> str:
     )
     if not targets_creature:
         return ""
-    opp_creatures = [c for c in opp_player.battlefield if c.is_creature()]
+    caster = next((p for p in game.players if p is not opp_player), None)
+    if caster is None:
+        return ""
+    from rules.targeting_helpers import _validate_target_for_action
+    opp_creatures = [
+        c for c in opp_player.battlefield
+        if c.is_creature()
+        and _validate_target_for_action(
+            game, c, opp_player, card, caster.name)[0]
+    ]
     if not opp_creatures:
         return ""
     # Pick the cheapest legal target as the hint (more likely to actually
@@ -244,7 +296,7 @@ class ClaudePlayer:
 
     def __init__(self, client: anthropic.Anthropic, usage_callback=None):
         self.client = client
-        self.model = "claude-sonnet-4-6"  # Game decisions use Sonnet (Opus reserved for emotional support)
+        self.model = "claude-sonnet-5"  # Game decisions use Sonnet (Opus reserved for emotional support)
         self.last_error = None  # Track errors for debugging
         self.usage_callback = usage_callback  # Callback for token tracking
         self.engine_ref = None  # Set by IntegratedGameEngine after init (for plan_turn PW access)
@@ -1274,6 +1326,7 @@ RULES (apply to your output, not your reasoning):
             # fragments. These are useless to the actor and worse than the
             # stale memo from last turn.
             if memo and len(memo) >= 80:
+                _record_strategy_memo_result(game, accepted=True)
                 self._strategy_memo = memo[:800]  # Cap length (matches sanitizer)
                 game._strategy_memo = self._strategy_memo
                 # Emit the kept memo update + a separate measurement line so a
@@ -1294,6 +1347,11 @@ RULES (apply to your output, not your reasoning):
                       f"final={_final_len} "
                       f"cap_binding={'yes' if _memo_raw_len > 800 else 'no'}")
             else:
+                # June 11 audit: game 1514621840440561704 paid for another
+                # 4,521-character memo that density validation discarded.
+                # Back off after repeated rejects instead of buying the same
+                # unusable result every turn.
+                _record_strategy_memo_result(game, accepted=False)
                 reason = "empty" if not memo else f"too short ({len(memo)} chars after sanitize)"
                 print(f"[STRATEGIST] Memo rejected ({reason}) — keeping previous "
                       f"({len(self._strategy_memo)} chars)")
@@ -3594,6 +3652,22 @@ Respond with ONLY "keep" or "mulligan"."""
         instants = self.has_instant_speed_cards(player)
         if not instants:
             return None  # No instants — auto-pass
+        # June 11 audit: the engine's pre-filter counts AFFORDABLE instants,
+        # but this list offered the LLM every instant in hand — it picked
+        # unpayable ones 305 times in one batch (doomed cast + retry each
+        # time). Filter here so the prompt only shows real options and the
+        # downstream vetoes are affordability-aware.
+        try:
+            _affordable = [c for c in instants if player.can_pay_mana_cost(c.mana_cost)[0]]
+            if len(_affordable) < len(instants):
+                _dropped = [c.name for c in instants if c not in _affordable]
+                print(f"[STACK-AI] {player.name}: filtered unaffordable instants from "
+                      f"response options: {_dropped[:4]}")
+            instants = _affordable
+        except (ValueError, KeyError, AttributeError, TypeError, IndexError) as _aff_err:
+            print(f"[STACK-AI] affordability filter error (offering full list): {_aff_err}")
+        if not instants:
+            return None  # Nothing affordable — auto-pass
 
         # May 16 audit: cheap pre-filter for "I literally have nothing that
         # could respond meaningfully" cases. Saves an API call when hand is
@@ -3863,11 +3937,21 @@ Respond with ONLY "keep" or "mulligan"."""
                                 and 'permanent' not in co
                                 and 'artifact' not in co
                                 and 'enchantment' not in co
+                                # June 11 audit: self-flicker (Ephemerate) is
+                                # protection, not removal.
+                                and not ('target creature you control' in co and 'return' in co)
                                 and not chosen_card_obj.is_creature()
                             )
                             if is_targeted_removal and not opp_creatures:
                                 print(f"[STACK-AI] Vetoed response '{explicit_card}' — targeted creature removal with no opposing creatures, passing instead")
                                 return None
+                        # June 11 audit: the model named a card outside the
+                        # affordable-instants list 305 times in one batch;
+                        # each pick burned a doomed cast attempt + retry.
+                        # Veto up-front instead of failing downstream.
+                        if chosen_card_obj is None:
+                            print(f"[STACK-AI] Vetoed response '{explicit_card}' — not in affordable instants list, passing instead")
+                            return None
                         return {"type": "cast", "card": explicit_card, "target": "stack_top"}
                     if text == "pass":
                         return None
@@ -3902,6 +3986,10 @@ Respond with ONLY "keep" or "mulligan"."""
                                     print(f"[STACK-AI] Vetoed response '{card_name}' — counterspell with empty stack, passing instead")
                                     return None
                                 break
+                    # June 11 audit: same affordability veto as the JSON path.
+                    if not any(c.name.lower() == card_name.lower() for c in instants):
+                        print(f"[STACK-AI] Vetoed response '{card_name}' — not in affordable instants list, passing instead")
+                        return None
                     return {"type": "cast", "card": card_name, "target": "stack_top"}
 
             # Last-resort fallback: the response may name an instant from hand without

@@ -295,6 +295,8 @@ def _find_any_valid_target(game, card, caster_name):
         # Check all permanents on the battlefield
         for pl in game.players:
             for perm in pl.battlefield:
+                if getattr(perm, '_phased_out', False):
+                    continue
                 t = _card_to_targetable(perm, pl.name, game=game)
                 if validator.can_target(src, t, restriction, caster_name)[0]:
                     return True
@@ -394,6 +396,8 @@ def _validate_target_for_action(game, target_card_or_name, target_owner_or_name,
             found = False
             for pl in game.players:
                 for c in pl.battlefield:
+                    if getattr(c, '_phased_out', False):
+                        continue
                     if c.name.lower() == target_name_lower:
                         target_card_or_name = c
                         ctrl_name = pl.name
@@ -403,6 +407,11 @@ def _validate_target_for_action(game, target_card_or_name, target_owner_or_name,
                     break
             if isinstance(target_card_or_name, str):
                 return True, ""  # Can't find target card — allow permissively
+
+        # CR 702.26b: a phased-out permanent is treated as though it does not
+        # exist, so it cannot be chosen or remain legal as a target.
+        if getattr(target_card_or_name, '_phased_out', False):
+            return False, f"{getattr(target_card_or_name, 'name', 'Target')} is phased out"
 
         tgt = _card_to_targetable(target_card_or_name, ctrl_name, game=game)
 
@@ -535,6 +544,8 @@ def _check_resolution_targets(game, stack_entry):
             target_found = False
             for pl in game.players:
                 for perm in pl.battlefield:
+                    if getattr(perm, '_phased_out', False):
+                        continue
                     if perm.name.lower() == target.lower() or target.lower() in perm.name.lower():
                         t = _card_to_targetable(perm, pl.name, game=game)
                         legal, reason = validator.can_target(src, t, restriction, caster_name)
@@ -597,6 +608,8 @@ def _check_resolution_targets(game, stack_entry):
             for pl in game.players:
                 if target in pl.battlefield:
                     card_still_on_bf = True
+                    if getattr(target, '_phased_out', False):
+                        return True, f"{card.name} fizzles — {target.name} is phased out"
                     t = _card_to_targetable(target, pl.name)
                     legal, reason = validator.can_target(src, t, restriction, caster_name)
                     if not legal:

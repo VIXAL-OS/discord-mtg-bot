@@ -117,6 +117,85 @@ try:
 except ImportError:
     HAS_PLANESWALKER = False
 
+
+def _clone_target_is_legal(source_card: Card, target_card: Card,
+                           entering_player: Player,
+                           target_controller: Player) -> bool:
+    """Apply the copy-choice restriction printed on the clone card."""
+    if source_card.name.lower() == "spark double":
+        return (target_controller is entering_player
+                and (target_card.is_creature() or target_card.is_planeswalker()))
+    # Preserve the existing clone-family scope here; broader noncreature-copy
+    # cards are handled by their dedicated template/action paths.
+    return target_card.is_creature()
+
+
+def _apply_clone_characteristics(card: Card, copy_target: Card) -> str:
+    """Apply battlefield copy values and Spark Double's exceptions."""
+    from mtg.actions import _snapshot_copy_source
+
+    original_name = card.name
+    _snapshot_copy_source(card)
+    card.name = copy_target.name
+    card.power = copy_target.power
+    card.toughness = copy_target.toughness
+    card.type_line = copy_target.type_line
+    card.oracle_text = copy_target.oracle_text
+    card.mana_cost = copy_target.mana_cost
+    card.cmc = copy_target.cmc
+    card.loyalty = copy_target.loyalty
+    card.keywords = list(copy_target.keywords or [])
+    card._is_copy = True
+    card._copy_of = copy_target.name
+    card._original_name = original_name
+
+    if original_name.lower() == "spark double":
+        # Spark Double's copy is explicitly nonlegendary. Removing the
+        # supertype keeps both the inline and delegated legend-rule checks
+        # from sacrificing a real permanent.
+        card.type_line = re.sub(r'\blegendary\s*', '', card.type_line or '',
+                                flags=re.IGNORECASE).strip()
+        if card.is_creature():
+            card.counters['+1/+1'] = card.counters.get('+1/+1', 0) + 1
+        elif card.is_planeswalker():
+            try:
+                card.loyalty_counters = int(card.loyalty or 0) + 1
+            except (TypeError, ValueError):
+                card.loyalty_counters = 1
+    elif card.is_planeswalker():
+        try:
+            card.loyalty_counters = int(card.loyalty or 0)
+        except (TypeError, ValueError):
+            card.loyalty_counters = 0
+    return original_name
+
+
+def _ghostly_flicker_targets(game: GameState, player: Player,
+                             target: Any) -> Tuple[List[Card], str]:
+    """Normalize and validate Ghostly Flicker's exactly-two target choice."""
+    legal = [
+        permanent for permanent in player.battlefield
+        if not getattr(permanent, '_phased_out', False)
+        and (permanent.is_creature() or permanent.is_land()
+             or 'artifact' in (permanent.type_line or '').lower())
+    ]
+    if target is None:
+        chosen = legal[:2]
+    else:
+        raw_targets = list(target) if isinstance(target, (list, tuple)) else [target]
+        chosen = []
+        for raw in raw_targets:
+            name = getattr(raw, 'name', str(raw))
+            match = next((card for card in legal
+                          if card is raw or card.name.lower() == name.lower()), None)
+            if match is None:
+                return [], (f"Ghostly Flicker can't target {name} — choose "
+                            "artifacts, creatures, or lands you control")
+            chosen.append(match)
+    if len(chosen) != 2 or chosen[0].id == chosen[1].id:
+        return [], "Ghostly Flicker requires exactly two distinct legal targets (CR 601.2c)"
+    return chosen, ""
+
 # Optional: XMage bridge for trigger discovery (used by _serialize_for_xmage)
 try:
     from rules.xmage_bridge import Permanent as XMagePermanent
@@ -221,13 +300,29 @@ async def cast_spell_async(engine, game: GameState, player: Player, card: Card, 
     if hasattr(card, '_spell_resolved'):
         card._spell_resolved = False
 
+    # June 11 audit: flashback/escape casts arrive here with the card in the
+    # GRAVEYARD (marked playable by the castable-list generator), but this
+    # gate only accepted hand membership — "'Momentary Blink' not found in
+    # hand" killed every flashback attempt in game 1514618481029677117.
+    # July 10: zone membership is checked BEFORE the mana/timing rules gate —
+    # a card the player doesn't hold must fail as "not in hand", not as a
+    # misleading "Not enough black mana" (which sent the autoplay AI into
+    # mana-fixing retries for cards that had already left the hand). All
+    # non-hand cast paths (command zone, rebound) pre-move the card into
+    # hand before calling this function, so hand ∪ marked-graveyard is the
+    # complete castable set here.
+    _cast_from_graveyard = (
+        card not in player.hand
+        and card in player.graveyard
+        and card.id in (getattr(player, 'playable_from_graveyard', None) or [])
+    )
+    if card not in player.hand and not _cast_from_graveyard:
+        return False, "Card not in hand", []
+
     # Check rules
     can_cast, reason = engine.rules.can_cast_spell(game, player, card)
     if not can_cast:
         return False, reason, []
-
-    if card not in player.hand:
-        return False, "Card not in hand", []
 
     # CR 601.2c: a spell that requires a target can't be cast unless at least
     # one legal target exists. May 17 audit: previously the engine would let
@@ -238,26 +333,66 @@ async def cast_spell_async(engine, game: GameState, player: Player, card: Card, 
     # today, so we narrow to auras here.
     _oracle_lower = (card.oracle_text or '').lower()
     _type_line_lower = (card.type_line or '').lower()
+    if card.name.lower() == 'ghostly flicker':
+        chosen_targets, target_error = _ghostly_flicker_targets(game, player, target)
+        if target_error:
+            return False, target_error, []
+        target = chosen_targets
     if 'aura' in _type_line_lower and ('enchant creature' in _oracle_lower or 'enchant permanent' in _oracle_lower):
-        # Quick legal-target scan: does ANY permanent on the battlefield
-        # satisfy "enchant creature" / "enchant permanent"? Hexproof/shroud
-        # checks are done at resolution; here we just want to see one body.
-        is_creature_only = 'enchant creature' in _oracle_lower
-        any_target = False
-        for p in game.players:
-            for c in p.battlefield:
-                if c.id == card.id:
-                    continue
-                if is_creature_only and not c.is_creature():
-                    continue
-                any_target = True
-                break
-            if any_target:
-                break
-        if not any_target:
-            return (False,
-                    f"{card.name} can't be cast — no legal targets on the battlefield (CR 601.2c)",
-                    [])
+        # June 11 audit: Animate Dead / Necromancy / Dance of the Dead say
+        # "Enchant creature card in a graveyard" — this scan checked the
+        # BATTLEFIELD for them, rejecting the cast 6 times in one game while
+        # the graveyard was full of legal targets (surfacing upstream as the
+        # "unknown reason — mana looks sufficient" retry storm). Scan the
+        # zone the aura actually enchants.
+        if 'in a graveyard' in _oracle_lower:
+            declared_graveyard_target = None
+            declared_graveyard_owner = None
+            if target is not None:
+                target_name = getattr(target, 'name', target)
+                for p in game.players:
+                    for gc in p.graveyard:
+                        if gc is target or (isinstance(target_name, str) and gc.name.lower() == target_name.lower()):
+                            declared_graveyard_target = gc
+                            declared_graveyard_owner = p
+                            break
+                    if declared_graveyard_target:
+                        break
+                if not declared_graveyard_target or not declared_graveyard_target.is_creature():
+                    return (False,
+                            f"{card.name} can't target {target_name} — it is not a creature card in a graveyard",
+                            [])
+                card._declared_graveyard_target_id = declared_graveyard_target.id
+                card._declared_graveyard_target_owner = declared_graveyard_owner.name
+            any_target = any(
+                gc.is_creature()
+                for p in game.players
+                for gc in p.graveyard
+            )
+            if not any_target:
+                return (False,
+                        f"{card.name} can't be cast — no creature cards in any graveyard (CR 601.2c)",
+                        [])
+        else:
+            # Quick legal-target scan: does ANY permanent on the battlefield
+            # satisfy "enchant creature" / "enchant permanent"? Hexproof/shroud
+            # checks are done at resolution; here we just want to see one body.
+            is_creature_only = 'enchant creature' in _oracle_lower
+            any_target = False
+            for p in game.players:
+                for c in p.battlefield:
+                    if c.id == card.id:
+                        continue
+                    if is_creature_only and not c.is_creature():
+                        continue
+                    any_target = True
+                    break
+                if any_target:
+                    break
+            if not any_target:
+                return (False,
+                        f"{card.name} can't be cast — no legal targets on the battlefield (CR 601.2c)",
+                        [])
 
     # CR 903.4: a card may not be cast in a singleton command-zone format if its
     # color identity is outside the player's commander color identity. Apr 30
@@ -336,6 +471,25 @@ async def cast_spell_async(engine, game: GameState, player: Player, card: Card, 
         if not _find_any_valid_target(game, card, player.name):
             print(f"[TARGETING] {card.name} has no valid targets — cast blocked")
             return False, f"{card.name} has no valid targets", []
+
+        # Validate the target actually declared by the caller, not merely the
+        # existence of some other legal target. Graveyard Auras are handled
+        # above because the generic adapter is battlefield-oriented.
+        if target is not None and 'in a graveyard' not in _oracle_lower:
+            declared_targets = (list(target)
+                                if isinstance(target, (list, tuple)) else [target])
+            for declared_target in declared_targets:
+                if hasattr(declared_target, 'battlefield'):
+                    legal, target_reason = _validate_player_target_for_action(
+                        game, declared_target, card, player.name)
+                else:
+                    target_owner = next(
+                        (p for p in game.players
+                         if declared_target in p.battlefield), player)
+                    legal, target_reason = _validate_target_for_action(
+                        game, declared_target, target_owner, card, player.name)
+                if not legal:
+                    return False, f"Illegal target for {card.name}: {target_reason}", []
 
     # Calculate total cost including commander tax
     # Handle X-cost spells: X defaults to all available mana minus fixed costs
@@ -508,6 +662,7 @@ async def cast_spell_async(engine, game: GameState, player: Player, card: Card, 
                         player.hand.remove(to_exile)
                         player.exile.append(to_exile)
                         player.life -= 1
+                        player.record_life_loss(1)
                         effect_messages = [f"💫 {card.name} cast via alternate cost: exile {to_exile.name}, pay 1 life (Life: {player.life})"]
                         pay_mana = False
                         used_alternate_cost = True
@@ -635,7 +790,27 @@ async def cast_spell_async(engine, game: GameState, player: Player, card: Card, 
         # Track mana paid for X spell calculations
         card._mana_paid = total_cost
 
-    player.hand.remove(card)
+    # Preserve the origin for effects such as Wash Away that inspect where
+    # the target spell was cast from after it has moved to the stack.
+    if getattr(card, 'cast_from_command_zone', False):
+        card._cast_origin = 'command_zone'
+    elif _cast_from_graveyard:
+        card._cast_origin = 'graveyard'
+    else:
+        card._cast_origin = 'hand'
+
+    if _cast_from_graveyard:
+        player.graveyard.remove(card)
+        try:
+            player.playable_from_graveyard.remove(card.id)
+        except (ValueError, AttributeError):
+            pass
+        # CR 702.34a: a flashbacked spell is exiled as it resolves —
+        # consumed by the resolution zone-routing below.
+        card._resolving_flashback = True
+        print(f"[FLASHBACK] {card.name} cast from graveyard (leaves graveyard)")
+    else:
+        player.hand.remove(card)
 
     # Track spells cast this turn (for day/night, werewolf transform, Esper Sentinel)
     player.spells_cast_this_turn += 1
@@ -907,9 +1082,42 @@ async def cast_spell_async(engine, game: GameState, player: Player, card: Card, 
                 game.stack.remove(stack_entry)
             _drop_from_priority_stack()
             # Signature spells return to command zone even when countered
+            _countered_to = getattr(stack_entry, 'countered_to', None)
             if getattr(card, 'is_signature_spell', False) and game.format == "oathbreaker":
                 player.command_zone.append(card)
                 print(f"[OATHBREAKER] {card.name} was countered → returns to command zone")
+                effect_messages.append(f"❌ **{card.name}** was countered! → returns to command zone")
+            elif _countered_to == "exile_suspend":
+                # Delay: exile with three time counters, suspended (owner
+                # recasts free when they run out — CR 702.62). June 11 audit:
+                # this went to graveyard, and the "countered" Bloodghast
+                # landfall-returned two turns later.
+                card.suspended = True
+                card.counters['time'] = 3
+                player.exile.append(card)
+                print(f"[STACK] {card.name} was countered — exiled with 3 time counters (suspend)")
+                effect_messages.append(f"❌ **{card.name}** was countered — exiled with three time counters (suspended)!")
+            elif _countered_to == "library":
+                # Commit: owner's library, second from the top (CR 608.2 —
+                # a resolved Commit moves the spell off the stack itself).
+                _pos = min(1, len(player.library))
+                player.library.insert(_pos, card)
+                print(f"[STACK] {card.name} was countered — put into library second from top")
+                effect_messages.append(f"❌ **{card.name}** is put into its owner's library, second from the top!")
+            elif _countered_to == "library_top":
+                player.library.insert(0, card)
+                print(f"[STACK] {card.name} was countered — put on top of its owner's library")
+                effect_messages.append(f"❌ **{card.name}** is put on top of its owner's library!")
+            elif (getattr(card, 'is_commander', False)
+                  and game.format in COMMAND_ZONE_FORMATS):
+                # CR 903.9b: a countered commander may go to the command zone
+                # instead of the graveyard; autoplay always chooses it. June 11
+                # audit: Aminatou was countered into the graveyard and lost for
+                # the remaining 16 turns (game 1514618481029677117).
+                if not hasattr(player, 'command_zone') or player.command_zone is None:
+                    player.command_zone = []
+                player.command_zone.append(card)
+                print(f"[STACK] {card.name} was countered — commander returns to command zone (CR 903.9)")
                 effect_messages.append(f"❌ **{card.name}** was countered! → returns to command zone")
             else:
                 player.graveyard.append(card)
@@ -1134,6 +1342,7 @@ async def cast_spell_async(engine, game: GameState, player: Player, card: Card, 
                             if 'source' not in action and '_source_card_name' not in action:
                                 action['_source_card_name'] = card.name
                                 action['_source_controller'] = player.name
+                                action['_source_oracle'] = card.oracle_text or ''
                                 # The deal_damage handler reads `source` first;
                                 # set it too for templates that don't supply one.
                                 if action.get('action') == 'deal_damage' and not action.get('source'):
@@ -1331,6 +1540,14 @@ async def cast_spell_async(engine, game: GameState, player: Player, card: Card, 
             player.command_zone.append(card)
             effect_messages.append(f"📜 {card.name} returns to command zone (signature spell)")
             print(f"[OATHBREAKER] {card.name} resolved → returns to command zone")
+        elif getattr(card, '_resolving_flashback', False):
+            # CR 702.34a: flashbacked spells exile instead of going to the
+            # graveyard (June 11 audit — flashback casts previously either
+            # failed outright or would have recycled into the graveyard).
+            card._resolving_flashback = False
+            player.exile.append(card)
+            effect_messages.append(f"📤 {card.name} is exiled (flashback)")
+            print(f"[FLASHBACK] {card.name} resolved → exiled (CR 702.34a)")
         elif 'rebound' in oracle_lower and not getattr(card, '_from_rebound', False):
             # Rebound: exile instead of graveyard, recast at next upkeep
             player.exile.append(card)
@@ -1342,12 +1559,19 @@ async def cast_spell_async(engine, game: GameState, player: Player, card: Card, 
                 "controller": player_idx,
                 "once": True,
                 "turn_delay": 0,
+                # Rebound recasts at the CASTER'S next upkeep (CR 702.87a);
+                # without upkeep_of it fired on the opponent's upkeep instead.
+                "upkeep_of": player_idx,
                 "actions": [
                     {"action": "rebound_cast", "card": card.name, "player": player.name}
                 ],
             })
             effect_messages.append(f"🔄 {card.name} exiled with rebound — will recast at your next upkeep")
             print(f"[REBOUND] {card.name} exiled, scheduled for next upkeep")
+        elif f"shuffle {card.name.lower()} into its owner's library" in oracle_lower:
+            player.library.append(card)
+            random.shuffle(player.library)
+            effect_messages.append(f"🔀 {card.name} is shuffled into its owner's library")
         elif getattr(card, 'is_signature_spell', False) and game.format == "oathbreaker":
             # CR Oathbreaker: Signature spell returns to command zone on resolve.
             if not hasattr(player, 'command_zone') or player.command_zone is None:
@@ -1369,6 +1593,10 @@ async def cast_spell_async(engine, game: GameState, player: Player, card: Card, 
         card.entered_this_turn = True
         player.battlefield.append(card)
         engine.rules.log_event(f"{player.name} casts {card.name} (permanent)")
+
+        if card.name.lower() == 'wishclaw talisman':
+            card.counters['wish'] = 3
+            effect_messages.append("🔮 Wishclaw Talisman enters with three wish counters")
 
         # [SAGA] Sagas get their first lore counter on ETB (CR 714.3a)
         if 'saga' in (card.type_line or '').lower():
@@ -1432,7 +1660,7 @@ async def cast_spell_async(engine, game: GameState, player: Player, card: Card, 
             if is_clone:
                 copy_target = None
                 # [CLONE] Honor the AI-specified target first if it resolves to a
-                # legal creature on the battlefield (any controller). Falls back to
+                # legal copy choice on the battlefield. Falls back to
                 # the best-power heuristic only if no target was given or it can't
                 # be found. Applies to Clone, Spark Double, Phantasmal Image,
                 # Body Double, Phyrexian Metamorph, Sakashima the Impostor, etc.
@@ -1447,7 +1675,8 @@ async def cast_spell_async(engine, game: GameState, player: Player, card: Card, 
                 if target_name:
                     for sp in game.players:
                         for c in sp.battlefield:
-                            if c.id == card.id or not c.is_creature():
+                            if (c.id == card.id
+                                    or not _clone_target_is_legal(card, c, player, sp)):
                                 continue
                             if c.name.lower() == target_name.lower():
                                 copy_target = c
@@ -1462,7 +1691,8 @@ async def cast_spell_async(engine, game: GameState, player: Player, card: Card, 
                     best_value = -1
                     for sp in game.players:
                         for c in sp.battlefield:
-                            if c.id == card.id or not c.is_creature():
+                            if (c.id == card.id
+                                    or not _clone_target_is_legal(card, c, player, sp)):
                                 continue
                             try:
                                 p_val = c.get_effective_power(game) if hasattr(c, 'get_effective_power') else (int(c.power) if c.power else 0)
@@ -1473,22 +1703,7 @@ async def cast_spell_async(engine, game: GameState, player: Player, card: Card, 
                                 best_value = p_val + t_val
                                 copy_target = c
                 if copy_target:
-                    original_name = card.name
-                    card.name = copy_target.name
-                    card.power = copy_target.power
-                    card.toughness = copy_target.toughness
-                    card.type_line = copy_target.type_line
-                    card.oracle_text = copy_target.oracle_text
-                    card.mana_cost = copy_target.mana_cost
-                    card.cmc = copy_target.cmc
-                    if copy_target.keywords:
-                        card.keywords = list(copy_target.keywords)
-                    card._is_copy = True
-                    card._copy_of = copy_target.name
-                    card._original_name = original_name
-                    # Spark Double: enters with an additional +1/+1 counter
-                    if "spark double" in original_name.lower():
-                        card.counters['+1/+1'] = card.counters.get('+1/+1', 0) + 1
+                    original_name = _apply_clone_characteristics(card, copy_target)
                     effect_messages.append(f"🪞 {original_name} enters as a copy of {copy_target.name}!")
                     print(f"[CLONE] {original_name} copies {copy_target.name} ({copy_target.power}/{copy_target.toughness})")
                 else:
@@ -1513,18 +1728,31 @@ async def cast_spell_async(engine, game: GameState, player: Player, card: Card, 
             reanimate_auras = ["animate dead", "dance of the dead", "necromancy"]
             if ("enchant creature card in a graveyard" in oracle_lower or
                 card.name.lower() in reanimate_auras):
-                # Find best creature in any graveyard
+                # Honor the target declared at cast time. Only targetless
+                # autoplay/manual fallbacks use the best-power heuristic.
                 target_card, target_player = None, None
+                declared_id = getattr(card, '_declared_graveyard_target_id', None)
+                declared_name = getattr(target, 'name', target) if target is not None else None
                 best_power = -1
                 for p in game.players:
                     for c in p.graveyard:
-                        if c.is_creature():
+                        is_declared = (
+                            declared_id and c.id == declared_id
+                        ) or (
+                            not declared_id and isinstance(declared_name, str)
+                            and c.name.lower() == declared_name.lower()
+                        )
+                        if c.is_creature() and (target is None or is_declared):
                             try:
                                 p_val = c.get_effective_power(game) if hasattr(c, 'get_effective_power') else 0
                             except (ValueError, TypeError):
                                 p_val = int(c.power) if c.power and str(c.power).lstrip('-').isdigit() else 0
-                            if p_val > best_power:
+                            if is_declared or p_val > best_power:
                                 best_power, target_card, target_player = p_val, c, p
+                                if is_declared:
+                                    break
+                    if target_card and target is not None:
+                        break
                 if target_card and target_player:
                     target_player.graveyard.remove(target_card)
                     target_card.reset_battlefield_state()
@@ -1902,16 +2130,12 @@ async def cast_spell_async(engine, game: GameState, player: Player, card: Card, 
                 # "When ~ enters..." (Scryfall uses card name, not ~)
                 # But NOT "Whenever another creature enters..." (ongoing trigger)
                 # And NOT "Whenever a land enters..." (landfall - ongoing)
-                is_self_etb = False
-                
-                if p_lower.startswith("when") and "enters" in p_lower:
-                    if not p_lower.startswith("whenever"):
-                        # "When X enters" — standard one-time ETB
-                        is_self_etb = True
-                    elif card.name.lower() in p_lower:
-                        # "Whenever Inferno Titan enters the battlefield or attacks"
-                        # Modern combined ETB+attack template — still a engine-ETB
-                        is_self_etb = True
+                # June 11 audit: modern Oracle text uses "this creature" for
+                # the Titan cycle's combined enter/attack triggers. The old
+                # printed-name-only branch silently skipped both Titan ETBs in
+                # game 1514633271047225385.
+                from mtg.triggers import _is_self_etb_trigger_paragraph
+                is_self_etb = _is_self_etb_trigger_paragraph(card, paragraph)
                 
                 # Also match "As [card name] enters" (replacement effects like clone)
                 if p_lower.startswith("as ") and "enters" in p_lower:
@@ -1930,9 +2154,17 @@ async def cast_spell_async(engine, game: GameState, player: Player, card: Card, 
                 # cast returned both Plaguecrafter and Sram). One-shot flag:
                 # cleared here so non-cast re-entries (flicker) still use the
                 # template path.
+                # June 11 audit: the C8 skip left effect_messages empty, so the
+                # Tier 2 gate below re-resolved the aura anyway via
+                # SpellResolver → XMage bridge (game 1514621789555265558: one
+                # Animate Dead reanimated Craterhoof inline AND a phantom
+                # Shriekmaw via the bridge, and discord reported the wrong
+                # one). _etb_handled_inline gates every later tier.
+                _etb_handled_inline = False
                 if not effect_messages and getattr(card, '_reanimate_handled', False):
                     print(f"[ETB-TEMPLATE] Skipping {card.name} — reanimation already handled inline (C8)")
                     card._reanimate_handled = False
+                    _etb_handled_inline = True
                 # Tier 1.5: Try effect template library (data-driven, no API)
                 elif not effect_messages and HAS_EFFECT_TEMPLATES:
                     try:
@@ -2080,7 +2312,7 @@ async def cast_spell_async(engine, game: GameState, player: Player, card: Card, 
                         print(f"[TEMPLATE] Error for {card.name}: {e}")
                 
                 # Tier 2: If no special handling, try SpellResolver with just the ETB text
-                if not effect_messages and engine.spell_resolver:
+                if not effect_messages and not _etb_handled_inline and engine.spell_resolver:
                     try:
                         etb_text = "\n".join(etb_paragraphs)
                         
@@ -2213,7 +2445,7 @@ async def cast_spell_async(engine, game: GameState, player: Player, card: Card, 
                         print(f"[SPELL_RESOLVER] Error resolving ETB for {card.name}: {e}")
                 
                 # If still nothing resolved, log for future hardcoding
-                if not effect_messages:
+                if not effect_messages and not _etb_handled_inline:
                     etb_text = "\n".join(etb_paragraphs)
                     print(f"[ETB-UNHANDLED] {card.name}: {etb_text[:150]}")
                     if _should_emit_resolve_hint(game, f"etb:{card.name}"):
@@ -2232,6 +2464,10 @@ async def cast_spell_async(engine, game: GameState, player: Player, card: Card, 
         if card.is_creature(game):
             terror_triggers = await engine._check_creature_etb_triggers(game, player, card)
             effect_messages.extend(terror_triggers)
+        else:
+            from mtg.triggers import _check_permanent_etb_watchers
+            effect_messages.extend(_check_permanent_etb_watchers(
+                engine, game, player, card))
 
         # June 10 deep-dive (B9): constellation / "whenever an enchantment
         # enters" watchers had no scan AT ALL — Eidolon of Blossoms drew 0 of
@@ -2240,6 +2476,15 @@ async def cast_spell_async(engine, game: GameState, player: Player, card: Card, 
             from mtg.triggers import _check_enchantment_etb_watchers
             ench_watcher_msgs = _check_enchantment_etb_watchers(engine, game, player, card)
             effect_messages.extend(ench_watcher_msgs)
+
+        # June 11 smaller queue: Hammer of Nazahn's placeholder claimed this
+        # watcher already existed. Resolve its free attach for Equipment that
+        # enter after Hammer; Hammer's own entry is handled by its template.
+        if card.is_artifact() and 'equipment' in (card.type_line or '').lower():
+            from mtg.triggers import _check_equipment_etb_watchers
+            equipment_watcher_msgs = _check_equipment_etb_watchers(
+                engine, game, player, card)
+            effect_messages.extend(equipment_watcher_msgs)
 
     # [LAYERS] Register static keyword-granting abilities and recalculate
     # [REPLACEMENT] Register replacement effects (Furnace of Rath, Rest in Peace, etc.)
@@ -3037,7 +3282,12 @@ def resolve_special_effects(engine, game: GameState, player: Player, card: Card,
                     hand_lands.append(land.name)
                 else:
                     # Check land's own ETB-tapped + replacement effects, OR spell-level tapped
-                    land_tapped, _ = engine.rules._check_enters_tapped(game, land, player)
+                    # June 11 audit: the message (shockland "pays 2 life") was
+                    # discarded here, so life payments on fetched shocklands
+                    # were console-only (game 1514629231433351168 turn 23).
+                    land_tapped, _etb_msg = engine.rules._check_enters_tapped(game, land, player)
+                    if _etb_msg:
+                        messages.append(f"🩸 {land.name}{_etb_msg}")
                     enters_tapped = spell_enters_tapped or land_tapped
                     land.tapped = enters_tapped
                     land.entered_this_turn = True
@@ -3045,6 +3295,18 @@ def resolve_special_effects(engine, game: GameState, player: Player, card: Card,
                     battlefield_lands.append(land.name)
                     if enters_tapped:
                         any_tapped = True
+                    # June 11 audit: landfall (Avenger of Zendikar, Omnath…)
+                    # fired for ability-based fetches but NOT for this
+                    # Kodama's Reach / Migration Path spell path — CR 603.2
+                    # doesn't care how the land entered. Two missed Avenger
+                    # triggers delayed a won game two full turns
+                    # (game 1514626038192144445).
+                    try:
+                        _lf_msgs = engine._handle_land_etb(game, player, land)
+                        if _lf_msgs:
+                            messages.extend(_lf_msgs)
+                    except (ValueError, KeyError, AttributeError, TypeError, IndexError) as _lf_err:
+                        print(f"[LANDFALL] Error in ramp-spell land ETB: {_lf_err}")
 
             if battlefield_lands:
                 tapped_str = " tapped" if any_tapped else ""

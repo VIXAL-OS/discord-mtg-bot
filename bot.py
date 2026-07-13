@@ -43,7 +43,7 @@ class BotConfig:
     # Model selection — Sonnet handles everything for the MTG bot.
     # (The companion bot in the sibling repo handles the Opus/Haiku distress
     # switching; here we just want fast, capable chat during games.)
-    model_default: str = "claude-sonnet-4-6"
+    model_default: str = "claude-sonnet-5"
     max_tokens: int = 2048
 
     # Context management

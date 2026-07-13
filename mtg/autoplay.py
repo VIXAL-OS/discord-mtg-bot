@@ -49,9 +49,40 @@ from typing import Any, Dict, List, Optional, Tuple
 import aiohttp, discord
 
 from mtg.constants import Phase, Zone, COMMAND_ZONE_FORMATS, PHASE_NAMES
-from mtg.helpers import _normalize_pw_ability_idx, _resolve_player_or_card_target
+from mtg.helpers import _normalize_pw_ability_idx, _resolve_player_or_card_target, coerce_ai_string
 from mtg.models import Card, Player, GameState
 from mtg.util import GameLogger
+
+# June 11 audit: process-wide autoplay concurrency counters. Concurrent games
+# share one API adapter, so per-game stat deltas sweep up other games' tokens;
+# these let the [STATS-GAME] emit label itself unreliable when that happened.
+_ACTIVE_AUTOPLAY_GAMES = 0
+_AUTOPLAY_GAMES_STARTED = 0
+_THREAD_CREATE_LOCK = None
+_THREAD_CREATE_LAST = 0.0
+
+
+async def _create_autoplay_thread(channel, name):
+    """Rate-limit parallel Discord thread creation and retry explicit 429s."""
+    global _THREAD_CREATE_LOCK, _THREAD_CREATE_LAST
+    if _THREAD_CREATE_LOCK is None:
+        _THREAD_CREATE_LOCK = asyncio.Lock()
+    async with _THREAD_CREATE_LOCK:
+        gap = 1.0 - (time.monotonic() - _THREAD_CREATE_LAST)
+        if gap > 0:
+            await asyncio.sleep(gap)
+        for attempt in range(4):
+            try:
+                thread = await channel.create_thread(
+                    name=name, type=discord.ChannelType.public_thread)
+                _THREAD_CREATE_LAST = time.monotonic()
+                return thread
+            except discord.HTTPException as exc:
+                if exc.status != 429 or attempt == 3:
+                    raise
+                retry_after = float(getattr(exc, 'retry_after', 2.0) or 2.0)
+                print(f"[AUTOPLAY-THREAD] Discord 429; retrying in {retry_after}s")
+                await asyncio.sleep(retry_after)
 
 try:
     from rules.effect_templates import get_effect_library, build_game_context
@@ -136,6 +167,13 @@ async def _resolve_combat(cog, ctx, game: GameState):
     events = cog.engine.check_state_based_actions(game)
     if events:
         await ctx.send("\n".join(events))
+
+    # June 11 audit: Judith's dies trigger was queued during combat but not
+    # drained until after main phase 2, allowing postcombat actions before a
+    # trigger that should already have resolved (game 1514621840440561704).
+    # Combat damage + SBAs form a priority boundary: drain before MAIN2.
+    for msg in await cog.engine.drain_pending_triggers(game):
+        await ctx.send(msg)
     
     # Save game state
     cog.engine.save_game(game)
@@ -542,12 +580,12 @@ async def _autoplay_human_turn(cog, thread, game: GameState, player_idx: int):
                 repeat_count += 1
                 if repeat_count >= 3:
                     if action.get('type') == 'resolve':
-                        desc = action.get('description', '')
+                        desc = coerce_ai_string(action.get('description', ''))
                         if desc:
                             desc_lower = desc.lower()
                             game.pending_resolves = [
                                 pr for pr in game.pending_resolves
-                                if not any(word in pr.lower() for word in desc_lower.split() if len(word) > 3)
+                                if not any(word in str(pr).lower() for word in desc_lower.split() if len(word) > 3)
                             ]
                             print(f"[AUTOPLAY] Cleared stale pending resolve: {desc[:80]}")
                     last_error = f"You've tried '{action.get('card', action.get('permanent', ''))}' multiple times. Try something else or pass."
@@ -625,8 +663,10 @@ async def _autoplay_human_turn(cog, thread, game: GameState, player_idx: int):
                         # Validate with rules engine (like !attack does)
                         can_attack, reason = cog.engine.rules.can_attack_with(game, player, c)
                         if can_attack:
-                            card = c
-                            break
+                            paid, tax_reason = cog.engine.rules.pay_attack_tax(game, player, c)
+                            if paid:
+                                card = c
+                                break
                 if card:
                     card.attacking = True
                     card.attacking_player = 1 - player_idx
@@ -844,8 +884,10 @@ async def _autoplay_human_turn(cog, thread, game: GameState, player_idx: int):
                             and c.is_creature() and not c.tapped):
                         can_attack, reason = cog.engine.rules.can_attack_with(game, player, c)
                         if can_attack:
-                            card = c
-                            break
+                            paid, tax_reason = cog.engine.rules.pay_attack_tax(game, player, c)
+                            if paid:
+                                card = c
+                                break
                 if card:
                     card.attacking = True
                     card.attacking_player = 1 - player_idx
@@ -979,12 +1021,12 @@ async def _autoplay_human_turn(cog, thread, game: GameState, player_idx: int):
                     repeat_count += 1
                     if repeat_count >= 3:
                         if action.get('type') == 'resolve':
-                            desc = action.get('description', '')
+                            desc = coerce_ai_string(action.get('description', ''))
                             if desc:
                                 desc_lower = desc.lower()
                                 game.pending_resolves = [
                                     pr for pr in game.pending_resolves
-                                    if not any(word in pr.lower() for word in desc_lower.split() if len(word) > 3)
+                                    if not any(word in str(pr).lower() for word in desc_lower.split() if len(word) > 3)
                                 ]
                                 print(f"[AUTOPLAY] Cleared stale pending resolve (MAIN2): {desc[:80]}")
                         if repeat_count >= 5:
@@ -1020,6 +1062,12 @@ async def _autoplay_execute_action(cog, thread, game: GameState, player_idx: int
     requiring a Discord ctx object.
     """
     player = game.players[player_idx]
+    # The LLM occasionally emits structured values (dict/list/int) in fields
+    # the schema types as strings; every downstream consumer assumes str
+    # (.strip()/.lower()), so coerce once here rather than at each use site.
+    for _sfield in ("card", "permanent", "target", "description"):
+        if _sfield in action and not isinstance(action[_sfield], str):
+            action[_sfield] = coerce_ai_string(action[_sfield])
     # June 10 audit (C3/V28): positional cast→resolve pairing. Capture the
     # previous action's cast/activate stamp, then clear; the cast/activate
     # branches below re-stamp on entry. A `resolve` that IMMEDIATELY follows
@@ -1856,6 +1904,7 @@ async def _autoplay_resolve_pending_action(cog, thread, game: GameState):
             pay = max(0, min(player.life - 5, 10))
             if pay > 0:
                 player.life -= pay
+                player.record_life_loss(pay)
                 # Store token size on the card
                 for c in player.battlefield:
                     if c.id == card_id:
@@ -1982,6 +2031,19 @@ async def _run_single_autoplay(cog, channel, game_format: str, deck1_name: str, 
               "p1_life": 0, "p2_life": 0, "error": None, "thread_id": None,
               "duration_seconds": 0}
 
+    # June 11 audit: concurrency tracking so the per-game stats line can say
+    # when its numbers are polluted by parallel games (all concurrent games
+    # share one adapter — see the PARALLEL-MODE CAVEAT near the emit).
+    global _ACTIVE_AUTOPLAY_GAMES, _AUTOPLAY_GAMES_STARTED
+    try:
+        _ACTIVE_AUTOPLAY_GAMES += 1
+        _AUTOPLAY_GAMES_STARTED += 1
+    except NameError:
+        _ACTIVE_AUTOPLAY_GAMES = 1
+        _AUTOPLAY_GAMES_STARTED = 1
+    _concurrency_at_start = _ACTIVE_AUTOPLAY_GAMES
+    _games_started_snapshot = _AUTOPLAY_GAMES_STARTED
+
     # --- Alternative provider swap for cost-efficient autoplay ---
     # Duck-typing means ClaudePlayer/RulesEngine work unchanged with any adapter.
     _original_clients = None
@@ -2087,10 +2149,8 @@ async def _run_single_autoplay(cog, channel, game_format: str, deck1_name: str, 
         label = matchup_label or f"{deck1_name} vs {deck2_name}"
 
         # Create game thread
-        thread = await channel.create_thread(
-            name=f"MTG Autoplay: {label} ({game_format})",
-            type=discord.ChannelType.public_thread
-        )
+        thread = await _create_autoplay_thread(
+            channel, f"MTG Autoplay: {label} ({game_format})")
         result["thread_id"] = thread.id
 
         # Create game
@@ -2369,9 +2429,29 @@ async def _run_single_autoplay(cog, channel, game_format: str, deck1_name: str, 
                         if max_l - min_l >= 3:
                             has_swing = True
                             break
+                    # June 11 audit: don't call a stagnation draw while a kill
+                    # is visibly pending — game 1514621789630631936 was drawn
+                    # with Rick at 1 life, empty board, one combat step before
+                    # Claude's newly-cast (summoning-sick) Peregrine Drake
+                    # could swing for lethal.
+                    if not has_swing:
+                        for _si, _sp in enumerate(game.players):
+                            _opp_p = game.players[1 - _si]
+                            if _sp.life <= 5 and any(
+                                    c.is_creature() for c in _opp_p.battlefield):
+                                has_swing = True
+                                print(f"[AUTOPLAY] [STUCK-GAME] Stagnation suppressed: "
+                                      f"{_sp.name} at {_sp.life} life with opposing "
+                                      f"creatures on board — kill pending")
+                                break
                     if not has_swing:
                         game.ended = True
                         game.winner = None
+                        # June 11 audit: without this, the Draw summary's
+                        # fallback printed "Reason: simultaneous loss" for
+                        # stagnation timeouts.
+                        game.loss_reason = ("stagnation — no significant life "
+                                            "change in 15 turns")
                         await cog._autoplay_send(thread,
                             "⏸️ **Stagnation draw — no significant "
                             "life change in 15 turns past turn 30 (likely a flicker or "
@@ -2630,9 +2710,13 @@ async def _run_single_autoplay(cog, channel, game_format: str, deck1_name: str, 
             loser = game.players[1 - game.winner]
             result["outcome"] = "win_p1" if game.winner == 0 else "win_p2"
             result["winner"] = winner.name
+            # June 11 audit: lose_the_game/pay_or_lose zero the loser's life as
+            # an SBA shortcut, which fabricated "Final life: 0" for players who
+            # died to a pact at 26 life. Prefer the stashed pre-loss total.
+            _loser_life = getattr(loser, '_final_life_before_loss', loser.life)
             await cog._autoplay_send(thread,
                 f"\U0001f3c6 **{winner.name} wins!**\n"
-                f"\u2022 Final life: {winner.name} {max(0, winner.life)} / {loser.name} {max(0, loser.life)}\n"
+                f"\u2022 Final life: {winner.name} {max(0, winner.life)} / {loser.name} {max(0, _loser_life)}\n"
                 f"\u2022 Turns: {game.turn_number}\n"
                 f"\u2022 Format: {game_format}")
         elif game.ended and game.winner is None:
@@ -2786,6 +2870,15 @@ async def _run_single_autoplay(cog, channel, game_format: str, deck1_name: str, 
                     total_game_completion = game_completion + strat_game_completion
 
                     tag = "STATS-GAME-ABORTED" if (api_disabled and total_game_calls == 0) else "STATS-GAME"
+                    # June 11 audit: label the line when other games shared the
+                    # adapter during this game — the delta then includes THEIR
+                    # tokens (the batch showed 814-2807 "per-game" calls that
+                    # were really batch-wide totals, incl. decide_mulligan=81
+                    # for a game with 3 mulligans).
+                    _shared = (_concurrency_at_start > 1
+                               or _AUTOPLAY_GAMES_STARTED > _games_started_snapshot)
+                    if _shared and tag == "STATS-GAME":
+                        tag = "STATS-GAME-SHARED(parallel batch — delta includes other games)"
                     # May 18 audit: also emit nominal (no-cache-discount) costs
                     # so this line reconciles with the lifetime `!cost` output
                     # (bot.py:get_cost_summary), which uses nominal rates only.
@@ -2909,6 +3002,7 @@ async def _run_single_autoplay(cog, channel, game_format: str, deck1_name: str, 
             if thread.id in cog.engine.games:
                 cog.engine.delete_game(thread.id)
         result["duration_seconds"] = _time.time() - start_time
+        _ACTIVE_AUTOPLAY_GAMES = max(0, _ACTIVE_AUTOPLAY_GAMES - 1)
 
     return result
 

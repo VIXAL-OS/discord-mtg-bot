@@ -298,6 +298,14 @@ def _compute_pt_for_sba(card, game):
                 is_cda = True
         except Exception:
             pass
+        try:
+            # Integer-P/T cards can still have a dynamic conditional bonus.
+            # Serra Ascendant's live 6 toughness exists only through the
+            # effective-P/T helpers, so collapse it like a CDA for SBA checks.
+            if card._get_life_threshold_bonus(game) != (0, 0):
+                is_cda = True
+        except Exception:
+            pass
 
     if is_cda and hasattr(card, 'get_effective_power') and hasattr(card, 'get_effective_toughness'):
         # CDA: fold everything into base and zero the rest to avoid double-counting
@@ -351,7 +359,11 @@ def build_sba_state(game, rules_engine=None):
         sba_state.players[str(i)] = SBAPlayer(
             id=str(i), name=player.name, life=player.life,
             poison_counters=player.poison,
-            attempted_draw_from_empty=False, has_lost=False,
+            attempted_draw_from_empty=bool(
+                getattr(player, 'attempted_draw_from_empty', False)
+                or player.name in getattr(game, '_library_loss', set())
+            ),
+            has_lost=False,
         )
         sba_state.library[str(i)] = len(player.library)
 

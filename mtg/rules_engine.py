@@ -91,7 +91,7 @@ class RulesEngine:
     - JUDGE: Asks Claude to interpret complex interactions
     """
     
-    def __init__(self, claude_client: anthropic.Anthropic = None, model: str = "claude-sonnet-4-6", usage_callback=None):
+    def __init__(self, claude_client: anthropic.Anthropic = None, model: str = "claude-sonnet-5", usage_callback=None):
         self.client = claude_client
         self.model = model
         self.usage_callback = usage_callback  # Track API costs
@@ -179,23 +179,23 @@ class RulesEngine:
 
         # [PW-STATIC] Teferi, Time Raveler: "Each opponent can only cast spells
         # any time they could cast a sorcery."  This restricts ALL spells (even
-        # instants) to sorcery speed for opponents.  Flash still bypasses.
-        if not has_flash:
-            for opp in game.players:
-                if opp == player:
-                    continue
-                for bf_card in opp.battlefield:
-                    oracle_lower = (bf_card.oracle_text or '').lower()
-                    if 'each opponent can only cast spells any time' in oracle_lower and 'sorcery' in oracle_lower:
-                        # Caster is an opponent of Teferi's controller → sorcery-speed restriction
-                        if game.phase not in [Phase.MAIN1, Phase.MAIN2]:
-                            return False, f"Can only cast spells at sorcery speed ({bf_card.name})"
-                        if player != game.active_player:
-                            return False, f"Can only cast spells on your own turn ({bf_card.name})"
-                        if game.stack:
-                            return False, f"Can only cast spells with empty stack ({bf_card.name})"
-                        print(f"[PW-STATIC] {bf_card.name} restricts {player.name} to sorcery speed")
-                        break  # One Teferi is enough
+        # instants) to sorcery speed for opponents. Flash does NOT bypass a
+        # restriction on when a spell may be cast (CR 101.2, 307.5).
+        for opp in game.players:
+            if opp == player:
+                continue
+            for bf_card in opp.battlefield:
+                oracle_lower = (bf_card.oracle_text or '').lower()
+                if ('opponent' in oracle_lower and 'cast spells' in oracle_lower
+                        and 'only' in oracle_lower and 'sorcery' in oracle_lower):
+                    if game.phase not in [Phase.MAIN1, Phase.MAIN2]:
+                        return False, f"Can only cast spells at sorcery speed ({bf_card.name})"
+                    if player != game.active_player:
+                        return False, f"Can only cast spells on your own turn ({bf_card.name})"
+                    if game.stack:
+                        return False, f"Can only cast spells with empty stack ({bf_card.name})"
+                    print(f"[PW-STATIC] {bf_card.name} restricts {player.name} to sorcery speed")
+                    break  # One Teferi is enough
 
         # Check for free-cast turn effect (Rishkar's Expertise, Cascade, etc.)
         if hasattr(game, 'turn_effects'):
@@ -284,6 +284,14 @@ class RulesEngine:
                     if m:
                         tax_per_attacker += int(m.group(1))
                         tax_sources.append(perm.name)
+                    if ("creatures can't attack you unless their controller pays {x}" in oracle
+                            and "x is the number of enchantments you control" in oracle):
+                        enchantments = sum(
+                            1 for permanent in opp.battlefield
+                            if 'enchantment' in (permanent.type_line or '').lower()
+                        )
+                        tax_per_attacker += enchantments
+                        tax_sources.append(perm.name)
             if tax_per_attacker > 0:
                 # Count creatures already declared as attackers this combat
                 # (excluding the candidate) so the tax compounds.
@@ -291,17 +299,14 @@ class RulesEngine:
                     1 for c in player.battlefield
                     if c is not creature and getattr(c, 'attacking', False)
                 )
-                required = tax_per_attacker * (already + 1)
-                # Estimate untapped mana from player's lands/rocks.
-                available = 0
-                for perm in player.battlefield:
-                    if getattr(perm, 'tapped', False):
-                        continue
-                    try:
-                        prod = player._get_mana_production(perm) or {}
-                    except Exception:
-                        prod = {}
-                    available += sum(int(v or 0) for v in prod.values())
+                # Declarations are paid sequentially; previously this multiplied
+                # by already-declared attackers even though earlier payments had
+                # already tapped their sources, double-counting the tax.
+                required = tax_per_attacker
+                # Use the authoritative mana-source scan. Calling
+                # _get_mana_production on every permanent treated vanilla
+                # creatures as plausible sources and let taxed attacks through.
+                available = sum(player.available_mana_detailed().values())
                 if available < required:
                     src_str = ", ".join(tax_sources) if tax_sources else "attack-tax effect"
                     return False, (f"{creature.name} can't attack — opponent's {src_str} "
@@ -310,6 +315,44 @@ class RulesEngine:
             # Defensive: don't block attacks on a parsing error
             pass
         return True, "OK"
+
+    def attack_tax_for(self, game: GameState, player: Player) -> Tuple[int, List[str]]:
+        """Return the generic mana cost for one creature to attack opponents."""
+        import re as _re
+        total = 0
+        sources = []
+        for opponent in game.players:
+            if opponent is player:
+                continue
+            for permanent in opponent.battlefield:
+                oracle = (permanent.oracle_text or '').lower()
+                match = _re.search(
+                    r"creatures can't attack(?: you| target player)?,? "
+                    r"unless (?:their controller |the attacker's controller )?"
+                    r"pays \{(\d+)\}", oracle)
+                if match:
+                    total += int(match.group(1))
+                    sources.append(permanent.name)
+                if ("creatures can't attack you unless their controller pays {x}" in oracle
+                        and "x is the number of enchantments you control" in oracle):
+                    total += sum(1 for c in opponent.battlefield
+                                 if 'enchantment' in (c.type_line or '').lower())
+                    sources.append(permanent.name)
+        return total, sources
+
+    def pay_attack_tax(self, game: GameState, player: Player,
+                       creature: Card) -> Tuple[bool, str]:
+        """Actually pay the cost to declare one attacker (CR 508.1h)."""
+        amount, sources = self.attack_tax_for(game, player)
+        if amount <= 0:
+            return True, ""
+        cost = f"{{{amount}}}"
+        if not player.tap_sources_for_cost(cost):
+            return False, (f"{creature.name} can't attack — unable to pay {cost} "
+                           f"for {', '.join(sources) or 'attack tax'}")
+        print(f"[ATTACK-TAX] {player.name} pays {cost} for {creature.name} "
+              f"({', '.join(sources)})")
+        return True, f"Paid {cost} attack tax"
 
     def can_block_with(self, game: GameState, player: Player, blocker: Card, attacker: Card) -> Tuple[bool, str]:
         """Check if a creature can block a specific attacker."""
@@ -683,6 +726,7 @@ class RulesEngine:
         if "you may pay 2 life" in oracle and "enters tapped" in oracle:
             if player.life > 4:
                 player.life -= 2
+                player.record_life_loss(2)
                 etb_msg = f" (paid 2 life — life: {player.life})"
                 print(f"[SHOCKLAND] {player.name} pays 2 life for {card.name} (life: {player.life})")
             else:
@@ -699,6 +743,18 @@ class RulesEngine:
                 # Enter untapped if you control 0, 1, or 2 other lands
                 other_land_count = sum(1 for c in player.lands() if c.id != card.id)
                 if other_land_count <= 2:
+                    enters_tapped = False
+            elif "two or more basic lands" in oracle:
+                # BFZ "tango" lands (Canopy Vista, Prairie Stream, etc.):
+                # "enters tapped unless you control two or more basic lands".
+                # June 11 audit: no branch handled the count-based wording, so
+                # the whole cycle was unconditionally tapped regardless of
+                # board state (game 1514629231433351168 turns 31/35).
+                basic_count = sum(
+                    1 for c in player.battlefield
+                    if c.is_land() and c.id != card.id
+                    and 'basic' in (c.type_line or '').lower())
+                if basic_count >= 2:
                     enters_tapped = False
             else:
                 # Check lands: "unless you control [land type(s)]"

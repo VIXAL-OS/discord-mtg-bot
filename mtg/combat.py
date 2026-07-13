@@ -143,7 +143,7 @@ def resolve_combat_damage(rules, game: GameState) -> List[str]:
                     game, game.players[idx], heal, source_name="Lifelink"
                 )
                 if ok:
-                    messages.append(f"💚 {game.players[idx].name} gains {actual_heal} life (lifelink) (life: {game.players[idx].life})")
+                    messages.append(f"💚 {game.players[idx].name} gains {actual_heal} life (lifelink) (life: {max(0, game.players[idx].life)})")
                     print(f"[LIFELINK] {game.players[idx].name}: +{actual_heal} life → {game.players[idx].life}")
                 else:
                     messages.append(f"🚫 Lifelink prevented for {game.players[idx].name} ({', '.join(chain)})")
@@ -174,7 +174,7 @@ def resolve_combat_damage(rules, game: GameState) -> List[str]:
                     game, game.players[idx], heal, source_name="Lifelink"
                 )
                 if ok:
-                    messages.append(f"💚 {game.players[idx].name} gains {actual_heal} life (lifelink) (life: {game.players[idx].life})")
+                    messages.append(f"💚 {game.players[idx].name} gains {actual_heal} life (lifelink) (life: {max(0, game.players[idx].life)})")
                     print(f"[LIFELINK] {game.players[idx].name}: +{actual_heal} life → {game.players[idx].life}")
         return messages
 
@@ -231,7 +231,7 @@ def resolve_combat_damage(rules, game: GameState) -> List[str]:
                 game, game.players[idx], heal, source_name="Lifelink"
             )
             if ok:
-                messages.append(f"💚 {game.players[idx].name} gains {actual_heal} life (lifelink) (life: {game.players[idx].life})")
+                messages.append(f"💚 {game.players[idx].name} gains {actual_heal} life (lifelink) (life: {max(0, game.players[idx].life)})")
                 print(f"[LIFELINK] {game.players[idx].name}: +{actual_heal} life → {game.players[idx].life}")
             else:
                 messages.append(f"🚫 Lifelink prevented for {game.players[idx].name} ({', '.join(chain)})")
@@ -247,6 +247,19 @@ def resolve_combat_damage(rules, game: GameState) -> List[str]:
     combat_damage_dealt = getattr(game, '_combat_damage_to_player', [])
     if combat_damage_dealt and HAS_EFFECT_TEMPLATES:
         for attacker, attacker_owner, damage_amount in combat_damage_dealt:
+            # Ohran Frostfang is a battlefield watcher, not an ability on the
+            # attacking creature. The prior attacker-only scan missed every
+            # draw unless Frostfang itself dealt the damage.
+            for watcher in list(attacker_owner.battlefield):
+                watcher_oracle = (watcher.oracle_text or '').lower()
+                if (watcher.name.lower() == 'ohran frostfang'
+                        and 'whenever a creature you control deals combat damage to a player' in watcher_oracle):
+                    msg = rules._execute_action_on_state(game, {
+                        "action": "draw_cards", "player": attacker_owner.name,
+                        "amount": 1, "_source_card_name": watcher.name,
+                    })
+                    if msg:
+                        messages.append(f"🐍 {watcher.name}: {msg}")
             if not attacker.oracle_text:
                 continue
             oracle_lower = attacker.oracle_text.lower()
@@ -295,7 +308,7 @@ def resolve_combat_damage(rules, game: GameState) -> List[str]:
                 # Apr 30 audit: console mirror for log-based reconciliation.
                 print(f"[LIFELINK-PREVENTED] {game.players[idx].name}: heal={heal} chain={','.join(chain)}")
                 continue
-            messages.append(f"💚 {game.players[idx].name} gains {actual_heal} life (lifelink) (life: {game.players[idx].life})")
+            messages.append(f"💚 {game.players[idx].name} gains {actual_heal} life (lifelink) (life: {max(0, game.players[idx].life)})")
             # Apr 30 audit: console mirror so post-batch life-total reconciliation
             # doesn't go missing in the per-game console log (Discord-only events
             # broke the audit's math three times).
@@ -392,6 +405,7 @@ def _fire_gain_life_triggers(rules, game: GameState, player: 'PlayerState',
                     if opp is player:
                         continue
                     opp.life -= amount
+                    opp.record_life_loss(amount)
                     print(f"[GAIN-TRIGGER] {perm.name}: {opp.name} loses {amount} life → {opp.life}")
                     pq.append(f"🩸 **{perm.name}**: {opp.name} loses {amount} life (life: {max(0, opp.life)})")
             elif _re.search(r'put a \+1/\+1 counter on (?:it|this creature)', clause) \
@@ -486,6 +500,7 @@ def apply_combat_damage_to_player(rules, game: GameState, player: 'PlayerState',
         # but the player doesn't lose life. Continue to commander-damage tracking below.
     else:
         player.life -= amount
+        player.record_life_loss(amount)
         if amount > 0:
             # May 18 audit: clamp the displayed life at 0 so a multi-creature
             # combat-damage step against a low-life player doesn't print a
@@ -617,6 +632,7 @@ def apply_noncombat_damage_to_player(rules, game: GameState, player: 'PlayerStat
             print(f"  [REPLACEMENT-APPLY] Noncombat damage modified: {amount} → {final.amount} ({', '.join(final.replacement_chain)})")
         amount = final.amount
     player.life -= amount
+    player.record_life_loss(amount)
     if amount > 0:
         # May 18 audit: clamp displayed life at 0 (same rationale as [COMBAT-LIFE]).
         print(f"[NONCOMBAT-LIFE] {player.name} takes {amount} noncombat damage from {source_name} (life: {max(0, player.life)})")
@@ -771,6 +787,21 @@ def deal_combat_damage(rules, game: GameState, attackers: List[Tuple[Card, Playe
                     f"⚔️ {attacker.name} deals {actual_damage} damage to "
                     f"{defending_player.name} (life: {max(0, defending_player.life)})"
                 )
+                # June 11 audit: commander-damage running totals were console-
+                # only ([COMMANDER-DAMAGE]); players first learned of the 21
+                # rule from their own death message in 9/139 games. Surface the
+                # tally whenever a commander connects.
+                if getattr(attacker, 'is_commander', False):
+                    _cd_total = None
+                    for _cd_idx, _cd_p in enumerate(game.players):
+                        if attacker in _cd_p.battlefield:
+                            _cd_total = defending_player.commander_damage.get(_cd_idx)
+                            break
+                    if _cd_total:
+                        messages.append(
+                            f"👑 Commander damage: {defending_player.name} has taken "
+                            f"{_cd_total}/21 from {attacker.name}"
+                        )
                 # Track for combat damage triggers (Ancient Bronze Dragon, etc.)
                 if not hasattr(game, '_combat_damage_to_player'):
                     game._combat_damage_to_player = []
@@ -994,6 +1025,19 @@ def deal_combat_damage(rules, game: GameState, attackers: List[Tuple[Card, Playe
                         f"🦏 {attacker.name} tramples for {actual_trample} damage to "
                         f"{defending_player.name} (life: {max(0, defending_player.life)})"
                     )
+                    # June 11 audit: surface commander-damage tally (see the
+                    # unblocked path above for rationale).
+                    if getattr(attacker, 'is_commander', False):
+                        _cd_total = None
+                        for _cd_idx, _cd_p in enumerate(game.players):
+                            if attacker in _cd_p.battlefield:
+                                _cd_total = defending_player.commander_damage.get(_cd_idx)
+                                break
+                        if _cd_total:
+                            messages.append(
+                                f"👑 Commander damage: {defending_player.name} has taken "
+                                f"{_cd_total}/21 from {attacker.name}"
+                            )
                     # Track for combat damage triggers
                     if not hasattr(game, '_combat_damage_to_player'):
                         game._combat_damage_to_player = []

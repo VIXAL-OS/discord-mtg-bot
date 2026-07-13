@@ -33,9 +33,28 @@ Thumbs.db
 *.log
 logs/
 
-# Java build artifacts (XMage bridge)
+# Java build artifacts (XMage bridge). July 10: the old rules/target/
+# pattern didn't match the real nested path — a sweep commit picked up a
+# 266MB H2 db and two 93MB shaded jars (GitHub rejects files >100MB).
 rules/*.class
 rules/target/
+rules/xmage-bridge/target/
+rules/xmage-bridge/db/
+
+# XMage card database copy at repo root (regenerable, ~240MB)
+db/
+
+# Bot runtime caches (re-downloadable from Scryfall / regenerated at runtime)
+data/card_images/
+data/card_cache/
+data/api_costs.json
+
+# Bot memories (private context — the memories/*.json pattern above didn't
+# cover this path)
+data/memories.json
+
+# Claude Code session-local worktree pointers
+.claude/worktrees/
 
 # Audit-script artifacts (tools/audit_card_cache.py)
 data/card_data_cache.json.bak

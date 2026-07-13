@@ -497,13 +497,13 @@ async def claude_make_pick(
     try:
         response = await asyncio.to_thread(
             client.messages.create,
-            model="claude-sonnet-4-6",
+            model="claude-sonnet-5",
             max_tokens=50,
             messages=[{"role": "user", "content": prompt}],
         )
 
         if usage_callback and hasattr(response, 'usage'):
-            usage_callback(response.usage, "claude-sonnet-4-6")
+            usage_callback(response.usage, "claude-sonnet-5")
 
         text = response.content[0].text.strip()
         # Parse the number from Claude's response
