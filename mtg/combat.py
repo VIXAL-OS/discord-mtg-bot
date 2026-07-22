@@ -260,6 +260,54 @@ def resolve_combat_damage(rules, game: GameState) -> List[str]:
                     })
                     if msg:
                         messages.append(f"🐍 {watcher.name}: {msg}")
+            # July 20 audit (Worldslayer): "Whenever EQUIPPED creature deals
+            # combat damage to a player" lives on the EQUIPMENT — the
+            # attacker-oracle scan below never saw it (three hits while
+            # equipped, zero wipes, game_1526071467035459665). Scan the
+            # attacker's attachments and resolve attack-templates keyed on
+            # the equipment's name.
+            for _att_id in list(getattr(attacker, 'attachments', []) or []):
+                _att = next((c for c in attacker_owner.battlefield
+                             if c.id == _att_id), None)
+                if _att is None or not _att.oracle_text:
+                    continue
+                if ('equipped creature deals combat damage to a player'
+                        not in _att.oracle_text.lower()):
+                    continue
+                try:
+                    _opp_idx = 1 - game.players.index(attacker_owner)
+                    _opp = game.players[_opp_idx]
+                    _ctx = build_game_context(game, attacker_owner, _opp,
+                                              card=_att,
+                                              attacking_creature=attacker)
+                    _ctx['damage_dealt'] = damage_amount
+                    _lib = get_effect_library()
+                    _actions, _explanation = _lib.resolve_attack_trigger(
+                        trigger_card_name=_att.name,
+                        trigger_oracle=_att.oracle_text,
+                        attacking_creature_name=attacker.name,
+                        attacking_creature_power=damage_amount,
+                        controller=attacker_owner.name,
+                        opponent=_opp.name,
+                        game_context=_ctx,
+                    )
+                    if _actions and any(a.get("action") != "no_action"
+                                        for a in _actions):
+                        for _action in _actions:
+                            if _action.get("action") == "no_action":
+                                continue
+                            _msg = rules._execute_action_on_state(game, _action)
+                            if _msg:
+                                messages.append(f"💥 {_att.name} trigger: {_msg}")
+                        print(f"[COMBAT-TRIGGER] {_att.name} (equipment on "
+                              f"{attacker.name}): {_explanation}")
+                except Exception as e:
+                    # Crash barrier mirroring the sibling attacker-loop catch;
+                    # visible in strict batches via maybe_reraise.
+                    print(f"[COMBAT-TRIGGER] Error for equipment {_att.name}: {e}")
+                    from mtg.util import maybe_reraise
+                    maybe_reraise(e)
+
             if not attacker.oracle_text:
                 continue
             oracle_lower = attacker.oracle_text.lower()
@@ -421,6 +469,20 @@ def _fire_gain_life_triggers(rules, game: GameState, player: 'PlayerState',
                     tgt.counters['+1/+1'] = tgt.counters.get('+1/+1', 0) + 1
                     print(f"[GAIN-TRIGGER] {perm.name}: +1/+1 counter on {tgt.name}")
                     pq.append(f"💪 **{perm.name}**: +1/+1 counter on **{tgt.name}**")
+            elif 'put a +1/+1 counter on each creature you control' in clause:
+                # Archangel of Thune. July 20 audit: fired
+                # [GAIN-TRIGGER-UNHANDLED] twice in game_1527462198430138448
+                # — her core passive did nothing all game.
+                _boosted = 0
+                for c in player.battlefield:
+                    if c.is_creature(game=game):
+                        c.counters['+1/+1'] = c.counters.get('+1/+1', 0) + 1
+                        _boosted += 1
+                if _boosted:
+                    game.recalculate_power_toughness()
+                    print(f"[GAIN-TRIGGER] {perm.name}: +1/+1 counter on {_boosted} creature(s)")
+                    pq.append(f"💪 **{perm.name}**: a +1/+1 counter on each of "
+                              f"{_boosted} creature(s) (life gain trigger)")
             else:
                 print(f"[GAIN-TRIGGER-UNHANDLED] {perm.name}: {clause[:100]}")
     finally:
@@ -957,8 +1019,16 @@ def deal_combat_damage(rules, game: GameState, attackers: List[Tuple[Card, Playe
                                 damage_to_blocker = remaining_damage
                         actual_dmg = rules._apply_combat_damage_to_creature(game, blocker, damage_to_blocker, attacker)
                         remaining_damage -= damage_to_blocker  # Use original for trample math
-                        # Display attacker's full power (not clamped amount) for clarity
-                        display_dmg = min(attacker_power, remaining_damage + damage_to_blocker) if len(blocker_ids) == 1 else actual_dmg
+                        # Display attacker's full power (not clamped amount) for
+                        # clarity — but ONLY when trample didn't split the
+                        # assignment. July 21 batch audit (R4-2): a 5-power
+                        # trampler vs a toughness-4 blocker displayed "deals 5"
+                        # to the blocker AND "tramples for 1" — 6 damage from a
+                        # 5-power creature (game_1529168842905882755). State was
+                        # correct; only the display double-counted.
+                        display_dmg = (min(attacker_power, remaining_damage + damage_to_blocker)
+                                       if (len(blocker_ids) == 1 and not has_trample)
+                                       else actual_dmg)
                         # CR 120.8: zero damage isn't dealt — skip the noise line
                         # (June 10 audit: 36 "deals 0 damage" lines per batch).
                         if display_dmg > 0:

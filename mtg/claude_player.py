@@ -30,6 +30,7 @@ from mtg.constants import (
     Phase, Zone, COMMAND_ZONE_FORMATS, FORMAT_DECK_SIZE,
     FORMAT_STARTING_LIFE, MANA_COLOR_IDENTITY, PHASE_NAMES, PHASE_ORDER,
 )
+from mtg.helpers import response_text
 from mtg.models import Card, Player, GameState, FormatValidator
 
 # Optional: structured mana cost parser
@@ -290,6 +291,37 @@ def _annotate_castable_with_legality(castable_cards: list, hand: list,
 # =============================================================================
 # CLAUDE PLAYER AI
 # =============================================================================
+
+def _resolve_annotated_card_name(name_str, name_map):
+    """Resolve a (possibly annotated) name through a disambiguation map.
+
+    July 20 batch-3 audit (reviewer A4): block prompts show attackers as
+    "Name(P/T)[kw1,kw2]"; the old end-anchored parenthetical strip failed
+    whenever a [keywords] suffix followed the (P/T) group, so the echoed
+    descriptor never matched the bare-name map and that block was silently
+    dropped ("Could not resolve attacker 'Faerie Rogue(1/1)[flying]'").
+    Strip trailing (…) / […] groups until stable.
+    """
+    clean = name_str
+    while True:
+        _stripped = re.sub(r'\s*(?:\([^)]*\)|\[[^\]]*\])\s*$', '', clean)
+        if _stripped == clean:
+            break
+        clean = _stripped
+    clean = clean.strip()
+    # Exact match (handles disambiguated names like Plant_1)
+    if clean in name_map:
+        return name_map[clean]
+    # Case-insensitive match
+    for k, v in name_map.items():
+        if k.lower() == clean.lower():
+            return v
+    # Match by base card name (AI dropped the _N suffix)
+    for k, v in name_map.items():
+        if v.name.lower() == clean.lower():
+            return v
+    return None
+
 
 class ClaudePlayer:
     """AI logic for Claude playing MTG."""
@@ -849,6 +881,22 @@ RULES (apply to your output, not your reasoning):
             if hasattr(strat_client.messages, '_log_tag'):
                 strat_kwargs['json_mode'] = False
                 strat_kwargs['purpose'] = 'strategist'
+                # July 20: adaptive degrade — after 2 deadman/hard-cap fires
+                # in THIS game, remaining strategist calls run at
+                # reasoning_effort=low. On a bad-DeepSeek day (July 12-13:
+                # 248 fires across 139 games vs the 0-2 healthy baseline)
+                # the deadman caps each hang at 90s, but without this the
+                # game keeps re-paying that tax every strategist turn.
+                # Per-game state, not adapter state — 25 concurrent games
+                # share one adapter and a good game must not be degraded by
+                # a bad one.
+                if game._strategist_fires >= 2:
+                    strat_kwargs['reasoning_effort'] = 'low'
+                    if not game._strategist_degraded:
+                        game._strategist_degraded = True
+                        print(f"[STRATEGIST-DEGRADE] {game._strategist_fires} "
+                              f"deadman/hard-cap fires this game — remaining "
+                              f"strategist calls drop to reasoning_effort=low")
             # May 18 audit: route the strategist call through streaming when
             # the adapter supports it, with a deadman-timer watchdog that
             # closes the stream if no token arrives in DEADMAN_S seconds.
@@ -894,6 +942,7 @@ RULES (apply to your output, not your reasoning):
                         if stalled > DEADMAN_S:
                             print(f"[STRATEGIST] Deadman fired: no chunk in "
                                   f"{stalled:.0f}s — closing stream")
+                            game._strategist_fires += 1
                             await stream.close()
                             return
 
@@ -910,6 +959,7 @@ RULES (apply to your output, not your reasoning):
                             if asyncio.get_event_loop().time() - stream_start > STREAM_HARD_CAP_S:
                                 print(f"[STRATEGIST] Hard cap fired: {STREAM_HARD_CAP_S}s "
                                       f"exceeded — closing stream")
+                                game._strategist_fires += 1
                                 break
                 finally:
                     watchdog.cancel()
@@ -982,7 +1032,7 @@ RULES (apply to your output, not your reasoning):
                     lambda: strat_client.messages.create(**strat_kwargs)
                 )
             self._track_usage(response, model_override=strat_model)
-            memo = response.content[0].text.strip()
+            memo = response_text(response).strip()
             # Legacy V3-style <think>...</think> stripping. V4 doesn't emit
             # those tags (its reasoning lives in `message.reasoning_content`,
             # which the adapter already separates), but we keep this for any
@@ -1006,7 +1056,7 @@ RULES (apply to your output, not your reasoning):
             # often returns "" in `.content`. Bumping to 4000 leaves room for
             # both the reasoning and the actual memo.
             if not memo:
-                raw_len = len(response.content[0].text or "")
+                raw_len = len(response_text(response))
                 reasoning_len = len(getattr(response, 'reasoning_content', '') or "")
                 print(f"[STRATEGIST] Empty memo (raw={raw_len}, reasoning={reasoning_len}) "
                       f"— retrying with larger budget")
@@ -1029,7 +1079,7 @@ RULES (apply to your output, not your reasoning):
                             lambda: strat_client.messages.create(**strat_kwargs)
                         )
                     self._track_usage(response, model_override=strat_model)
-                    memo = response.content[0].text.strip()
+                    memo = response_text(response).strip()
                     memo = re.sub(r'<think>.*?</think>\s*', '', memo, flags=re.DOTALL).strip()
                     if '<think>' in memo and '</think>' not in memo:
                         memo = re.sub(r'<think>.*$', '', memo, flags=re.DOTALL).strip()
@@ -2137,7 +2187,7 @@ Based on this game state, what is your best play?
             self._track_usage(response)
 
             # Parse JSON from response — strip <think> scratchpad first
-            raw_text = response.content[0].text.strip()
+            raw_text = response_text(response).strip()
             # May 7 audit fix #10: collapse whitespace in the log line so
             # multi-line pretty-printed JSON doesn't bloat the console
             # (was ~25% of all log lines for DeepSeek runs). Cap at 300 chars
@@ -2752,7 +2802,7 @@ IMPORTANT: Always end with {"type": "pass"}. No text outside the JSON array."""
                   f"approx_cost=${_pt_approx_cost:.5f}")
             self._track_usage(response)
 
-            raw_text = response.content[0].text.strip()
+            raw_text = response_text(response).strip()
             print(f"{self.provider_tag} [PLAN] Raw: {raw_text[:300]}")
 
             text = self._strip_think_tags(raw_text, context="plan")
@@ -2984,7 +3034,7 @@ IMPORTANT: Output ONLY the JSON object. No text before or after."""
 
             self._track_usage(response)
 
-            raw_text = response.content[0].text.strip()
+            raw_text = response_text(response).strip()
             print(f"{self.provider_tag} Attackers response: {raw_text[:200]}")
 
             # Strip <think> scratchpad
@@ -3311,7 +3361,7 @@ IMPORTANT: Output ONLY the JSON object. No text before or after."""
                 # Track usage
                 self._track_usage(response)
 
-                raw_text = response.content[0].text.strip()
+                raw_text = response_text(response).strip()
                 if not raw_text:
                     print(f"[COMBAT] Claude returned empty response (attempt {attempt + 1})")
                     continue
@@ -3397,21 +3447,7 @@ IMPORTANT: Output ONLY the JSON object. No text before or after."""
 
                 # Resolve attacker/blocker names through disambiguation maps → card IDs.
                 # Returns {attacker_card_id: [blocker_card_ids]} for unambiguous registration.
-                def _resolve_card(name_str, name_map):
-                    """Resolve a (possibly annotated) name through the disambiguation map."""
-                    clean = re.sub(r'\s*\([^)]*\)\s*$', '', name_str).strip()
-                    # Exact match (handles disambiguated names like Plant_1)
-                    if clean in name_map:
-                        return name_map[clean]
-                    # Case-insensitive match
-                    for k, v in name_map.items():
-                        if k.lower() == clean.lower():
-                            return v
-                    # Match by base card name (AI dropped the _N suffix)
-                    for k, v in name_map.items():
-                        if v.name.lower() == clean.lower():
-                            return v
-                    return None
+                _resolve_card = _resolve_annotated_card_name
 
                 result = {}
                 used_blocker_ids = set()  # Prevent same blocker assigned twice
@@ -3458,11 +3494,11 @@ IMPORTANT: Output ONLY the JSON object. No text before or after."""
 
                 # Bug fix: double braces were escaping the dict comprehension, printing literal code
                 summary = {k[:8]: v for k, v in list(result.items())[:5]}
-                print(f"[COMBAT] Claude blocking decision (attempt {attempt + 1}): {summary}")
+                print(f"[COMBAT] {player.name} blocking decision (attempt {attempt + 1}): {summary}")
                 return result
 
             except Exception as e:
-                print(f"[COMBAT] Claude blocking decision error (attempt {attempt + 1}): {e}")
+                print(f"[COMBAT] {player.name} blocking decision error (attempt {attempt + 1}): {e}")
                 if attempt < 2:
                     await asyncio.sleep(1)  # Brief pause before retry
 
@@ -3529,7 +3565,7 @@ Respond with ONLY "keep" or "mulligan"."""
             # Track usage
             self._track_usage(response)
 
-            text = response.content[0].text.strip().lower()
+            text = response_text(response).strip().lower()
             return "mulligan" in text
             
         except Exception as e:
@@ -3658,12 +3694,47 @@ Respond with ONLY "keep" or "mulligan"."""
         # time). Filter here so the prompt only shows real options and the
         # downstream vetoes are affordability-aware.
         try:
-            _affordable = [c for c in instants if player.can_pay_mana_cost(c.mana_cost)[0]]
+            # July 20: alternate-cost aware — Force of Will is castable off
+            # 1 life + a blue card even at zero mana (was dead in hand).
+            _affordable = [c for c in instants
+                           if player.can_pay_mana_cost(c.mana_cost)[0]
+                           or player.can_pay_printed_alternate_cost(c)]
             if len(_affordable) < len(instants):
                 _dropped = [c.name for c in instants if c not in _affordable]
                 print(f"[STACK-AI] {player.name}: filtered unaffordable instants from "
                       f"response options: {_dropped[:4]}")
             instants = _affordable
+            # July 20 batch-3 audit: a {0} Pact is only a real option if its
+            # upkeep cost is plausibly payable NEXT turn. Claude countered a
+            # turn-3 Sylvan Library with Pact of Negation on ~3 mana sources
+            # and auto-lost to the unpayable {3}{U}{U} at his upkeep
+            # (game_1528942795019255889 — engine correct, decision suicidal).
+            # Filter pacts when the controller's battlefield could not cover
+            # the followup cost even fully untapped.
+            _kept = []
+            for c in instants:
+                if not (getattr(c, 'cmc', None) == 0 and 'pact' in c.name.lower()):
+                    _kept.append(c)
+                    continue
+                _pay_m = re.search(r'pay ((?:\{[^}]+\})+)', c.oracle_text or '', re.IGNORECASE)
+                _needed = 0
+                if _pay_m:
+                    for _sym in re.findall(r'\{([^}]+)\}', _pay_m.group(1)):
+                        _needed += int(_sym) if _sym.isdigit() else 1
+                _potential = 0
+                for _b in player.battlefield:
+                    try:
+                        _prod = player._get_mana_production(_b) or {}
+                    except (ValueError, KeyError, AttributeError, TypeError):
+                        _prod = {}
+                    if _prod:
+                        _potential += max(_prod.values())
+                if _needed and _potential < _needed:
+                    print(f"[STACK-AI] {player.name}: filtered {c.name} — pact upkeep "
+                          f"cost needs {_needed} mana, only {_potential} producible on battlefield")
+                else:
+                    _kept.append(c)
+            instants = _kept
         except (ValueError, KeyError, AttributeError, TypeError, IndexError) as _aff_err:
             print(f"[STACK-AI] affordability filter error (offering full list): {_aff_err}")
         if not instants:
@@ -3836,7 +3907,7 @@ Respond with ONLY "keep" or "mulligan"."""
             )
             self._track_usage(response)
 
-            raw_text = response.content[0].text.strip()
+            raw_text = response_text(response).strip()
             text = raw_text.lower()
 
             # Try parsing as JSON first — DeepSeek/Claude sometimes wraps the answer

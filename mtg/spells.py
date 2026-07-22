@@ -59,8 +59,10 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from mtg.constants import Phase, Zone, COMMAND_ZONE_FORMATS
+from mtg import helpers
 from mtg.helpers import _should_emit_resolve_hint
 from mtg.models import Card, Player, GameState, StackEntry
+from mtg import events
 
 # Optional: Tier 2 spell resolver
 try:
@@ -273,19 +275,27 @@ def _serialize_for_xmage(engine, game: GameState) -> Tuple['XMageGameState', Dic
     return xmage_state, player_name_map
 
 
-async def cast_spell_async(engine, game: GameState, player: Player, card: Card, pay_mana: bool = True, target: Any = None, additional_cost: int = 0) -> Tuple[bool, str, List[str]]:
-    """Cast a spell with full effect resolution (async version).
+def _validate_cast(engine, game: GameState, player: Player, card: Card,
+                   target: Any) -> Tuple[Optional[Tuple[bool, str, List[str]]], bool, Any]:
+    """CR 601 cast-legality gates (refactor #2 step 2 — extracted July 20, 2026).
 
-    Args:
-        game: Game state
-        player: Casting player
-        card: Card to cast
-        pay_mana: Whether to pay mana cost
-        target: Optional target for the spell
-        additional_cost: Additional generic mana cost (e.g., commander tax)
+    Gate order (behavior-preserving; each gate's rationale is inline):
+      1. per-cast `_spell_resolved` reset
+      2. zone membership — hand ∪ marked-graveyard runs FIRST (July 10 fix)
+      3. rules gate (mana/timing via engine.rules.can_cast_spell)
+      4. Ghostly Flicker two-target selection (mutates `target`)
+      5. aura target scans — battlefield + "in a graveyard" variants (CR 601.2c)
+      6. commander color identity (CR 903.4)
+      7. counter-with-empty-stack gate (CR 601.2c, modal/creature carve-outs)
+      8. targeting module — any-legal-target + declared-target validation
 
-    Returns:
-        Tuple of (success, message, effect_messages)
+    Returns (rejection, cast_from_graveyard, target):
+      rejection            — the (False, reason, []) tuple to return verbatim,
+                             or None when every gate passes
+      cast_from_graveyard  — flashback/escape zone flag consumed by the
+                             payment + zone-move stages
+      target               — possibly rewritten (Ghostly Flicker picks its
+                             own two targets)
     """
     # Reset per-cast resolution flag. `card._spell_resolved` is set by Tier 1
     # / Tier 1.5 / Tier 3 handlers to prevent double-resolution within a
@@ -317,12 +327,12 @@ async def cast_spell_async(engine, game: GameState, player: Player, card: Card, 
         and card.id in (getattr(player, 'playable_from_graveyard', None) or [])
     )
     if card not in player.hand and not _cast_from_graveyard:
-        return False, "Card not in hand", []
+        return (False, "Card not in hand", []), False, target
 
     # Check rules
     can_cast, reason = engine.rules.can_cast_spell(game, player, card)
     if not can_cast:
-        return False, reason, []
+        return (False, reason, []), _cast_from_graveyard, target
 
     # CR 601.2c: a spell that requires a target can't be cast unless at least
     # one legal target exists. May 17 audit: previously the engine would let
@@ -336,7 +346,7 @@ async def cast_spell_async(engine, game: GameState, player: Player, card: Card, 
     if card.name.lower() == 'ghostly flicker':
         chosen_targets, target_error = _ghostly_flicker_targets(game, player, target)
         if target_error:
-            return False, target_error, []
+            return (False, target_error, []), _cast_from_graveyard, target
         target = chosen_targets
     if 'aura' in _type_line_lower and ('enchant creature' in _oracle_lower or 'enchant permanent' in _oracle_lower):
         # June 11 audit: Animate Dead / Necromancy / Dance of the Dead say
@@ -359,9 +369,9 @@ async def cast_spell_async(engine, game: GameState, player: Player, card: Card, 
                     if declared_graveyard_target:
                         break
                 if not declared_graveyard_target or not declared_graveyard_target.is_creature():
-                    return (False,
-                            f"{card.name} can't target {target_name} — it is not a creature card in a graveyard",
-                            [])
+                    return ((False,
+                             f"{card.name} can't target {target_name} — it is not a creature card in a graveyard",
+                             []), _cast_from_graveyard, target)
                 card._declared_graveyard_target_id = declared_graveyard_target.id
                 card._declared_graveyard_target_owner = declared_graveyard_owner.name
             any_target = any(
@@ -370,16 +380,23 @@ async def cast_spell_async(engine, game: GameState, player: Player, card: Card, 
                 for gc in p.graveyard
             )
             if not any_target:
-                return (False,
-                        f"{card.name} can't be cast — no creature cards in any graveyard (CR 601.2c)",
-                        [])
+                return ((False,
+                         f"{card.name} can't be cast — no creature cards in any graveyard (CR 601.2c)",
+                         []), _cast_from_graveyard, target)
         else:
             # Quick legal-target scan: does ANY permanent on the battlefield
             # satisfy "enchant creature" / "enchant permanent"? Hexproof/shroud
             # checks are done at resolution; here we just want to see one body.
+            # July 20: "enchant creature YOU CONTROL" scans only the caster's
+            # battlefield — Draconic Destiny passed this gate off opponent
+            # creatures, paid its mana, then fizzled at resolution.
             is_creature_only = 'enchant creature' in _oracle_lower
+            _own_only = ('enchant creature you control' in _oracle_lower
+                         or 'enchant permanent you control' in _oracle_lower)
             any_target = False
             for p in game.players:
+                if _own_only and p is not player:
+                    continue
                 for c in p.battlefield:
                     if c.id == card.id:
                         continue
@@ -390,9 +407,9 @@ async def cast_spell_async(engine, game: GameState, player: Player, card: Card, 
                 if any_target:
                     break
             if not any_target:
-                return (False,
-                        f"{card.name} can't be cast — no legal targets on the battlefield (CR 601.2c)",
-                        [])
+                return ((False,
+                         f"{card.name} can't be cast — no legal targets on the battlefield (CR 601.2c)",
+                         []), _cast_from_graveyard, target)
 
     # CR 903.4: a card may not be cast in a singleton command-zone format if its
     # color identity is outside the player's commander color identity. Apr 30
@@ -426,7 +443,7 @@ async def cast_spell_async(engine, game: GameState, player: Player, card: Card, 
                 if not hasattr(player, '_color_id_blocklist'):
                     player._color_id_blocklist = set()
                 player._color_id_blocklist.add(card.name)
-                return False, msg, []
+                return (False, msg, []), _cast_from_graveyard, target
         except Exception as e:
             print(f"[COLOR-IDENTITY] Check failed for {card.name}: {e}")
 
@@ -462,7 +479,32 @@ async def cast_spell_async(engine, game: GameState, player: Player, card: Card, 
             or 'choose three' in oracle_lower
         )
         if not stack_has_spells and not is_creature and not is_modal_with_other_modes:
-            return False, f"{card.name} requires a target spell on the stack", []
+            return ((False, f"{card.name} requires a target spell on the stack", []),
+                    _cast_from_graveyard, target)
+
+    # July 20 audit (Diabolic Intent): "As an additional cost to cast this
+    # spell, sacrifice a creature" — the plan-validate path checked this, but
+    # the decide_action_inline fallback didn't, so the cast went through,
+    # burned the card and its mana, and fizzled with "no creature to
+    # sacrifice" (game_1526071467035459665). Gate it here so EVERY cast path
+    # is covered (CR 601.2g — a spell can't be cast without paying its costs).
+    _sac_m = re.search(
+        r'as an additional cost to cast this spell, sacrifice '
+        r'(?:a|an|two|three)?\s*(\w+)', oracle_lower)
+    if _sac_m:
+        _sac_type = _sac_m.group(1).rstrip('s')
+        _type_checks = {
+            'creature': lambda c: c.is_creature(),
+            'artifact': lambda c: c.is_artifact(),
+            'land': lambda c: c.is_land(),
+            'permanent': lambda c: True,
+        }
+        _chk = _type_checks.get(_sac_type)
+        if _chk is not None and not any(
+                _chk(c) and c is not card for c in player.battlefield):
+            return ((False,
+                     f"{card.name} needs a {_sac_type} to sacrifice as an additional cost",
+                     []), _cast_from_graveyard, target)
 
     # [TARGETING] Pre-cast target validation (CR 601.2c) — block spells with
     # no legal targets.  Only checks instant/sorcery spells that require targets.
@@ -470,7 +512,8 @@ async def cast_spell_async(engine, game: GameState, player: Player, card: Card, 
     if HAS_TARGETING and _spell_requires_targets(card):
         if not _find_any_valid_target(game, card, player.name):
             print(f"[TARGETING] {card.name} has no valid targets — cast blocked")
-            return False, f"{card.name} has no valid targets", []
+            return ((False, f"{card.name} has no valid targets", []),
+                    _cast_from_graveyard, target)
 
         # Validate the target actually declared by the caller, not merely the
         # existence of some other legal target. Graveyard Auras are handled
@@ -479,6 +522,17 @@ async def cast_spell_async(engine, game: GameState, player: Player, card: Card, 
             declared_targets = (list(target)
                                 if isinstance(target, (list, tuple)) else [target])
             for declared_target in declared_targets:
+                # A declared target that is a spell ON THE STACK (counterspell
+                # responses forward top_stack.card from mtg/engine.py) must not
+                # go through the battlefield-oriented validator — it would be
+                # rejected as "not a valid target type". July 20 audit: every
+                # explicit-target counter response in the July 16 batch fizzled
+                # at cast this way. Stack targets are validated by the
+                # counter-gate above (stack_has_spells) and fizzle-checked at
+                # resolution instead.
+                if any(getattr(entry, 'card', None) is declared_target
+                       for entry in getattr(game, 'stack', [])):
+                    continue
                 if hasattr(declared_target, 'battlefield'):
                     legal, target_reason = _validate_player_target_for_action(
                         game, declared_target, card, player.name)
@@ -489,8 +543,34 @@ async def cast_spell_async(engine, game: GameState, player: Player, card: Card, 
                     legal, target_reason = _validate_target_for_action(
                         game, declared_target, target_owner, card, player.name)
                 if not legal:
-                    return False, f"Illegal target for {card.name}: {target_reason}", []
+                    return ((False, f"Illegal target for {card.name}: {target_reason}", []),
+                            _cast_from_graveyard, target)
+    return None, _cast_from_graveyard, target
 
+
+def _compute_alt_costs(engine, game: GameState, player: Player, card: Card,
+                       pay_mana: bool, additional_cost: int
+                       ) -> Tuple[Optional[Tuple[bool, str, List[str]]], Optional[Dict]]:
+    """Cost selection + alternative/additional cost handling (refactor #2 step 2b).
+
+    Covers, in original order (rationale comments inline):
+      1. effective cost selection — flashback / adventure-half / split-half
+      2. suspend-only gate (no mana cost ⇒ can only be suspended)
+      3. X-cost computation (+ the X-bounded re-target check)
+      4. free-cast turn effects (Rishkar's Expertise, cascade)
+      5. printed alternate costs (Force of Will, Fireblast, Pacts) — these
+         MUTATE state when taken (exile/life/sacrifice), same as before
+      6. convoke / delve / improvise generic-cost reductions (tap/exile
+         state mutations happen here, same as before)
+
+    Returns (rejection, costs): rejection is the (False, reason, []) tuple to
+    return verbatim (costs is then None); on success costs carries
+    effective_mana_cost / effective_cmc / total_cost / x_value_chosen /
+    pay_mana / free_cast_source / total_alt_reduction for the payment stage.
+    NOTE (pre-existing, pinned behavior): the alternate-cost branches build a
+    local effect_messages line that the orchestrator has always discarded —
+    kept verbatim, not surfaced, so the split stays behavior-preserving.
+    """
     # Calculate total cost including commander tax
     # Handle X-cost spells: X defaults to all available mana minus fixed costs
     # Use adventure cost if casting the adventure half
@@ -510,10 +590,9 @@ async def cast_spell_async(engine, game: GameState, player: Player, card: Card, 
         card._flashback_cost = None  # Clear after use
     if getattr(card, 'cast_as_adventure', False) and card.adventure_cost:
         effective_mana_cost = card.adventure_cost
-        # Calculate adventure CMC from its mana cost
-        adv_cost_upper = card.adventure_cost.upper()
-        effective_cmc = sum(int(m) for m in re.findall(r'\{(\d+)\}', adv_cost_upper))
-        effective_cmc += sum(adv_cost_upper.count(f'{{{c}}}') for c in ['W', 'U', 'B', 'R', 'G'])
+        # July 21 batch audit: was a digits + plain-single-pip count that gave
+        # hybrid pips 0 — Bring Back ({G/W}{G/W}{G/W}{G/W}) computed CMC 0.
+        effective_cmc = helpers.cmc_of_cost_string(card.adventure_cost)
         print(f"[ADVENTURE] Using adventure cost {card.adventure_cost} (CMC {effective_cmc}) instead of creature cost {card.mana_cost}")
     elif (' // ' in (effective_mana_cost or '')
           and getattr(card, 'adventure_name', '')):
@@ -529,17 +608,14 @@ async def cast_spell_async(engine, game: GameState, player: Player, card: Card, 
             print(f"[ADVENTURE] Casting as creature half — using {creature_half} "
                   f"(stripped from {effective_mana_cost})")
             effective_mana_cost = creature_half
-            # Recompute effective_cmc against the stripped creature cost.
-            ch_upper = creature_half.upper()
-            effective_cmc = sum(int(m) for m in re.findall(r'\{(\d+)\}', ch_upper))
-            effective_cmc += sum(ch_upper.count(f'{{{c}}}') for c in ['W', 'U', 'B', 'R', 'G'])
+            # Recompute effective_cmc against the stripped creature cost
+            # (hybrid-aware — July 21 batch audit).
+            effective_cmc = helpers.cmc_of_cost_string(creature_half)
     elif getattr(card, 'cast_as_split_half', -1) >= 0 and card.split_costs:
         half_idx = card.cast_as_split_half
         effective_mana_cost = card.split_costs[half_idx]
-        # Calculate split half CMC from its mana cost
-        half_cost_upper = effective_mana_cost.upper()
-        effective_cmc = sum(int(m) for m in re.findall(r'\{(\d+)\}', half_cost_upper))
-        effective_cmc += sum(half_cost_upper.count(f'{{{c}}}') for c in ['W', 'U', 'B', 'R', 'G'])
+        # Split-half CMC (hybrid-aware — July 21 batch audit).
+        effective_cmc = helpers.cmc_of_cost_string(effective_mana_cost)
         half_name = card.split_names[half_idx] if card.split_names else card.name
         print(f"[SPLIT] Using {half_name} cost {effective_mana_cost} (CMC {effective_cmc}) instead of full card cost {card.mana_cost}")
 
@@ -548,7 +624,8 @@ async def cast_spell_async(engine, game: GameState, player: Player, card: Card, 
     if not effective_mana_cost and card.oracle_text:
         oracle_lower = card.oracle_text.lower()
         if re.search(r'suspend\s+\d', oracle_lower) and card in player.hand:
-            return False, f"{card.name} has no mana cost — it can only be suspended, not cast from hand", []
+            return ((False, f"{card.name} has no mana cost — it can only be suspended, not cast from hand", []),
+                    None)
 
     total_cost = effective_cmc + additional_cost
     x_value_chosen = 0
@@ -610,10 +687,10 @@ async def cast_spell_async(engine, game: GameState, player: Player, card: Card, 
                 if not _found:
                     print(f"[X-TARGET-CHECK] {card.name}: no legal targets "
                           f"with MV {_op} X={x_value_chosen} — cast blocked")
-                    return False, (
+                    return ((False, (
                         f"{card.name}: no legal targets with mana value X={x_value_chosen} "
                         f"or {_op}"
-                    ), []
+                    ), []), None)
 
     # Check for free-cast from turn effects (Rishkar's Expertise, Cascade, etc.)
     free_cast_source = None
@@ -764,6 +841,36 @@ async def cast_spell_async(engine, game: GameState, player: Player, card: Card, 
             print(f"[IMPROVISE] {card.name}: tapped {improvise_reduction} artifact(s) to help pay")
 
     total_alt_reduction = convoke_reduction + delve_reduction + improvise_reduction
+    return None, {
+        'effective_mana_cost': effective_mana_cost,
+        'effective_cmc': effective_cmc,
+        'total_cost': total_cost,
+        'x_value_chosen': x_value_chosen,
+        'pay_mana': pay_mana,
+        'free_cast_source': free_cast_source,
+        'total_alt_reduction': total_alt_reduction,
+    }
+
+
+def _pay_costs(engine, game: GameState, player: Player, card: Card,
+               costs: Dict, additional_cost: int
+               ) -> Optional[Tuple[bool, str, List[str]]]:
+    """Mana payment (refactor #2 step 2c — extracted July 20, 2026).
+
+    Color-aware tapping via the mana engine when available (convoke/delve/
+    improvise reductions apply to the GENERIC portion, commander tax rides
+    as additional generic); amount-based tapping fallback otherwise. No-op
+    when the cost stage already waived payment (free cast, alternate cost).
+
+    Returns the (False, reason, []) rejection tuple when tapping fails, or
+    None on success (card._mana_paid stamped for X-spell math).
+    """
+    effective_mana_cost = costs['effective_mana_cost']
+    effective_cmc = costs['effective_cmc']
+    total_cost = costs['total_cost']
+    x_value_chosen = costs['x_value_chosen']
+    total_alt_reduction = costs['total_alt_reduction']
+    pay_mana = costs['pay_mana']
 
     # Pay mana cost — use color-aware tapping when mana engine is available
     if pay_mana and (effective_mana_cost or additional_cost > 0):
@@ -789,58 +896,27 @@ async def cast_spell_async(engine, game: GameState, player: Player, card: Card, 
             return False, f"Not enough mana to cast {cast_name} (needs {effective_cmc}{tax_note} = {total_cost} total)", []
         # Track mana paid for X spell calculations
         card._mana_paid = total_cost
+    return None
 
-    # Preserve the origin for effects such as Wash Away that inspect where
-    # the target spell was cast from after it has moved to the stack.
-    if getattr(card, 'cast_from_command_zone', False):
-        card._cast_origin = 'command_zone'
-    elif _cast_from_graveyard:
-        card._cast_origin = 'graveyard'
-    else:
-        card._cast_origin = 'hand'
 
-    if _cast_from_graveyard:
-        player.graveyard.remove(card)
-        try:
-            player.playable_from_graveyard.remove(card.id)
-        except (ValueError, AttributeError):
-            pass
-        # CR 702.34a: a flashbacked spell is exiled as it resolves —
-        # consumed by the resolution zone-routing below.
-        card._resolving_flashback = True
-        print(f"[FLASHBACK] {card.name} cast from graveyard (leaves graveyard)")
-    else:
-        player.hand.remove(card)
+async def _await_stack_window(engine, game: GameState, player: Player,
+                              card: Card, target: Any,
+                              effect_messages: List[str]
+                              ) -> Tuple[Optional[Tuple[bool, str, List[str]]], List[str], int]:
+    """Stack push + priority window (refactor #2 step 2d — extracted July 20, 2026).
 
-    # Track spells cast this turn (for day/night, werewolf transform, Esper Sentinel)
-    player.spells_cast_this_turn += 1
-    if not card.is_creature():
-        player.noncreature_spells_cast_this_turn += 1
+    In original order: push the StackEntry, early cast announcement, cast
+    triggers (Rhystic Study fire on CAST, before any counter window),
+    priority-system resync + announce, the adaptive resolution timeout with
+    LIFO extensions, the countered-spell zone routing (command zone /
+    suspend-exile / library / graveyard per CR 903.9b etc.), resolution-time
+    target fizzle (CR 608.2b), and the pre-resolve stack pop.
 
-    # May 14 audit (A7): track per-game spell-type counts on the game state so
-    # the strategist can detect "opponent has cast 0 noncreature spells in 8
-    # turns — your Mana Drain is dead this matchup, pivot." Without this, the
-    # control deck holds counterspells for 20 turns and dies.
-    if not hasattr(game, '_spell_counts_by_player'):
-        game._spell_counts_by_player = {}  # player_name -> {creature, noncreature, instant, sorcery, total}
-    counts = game._spell_counts_by_player.setdefault(
-        player.name, {'creature': 0, 'noncreature': 0, 'instant': 0, 'sorcery': 0, 'total': 0}
-    )
-    type_l = (card.type_line or '').lower()
-    counts['total'] += 1
-    if 'creature' in type_l:
-        counts['creature'] += 1
-    else:
-        counts['noncreature'] += 1
-    if 'instant' in type_l:
-        counts['instant'] += 1
-    elif 'sorcery' in type_l:
-        counts['sorcery'] += 1
-
-    effect_messages = []
-    if free_cast_source:
-        effect_messages.append(f"🆓 {card.name} cast for free via {free_cast_source}!")
-
+    Returns (final, cast_trigger_msgs, player_idx): `final` is a completed
+    (success, message, effect_messages) result when the spell was countered
+    or fizzled — the caller returns it verbatim; None means resolve on.
+    `effect_messages` is mutated in place throughout (shared list).
+    """
     # [STACK] Push spell onto the stack
     player_idx = game.players.index(player) if player in game.players else 0
     stack_entry = StackEntry(
@@ -984,7 +1060,10 @@ async def cast_spell_async(engine, game: GameState, player: Player, card: Card, 
                     if engine.claude_ai:
                         opp_instants = engine.claude_ai.has_instant_speed_cards(opp)
                         if opp_instants:
-                            affordable = [c for c in opp_instants if opp.can_pay_mana_cost(c.mana_cost)[0]]
+                            # July 20: alternate-cost aware — FoW class
+                            affordable = [c for c in opp_instants
+                                          if opp.can_pay_mana_cost(c.mana_cost)[0]
+                                          or opp.can_pay_printed_alternate_cost(c)]
                             if affordable:
                                 opponent_has_interaction = True
                                 instant_names = [c.name for c in affordable[:3]]
@@ -1124,7 +1203,8 @@ async def cast_spell_async(engine, game: GameState, player: Player, card: Card, 
                 print(f"[STACK] {card.name} was countered — goes to graveyard")
                 effect_messages.append(f"❌ **{card.name}** was countered!")
             engine.rules.log_event(f"{player.name}'s {card.name} was countered")
-            return True, f"Cast {card.name} (countered)", effect_messages
+            return ((True, f"Cast {card.name} (countered)", effect_messages),
+                    cast_trigger_msgs, player_idx)
 
     # [TARGETING] Resolution-time target validation (CR 608.2b)
     # If ALL targets are now illegal, the spell fizzles (countered by game rules).
@@ -1144,13 +1224,29 @@ async def cast_spell_async(engine, game: GameState, player: Player, card: Card, 
                 effect_messages.append(f"💨 **{fizzle_reason}**")
             print(f"[TARGETING] {fizzle_reason}")
             engine.rules.log_event(f"{card.name} fizzled — all targets illegal")
-            return True, f"Cast {card.name} (fizzled)", effect_messages
+            return ((True, f"Cast {card.name} (fizzled)", effect_messages),
+                    cast_trigger_msgs, player_idx)
 
     # Pop from stack before resolving
     if stack_entry in game.stack:
         game.stack.remove(stack_entry)
     _drop_from_priority_stack()
+    return None, cast_trigger_msgs, player_idx
 
+
+async def _dispatch_resolution(engine, game: GameState, player: Player,
+                               card: Card, target: Any,
+                               effect_messages: List[str],
+                               cast_trigger_msgs: List[str],
+                               player_idx: int) -> Tuple[bool, str, List[str]]:
+    """Spell-effect resolution (refactor #2 step 2d — extracted July 20, 2026).
+
+    Everything after the spell survives the stack: split/adventure half
+    handling, permanent-vs-nonpermanent zone routing, ETB scans + Tier
+    1/1.5/2/2.5/3 effect cascade, clone/aura/equipment handling, saga
+    setup, layers/replacement registration, and the pending-message flush.
+    Returns the final (success, message, effect_messages) for the cast.
+    """
     # Handle split card casting — resolve only the chosen half's effect,
     # then the card goes to graveyard (both halves share one physical card)
     if getattr(card, 'cast_as_split_half', -1) >= 0 and card.split_texts:
@@ -1593,6 +1689,13 @@ async def cast_spell_async(engine, game: GameState, player: Player, card: Card, 
         card.entered_this_turn = True
         player.battlefield.append(card)
         engine.rules.log_event(f"{player.name} casts {card.name} (permanent)")
+        # (Pub/sub slice 2: the PERMANENT_ENTERED emit for the cast path
+        # lives further down, next to the watcher-scan dispatch — NOT here
+        # at the raw append. Today's-batch parity lines proved the append is
+        # too early: a fizzled aura appends-then-leaves (no entry per CR),
+        # and a clone's characteristics apply after the append, so kind was
+        # recorded pre-copy — Clever Impersonator copying devotion-gated
+        # Thassa was flagged as a missed creature scan.)
 
         if card.name.lower() == 'wishclaw talisman':
             card.counters['wish'] = 3
@@ -1780,10 +1883,14 @@ async def cast_spell_async(engine, game: GameState, player: Player, card: Card, 
                     print(f"[REANIMATE-BIND] {card.name} bound to {target_card.name}")
                     effect_messages.append(f"💀 {card.name} reanimates {target_card.name}!")
                     print(f"[REANIMATE] {card.name} brought back {target_card.name} from {target_player.name}'s graveyard")
-                    # Fire ETB triggers for reanimated creature
-                    etb_msgs, _ = engine._check_creature_etb_triggers_sync(game, player, target_card)
-                    if etb_msgs:
-                        effect_messages.extend(etb_msgs)
+                    # Slice 2b (July 21): this inline aura-reanimation path
+                    # never emitted PERMANENT_ENTERED (the actions.py
+                    # reanimate handler does) — emit now drives the watcher
+                    # dispatch, then drain in place.
+                    events.emit(events.PERMANENT_ENTERED, game, card=target_card,
+                                controller=player, via="reanimate",
+                                rules=engine.rules)
+                    effect_messages.extend(helpers.drain_pending_messages(game))
                 else:
                     effect_messages.append(f"💨 {card.name} fizzles (no creatures in any graveyard)")
                     if card in player.battlefield:
@@ -1861,6 +1968,19 @@ async def cast_spell_async(engine, game: GameState, player: Player, card: Card, 
                         is_creature_only_check = "enchant creature" in oracle_lower
                         if is_creature_only_check and not target_card.is_creature():
                             print(f"[AURA-TARGET] AI target {target_card.name} is not a creature — falling back to auto-select")
+                            target_card = None
+                        # July 20 audit (Faith Unbroken): "Enchant creature
+                        # YOU CONTROL" — the honoring path attached the aura
+                        # to the OPPONENT's creature (the AI's single target
+                        # was really the ETB-exile target). Enforce the
+                        # controller restriction; auto-select then picks a
+                        # legal own-side bearer.
+                        elif ('enchant creature you control' in oracle_lower
+                                and target_card not in player.battlefield):
+                            print(f"[AURA-TARGET] AI target {target_card.name} "
+                                  f"isn't controlled by {player.name} "
+                                  f"(enchant creature you control) — falling "
+                                  f"back to auto-select")
                             target_card = None
                         elif HAS_TARGETING:
                             # Find the target's controller for validation
@@ -2004,6 +2124,16 @@ async def cast_spell_async(engine, game: GameState, player: Player, card: Card, 
             except Exception as _lw_exc:
                 print(f"[LIVING-WEAPON] P/T check raised: {_lw_exc}")
             effect_messages.append(f"⚔️ {card.name} — Living weapon creates a 0/0 Phyrexian Germ token, equipped with {card.name}")
+            # Pub/sub slice 2 (July 20): the germ is its own battlefield
+            # entry — emit, and run the creature-enters watcher scan that
+            # this path never had (Soul Warden never saw a Batterskull
+            # germ; found by relocating the cast emit, fixed by reading).
+            events.emit(events.PERMANENT_ENTERED, game, card=germ,
+                        controller=player, via="living_weapon",
+                        rules=engine.rules)
+            # Slice 2b (July 21): watcher dispatch ran in the
+            # PERMANENT_ENTERED subscriber (emit above). Drain in place.
+            effect_messages.extend(helpers.drain_pending_messages(game))
 
         # Handle "As ~ enters, pay any amount of life" (Phyrexian Processor)
         if card.oracle_text and card.is_artifact():
@@ -2093,19 +2223,22 @@ async def cast_spell_async(engine, game: GameState, player: Player, card: Card, 
             # Special planeswalker loyalty rules
             oracle_lower = card.oracle_text.lower() if card.oracle_text else ""
             
-            # Jeska, Thrice Reborn: enters with loyalty = times you've cast a commander
-            if "jeska" in card.name.lower() and "enters with a number of loyalty counters" in oracle_lower:
-                # Count total times commanders have been cast from command zone
-                total_commander_casts = 0
-                for cmd in player.command_zone:
-                    total_commander_casts += cmd.times_cast_from_command_zone
-                # Include any commanders on battlefield
-                for perm in player.battlefield:
-                    if perm.is_commander:
-                        total_commander_casts += perm.times_cast_from_command_zone
-                # Minimum of 1 (since we're casting Jeska, that's at least 1 commander cast)
-                card.loyalty_counters = max(1, total_commander_casts)
-                effect_messages.append(f"⚡ {card.name} enters with {card.loyalty_counters} loyalty")
+            # Jeska, Thrice Reborn class: enters with loyalty = times you've
+            # cast a commander from the command zone. July 21 batch audit
+            # (game_1529160614050791549): the old predicate here checked for
+            # an "enters with a number of..." wording that matches NO
+            # printing of Jeska ("...with a loyalty counter on her for each
+            # time you've cast a commander...") — dead branch, so the MAIN
+            # cast path fell to base loyalty 0 and she died to the SBA even
+            # after Daretti was cast from the CZ. The July 20 helper had only
+            # been wired into the suspend + noncast paths. Route through it.
+            from mtg.helpers import loyalty_from_commander_casts
+            _cmd_bonus = loyalty_from_commander_casts(game, player, card)
+            if _cmd_bonus:
+                card.loyalty_counters = base_loyalty + _cmd_bonus
+                effect_messages.append(
+                    f"⚡ {card.name} enters with {card.loyalty_counters} loyalty "
+                    f"({_cmd_bonus} commander cast(s) this game)")
             else:
                 card.loyalty_counters = base_loyalty
                 if base_loyalty > 0:
@@ -2458,12 +2591,26 @@ async def cast_spell_async(engine, game: GameState, player: Player, card: Card, 
                         f"{card.name} ETB: {etb_text[:150]}"
                     )
         
+        # Pub/sub slice 2: one PERMANENT_ENTERED per physical entry, emitted
+        # HERE — after aura-fizzle early-returns (a fizzled aura never
+        # entered, CR 303.4) and after clone characteristics applied (kind
+        # must be post-copy). The only early return between the battlefield
+        # append and this point is the aura fizzle, verified July 20.
+        if card in player.battlefield:
+            events.emit(events.PERMANENT_ENTERED, game, card=card,
+                        controller=player, via="cast", rules=engine.rules)
+            # Slice 2b (July 21): the emit above ran the creature watcher
+            # dispatch (subscriber). Drain its lines at the position the
+            # old direct scan call occupied.
+            effect_messages.extend(helpers.drain_pending_messages(game))
+
         # Check for "whenever another creature enters" triggers (Terror of the Peaks, etc.)
         # May 30 audit: pass game so a devotion-gated god entering as a NON-creature
         # (Purphoros at devotion<5) doesn't trigger creature-ETB watchers (CR 603.2a).
         if card.is_creature(game):
-            terror_triggers = await engine._check_creature_etb_triggers(game, player, card)
-            effect_messages.extend(terror_triggers)
+            # Slice 2b (July 21): watcher dispatch ran in the
+            # PERMANENT_ENTERED subscriber (emit above); already drained.
+            pass
         else:
             from mtg.triggers import _check_permanent_etb_watchers
             effect_messages.extend(_check_permanent_etb_watchers(
@@ -2473,9 +2620,9 @@ async def cast_spell_async(engine, game: GameState, player: Player, card: Card, 
         # enters" watchers had no scan AT ALL — Eidolon of Blossoms drew 0 of
         # 3 owed cards while three enchantments entered past it.
         if card.is_enchantment():
-            from mtg.triggers import _check_enchantment_etb_watchers
-            ench_watcher_msgs = _check_enchantment_etb_watchers(engine, game, player, card)
-            effect_messages.extend(ench_watcher_msgs)
+            # Slice 2b (2/2, July 21): constellation dispatch ran in the
+            # PERMANENT_ENTERED subscriber (cast emit above). Drain in place.
+            effect_messages.extend(helpers.drain_pending_messages(game))
 
         # June 11 smaller queue: Hammer of Nazahn's placeholder claimed this
         # watcher already existed. Resolve its free attach for Equipment that
@@ -2498,6 +2645,104 @@ async def cast_spell_async(engine, game: GameState, player: Player, card: Card, 
     # Flush draw-trigger side-channel (Smothering Tithe, Consecrated Sphinx)
     engine._flush_pending_messages(game, effect_messages)
     return True, f"Cast {card.name}", effect_messages
+
+
+async def cast_spell_async(engine, game: GameState, player: Player, card: Card, pay_mana: bool = True, target: Any = None, additional_cost: int = 0) -> Tuple[bool, str, List[str]]:
+    """Cast a spell with full effect resolution (async version).
+
+    Args:
+        game: Game state
+        player: Casting player
+        card: Card to cast
+        pay_mana: Whether to pay mana cost
+        target: Optional target for the spell
+        additional_cost: Additional generic mana cost (e.g., commander tax)
+
+    Returns:
+        Tuple of (success, message, effect_messages)
+    """
+    _rejection, _cast_from_graveyard, target = _validate_cast(
+        engine, game, player, card, target)
+    if _rejection is not None:
+        return _rejection
+
+    _rejection, _costs = _compute_alt_costs(
+        engine, game, player, card, pay_mana, additional_cost)
+    if _rejection is not None:
+        return _rejection
+    free_cast_source = _costs['free_cast_source']
+
+    _rejection = _pay_costs(engine, game, player, card, _costs, additional_cost)
+    if _rejection is not None:
+        return _rejection
+
+    # Preserve the origin for effects such as Wash Away that inspect where
+    # the target spell was cast from after it has moved to the stack.
+    if getattr(card, 'cast_from_command_zone', False):
+        card._cast_origin = 'command_zone'
+    elif _cast_from_graveyard:
+        card._cast_origin = 'graveyard'
+    else:
+        card._cast_origin = 'hand'
+
+    if _cast_from_graveyard:
+        player.graveyard.remove(card)
+        try:
+            player.playable_from_graveyard.remove(card.id)
+        except (ValueError, AttributeError):
+            pass
+        # CR 702.34a: a flashbacked spell is exiled as it resolves —
+        # consumed by the resolution zone-routing below.
+        card._resolving_flashback = True
+        print(f"[FLASHBACK] {card.name} cast from graveyard (leaves graveyard)")
+    else:
+        player.hand.remove(card)
+
+    # Track spells cast this turn (for day/night, werewolf transform, Esper Sentinel)
+    player.spells_cast_this_turn += 1
+    if not card.is_creature():
+        player.noncreature_spells_cast_this_turn += 1
+
+    # May 14 audit (A7): track per-game spell-type counts on the game state so
+    # the strategist can detect "opponent has cast 0 noncreature spells in 8
+    # turns — your Mana Drain is dead this matchup, pivot." Without this, the
+    # control deck holds counterspells for 20 turns and dies.
+    if not hasattr(game, '_spell_counts_by_player'):
+        game._spell_counts_by_player = {}  # player_name -> {creature, noncreature, instant, sorcery, total}
+    counts = game._spell_counts_by_player.setdefault(
+        player.name, {'creature': 0, 'noncreature': 0, 'instant': 0, 'sorcery': 0, 'total': 0}
+    )
+    type_l = (card.type_line or '').lower()
+    counts['total'] += 1
+    if 'creature' in type_l:
+        counts['creature'] += 1
+    else:
+        counts['noncreature'] += 1
+    if 'instant' in type_l:
+        counts['instant'] += 1
+    elif 'sorcery' in type_l:
+        counts['sorcery'] += 1
+
+    effect_messages = []
+    # July 20 audit: surface pain-land tap damage (City of Brass, Ancient
+    # Tomb) buffered by tap_sources_for_cost — it was console-only, leaving
+    # unexplained life drops in the Discord narration (13 in one July 16
+    # game). Drained here so the lines ride the normal effect_messages path.
+    _tap_dmg_msgs = getattr(player, '_pending_tap_damage_msgs', None)
+    if _tap_dmg_msgs:
+        effect_messages.extend(_tap_dmg_msgs)
+        _tap_dmg_msgs.clear()
+    if free_cast_source:
+        effect_messages.append(f"🆓 {card.name} cast for free via {free_cast_source}!")
+
+    _final, cast_trigger_msgs, player_idx = await _await_stack_window(
+        engine, game, player, card, target, effect_messages)
+    if _final is not None:
+        return _final
+
+    return await _dispatch_resolution(engine, game, player, card, target,
+                                      effect_messages, cast_trigger_msgs,
+                                      player_idx)
 
 # =========================================================================
 # PENDING ASYNC TRIGGER QUEUE
@@ -2635,15 +2880,19 @@ def _process_suspend_upkeep(engine, game: GameState) -> List[str]:
             player.battlefield.append(card)
             card.entered_this_turn = True
             messages.append(f"⏰ {card.name} comes off suspend and enters the battlefield with haste!")
-            
+            events.emit(events.PERMANENT_ENTERED, game, card=card,
+                        controller=player, via="suspend", rules=engine.rules)
+
             # Check for ETB triggers
             etb_msgs = engine._handle_etb_triggers(game, player, card)
             messages.extend(etb_msgs)
-            
+
         elif card.is_land():
             # Lands just enter
             player.battlefield.append(card)
             messages.append(f"⏰ {card.name} comes off suspend and enters the battlefield!")
+            events.emit(events.PERMANENT_ENTERED, game, card=card,
+                        controller=player, via="suspend", rules=engine.rules)
             
         elif card.is_instant() or card.is_sorcery():
             # Resolve spell effects
@@ -2662,6 +2911,8 @@ def _process_suspend_upkeep(engine, game: GameState) -> List[str]:
             player.battlefield.append(card)
             card.entered_this_turn = True
             messages.append(f"⏰ {card.name} comes off suspend and enters the battlefield!")
+            events.emit(events.PERMANENT_ENTERED, game, card=card,
+                        controller=player, via="suspend", rules=engine.rules)
             
             # Handle planeswalker loyalty
             if card.is_planeswalker() and card.loyalty:
@@ -2669,6 +2920,17 @@ def _process_suspend_upkeep(engine, game: GameState) -> List[str]:
                     card.loyalty_counters = int(card.loyalty)
                 except:
                     pass
+                # July 20 audit (Jeska, Thrice Reborn): printed loyalty 0 +
+                # "enters with a loyalty counter for each time you've cast a
+                # commander" — without the bonus she died to SBA the instant
+                # she resolved, with zero player-visible explanation.
+                from mtg.helpers import loyalty_from_commander_casts
+                _cmd_bonus = loyalty_from_commander_casts(game, player, card)
+                if _cmd_bonus:
+                    card.loyalty_counters += _cmd_bonus
+                    effect_messages.append(
+                        f"⚡ {card.name} enters with {card.loyalty_counters} "
+                        f"loyalty ({_cmd_bonus} commander cast(s) this game)")
             
             # Check for ETB triggers
             etb_msgs = engine._handle_etb_triggers(game, player, card)
@@ -2895,6 +3157,63 @@ def resolve_special_effects(engine, game: GameState, player: Player, card: Card,
     player_idx = game.players.index(player) if player in game.players else 0
     opponent_idx = 1 - player_idx
     opponent = game.players[opponent_idx]
+
+    # Summary Dismissal: exile all other spells and counter all abilities.
+    # July 21 batch audit (R2-2): Tier 2's EXILE regex garbled this into an
+    # untargeted no-op with EMPTY messages, which also dodged the Tier 3
+    # escalation gate — the whole effect silently evaporated while the
+    # cosmetic fallback line claimed it resolved, and a Summary Dismissal
+    # cast specifically at Avenger of Zendikar let the Avenger resolve in
+    # full (game_1529172161636597770). Needs direct stack access → Tier 1.
+    if card_name_lower == "summary dismissal":
+        exiled_names = []
+        for entry in list(getattr(game, 'stack', [])):
+            e_card = getattr(entry, 'card', None)
+            if e_card is None or e_card is card:
+                continue
+            try:
+                game.stack.remove(entry)
+            except ValueError:
+                continue
+            # Keep the PrioritySystem's mirror stack in sync (May 19
+            # phantom-entry class).
+            _pid = getattr(entry, 'priority_id', None)
+            _ps = getattr(game, '_priority_system', None)
+            if _pid and _ps is not None and hasattr(_ps, 'remove_stack_entry_by_priority_id'):
+                try:
+                    _ps.remove_stack_entry_by_priority_id(_pid)
+                except Exception as _ps_err:
+                    print(f"[SUMMARY-DISMISSAL] priority-stack sync failed: {_ps_err}")
+                    from mtg.util import maybe_reraise
+                    maybe_reraise(_ps_err)
+            e_owner_idx = getattr(e_card, 'owner_index', None)
+            e_owner = (game.players[e_owner_idx]
+                       if isinstance(e_owner_idx, int) and 0 <= e_owner_idx < len(game.players)
+                       else getattr(entry, 'controller', None) or player)
+            if not hasattr(e_owner, 'exile'):
+                e_owner.exile = []
+            e_owner.exile.append(e_card)
+            exiled_names.append(e_card.name)
+            print(f"[SUMMARY-DISMISSAL] Exiled {e_card.name} from the stack")
+        # "Counter all abilities" — wipe the pending trigger queues (the
+        # engine's stack-adjacent representation of triggered abilities).
+        countered_triggers = 0
+        pat = getattr(game, 'pending_async_triggers', None)
+        if pat:
+            countered_triggers = len(pat)
+            game.pending_async_triggers = []
+            print(f"[SUMMARY-DISMISSAL] Countered {countered_triggers} pending triggered abilit(ies)")
+        if exiled_names:
+            messages.append("🌀 **Summary Dismissal** exiles "
+                            + ", ".join(f"**{n}**" for n in exiled_names)
+                            + " from the stack")
+        if countered_triggers:
+            messages.append(f"🌀 **Summary Dismissal** counters {countered_triggers} "
+                            f"triggered abilit{'y' if countered_triggers == 1 else 'ies'}")
+        if not exiled_names and not countered_triggers:
+            messages.append("🌀 **Summary Dismissal** resolves — no other spells "
+                            "or abilities on the stack")
+        return messages
 
     # Chaos Warp: target permanent → shuffle into library, reveal top, if permanent put onto battlefield
     if "chaos warp" in card_name_lower or (

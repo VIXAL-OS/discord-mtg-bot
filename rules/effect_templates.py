@@ -31,7 +31,9 @@ Inspired by XMage's effect class taxonomy (DamageTargetEffect, DrawCardEffect, e
 but implemented as pure Python pattern matching — no Java required.
 """
 
+import json
 import re
+from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple, Callable
 from dataclasses import dataclass, field
 
@@ -54,6 +56,46 @@ class EffectTemplate:
     needs_target: bool = False
     # Whether this effect is mandatory
     mandatory: bool = True
+
+
+# =============================================================================
+# JSON-backed templates (refactor #2, second half — July 20, 2026)
+# =============================================================================
+# The FIXED half of the name-keyed library lives in data/card_templates.json:
+# entries whose action lists are constant apart from $controller/$opponent
+# substitution. Adding a simple card = adding a JSON entry (the OSS
+# contribution path). Generator-style templates — anything that reads the
+# game context, branches, or computes — stays in Python below, as do the
+# table-driven families (signets, fetchlands, counterspell variants) whose
+# loops are already data.
+# data/card_templates.json is validated two ways in CI: the schema check in
+# _load_json_templates (raises → pytest fails on any import) and the Scryfall
+# card-name validator (tools/validate_card_names.py reads the same registries
+# the JSON loads into).
+
+# Path anchored to the repo root (rules/ → repo root → data/).
+CARD_TEMPLATES_JSON = Path(__file__).resolve().parent.parent / "data" / "card_templates.json"
+
+
+def _substitute_placeholders(obj, ctrl: str, opp: str):
+    """Deep-substitute $controller/$opponent in every string of a JSON action
+    tree. Rebuilds containers, so each generated action list is a fresh
+    structure — the action interpreter enriches actions in place and must
+    never mutate the shared JSON master copy."""
+    if isinstance(obj, str):
+        return obj.replace("$controller", ctrl).replace("$opponent", opp)
+    if isinstance(obj, list):
+        return [_substitute_placeholders(x, ctrl, opp) for x in obj]
+    if isinstance(obj, dict):
+        return {k: _substitute_placeholders(v, ctrl, opp) for k, v in obj.items()}
+    return obj
+
+
+def _make_json_action_generator(actions: List[Dict]) -> Callable:
+    """Wrap a JSON action list in the (ctrl, opp, ctx) generator interface."""
+    def _generate(ctrl, opp, ctx):
+        return _substitute_placeholders(actions, ctrl, opp)
+    return _generate
 
 
 # =============================================================================
@@ -135,6 +177,32 @@ def _find_player_by_name(game, name: Optional[str]):
     return None
 
 
+def strip_activated_ability_lines(text: str) -> str:
+    """Drop activated-ability lines ("<cost>: <effect>", CR 602.1) from
+    oracle text before the GENERIC pattern pass.
+
+    July 21 batch audit (R3-5, Glen Elendra Archmage): her ACTIVATED
+    "{U}, Sacrifice this creature: Counter target noncreature spell."
+    matched the generic counter-spell pattern on every ETB resolution
+    (cast, persist return, flicker) and fired a free counter with no cost
+    paid — harmless only because the stack happened to be empty. A colon
+    preceded by cost-shaped text (mana/tap symbols, sacrifice, pay,
+    discard, exile) or a bare loyalty number marks an activated ability;
+    triggered abilities ("When/Whenever/At ...") have no such prefix.
+    Name-keyed templates are unaffected — they never see this filter.
+    """
+    kept = []
+    for line in (text or '').split('\n'):
+        head = line.split(':', 1)[0] if ':' in line else ''
+        head = head.strip()
+        if head and len(head) <= 80 and (
+                re.search(r'\{[^}]+\}|\btap\b|sacrifice|\bpay\b|discard|exile', head)
+                or re.fullmatch(r'[+\-−]?\d+', head)):
+            continue
+        kept.append(line)
+    return '\n'.join(kept)
+
+
 def word_to_num(word: str) -> int:
     """Convert English number words to ints ('one' → 1, 'two' → 2, etc.).
 
@@ -185,6 +253,7 @@ class EffectTemplateLibrary:
         # one registration silently overwriting the other when keyed by name.
         self._dies_templates: Dict[str, EffectTemplate] = {}
         self._build_library()
+        self._load_json_templates()
 
     def tier_for_card(self, card_name: str, oracle_text: str = "") -> str:
         """Classify what tier of the engine will resolve a card's effects.
@@ -417,7 +486,12 @@ class EffectTemplateLibrary:
         
         # 2. Try oracle text pattern matching
         if oracle_text:
-            oracle_lower = oracle_text.lower()
+            # July 21 batch audit (R3-5): generic patterns must never match
+            # ACTIVATED-ability text — Glen Elendra Archmage's "{U},
+            # Sacrifice...: Counter target noncreature spell." fired a free
+            # counter on every ETB resolution. Name-keyed templates above
+            # already saw the full text.
+            oracle_lower = strip_activated_ability_lines(oracle_text.lower())
             for pattern, template in self._pattern_templates:
                 match = re.search(pattern, oracle_lower)
                 if match:
@@ -904,17 +978,6 @@ class EffectTemplateLibrary:
                 action_generator=_counter_action,
             ))
 
-        # Delay: counter → exile with three time counters (suspend). June 11
-        # audit: resolved via the generic pattern as counter-to-graveyard,
-        # letting Bloodghast landfall-return two turns later.
-        self._add_card("delay", EffectTemplate(
-            name="Delay",
-            description="Counter target spell; exile it with three time counters (suspended)",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "counter_spell", "player": ctrl, "target": "stack_top",
-                 "countered_to": "exile_suspend"},
-            ],
-        ))
 
         # Conditional counters — "unless its controller pays {N}". June 11
         # audit: these resolved as hard counters with no payment offered
@@ -964,22 +1027,6 @@ class EffectTemplateLibrary:
                 action_generator=_noncreature_counter,
             ))
 
-        self._add_card('dispel', EffectTemplate(
-            name="Dispel", description="Counter target instant spell",
-            action_generator=_counter_action,
-        ))
-        self._add_card('wash away', EffectTemplate(
-            name="Wash Away", description="Counter target spell not cast from its owner's hand",
-            action_generator=_counter_action,
-        ))
-        self._add_card('memory lapse', EffectTemplate(
-            name="Memory Lapse",
-            description="Counter target spell; put it on top of its owner's library",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "counter_spell", "player": ctrl,
-                 "target": "stack_top", "countered_to": "library_top"},
-            ],
-        ))
 
         # Creature-only counterspells
         def _creature_counter(ctrl, opp, ctx):
@@ -1002,10 +1049,6 @@ class EffectTemplateLibrary:
             name="Arcane Denial", description="Counter target spell, its controller draws 1",
             action_generator=_counter_and_draw,
         ))
-        self._add_card("swan song", EffectTemplate(
-            name="Swan Song", description="Counter target enchantment/instant/sorcery, controller gets 2/2 Bird",
-            action_generator=_counter_and_token,
-        ))
 
         # Pact of Negation: counter + delayed trigger at the CASTER'S next
         # upkeep — pay {3}{U}{U} or lose the game.
@@ -1023,11 +1066,6 @@ class EffectTemplateLibrary:
                               "reason": "failed to pay Pact of Negation cost"}],
                  "source": "Pact of Negation"},
             ]
-        self._add_card("pact of negation", EffectTemplate(
-            name="Pact of Negation",
-            description="Counter target spell. At next upkeep, pay {3}{U}{U} or lose the game.",
-            action_generator=_pact_of_negation,
-        ))
 
         # Modal spells — default to best autoplay mode choices
         def _mystic_confluence(ctrl, opp, ctx):
@@ -1047,11 +1085,6 @@ class EffectTemplateLibrary:
                 {"action": "draw_cards", "player": ctrl, "amount": 1},
             ]
 
-        self._add_card("cryptic command", EffectTemplate(
-            name="Cryptic Command",
-            description="Choose two: counter / bounce / tap all / draw. Default: counter + draw.",
-            action_generator=_cryptic_command,
-        ))
 
         # =================================================================
         # COUNTER ABILITY FAMILY (Stifle effects)
@@ -1151,7 +1184,8 @@ class EffectTemplateLibrary:
             name="Inferno Titan",
             description="Deal 3 damage divided among up to 3 targets",
             action_generator=lambda ctrl, opp, ctx: [
-                {"action": "deal_damage", "amount": 3, "target_player": opp}
+                {"action": "deal_damage", "amount": 3, "target_player": opp,
+                 "source": "Inferno Titan"}
             ],
         ))
 
@@ -1168,13 +1202,6 @@ class EffectTemplateLibrary:
             needs_target=True,
         ))
 
-        self._add_card("primeval titan", EffectTemplate(
-            name="Primeval Titan",
-            description="Search library for two lands, put onto battlefield tapped",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "no_action", "reason": f"{ctrl} searches for 2 lands (use !fix to add them)"}
-            ],
-        ))
 
         self._add_card("solitude", EffectTemplate(
             name="Solitude",
@@ -1210,14 +1237,6 @@ class EffectTemplateLibrary:
             needs_target=True,
         ))
 
-        # --- Cards with no_action hints (complex state changes) ---
-        self._add_card("plaguecrafter", EffectTemplate(
-            name="Plaguecrafter",
-            description="Each player sacrifices a creature or planeswalker, or discards a card",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "no_action", "reason": f"Each player must sacrifice a creature/planeswalker or discard (use !fix)"}
-            ],
-        ))
 
         self._add_card("agent of treachery", EffectTemplate(
             name="Agent of Treachery",
@@ -1239,20 +1258,6 @@ class EffectTemplateLibrary:
         # Etali, Primal Storm — attack trigger template is registered below (line ~1251)
         # with a proper etali_trigger action that actually exiles and casts cards
 
-        self._add_card("aurelia, the warleader", EffectTemplate(
-            name="Aurelia, the Warleader",
-            description="First attack each turn: untap all creatures, get extra combat + main phase",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "no_action", "reason": f"Aurelia: extra combat phase! Untap all creatures, additional combat + main (use !fix)"}
-            ],
-        ))
-
-        # --- Library interaction (game-state-dependent) ---
-        self._add_card("sphinx of uthuun", EffectTemplate(
-            name="Sphinx of Uthuun",
-            description="Fact or Fiction — reveal top 5, split into 2 piles, choose one for hand",
-            action_generator=lambda ctrl, opp, ctx: self._sphinx_of_uthuun(ctrl, opp, ctx),
-        ))
 
         self._add_card("gonti, lord of luxury", EffectTemplate(
             name="Gonti, Lord of Luxury",
@@ -1342,26 +1347,6 @@ class EffectTemplateLibrary:
             action_generator=_gen_abrupt_decay,
         ))
 
-        # Faithless Looting: draw 2, then discard 2
-        self._add_card("faithless looting", EffectTemplate(
-            name="Faithless Looting",
-            description="Draw 2, then discard 2",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "draw_cards", "player": ctrl, "amount": 2},
-                {"action": "discard", "player": ctrl, "card": "random"},
-                {"action": "discard", "player": ctrl, "card": "random"},
-            ],
-        ))
-
-        # Thrill of Possibility: discard a card, draw 2 (rummage)
-        self._add_card("thrill of possibility", EffectTemplate(
-            name="Thrill of Possibility",
-            description="Discard a card, then draw 2",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "discard", "player": ctrl, "card": "random"},
-                {"action": "draw_cards", "player": ctrl, "amount": 2},
-            ],
-        ))
 
         # Wheel of Fortune / Reforge the Soul / Wheel of Misfortune-likes:
         # each player discards their hand and draws 7
@@ -1379,16 +1364,6 @@ class EffectTemplateLibrary:
                 action_generator=wheel_action,
             ))
 
-        # Dramatic Reversal: untap all nonland permanents you control
-        self._add_card("dramatic reversal", EffectTemplate(
-            name="Dramatic Reversal",
-            description="Untap all nonland permanents you control",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "untap_lands", "player": ctrl,
-                 "include_nonlands": True, "exclude_lands": True,
-                 "reason": "Dramatic Reversal untaps nonlands"}
-            ],
-        ))
 
         # Unbreakable Formation: creatures you control gain indestructible until EOT
         self._add_card("unbreakable formation", EffectTemplate(
@@ -1397,28 +1372,6 @@ class EffectTemplateLibrary:
             action_generator=self._gen_unbreakable_formation,
         ))
 
-        # Past in Flames: target instant/sorcery in your graveyard gains flashback
-        # (approximation: grant flashback to the best instant/sorcery in graveyard)
-        self._add_card("past in flames", EffectTemplate(
-            name="Past in Flames",
-            description="Each instant/sorcery in your graveyard gains flashback until EOT",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "grant_flashback", "player": ctrl,
-                 "source": "Past in Flames",
-                 "reason": "Past in Flames: instants/sorceries gain flashback"},
-            ],
-        ))
-
-        # Long-Term Plans: search library for a card, shuffle, place that card
-        # third from top (approximate: tutor to hand, since "third from top" isn't modeled)
-        self._add_card("long-term plans", EffectTemplate(
-            name="Long-Term Plans",
-            description="Search library for a card, shuffle, place third from top (approximated as tutor-to-hand)",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "search_library", "player": ctrl, "count": 1,
-                 "reason": "Long-Term Plans (third-from-top approximated as tutor-to-hand)"},
-            ],
-        ))
 
         # Green Sun's Zenith: search for green creature with CMC <= X, put onto battlefield, shuffle Zenith into library
         self._add_card("green sun's zenith", EffectTemplate(
@@ -1433,16 +1386,6 @@ class EffectTemplateLibrary:
             ],
         ))
 
-        # Traverse the Ulvenwald: search library for creature/land
-        self._add_card("traverse the ulvenwald", EffectTemplate(
-            name="Traverse the Ulvenwald",
-            description="Search library for a creature or land card",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "search_library", "player": ctrl, "count": 1,
-                 "card_type": "creature_or_land",
-                 "reason": "Traverse the Ulvenwald: tutor creature or land"},
-            ],
-        ))
 
         # =================================================================
         # ADVENTURE-HALF TEMPLATES (Throne of Eldraine, Wilds of Eldraine).
@@ -1453,16 +1396,6 @@ class EffectTemplateLibrary:
         # without actually firing the effect.
         # =================================================================
 
-        # Welcome Home (Flaxen Intruder — sorcery): 3× 2/2 green Bear tokens
-        self._add_card("welcome home", EffectTemplate(
-            name="Welcome Home",
-            description="Create three 2/2 green Bear creature tokens",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "create_token", "player": ctrl, "name": "Bear",
-                 "power": 2, "toughness": 2,
-                 "types": "Creature — Bear", "count": 3},
-            ],
-        ))
         # Oaken Boon (Tuinvale Treefolk — sorcery): two +1/+1 counters on a creature
         self._add_card("oaken boon", EffectTemplate(
             name="Oaken Boon",
@@ -1488,16 +1421,6 @@ class EffectTemplateLibrary:
                 else [{"action": "no_action", "reason": "Petty Theft: no nonland permanent target"}]
             ),
         ))
-        # Heart's Desire (Lovestruck Beast — sorcery): 1/1 white Human "Heart's Desire"
-        self._add_card("heart's desire", EffectTemplate(
-            name="Heart's Desire",
-            description="Create a 1/1 white Human creature token named Heart's Desire",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "create_token", "player": ctrl, "name": "Heart's Desire",
-                 "power": 1, "toughness": 1,
-                 "types": "Creature — Human", "count": 1},
-            ],
-        ))
         # Gift of the Fae (Faerie Guidemother — instant): +1/+1 + flying EOT (target)
         # Approximation: pump the controller's best creature; flying is granted via temp keyword
         self._add_card("gift of the fae", EffectTemplate(
@@ -1515,14 +1438,6 @@ class EffectTemplateLibrary:
                 if ctx.get('controller_creature_count', 0) > 0
                 else [{"action": "no_action", "reason": "Gift of the Fae: no creature to pump"}]
             ),
-        ))
-        # Fertile Footsteps (Beanstalk Giant — sorcery): search basic land → battlefield
-        self._add_card("fertile footsteps", EffectTemplate(
-            name="Fertile Footsteps",
-            description="Search library for a basic land card and put it onto the battlefield",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "search_library_land", "player": ctrl, "basic_only": True},
-            ],
         ))
         # Usher to Safety (Shepherd of the Flock — instant): return your creature to hand
         self._add_card("usher to safety", EffectTemplate(
@@ -1549,15 +1464,6 @@ class EffectTemplateLibrary:
                        "reason": "Chop Down: no opponent creature with power 4+"}]
             ),
         ))
-        # Cast Off (Realm-Cloaked Giant — sorcery): destroy all non-Giant creatures
-        self._add_card("cast off", EffectTemplate(
-            name="Cast Off",
-            description="Destroy all non-Giant creatures",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "destroy_all_creatures", "exclude_types": ["Giant"],
-                 "reason": "Cast Off: destroy all non-Giant creatures"},
-            ],
-        ))
         # Dizzying Swoop (Ardenvale Tactician — instant): tap up to 2 creatures
         # Tap two opponent creatures (best two)
         def _gen_dizzying_swoop(ctrl, opp, ctx):
@@ -1573,36 +1479,6 @@ class EffectTemplateLibrary:
             description="Tap up to two target creatures",
             action_generator=_gen_dizzying_swoop,
         ))
-        # Granted (Fae of Wishes — sorcery): wishboard fetch — not modeled
-        self._add_card("granted", EffectTemplate(
-            name="Granted",
-            description="Wishboard fetch (not modeled — sideboard not tracked)",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "no_action", "reason": "Granted: wishboard not modeled"},
-            ],
-        ))
-        # Treats to Share (Curious Pair — sorcery): create a Food token
-        self._add_card("treats to share", EffectTemplate(
-            name="Treats to Share",
-            description="Create a Food token",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "create_token", "player": ctrl, "name": "Food",
-                 "power": 0, "toughness": 0,
-                 "types": "Artifact — Food", "count": 1,
-                 "oracle_text": "{2}, {T}, Sacrifice this artifact: You gain 3 life."},
-            ],
-        ))
-        # On Alert (Silverflame Squire — instant): up to 2 Knights get +2/+1 EOT
-        # Approximation: pump-all on Knight subtype only
-        self._add_card("on alert", EffectTemplate(
-            name="On Alert",
-            description="Up to two target Knights get +2/+1 until end of turn",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "pump_all_creatures", "player": ctrl,
-                 "power": 2, "toughness": 1,
-                 "source": "On Alert"},
-            ],
-        ))
         # Shield's Might (Garenbrig Carver — instant): target creature +2/+2 EOT
         # Approximation: pump-all on the controller's creatures
         self._add_card("shield's might", EffectTemplate(
@@ -1615,15 +1491,6 @@ class EffectTemplateLibrary:
                 if ctx.get('controller_creature_count', 0) > 0
                 else [{"action": "no_action", "reason": "Shield's Might: no creature to pump"}]
             ),
-        ))
-        # Mesmeric Glare (Hypnotic Sprite — instant): counter target spell with MV ≤ 3
-        self._add_card("mesmeric glare", EffectTemplate(
-            name="Mesmeric Glare",
-            description="Counter target spell with mana value 3 or less",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "counter_spell", "max_mv": 3,
-                 "reason": "Mesmeric Glare: counter spell with MV ≤ 3"},
-            ],
         ))
         # Bring Back (Oakhame Ranger — instant): two creatures +1/+1 EOT
         self._add_card("bring back", EffectTemplate(
@@ -1664,15 +1531,6 @@ class EffectTemplateLibrary:
                  "power": 5, "toughness": 5,
                  "permanent_until_leaves": True,
                  "card": ctx.get('target_card', '')},
-            ],
-        ))
-        # Seasonal Ritual (Rosethorn Acolyte — sorcery): add 1 mana of any color
-        self._add_card("seasonal ritual", EffectTemplate(
-            name="Seasonal Ritual",
-            description="Add one mana of any color",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "add_mana", "player": ctrl, "color": "G", "amount": 1,
-                 "reason": "Seasonal Ritual (default green; can be any color)"},
             ],
         ))
 
@@ -1934,35 +1792,6 @@ class EffectTemplateLibrary:
             needs_target=True,
         ))
 
-        # --- Opt: scry 1, draw a card ---
-        self._add_card("opt", EffectTemplate(
-            name="Opt",
-            description="Scry 1. Draw a card.",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "scry", "player": ctrl, "amount": 1},
-                {"action": "draw_cards", "player": ctrl, "amount": 1},
-            ],
-        ))
-
-        # --- Preordain: scry 2, draw a card ---
-        self._add_card("preordain", EffectTemplate(
-            name="Preordain",
-            description="Scry 2, then draw a card.",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "scry", "player": ctrl, "amount": 2},
-                {"action": "draw_cards", "player": ctrl, "amount": 1},
-            ],
-        ))
-
-        # --- Serum Visions: draw a card, scry 2 ---
-        self._add_card("serum visions", EffectTemplate(
-            name="Serum Visions",
-            description="Draw a card, then scry 2.",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "draw_cards", "player": ctrl, "amount": 1},
-                {"action": "scry", "player": ctrl, "amount": 2},
-            ],
-        ))
 
         # --- Archmage's Charm: modal (counter, draw 2, steal MV≤1) ---
         self._add_card("archmage's charm", EffectTemplate(
@@ -2031,26 +1860,33 @@ class EffectTemplateLibrary:
             ],
         ))
 
-        # --- Gitaxian Probe: target player reveals hand, draw a card ---
-        self._add_card("gitaxian probe", EffectTemplate(
-            name="Gitaxian Probe",
-            description="Target player reveals their hand. Draw a card.",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "draw_cards", "player": ctrl, "amount": 1},
-            ],
-        ))
-
-        # --- Heroic Intervention: all permanents gain hexproof + indestructible ---
-        self._add_card("heroic intervention", EffectTemplate(
-            name="Heroic Intervention",
-            description="Your permanents gain hexproof and indestructible until end of turn",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "grant_keywords", "player": ctrl,
-                 "keywords": ["Hexproof", "Indestructible"], "target": "all_own_permanents"},
-            ],
-        ))
 
         # --- Swords to Plowshares: exile creature, controller gains life equal to its power ---
+        # July 21 batch audit (R3-4): the generic "exile target X" pattern
+        # only ever applies the FIRST clause (single-pattern-per-resolution),
+        # so Anguished Unmaking's "You lose 3 life." was silently dropped —
+        # a clean 3-point hole in an otherwise fully-reconciled life ledger
+        # (game_1529168824723570750). Name-keyed template carries both.
+        self._add_card("anguished unmaking", EffectTemplate(
+            name="Anguished Unmaking",
+            description="Exile target nonland permanent. You lose 3 life.",
+            action_generator=lambda ctrl, opp, ctx: [
+                {"action": "move_card",
+                 "card": (ctx.get('explicit_target_name')
+                          or ctx.get('best_opponent_nonland')
+                          or ctx.get('best_opponent_creature') or ''),
+                 "from_zone": "battlefield", "to_zone": "exile",
+                 "player": ctx.get('explicit_target_owner') or opp},
+                {"action": "lose_life", "player": ctrl, "amount": 3},
+            ] if (ctx.get('explicit_target_name')
+                  or ctx.get('best_opponent_nonland')
+                  or ctx.get('best_opponent_creature')) else [
+                {"action": "no_action",
+                 "reason": "No nonland permanent to target"}
+            ],
+            needs_target=True,
+        ))
+
         self._add_card("swords to plowshares", EffectTemplate(
             name="Swords to Plowshares",
             description="Exile target creature. Its controller gains life equal to its power.",
@@ -2095,24 +1931,6 @@ class EffectTemplateLibrary:
             needs_target=True,
         ))
 
-        # --- Yorion, Sky Nomad: flicker up to 5 other nonland permanents you own ---
-        self._add_card("yorion, sky nomad", EffectTemplate(
-            name="Yorion, Sky Nomad",
-            description="Exile any number of other nonland permanents you own, return at next end step",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "mass_flicker", "player": ctrl, "count": 5, "exclude_lands": True,
-                 "exclude_self": "Yorion, Sky Nomad"},
-            ],
-        ))
-
-        # --- Spell Queller: exile target spell with MV 4 or less from the stack ---
-        self._add_card("spell queller", EffectTemplate(
-            name="Spell Queller",
-            description="When Spell Queller enters, exile target spell with MV 4 or less",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "exile_from_stack", "controller": ctrl, "max_mv": 4},
-            ],
-        ))
 
         # --- Dream Stalker: return a permanent you control to hand on ETB ---
         self._add_card("dream stalker", EffectTemplate(
@@ -2129,7 +1947,11 @@ class EffectTemplateLibrary:
         # See dedicated Toxic Deluge entry below for the -X/-X pump_all_creatures
         # template (which kills indestructibles via 0-toughness SBA, persists
         # for end of turn, and costs X life).
-        for wipe_name in ["wrath of god", "day of judgment", "damnation", "decree of pain",
+        # July 20: "decree of pain" removed from this table — its draw clause
+        # ("Draw a card for each creature destroyed this way") was silently
+        # dropped by the generic wipe (2 cards lost, game_1526071467035459665).
+        # It now lives in data/card_templates.json with draw_per_destroyed.
+        for wipe_name in ["wrath of god", "day of judgment", "damnation",
                           "blasphemous act", "black sun's zenith",
                           "fumigate", "cleansing nova"]:
             self._add_card(wipe_name, EffectTemplate(
@@ -2173,12 +1995,19 @@ class EffectTemplateLibrary:
         self._add_card("dread return", EffectTemplate(
             name="Dread Return",
             description="Return target creature card from your graveyard to the battlefield",
+            # July 21 batch audit (R3-2): honor the declared cast-time target
+            # (CR 601.2c/608.2b) — the heuristic-only pick reanimated
+            # Sakura-Tribe Elder when the AI declared Blood Artist
+            # (game_1529168824723570750). The reanimate handler's
+            # own_graveyard restriction still gates an illegal declared name.
             action_generator=lambda ctrl, opp, ctx: [
                 {"action": "reanimate", "player": ctrl,
-                 "card": ctx.get('best_own_graveyard_creature', ''),
+                 "card": (ctx.get('explicit_target_name')
+                          or ctx.get('best_own_graveyard_creature', '')),
                  "own_graveyard": True,
                  "reason": "Dread Return single-target reanimate"},
-            ] if ctx.get('best_own_graveyard_creature') else [
+            ] if (ctx.get('explicit_target_name')
+                  or ctx.get('best_own_graveyard_creature')) else [
                 {"action": "no_action", "reason": "No creature cards in your graveyard"}
             ],
         ))
@@ -2249,18 +2078,6 @@ class EffectTemplateLibrary:
             action_generator=_gen_karlach_attack,
         ))
 
-        # June 10 deep-dive: Lightning Reaver's combat-damage half — the
-        # combat-damage-to-player dispatcher (mtg/combat.py) resolves via
-        # this registry; without a template the charge counter never landed
-        # (3 hits, 0 counters, end-step X stayed 0 all game).
-        self._add_attack_card("lightning reaver", EffectTemplate(
-            name="Lightning Reaver (combat damage)",
-            description="Whenever this creature deals combat damage to a player, put a charge counter on it",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "add_counters", "card": "Lightning Reaver",
-                 "counter_type": "charge", "amount": 1},
-            ],
-        ))
 
         # June 10 round 3: Teachings of the Kirin — chapter-dispatching
         # name-keyed template. The saga resolver passes ONLY the chapter
@@ -2340,25 +2157,6 @@ class EffectTemplateLibrary:
             action_generator=_gen_kirin_orochi_attack,
         ))
 
-        self._add_attack_card("goblin rabblemaster", EffectTemplate(
-            name="Goblin Rabblemaster (attack)",
-            description="Create a 1/1 red Goblin tapped attacking; other Goblins get +1/+1 until EOT",
-            action_generator=lambda ctrl, opp, ctx: [
-                # Token: 1/1 red Goblin, tapped + attacking. The `tapped` and
-                # `attacking` flags are honored by create_token (May 20 audit).
-                {"action": "create_token", "player": ctrl, "name": "Goblin",
-                 "power": 1, "toughness": 1, "types": "Creature — Goblin",
-                 "count": 1, "tapped": True, "attacking": True,
-                 "colors": ["R"], "attacking_player": opp},
-                # Anthem for other Goblins controlled by Rabblemaster's controller.
-                # `subtype` filter pumps only Goblins; `exclude` skips Rabblemaster
-                # itself (it's not "other Goblins" — see CR 700.5 "another").
-                {"action": "pump_all_creatures", "player": ctrl,
-                 "subtype": "Goblin", "exclude": "Goblin Rabblemaster",
-                 "power": 1, "toughness": 1,
-                 "source": "Goblin Rabblemaster attack anthem"},
-            ],
-        ))
 
         # Austere Command: choose two — destroy artifacts; destroy creatures
         # CMC ≤3; destroy creatures CMC ≥4; destroy enchantments. Pick the two
@@ -2369,27 +2167,6 @@ class EffectTemplateLibrary:
             name="Austere Command",
             description="Choose two — destroy artifacts; destroy creatures with mana value 3 or less; destroy creatures with mana value 4 or greater; destroy enchantments",
             action_generator=lambda ctrl, opp, ctx: _austere_command_modes(ctrl, opp, ctx),
-        ))
-        self._add_card("supreme verdict", EffectTemplate(
-            name="Supreme Verdict",
-            description="Destroy all creatures (can't be countered)",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "destroy_all_creatures"},
-            ],
-        ))
-        self._add_card("terminus", EffectTemplate(
-            name="Terminus",
-            description="Put all creatures on the bottom of their owners' libraries",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "tuck_all_creatures"},
-            ],
-        ))
-        self._add_card("hallowed burial", EffectTemplate(
-            name="Hallowed Burial",
-            description="Put all creatures on the bottom of their owners' libraries",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "tuck_all_creatures"},
-            ],
         ))
         self._add_card("cyclonic rift", EffectTemplate(
             name="Cyclonic Rift",
@@ -2427,14 +2204,21 @@ class EffectTemplateLibrary:
                 {"action": "no_action", "reason": "No creature to bounce"}
             ],
         ))
+        # July 21 batch audit (R1-1): Snap + Vapor Snag were the two bounce
+        # templates skipping the explicit_target_name override — Snap bounced
+        # Korvold when the AI declared Birds of Paradise (CR 601.2c/608.2b,
+        # game_1529154418816057364). Same or-chain every other template uses.
         self._add_card("vapor snag", EffectTemplate(
             name="Vapor Snag",
             description="Return target creature to its owner's hand, its controller loses 1 life",
             action_generator=lambda ctrl, opp, ctx: [
-                {"action": "move_card", "card": ctx.get('best_opponent_creature', ''),
+                {"action": "move_card",
+                 "card": (ctx.get('explicit_target_name')
+                          or ctx.get('best_opponent_creature', '')),
                  "from_zone": "battlefield", "to_zone": "hand", "player": opp},
                 {"action": "lose_life", "player": opp, "amount": 1},
-            ] if ctx.get('best_opponent_creature') else [
+            ] if (ctx.get('explicit_target_name')
+                  or ctx.get('best_opponent_creature')) else [
                 {"action": "no_action", "reason": "No creature to bounce"}
             ],
         ))
@@ -2443,10 +2227,13 @@ class EffectTemplateLibrary:
             name="Snap",
             description="Return target creature to its owner's hand, untap up to two lands",
             action_generator=lambda ctrl, opp, ctx: [
-                {"action": "move_card", "card": ctx.get('best_opponent_creature', ''),
+                {"action": "move_card",
+                 "card": (ctx.get('explicit_target_name')
+                          or ctx.get('best_opponent_creature', '')),
                  "from_zone": "battlefield", "to_zone": "hand", "player": opp},
                 {"action": "untap_lands", "player": ctrl, "count": 2},
-            ] if ctx.get('best_opponent_creature') else [
+            ] if (ctx.get('explicit_target_name')
+                  or ctx.get('best_opponent_creature')) else [
                 {"action": "no_action", "reason": "No creature to bounce"}
             ],
         ))
@@ -2457,23 +2244,6 @@ class EffectTemplateLibrary:
             action_generator=self._gen_bounce_opponent_permanent,
         ))
 
-        # --- Snapcaster Mage: grant flashback to instant/sorcery in graveyard ---
-        self._add_card("snapcaster mage", EffectTemplate(
-            name="Snapcaster Mage",
-            description="Target instant or sorcery in your graveyard gains flashback",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "grant_flashback", "player": ctrl},
-            ],
-        ))
-
-        # --- Sphinx of Uthuun: Fact or Fiction variant (reveal 5, split into 2 piles) ---
-        self._add_card("sphinx of uthuun", EffectTemplate(
-            name="Sphinx of Uthuun",
-            description="When Sphinx of Uthuun enters, reveal top 5, opponent splits, you choose a pile",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "draw_cards", "player": ctrl, "amount": 3},
-            ],
-        ))
 
         # (Gonti already registered at line ~754 with proper _gonti_etb handler)
 
@@ -2504,11 +2274,6 @@ class EffectTemplateLibrary:
                 "count": 1,
                 "reason": "Protean Hulk: tutor creature(s) totaling MV<=6",
             }]
-        self._add_dies_card("protean hulk", EffectTemplate(
-            name="Protean Hulk",
-            description="When Protean Hulk dies, search library for creatures with total MV ≤ 6, put them onto the battlefield",
-            action_generator=_protean_hulk_gen,
-        ))
 
         # Pattern of Rebirth: "Enchanted creature has 'When this creature
         # dies, search your library for a creature card, put that card onto
@@ -2529,11 +2294,6 @@ class EffectTemplateLibrary:
                 "count": 1,
                 "reason": "Pattern of Rebirth: enchanted creature died, tutor any creature",
             }]
-        self._add_dies_card("pattern of rebirth", EffectTemplate(
-            name="Pattern of Rebirth",
-            description="When enchanted creature dies, search library for a creature, put it onto the battlefield",
-            action_generator=_pattern_of_rebirth_gen,
-        ))
 
         # Sidisi, Undead Vizier: "Exploit (When this creature enters, you
         # may sacrifice a creature). When you exploit a creature, you may
@@ -2585,33 +2345,6 @@ class EffectTemplateLibrary:
             action_generator=_bloodghast_landfall_gen,
         ))
 
-        # Solemn Simulacrum dies → draw. Register on the dies-templates path
-        # so it doesn't collide with the ETB land-search registration above.
-        # May 17 audit: the old `_add_card` registration overwrote the ETB
-        # entry, meaning Solemn Sim's land-search never fired in play.
-        self._add_dies_card("solemn simulacrum", EffectTemplate(
-            name="Solemn Simulacrum",
-            description="When Solemn Simulacrum dies, draw a card",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "draw_cards", "player": ctrl, "amount": 1}
-            ],
-        ))
-
-        # June 10 deep-dive (B6): Meren — her name-keyed END-STEP template was
-        # ALSO firing as a dies trigger (the relaxed Bug-B gate falls through
-        # to name keys), so every death of one of Claude's creatures returned
-        # a creature immediately, mid-opponent-turn, on top of the legitimate
-        # end-step fire. Same collision class as Geralf's Messenger (May 26);
-        # same fix: an explicit dies-event no-op (the dies half only grants
-        # an experience counter, which the engine tracks separately).
-        self._add_dies_card("meren of clan nel toth", EffectTemplate(
-            name="Meren of Clan Nel Toth (dies guard)",
-            description="Experience counter tracked by the engine; the graveyard return fires at end step only",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "no_action",
-                 "reason": "Meren: experience counter tracked by engine; return resolves at end step"}
-            ],
-        ))
 
         # June 10 deep-dive (CRITICAL — Tier 3 fabricated a mana payment):
         # Leyline Tyrant's death trigger ("you may pay any amount of {R}…")
@@ -2650,38 +2383,6 @@ class EffectTemplateLibrary:
             action_generator=_gen_leyline_tyrant_dies,
         ))
 
-        # June 10 audit (V16): Midnight Reaper — the generic dies pattern
-        # resolved only the draw and dropped the "deals 1 damage to you"
-        # half. (The token-death over-fire is fixed at the trigger gate in
-        # mtg/triggers.py.)
-        self._add_dies_card("midnight reaper", EffectTemplate(
-            name="Midnight Reaper",
-            description="Whenever a nontoken creature you control dies, Midnight Reaper deals 1 damage to you and you draw a card",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "draw_cards", "player": ctrl, "amount": 1},
-                {"action": "lose_life", "player": ctrl, "amount": 1,
-                 "source": "Midnight Reaper"},
-            ],
-        ))
-
-        # --- Upkeep triggers ---
-        self._add_card("phyrexian arena", EffectTemplate(
-            name="Phyrexian Arena",
-            description="At the beginning of your upkeep, draw a card and lose 1 life",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "draw_cards", "player": ctrl, "amount": 1},
-                {"action": "lose_life", "player": ctrl, "amount": 1},
-            ],
-        ))
-
-        self._add_card("bitterblossom", EffectTemplate(
-            name="Bitterblossom",
-            description="At the beginning of your upkeep, lose 1 life and create a 1/1 Faerie Rogue token with flying",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "lose_life", "player": ctrl, "amount": 1},
-                make_token_action(ctrl, "faerie_rogue_1_1", 1),
-            ],
-        ))
 
         # June 10 audit: Land Tax was the batch's #1 Tier-3 money pit (53
         # escalations, 9 in one game — one per upkeep). Free upkeep template:
@@ -2878,13 +2579,6 @@ class EffectTemplateLibrary:
         # the mill action — flag for future template work.)
         # (No template change yet — keeping mill in Tier 3 fallback.)
 
-        # --- Attack triggers ---
-        # Bug #18: Goldspan Dragon — create Treasure on attack
-        self._add_card("goldspan dragon", EffectTemplate(
-            name="Goldspan Dragon",
-            description="Whenever Goldspan Dragon attacks, create a Treasure token",
-            action_generator=lambda ctrl, opp, ctx: [make_token_action(ctrl, "treasure", 1)],
-        ))
 
         # --- Creature-enters triggers (for other permanents) ---
         # Trostani: whenever a creature enters, gain life equal to its toughness
@@ -2943,16 +2637,6 @@ class EffectTemplateLibrary:
         # doubler, now registered in rules/replacement.py. A normal cast
         # would have dealt 5 phantom damage; deleted.
 
-        self._add_card("skyshroud claim", EffectTemplate(
-            name="Skyshroud Claim",
-            description="Search for up to two Forest cards, put onto battlefield untapped",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "search_library", "player": ctrl, "card_type": "Forest",
-                 "destination": "battlefield", "tapped": False},
-                {"action": "search_library", "player": ctrl, "card_type": "Forest",
-                 "destination": "battlefield", "tapped": False},
-            ],
-        ))
 
         self._add_card("oath of teferi", EffectTemplate(
             name="Oath of Teferi",
@@ -2985,18 +2669,6 @@ class EffectTemplateLibrary:
             ],
         ))
 
-        self._add_card("tooth and nail", EffectTemplate(
-            name="Tooth and Nail",
-            description="Search for 2 creatures, put 2 from hand onto battlefield (entwined)",
-            action_generator=self._gen_tooth_and_nail,
-        ))
-
-        # --- Teferi's Protection: phase out all permanents, protection from everything ---
-        self._add_card("teferi's protection", EffectTemplate(
-            name="Teferi's Protection",
-            description="Phase out all permanents you control, protection from everything until next turn",
-            action_generator=self._gen_teferis_protection,
-        ))
 
         # --- Fog / damage prevention spells ---
         for fog_name in ["fog", "moment's peace", "constant mists", "tangle",
@@ -3010,21 +2682,6 @@ class EffectTemplateLibrary:
                 ],
             ))
 
-        # Settle the Wreckage: exile all attacking creatures, defender searches for basics
-        self._add_card("settle the wreckage", EffectTemplate(
-            name="Settle the Wreckage",
-            description="Exile all attacking creatures. Controller searches for that many basics tapped.",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "no_action", "reason": "Settle the Wreckage: exile attacking creatures, search for basics tapped (complex)"},
-            ],
-        ))
-
-        # --- Graveyard spells ---
-        self._add_card("buried alive", EffectTemplate(
-            name="Buried Alive",
-            description="Search library for up to 3 creature cards, put into graveyard",
-            action_generator=self._gen_buried_alive,
-        ))
 
         self._add_card("reanimate", EffectTemplate(
             name="Reanimate",
@@ -3053,47 +2710,6 @@ class EffectTemplateLibrary:
             action_generator=lambda ctrl, opp, ctx: self._gen_sidisi_exploit(ctrl, opp, ctx),
         ))
 
-        self._add_card("living death", EffectTemplate(
-            name="Living Death",
-            description="All players sacrifice all creatures, then return all creature cards from graveyards",
-            action_generator=self._gen_living_death,
-        ))
-
-        self._add_card("rise of the dark realms", EffectTemplate(
-            name="Rise of the Dark Realms",
-            description="Put all creature cards from all graveyards onto the battlefield under your control",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "rise_of_dark_realms", "player": ctrl,
-                 "reason": "Rise of the Dark Realms: reanimate all creatures from all graveyards"},
-            ],
-        ))
-
-        # --- Open the Vaults: return all artifact and enchantment cards from all graveyards ---
-        self._add_card("open the vaults", EffectTemplate(
-            name="Open the Vaults",
-            description="Return all artifact and enchantment cards from all graveyards to the battlefield under their owners' control",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "open_the_vaults", "player": ctrl,
-                 "reason": "Open the Vaults: return all artifacts and enchantments from all graveyards"},
-            ],
-        ))
-
-        # --- Replenish: return all enchantment cards from YOUR graveyard ---
-        self._add_card("replenish", EffectTemplate(
-            name="Replenish",
-            description="Return all enchantment cards from your graveyard to the battlefield",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "replenish", "player": ctrl,
-                 "reason": "Replenish: return all enchantments from your graveyard"},
-            ],
-        ))
-
-        # --- Fact or Fiction ---
-        self._add_card("fact or fiction", EffectTemplate(
-            name="Fact or Fiction",
-            description="Reveal top 5, split into piles (simplified: draw 3, mill 2)",
-            action_generator=self._gen_fact_or_fiction,
-        ))
 
         # --- Commit // Memory (Commit half — fizzles politely if no target) ---
         # Aftermath card; only the Commit half is castable from hand. The
@@ -3208,17 +2824,11 @@ class EffectTemplateLibrary:
             name="Inferno Titan",
             description="Deal 3 damage divided among targets on ETB and attack",
             action_generator=lambda ctrl, opp, ctx: [
-                {"action": "deal_damage", "amount": 3, "target_player": opp},
+                {"action": "deal_damage", "amount": 3, "target_player": opp,
+                 "source": "Inferno Titan"},
             ],
         ))
 
-        self._add_card("bogardan hellkite", EffectTemplate(
-            name="Bogardan Hellkite",
-            description="Deal 5 damage divided among targets",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "deal_damage", "amount": 5, "target_player": opp},
-            ],
-        ))
 
         # --- Altar of Dementia: sacrifice creature, mill equal to power ---
         self._add_card("altar of dementia", EffectTemplate(
@@ -3242,14 +2852,6 @@ class EffectTemplateLibrary:
             ],
         ))
 
-        self._add_attack_card("etali, primal storm", EffectTemplate(
-            name="Etali, Primal Storm",
-            description="Whenever Etali attacks, exile top card of each library and cast nonlands for free",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "etali_trigger", "player": ctrl,
-                 "reason": "Exile top of each library, may cast nonland cards without paying mana costs"}
-            ],
-        ))
 
         self._add_attack_card("robber of the rich", EffectTemplate(
             name="Robber of the Rich",
@@ -3270,13 +2872,6 @@ class EffectTemplateLibrary:
             action_generator=lambda ctrl, opp, ctx: self._gen_felidar_guardian(ctrl, opp, ctx),
         ))
 
-        self._add_card("altar of the brood", EffectTemplate(
-            name="Altar of the Brood",
-            description="Each opponent mills 1 card",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "mill", "player": opp, "amount": 1}
-            ],
-        ))
 
         self._add_card("ancient bronze dragon", EffectTemplate(
             name="Ancient Bronze Dragon",
@@ -3284,30 +2879,11 @@ class EffectTemplateLibrary:
             action_generator=self._gen_ancient_bronze_dragon,
         ))
 
-        self._add_card("ponder", EffectTemplate(
-            name="Ponder",
-            description="Look at top 3, reorder, may shuffle. Draw 1",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "draw_cards", "player": ctrl, "amount": 1}
-            ],
-        ))
 
         # ===========================================================
         # NEW TEMPLATES — March 27 Tier 3 gap closure
         # ===========================================================
 
-        # --- Jarad's Orders: search for 2 creatures (one to hand, one to graveyard) ---
-        # Can't actually search the library, so hint for manual resolution
-        self._add_card("jarad's orders", EffectTemplate(
-            name="Jarad's Orders",
-            description="Search library for two creature cards: one to hand, one to graveyard, shuffle",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "search_library", "player": ctrl, "filter_type": "creature",
-                 "to_zone": "hand", "count": 1, "shuffle": False},
-                {"action": "search_library", "player": ctrl, "filter_type": "creature",
-                 "to_zone": "graveyard", "count": 1, "shuffle": True},
-            ],
-        ))
 
         # --- Grisly Salvage: reveal top 5, creature/land to hand, rest to graveyard ---
         self._add_card("grisly salvage", EffectTemplate(
@@ -3339,26 +2915,6 @@ class EffectTemplateLibrary:
             ),
         ))
 
-        # --- Single Combat: each player keeps 1 creature/PW, destroy the rest ---
-        self._add_card("single combat", EffectTemplate(
-            name="Single Combat",
-            description="Each player chooses a creature or planeswalker. Destroy all others.",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "single_combat_wipe", "player": ctrl,
-                 "reason": "Single Combat: each player keeps their best creature/PW, destroy the rest"}
-            ],
-        ))
-
-        # --- Rootborn Defenses: populate + indestructible ---
-        self._add_card("rootborn defenses", EffectTemplate(
-            name="Rootborn Defenses",
-            description="Populate. Creatures you control gain indestructible until end of turn.",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "populate", "player": ctrl},
-                {"action": "grant_keywords", "player": ctrl,
-                 "keywords": ["Indestructible"], "target": "all_own_creatures"},
-            ],
-        ))
 
         # NOTE: Light Up the Stage is registered later in this file with a
         # working draw-2 approximation (line ~5778). The earlier "exile
@@ -3367,25 +2923,6 @@ class EffectTemplateLibrary:
         # change. Removed during Apr 29 audit — the later registration is the
         # canonical one.
 
-        # --- Flawless Maneuver: creatures gain indestructible ---
-        self._add_card("flawless maneuver", EffectTemplate(
-            name="Flawless Maneuver",
-            description="Creatures you control gain indestructible until end of turn",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "grant_keywords", "player": ctrl,
-                 "keywords": ["Indestructible"], "target": "all_own_creatures"},
-            ],
-        ))
-
-        # --- Species Specialist: choose and persist a creature type ---
-        self._add_card("species specialist", EffectTemplate(
-            name="Species Specialist",
-            description="As Species Specialist enters, choose a creature type",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "choose_creature_type", "player": ctrl,
-                 "card": "Species Specialist"}
-            ],
-        ))
 
         def _shared_animosity_gen(ctrl, opp, ctx):
             attacker = ctx.get('_attacking_creature')
@@ -3645,6 +3182,106 @@ class EffectTemplateLibrary:
                 action_generator=self._gen_proliferate,
             )
         )
+
+        # July 20 audit (CRITICAL): populate had no lower-tier handler — Song
+        # of the Worldsoul escalated to Tier 3, which FABRICATED a Human token
+        # on a zero-token board (CR 701.34a: no token → populate does
+        # nothing); the phantom token blocked and fed an Athreos misfire
+        # (game_1526071401499328634). Deterministic populate action; same
+        # event guard shape as proliferate (don't fire on a permanent's own
+        # ETB scan when the populate belongs to a whenever/scheduled clause).
+        def _gen_populate(ctrl, opp, ctx):
+            if ctx.get('_event_type', 'etb') == 'etb':
+                m = ctx.get('_match')
+                oracle = ctx.get('_oracle', '') or ''
+                head = oracle[:m.start()] if m else oracle
+                if 'enters' not in head[-60:].lower():
+                    return None
+            return [{"action": "populate", "player": ctrl}]
+
+        self._add_pattern(
+            r"(?:^|[,.:—]\s*|then\s+)populate\b\.?\s*(?:\(|$)",
+            EffectTemplate(
+                name="Populate",
+                description="Populate (copy a creature token you control; nothing if you control none)",
+                action_generator=_gen_populate,
+            )
+        )
+
+        # July 20 audit (CRITICAL — Athreos, God of Passage): "Whenever
+        # another creature YOU OWN dies, return it to your hand unless target
+        # opponent pays 3 life." Tier 3 resolved this with NO ownership gate
+        # — it fired on the OPPONENT's dying creatures all game, and once
+        # even drained Athreos's own controller 3 life
+        # (game_1526071401499328634, game-deciding). Ownership comes from
+        # build_game_context's dying_owned_by_controller; None (unknown)
+        # does not fire. Opponent-pays heuristic mirrors the Rhystic/extort
+        # style: pay 3 while life is comfortable, otherwise let it return.
+        def names_match_local(a, b):
+            return (a or "").strip().lower() == b.strip().lower()
+
+        def _gen_athreos_dies(ctrl, opp, ctx):
+            dying_name = ctx.get('dying_name', '')
+            opp_player = ctx.get('_opponent_player')
+            if names_match_local(dying_name, "Athreos, God of Passage"):
+                return [{"action": "no_action",
+                         "reason": "Athreos: 'another creature' — his own death doesn't trigger"}]
+            owned = ctx.get('dying_owned_by_controller')
+            if owned is not True:
+                return [{"action": "no_action",
+                         "reason": f"Athreos: {dying_name or 'the creature'} isn't owned by Athreos's controller — no trigger"}]
+            if opp_player is not None and opp_player.life >= 8:
+                return [{"action": "lose_life", "player": opp,
+                         "amount": 3, "source": "Athreos, God of Passage"}]
+            return [{"action": "move_card", "card": dying_name,
+                     "from_zone": "graveyard", "to_zone": "hand",
+                     "player": ctrl}]
+
+        self._add_dies_card("athreos, god of passage", EffectTemplate(
+            name="Athreos, God of Passage",
+            description="Whenever another creature you own dies, return it to your hand unless target opponent pays 3 life",
+            action_generator=_gen_athreos_dies,
+        ))
+
+        # July 20 audit (CRITICAL — Faith Unbroken): the generic exile
+        # pattern gave it NO return tracking, so the aura's forced-detach
+        # (SBA) re-ran the ETB exile on a SECOND unrelated creature instead
+        # of returning the first — one cast permanently ate two of the
+        # opponent's creatures (game_1526071467035459665). Register through
+        # the banisher (Oblivion Ring) shape: exile + track_exiled_by; the
+        # LTB return is handled by _check_ltb_triggers_sync.
+        def _gen_faith_unbroken(ctrl, opp, ctx):
+            target = (ctx.get('explicit_target_name')
+                      or ctx.get('best_opponent_creature'))
+            if not target:
+                return [{"action": "no_action",
+                         "reason": "Faith Unbroken: no opponent creature to exile"}]
+            return [
+                {"action": "move_card", "card": target,
+                 "from_zone": "battlefield", "to_zone": "exile", "player": opp},
+                {"action": "track_exiled_by", "source": "Faith Unbroken",
+                 "card": target, "owner": opp},
+            ]
+
+        self._add_card("faith unbroken", EffectTemplate(
+            name="Faith Unbroken",
+            description="Exile target creature an opponent controls until Faith Unbroken leaves the battlefield; enchanted creature gets +2/+2",
+            action_generator=_gen_faith_unbroken,
+            needs_target=True,
+        ))
+
+        # July 20 audit (CRITICAL — Worldslayer): the card's entire defining
+        # ability had no handler — three combat hits while equipped, zero
+        # wipes (game_1526071467035459665). The combat-damage-to-player
+        # dispatcher (mtg/combat.py) now scans the attacker's EQUIPMENT and
+        # resolves attack-templates keyed on the equipment's name.
+        self._add_attack_card("worldslayer", EffectTemplate(
+            name="Worldslayer",
+            description="Whenever equipped creature deals combat damage to a player, destroy all permanents other than Worldslayer",
+            action_generator=lambda ctrl, opp, ctx: [
+                {"action": "destroy_all_permanents",
+                 "except_card": "Worldslayer"}],
+        ))
         
         # "When [this] enters, scry N"
         self._add_pattern(
@@ -4629,25 +4266,6 @@ class EffectTemplateLibrary:
             )
         )
 
-        # Thousand-Faced Shadow — specific card template (ninjutsu + copy on ETB)
-        self._add_card("thousand-faced shadow", EffectTemplate(
-            name="Thousand-Faced Shadow",
-            description="When Thousand-Faced Shadow enters attacking via ninjutsu, create a copy of another attacking creature",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "create_copy_token", "player": ctrl,
-                 "target": "best_attacking_creature", "filter": "attacking", "count": 1}
-            ],
-        ))
-
-        # Helm of the Host — creates copy of equipped creature at combat
-        self._add_card("helm of the host", EffectTemplate(
-            name="Helm of the Host",
-            description="At the beginning of combat, create a token copy of equipped creature",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "create_copy_token", "player": ctrl,
-                 "target": "best_creature", "filter": "own", "count": 1}
-            ],
-        ))
 
         # --- Clone creatures: enter as a copy of another creature ---
         # These modify themselves, NOT create tokens. Uses 'become_copy' action.
@@ -4732,6 +4350,24 @@ class EffectTemplateLibrary:
             ],
         ))
 
+        # Gatekeeper of Malakir — kicked ETB ("if it was kicked, target player
+        # sacrifices a creature"). Kicker payment isn't modeled at cast time,
+        # so today the intervening-if (CR 603.4) correctly no-ops — this
+        # template exists to say so instead of [ETB-UNHANDLED] (15289 batch
+        # ×2). Base {B}{B}, kicker {B}: mana_paid_total >= 3 reads as kicked,
+        # same heuristic as Rite of Replication above, so the sacrifice half
+        # goes live the moment kicker payment starts being recorded.
+        self._add_card("gatekeeper of malakir", EffectTemplate(
+            name="Gatekeeper of Malakir",
+            description="When this creature enters, if it was kicked, target player sacrifices a creature",
+            action_generator=lambda ctrl, opp, ctx: (
+                self._force_sacrifice_creature(ctrl, opp, ctx)
+                if (ctx.get('kicked', False) or (ctx.get('mana_paid_total', 0) or 0) >= 3)
+                else [{"action": "no_action",
+                       "reason": "Gatekeeper of Malakir: not kicked (intervening if, CR 603.4)"}]
+            ),
+        ))
+
         # =================================================================
         # NEW TEMPLATES — Batch added for autoplay coverage
         # =================================================================
@@ -4743,43 +4379,6 @@ class EffectTemplateLibrary:
             action_generator=lambda ctrl, opp, ctx: self._return_best_from_graveyard(ctrl, opp, ctx),
         ))
 
-        # --- Brainstorm: draw 3, put 2 back on top ---
-        self._add_card("brainstorm", EffectTemplate(
-            name="Brainstorm",
-            description="Draw 3 cards, put 2 back on top of library",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "draw_cards", "player": ctrl, "amount": 3},
-                {"action": "put_back_from_hand", "player": ctrl, "count": 2,
-                 "reason": "Brainstorm: put 2 cards from hand on top of library"}
-            ],
-        ))
-
-        # --- Treasure Cruise: draw 3 ---
-        self._add_card("treasure cruise", EffectTemplate(
-            name="Treasure Cruise",
-            description="Draw three cards",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "draw_cards", "player": ctrl, "amount": 3}
-            ],
-        ))
-
-        # --- Harmonize: draw 3 ---
-        self._add_card("harmonize", EffectTemplate(
-            name="Harmonize",
-            description="Draw three cards",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "draw_cards", "player": ctrl, "amount": 3}
-            ],
-        ))
-
-        # --- Divination: draw 2 ---
-        self._add_card("divination", EffectTemplate(
-            name="Divination",
-            description="Draw two cards",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "draw_cards", "player": ctrl, "amount": 2}
-            ],
-        ))
 
         # --- Lose-N-life, draw-N-cards family (Night's Whisper, Sign in Blood,
         # Ambition's Cost, Read the Bones-without-scry, Promise of Power, etc.)
@@ -4800,14 +4399,6 @@ class EffectTemplateLibrary:
                 ],
             ))
 
-        # --- Spectral Procession: create three 1/1 white Spirit tokens with flying ---
-        self._add_card("spectral procession", EffectTemplate(
-            name="Spectral Procession",
-            description="Create three 1/1 white Spirit creature tokens with flying",
-            action_generator=lambda ctrl, opp, ctx: [
-                make_token_action(ctrl, "spirit_1_1_fly", 3),
-            ],
-        ))
 
         # --- Call to the Netherworld: return target black creature from graveyard to hand ---
         self._add_card("call to the netherworld", EffectTemplate(
@@ -4820,23 +4411,6 @@ class EffectTemplateLibrary:
             ],
         ))
 
-        # --- Dig Through Time: look at top 7, put 2 in hand (simplified) ---
-        self._add_card("dig through time", EffectTemplate(
-            name="Dig Through Time",
-            description="Look at top seven, put two into hand (simplified as draw 2)",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "draw_cards", "player": ctrl, "amount": 2}
-            ],
-        ))
-
-        # --- Peregrine Drake: untap up to 5 lands ---
-        self._add_card("peregrine drake", EffectTemplate(
-            name="Peregrine Drake",
-            description="Untap up to five lands",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "untap_lands", "player": ctrl, "count": 5}
-            ],
-        ))
 
         # --- Fleshbag Marauder / Merciless Executioner: each player sacrifices a creature ---
         # No "sacrifice_creature" action, so we use a no_action hint for the
@@ -4888,9 +4462,10 @@ class EffectTemplateLibrary:
             action_generator=lambda ctrl, opp, ctx: [
                 {"action": "deal_damage", "amount": 3,
                  "target_card": ctx.get('best_opponent_creature', ''),
-                 "target_controller": opp},
+                 "target_controller": opp, "source": "Inferno Titan"},
             ] if ctx.get('best_opponent_creature') else [
-                {"action": "deal_damage", "amount": 3, "target_player": opp},
+                {"action": "deal_damage", "amount": 3, "target_player": opp,
+                 "source": "Inferno Titan"},
             ],
         ))
 
@@ -4944,15 +4519,6 @@ class EffectTemplateLibrary:
             action_generator=self._gen_restoration_angel,
         ))
 
-        # --- Satyr Wayfinder: reveal top 4, land to hand, rest to graveyard ---
-        # Simplified as drawing 1 card (finding a land)
-        self._add_card("satyr wayfinder", EffectTemplate(
-            name="Satyr Wayfinder",
-            description="Reveal top 4, put a land into hand, rest into graveyard (simplified as draw 1)",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "draw_cards", "player": ctrl, "amount": 1}
-            ],
-        ))
 
         # --- Hullbreaker Horror: "Whenever you cast another spell, choose one
         # that hasn't been chosen — return target creature/artifact/enchantment/
@@ -4989,14 +4555,6 @@ class EffectTemplateLibrary:
             action_generator=_hullbreaker_trigger,
         ))
 
-        # --- Stitcher's Supplier: mill 3 on ETB ---
-        self._add_card("stitcher's supplier", EffectTemplate(
-            name="Stitcher's Supplier",
-            description="Mill three cards",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "mill", "player": ctrl, "amount": 3}
-            ],
-        ))
 
         # --- Craterhoof Behemoth: pump all creatures +X/+X where X = creature count ---
         # Game-context-dependent: needs creature count. Uses grant_keywords for trample
@@ -5017,18 +4575,6 @@ class EffectTemplateLibrary:
             needs_target=True,
         ))
 
-        # --- Kogla ATTACK trigger: destroy target artifact or enchantment ---
-        # Separate from the ETB fight trigger above — uses _add_attack_card so
-        # resolve_attack_trigger picks this up instead of the ETB fight template.
-        self._add_attack_card("kogla, the titan ape", EffectTemplate(
-            name="Kogla, the Titan Ape (attack)",
-            description="Destroy target artifact or enchantment defending player controls",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "destroy", "card": "BEST_ARTIFACT_OR_ENCHANTMENT",
-                 "target_controller": opp}
-            ],
-            needs_target=True,
-        ))
 
         # =================================================================
         # FETCHLANDS — sacrifice to search library for a land
@@ -5067,16 +4613,6 @@ class EffectTemplateLibrary:
                 ],
             ))
 
-        # --- Prismatic Vista (pay 1 life, basic land, untapped) ---
-        self._add_card("prismatic vista", EffectTemplate(
-            name="Prismatic Vista",
-            description="Pay 1 life, sacrifice: search for a basic land (untapped)",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "lose_life", "player": ctrl, "amount": 1},
-                {"action": "search_library_land", "player": ctrl,
-                 "basic_only": True, "enters_tapped": False},
-            ],
-        ))
 
         # --- Evolving Wilds / Terramorphic Expanse (basic land, tapped, no life) ---
         for _ew_name in ["evolving wilds", "terramorphic expanse"]:
@@ -5178,15 +4714,6 @@ class EffectTemplateLibrary:
             action_generator=lambda ctrl, opp, ctx: self._gen_aura_shards(ctrl, opp, ctx),
         ))
 
-        # --- Tatyova, Benthic Druid: landfall draw + gain 1 life ---
-        self._add_card("tatyova, benthic druid", EffectTemplate(
-            name="Tatyova, Benthic Druid",
-            description="Whenever a land enters under your control, draw a card and gain 1 life",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "draw_cards", "player": ctrl, "amount": 1},
-                {"action": "gain_life", "player": ctrl, "amount": 1},
-            ],
-        ))
 
         # --- Martial Coup: create X tokens, wipe if X >= 5 ---
         self._add_card("martial coup", EffectTemplate(
@@ -5202,66 +4729,11 @@ class EffectTemplateLibrary:
             action_generator=lambda ctrl, opp, ctx: self._gen_inquisition(ctrl, opp, ctx),
         ))
 
-        # --- Thoughtseize (like Inquisition but no MV restriction, caster loses 2 life) ---
-        self._add_card("thoughtseize", EffectTemplate(
-            name="Thoughtseize",
-            description="Target opponent reveals hand, you choose a nonland card, they discard it. You lose 2 life.",
-            action_generator=lambda ctrl, opp, ctx: self._gen_thoughtseize(ctrl, opp, ctx),
-        ))
 
         # =================================================================
         # RESTRICTED TUTORS — search library for specific card types to hand
         # =================================================================
 
-        # Recruiter of the Guard: search for creature with toughness 2 or less
-        self._add_card("recruiter of the guard", EffectTemplate(
-            name="Recruiter of the Guard",
-            description="Search library for a creature with toughness 2 or less, put into hand",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "search_library", "player": ctrl, "card_type": "Creature",
-                 "max_toughness": 2, "to_zone": "hand"}
-            ],
-        ))
-
-        # Stoneforge Mystic: search for Equipment card
-        self._add_card("stoneforge mystic", EffectTemplate(
-            name="Stoneforge Mystic",
-            description="Search library for an Equipment card, put into hand",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "search_library", "player": ctrl, "card_type": "Equipment",
-                 "to_zone": "hand"}
-            ],
-        ))
-
-        # Trinket Mage: search for artifact with MV 1 or less
-        self._add_card("trinket mage", EffectTemplate(
-            name="Trinket Mage",
-            description="Search library for an artifact card with MV 1 or less, put into hand",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "search_library", "player": ctrl, "card_type": "Artifact",
-                 "max_mv": 1, "to_zone": "hand"}
-            ],
-        ))
-
-        # Trophy Mage: search for artifact with MV exactly 3
-        self._add_card("trophy mage", EffectTemplate(
-            name="Trophy Mage",
-            description="Search library for an artifact card with MV exactly 3, put into hand",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "search_library", "player": ctrl, "card_type": "Artifact",
-                 "exact_mv": 3, "to_zone": "hand"}
-            ],
-        ))
-
-        # Tribute Mage: search for artifact with MV exactly 2
-        self._add_card("tribute mage", EffectTemplate(
-            name="Tribute Mage",
-            description="Search library for an artifact card with MV exactly 2, put into hand",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "search_library", "player": ctrl, "card_type": "Artifact",
-                 "exact_mv": 2, "to_zone": "hand"}
-            ],
-        ))
 
         # =================================================================
         # LANDFALL / ATTACK / MISC TRIGGERS — Named cards
@@ -5285,30 +4757,6 @@ class EffectTemplateLibrary:
                 ],
             ))
 
-        # Geralf's Messenger: "When Geralf's Messenger enters, target opponent loses
-        # 2 life." It ALSO has undying — but undying is SBA-handled, so it must NOT be
-        # in the no-action list above (May 26 audit: that list swallowed the ETB drain
-        # on the initial cast AND every undying return). CR 603.6c: the undying-returned
-        # permanent is a new object whose ETB fires again, so this drain repeats per enter.
-        self._add_card("geralf's messenger", EffectTemplate(
-            name="Geralf's Messenger",
-            description="ETB: target opponent loses 2 life (undying still SBA-handled)",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "lose_life", "player": opp, "amount": 2}
-            ],
-        ))
-        # ...but on the DIES event we must NOT re-run the ETB drain. resolve_etb
-        # checks _dies_templates first (early return), so register a no-op there;
-        # this also preserves the old behavior of suppressing the spurious
-        # !resolve prompt on the second death (undying can't re-apply once a
-        # +1/+1 counter is present, but the undying text is still in the oracle).
-        self._add_dies_card("geralf's messenger", EffectTemplate(
-            name="Geralf's Messenger",
-            description="Undying handled by SBA engine; ETB drain does not re-fire on death",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "no_action", "reason": "Undying is handled mechanically by the SBA engine"}
-            ],
-        ))
 
         # Finale of Devastation: {X}{G}{G} — creatures you control get +X/+X and
         # gain trample; if X >= 10, search your library for a creature and put it
@@ -5340,15 +4788,6 @@ class EffectTemplateLibrary:
             action_generator=_gen_voice_of_resurgence,
         ))
 
-        # Scute Swarm: landfall — create a 1/1 green Insect creature token
-        # (The "6+ lands → copy" mode is too complex for templates; always make 1/1 Insect)
-        self._add_card("scute swarm", EffectTemplate(
-            name="Scute Swarm",
-            description="Landfall: create a 1/1 green Insect creature token",
-            action_generator=lambda ctrl, opp, ctx: [
-                make_token_action(ctrl, "insect_1_1_plain", 1)
-            ],
-        ))
 
         # Goblin Guide: attack trigger — defending player reveals top card,
         # if it's a land, they put it into their hand
@@ -5378,46 +4817,6 @@ class EffectTemplateLibrary:
             ],
         ))
 
-        # Mystical Tutor: search library for instant or sorcery, put on top
-        self._add_card("mystical tutor", EffectTemplate(
-            name="Mystical Tutor",
-            description="Search library for an instant or sorcery card, put on top",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "search_library", "player": ctrl,
-                 "card_type": "Instant or Sorcery", "to_zone": "library_top"}
-            ],
-        ))
-
-        # Worldly Tutor: search library for a creature, put on top
-        self._add_card("worldly tutor", EffectTemplate(
-            name="Worldly Tutor",
-            description="Search library for a creature card, put on top",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "search_library", "player": ctrl,
-                 "card_type": "Creature", "to_zone": "library_top"}
-            ],
-        ))
-
-        # Vampiric Tutor: search library for any card, put on top, lose 2 life
-        self._add_card("vampiric tutor", EffectTemplate(
-            name="Vampiric Tutor",
-            description="Search library for any card, put on top; lose 2 life",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "search_library", "player": ctrl,
-                 "card_type": "Any", "to_zone": "library_top"},
-                {"action": "lose_life", "player": ctrl, "amount": 2},
-            ],
-        ))
-
-        # Demonic Tutor: search library for any card, put into hand
-        self._add_card("demonic tutor", EffectTemplate(
-            name="Demonic Tutor",
-            description="Search library for any card, put into hand",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "search_library", "player": ctrl,
-                 "card_type": "Any", "to_zone": "hand"}
-            ],
-        ))
 
         # Temur Sabertooth: activated ability — {1}{G}, return another creature
         # you control to hand: target creature you control gains indestructible.
@@ -5429,47 +4828,9 @@ class EffectTemplateLibrary:
             action_generator=self._gen_temur_sabertooth,
         ))
 
-        # --- Enlightened Tutor: search for artifact or enchantment, put on top ---
-        self._add_card("enlightened tutor", EffectTemplate(
-            name="Enlightened Tutor",
-            description="Search library for an artifact or enchantment card, put on top",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "search_library", "player": ctrl,
-                 "card_type": "Artifact or Enchantment", "to_zone": "library_top"}
-            ],
-        ))
-
-        # --- Entomb: search library for a card, put into graveyard ---
-        self._add_card("entomb", EffectTemplate(
-            name="Entomb",
-            description="Search library for a card and put it into your graveyard",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "search_library", "player": ctrl,
-                 "card_type": "Any", "to_zone": "graveyard"}
-            ],
-        ))
 
         # --- Apr 29 audit additions: gap-filling tutors ---
 
-        # Idyllic Tutor: search library for an enchantment, put into hand
-        self._add_card("idyllic tutor", EffectTemplate(
-            name="Idyllic Tutor",
-            description="Search library for an enchantment card, put into hand",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "search_library", "player": ctrl,
-                 "card_type": "Enchantment", "to_zone": "hand"}
-            ],
-        ))
-
-        # Eladamri's Call: search library for a creature, put into hand
-        self._add_card("eladamri's call", EffectTemplate(
-            name="Eladamri's Call",
-            description="Search library for a creature card, put into hand",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "search_library", "player": ctrl,
-                 "card_type": "Creature", "to_zone": "hand"}
-            ],
-        ))
 
         # --- Increasing Devotion: create 5 (or 10 from graveyard) 1/1 Human tokens ---
         self._add_card("increasing devotion", EffectTemplate(
@@ -5488,17 +4849,6 @@ class EffectTemplateLibrary:
             action_generator=lambda ctrl, opp, ctx: [],
         ))
 
-        # Korvold, Fae-Cursed King: ETB — sacrifice another permanent
-        # (The "draw a card + +1/+1 counter on sacrifice" trigger is ongoing, handled separately)
-        self._add_card("korvold, fae-cursed king", EffectTemplate(
-            name="Korvold, Fae-Cursed King",
-            description="When Korvold enters or attacks, sacrifice another permanent",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "sacrifice_permanent", "player": ctrl,
-                 "exclude": "Korvold, Fae-Cursed King",
-                 "reason": "Korvold, Fae-Cursed King: sacrifice another permanent"}
-            ],
-        ))
 
         # =================================================================
         # CONDITIONAL CREATURE-ENTERS TRIGGERS
@@ -5560,22 +4910,6 @@ class EffectTemplateLibrary:
             action_generator=_guardian_project_gen,
         ))
 
-        # Mikaeus, the Lunarch: — already exists elsewhere.
-        # Mikaeus, Archon of Sun's Grace: "Whenever an enchantment enters
-        # under your control, create a 1/1 white and black Spirit creature
-        # token with flying." (Own-ETB trigger via Aura or Sigarda variant;
-        # here as a simple template emitting the Spirit token on self-ETB AND
-        # triggered via enchantment-enters scan.)
-        self._add_card("archon of sun's grace", EffectTemplate(
-            name="Archon of Sun's Grace",
-            description="Create a 1/1 white/black Spirit with flying when an enchantment enters",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "create_token", "player": ctrl, "name": "Spirit",
-                 "power": 1, "toughness": 1,
-                 "types": "Creature — Spirit", "count": 1,
-                 "keywords": ["Flying"]}
-            ],
-        ))
 
         # Scry lands (Temple of Mystery, Temple of Triumph, etc.):
         # "When X enters, scry 1." Tapped land with scry ETB.
@@ -5593,42 +4927,11 @@ class EffectTemplateLibrary:
                 ],
             ))
 
-        # Draconic Destiny: "Enchanted creature gets +3/+3 and is a Dragon in
-        # addition to its other types." Aura; the pump is static via layers,
-        # not a combat-start trigger. Template is a safe no-op so Tier 3
-        # doesn't spin up trying to resolve the static ability.
-        self._add_card("draconic destiny", EffectTemplate(
-            name="Draconic Destiny",
-            description="Static +3/+3 aura — handled via layers, not an ETB action",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "no_action",
-                 "reason": "Draconic Destiny: static pump handled by layers engine"}
-            ],
-        ))
 
         # =================================================================
         # EDICT EFFECTS — Plaguecrafter and similar
         # =================================================================
 
-        # Plaguecrafter: each player sacrifices a creature or planeswalker,
-        # each player who can't discards a card
-        self._add_card("plaguecrafter", EffectTemplate(
-            name="Plaguecrafter",
-            description="Each player sacrifices a creature or planeswalker. Can't? Discard.",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "edict_sacrifice", "types": "creature_or_planeswalker",
-                 "fallback": "discard"}
-            ],
-        ))
-
-        # Demon's Disciple: same as Fleshbag but also includes planeswalkers
-        self._add_card("demon's disciple", EffectTemplate(
-            name="Demon's Disciple",
-            description="Each player sacrifices a creature or planeswalker",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "edict_sacrifice", "types": "creature_or_planeswalker"}
-            ],
-        ))
 
     def _build_pw_ability_templates(self):
         """
@@ -6016,51 +5319,6 @@ class EffectTemplateLibrary:
             action_generator=lambda ctrl, opp, ctx: self._gen_meren_end_step(ctrl, opp, ctx),
         ))
 
-        # --- Flame Rift: deals 4 damage to each player ---
-        self._add_card("flame rift", EffectTemplate(
-            name="Flame Rift",
-            description="Flame Rift deals 4 damage to each player",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "deal_damage", "amount": 4, "target_player": ctrl},
-                {"action": "deal_damage", "amount": 4, "target_player": opp},
-            ],
-        ))
-
-        # --- Thoughtseize: target player reveals hand, you choose nonland, they discard. You lose 2 life. ---
-        self._add_card("thoughtseize", EffectTemplate(
-            name="Thoughtseize",
-            description="Target player discards a nonland card. You lose 2 life.",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "discard", "player": opp, "card": "best_nonland"},
-                {"action": "lose_life", "player": ctrl, "amount": 2},
-            ],
-        ))
-
-        # --- Brago, King Eternal: combat damage trigger (blink nonland permanents) ---
-        # Fires when Brago deals combat damage to a player — used as attack template
-        # because combat damage triggers go through resolve_attack_trigger
-        self._add_attack_card("brago, king eternal", EffectTemplate(
-            name="Brago, King Eternal (combat damage)",
-            description="Exile any number of target nonland permanents you control, return them",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "mass_flicker", "player": ctrl, "filter": "nonland",
-                 "reason": "Brago, King Eternal blinks nonland permanents"},
-            ],
-        ))
-
-        # --- Cavalry Pegasus attack trigger ---
-        # "Whenever Cavalry Pegasus attacks, each attacking Knight and each other
-        # attacking Pegasus gain flying until end of turn."
-        self._add_attack_card("cavalry pegasus", EffectTemplate(
-            name="Cavalry Pegasus (attack)",
-            description="Each attacking Knight and each other attacking Pegasus gain flying until end of turn",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "grant_keywords", "player": ctrl,
-                 "keywords": ["Flying"], "duration": "end_of_turn",
-                 "filter": "attacking_knights_and_other_pegasi",
-                 "reason": "Cavalry Pegasus grants flying to attacking Knights and other attacking Pegasi"},
-            ],
-        ))
 
         # --- Assassin's Trophy: destroy nonland permanent, controller searches for basic land ---
         self._add_card("assassin's trophy", EffectTemplate(
@@ -6392,12 +5650,6 @@ class EffectTemplateLibrary:
         # no template existed. Adding them eliminates the prompts.
         # =================================================================
 
-        # --- Halimar Depths: scry 3 (look at top 3, reorder) ---
-        self._add_card("halimar depths", EffectTemplate(
-            name="Halimar Depths",
-            description="Look at the top 3 cards of your library, put them back in any order (scry 3)",
-            action_generator=lambda ctrl, opp, ctx: self._scry_n(ctrl, 3),
-        ))
 
         # --- Temple of Mystery / Abandon / etc.: scry 1 ---
         for temple_name in ["temple of mystery", "temple of abandon", "temple of deceit",
@@ -6410,73 +5662,6 @@ class EffectTemplateLibrary:
                 action_generator=lambda ctrl, opp, ctx: self._scry_n(ctrl, 1),
             ))
 
-        # --- Obscura Storefront: sacrifice, search for basic land, gain 1 life ---
-        self._add_card("obscura storefront", EffectTemplate(
-            name="Obscura Storefront",
-            description="Sacrifice, search for basic Plains/Island/Swamp tapped, gain 1 life",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "destroy", "card": "Obscura Storefront"},
-                {"action": "search_library_land", "player": ctrl,
-                 "basic_only": True, "enters_tapped": True},
-                {"action": "gain_life", "player": ctrl, "amount": 1},
-            ],
-        ))
-
-        # --- Cathartic Reunion: as additional cost discard 2, draw 3 ---
-        self._add_card("cathartic reunion", EffectTemplate(
-            name="Cathartic Reunion",
-            description="Discard 2 cards, draw 3 cards",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "discard", "player": ctrl, "card": "random"},
-                {"action": "discard", "player": ctrl, "card": "random"},
-                {"action": "draw_cards", "player": ctrl, "amount": 3},
-            ],
-        ))
-
-        # --- Tooth and Nail (entwined): search 2 creatures, put them onto the battlefield ---
-        # Entwined cost is normally paid in Commander autoplay; collapse both
-        # halves ("search 2 to hand" + "put up to 2 from hand onto battlefield")
-        # into a single search-straight-to-battlefield so the message actually
-        # names the two creatures that enter the battlefield.
-        self._add_card("tooth and nail", EffectTemplate(
-            name="Tooth and Nail",
-            description="Search for 2 creatures and put them onto the battlefield",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "search_library", "player": ctrl, "count": 2,
-                 "card_type": "creature", "to_zone": "battlefield",
-                 "reason": "Tooth and Nail (entwined): 2 creatures to battlefield"},
-            ],
-        ))
-
-        # --- Yawgmoth's Will: play from graveyard this turn ---
-        self._add_card("yawgmoth's will", EffectTemplate(
-            name="Yawgmoth's Will",
-            description="Until end of turn, you may play lands and cast spells from your graveyard",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "grant_flashback", "player": ctrl, "duration": "end_of_turn",
-                 "source": "Yawgmoth's Will",
-                 "reason": "Yawgmoth's Will: cast spells from graveyard this turn"},
-            ],
-        ))
-
-        # --- Armored Skyhunter: attack trigger, look at top 6 for Equipment/Aura ---
-        self._add_attack_card("armored skyhunter", EffectTemplate(
-            name="Armored Skyhunter (attack)",
-            description="Look at top 6 cards, put an Aura or Equipment onto the battlefield",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "no_action",
-                 "reason": f"{ctrl} looks at top 6 cards for Aura/Equipment (autoplay: no equipment found)"},
-            ],
-        ))
-
-        # --- Courser of Kruphix: reveal top card of library (static), landfall gain 1 life ---
-        self._add_card("courser of kruphix", EffectTemplate(
-            name="Courser of Kruphix",
-            description="Landfall: gain 1 life when a land enters",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "gain_life", "player": ctrl, "amount": 1},
-            ],
-        ))
 
         # --- Vineglimmer Snarl / check lands: reveal or enter tapped ---
         for check_land in ["vineglimmer snarl", "foreboding ruins", "choked estuary",
@@ -6505,82 +5690,6 @@ class EffectTemplateLibrary:
             ],
         ))
 
-        # --- Wilderness Reclamation: at beginning of your end step, untap all lands ---
-        self._add_card("wilderness reclamation", EffectTemplate(
-            name="Wilderness Reclamation",
-            description="At the beginning of your end step, untap all lands you control",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "untap_lands", "player": ctrl, "count": 99},
-            ],
-        ))
-
-        # --- Trostani Discordant: ETB creates two 1/1 Soldier tokens with lifelink ---
-        # NOTE: Trostani's static "+1/+1 to other creatures" is an anthem
-        # registered by the layers system, NOT an ETB action. Earlier versions
-        # of this template also granted Lifelink UEOT to all creatures — that
-        # was wrong (the printed card has no such clause) and caused the
-        # May 14 "Rhys at +2/+2 and '+1/+1 UEOT' message" audit finding.
-        self._add_card("trostani discordant", EffectTemplate(
-            name="Trostani Discordant",
-            description="When Trostani Discordant enters, create two 1/1 white Soldier tokens with lifelink.",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "create_token", "player": ctrl, "name": "Soldier",
-                 "power": 1, "toughness": 1, "types": "Creature — Soldier", "count": 2,
-                 "keywords": "lifelink"},
-            ],
-        ))
-        # --- Trostani Discordant: end step return stolen creatures ---
-        self._add_card("trostani discordant endstep", EffectTemplate(
-            name="Trostani Discordant",
-            description="At the beginning of your end step, each player gains control of all creatures they own",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "no_action",
-                 "reason": "Trostani Discordant: creatures return to their owners' control (no stolen creatures to return)"},
-            ],
-        ))
-
-        # --- Korvold sacrifice trigger: whenever you sacrifice, +1/+1 counter + draw ---
-        # (Korvold ETB already exists above — sacrifice another permanent)
-        # This trigger fires from the Korvold card itself whenever ANY permanent is sacrificed
-        self._add_card("korvold, fae-cursed king sacrifice", EffectTemplate(
-            name="Korvold Sacrifice Trigger",
-            description="Whenever you sacrifice a permanent, put a +1/+1 counter on Korvold and draw a card",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "add_counters", "card": "Korvold, Fae-Cursed King",
-                 "counter_type": "+1/+1", "amount": 1},
-                {"action": "draw_cards", "player": ctrl, "amount": 1},
-            ],
-        ))
-
-        # --- Vindictive Vampire: whenever another creature you control dies, drain 1 ---
-        self._add_card("vindictive vampire", EffectTemplate(
-            name="Vindictive Vampire",
-            description="Whenever another creature you control dies, each opponent loses 1 life and you gain 1 life",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "lose_life", "player": opp, "amount": 1},
-                {"action": "gain_life", "player": ctrl, "amount": 1},
-            ],
-        ))
-
-        # --- Sythis, Harvest's Hand: cast enchantment → gain 1 life + draw a card ---
-        self._add_card("sythis, harvest's hand", EffectTemplate(
-            name="Sythis, Harvest's Hand",
-            description="Whenever you cast an enchantment spell, you gain 1 life and draw a card",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "gain_life", "player": ctrl, "amount": 1},
-                {"action": "draw_cards", "player": ctrl, "amount": 1},
-            ],
-        ))
-
-        # --- Kambal, Consul of Allocation: opponent casts noncreature → drain 2 ---
-        self._add_card("kambal, consul of allocation", EffectTemplate(
-            name="Kambal, Consul of Allocation",
-            description="Whenever an opponent casts a noncreature spell, that player loses 2 life and you gain 2 life",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "lose_life", "player": opp, "amount": 2},
-                {"action": "gain_life", "player": ctrl, "amount": 2},
-            ],
-        ))
 
         # --- Cathar's Crusade: whenever a creature enters, put a +1/+1 counter
         # on EACH creature you control (not on the enchantment itself) ---
@@ -6647,24 +5756,6 @@ class EffectTemplateLibrary:
             action_generator=_extraction_specialist_gen,
         ))
 
-        # --- Icebreaker Kraken: ETB freezes opponent's creatures+artifacts ---
-        # "When this creature enters, artifacts and creatures target opponent
-        # controls don't untap during that player's next untap step."
-        # Approximation: tap all opponent creatures+artifacts now AND set
-        # _skip_next_untap so they stay tapped through the opponent's next
-        # untap step. (Strict CR would have you choose specific targets, but
-        # the deck plays it for the freeze effect — close enough.)
-        self._add_card("icebreaker kraken", EffectTemplate(
-            name="Icebreaker Kraken",
-            description="Tap each artifact and creature target opponent controls — they don't untap next turn",
-            action_generator=lambda ctrl, opp, ctx: [{
-                "action": "tap",
-                "scope": "creatures_and_artifacts",
-                "target_player": opp,
-                "skip_next_untap": True,
-                "source": "Icebreaker Kraken",
-            }],
-        ))
 
         # --- Nightshade Assassin: ETB reveal X black cards to -X/-X ---
         # "When this creature enters, you may reveal X black cards in your
@@ -6704,15 +5795,6 @@ class EffectTemplateLibrary:
             action_generator=_nightshade_assassin_gen,
         ))
 
-        # --- Syr Konrad, the Grim: whenever a creature dies or creature card enters/leaves
-        # graveyard from anywhere, deal 1 damage to each opponent ---
-        self._add_card("syr konrad, the grim", EffectTemplate(
-            name="Syr Konrad, the Grim",
-            description="Whenever another creature dies or a creature card enters/leaves graveyard, deal 1 to each opponent",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "deal_damage", "amount": 1, "target_player": opp},
-            ],
-        ))
 
         # --- Luminarch Aspirant: at the beginning of combat on your turn,
         # put a +1/+1 counter on target creature you control ---
@@ -6753,47 +5835,11 @@ class EffectTemplateLibrary:
             action_generator=_ophiomancer_gen,
         ))
 
-        # --- Eidolon of Blossoms: constellation — whenever this or another enchantment
-        # enters the battlefield under your control, draw a card ---
-        self._add_card("eidolon of blossoms", EffectTemplate(
-            name="Eidolon of Blossoms",
-            description="Constellation: Whenever Eidolon of Blossoms or another enchantment enters under your control, draw a card",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "draw_cards", "player": ctrl, "amount": 1},
-            ],
-        ))
-
-        # --- Setessan Champion: constellation — whenever an enchantment enters
-        # under your control, put a +1/+1 counter on Setessan Champion and draw a card ---
-        self._add_card("setessan champion", EffectTemplate(
-            name="Setessan Champion",
-            description="Constellation: Whenever an enchantment enters under your control, +1/+1 counter on Setessan Champion and draw a card",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "add_counters", "card": "Setessan Champion",
-                 "counter_type": "+1/+1", "amount": 1},
-                {"action": "draw_cards", "player": ctrl, "amount": 1},
-            ],
-        ))
 
         # =====================================================================
         # APR 6 AUDIT FIXES — New templates to eliminate Tier 3 API calls
         # =====================================================================
 
-        # Fix 5: Dusk // Dawn — destroy creatures with power >= 3
-        self._add_card("dusk // dawn", EffectTemplate(
-            name="Dusk // Dawn",
-            description="Destroy all creatures with power 3 or greater",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "destroy_by_power", "min_power": 3},
-            ],
-        ))
-        self._add_card("dusk", EffectTemplate(
-            name="Dusk",
-            description="Destroy all creatures with power 3 or greater",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "destroy_by_power", "min_power": 3},
-            ],
-        ))
 
         # Fix 9: Merciless Eviction — exile all of a chosen type
         self._add_card("merciless eviction", EffectTemplate(
@@ -6965,15 +6011,6 @@ class EffectTemplateLibrary:
             ],
         ))
 
-        # Fix 19: Nightpack Ambusher — end step wolf token
-        self._add_card("nightpack ambusher", EffectTemplate(
-            name="Nightpack Ambusher",
-            description="At end step, if you cast no spells this turn, create a 2/2 green Wolf token",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "create_token", "player": ctrl, "name": "Wolf",
-                 "power": 2, "toughness": 2, "types": "Creature — Wolf", "count": 1},
-            ],
-        ))
 
         # Fix 20: Nevermaker LTB — put nonland permanent on top of library
         self._add_card("nevermaker", EffectTemplate(
@@ -6988,24 +6025,6 @@ class EffectTemplateLibrary:
             needs_target=True,
         ))
 
-        # Additional Tier 3 eliminators from audit
-        self._add_card("torrential gearhulk", EffectTemplate(
-            name="Torrential Gearhulk",
-            description="When Torrential Gearhulk enters, you may cast an instant from your graveyard without paying its mana cost",
-            action_generator=lambda ctrl, opp, ctx: [
-                # May 24 audit fix: source name passed so the action handler
-                # doesn't mis-attribute the flashback grant to Snapcaster Mage.
-                {"action": "grant_flashback", "player": ctrl, "source": "Torrential Gearhulk"},
-            ],
-        ))
-
-        self._add_card("goblin chainwhirler", EffectTemplate(
-            name="Goblin Chainwhirler",
-            description="When Goblin Chainwhirler enters, it deals 1 damage to each opponent and each creature and planeswalker they control",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "deal_damage", "amount": 1, "target_player": opp},
-            ],
-        ))
 
         self._add_card("mnemonic wall", EffectTemplate(
             name="Mnemonic Wall",
@@ -7017,13 +6036,6 @@ class EffectTemplateLibrary:
             ],
         ))
 
-        self._add_card("rest in peace", EffectTemplate(
-            name="Rest in Peace",
-            description="When Rest in Peace enters, exile all cards from all graveyards",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "exile_all_graveyards"},
-            ],
-        ))
 
         # --- Remaining !judge prompt eliminators ---
 
@@ -7061,15 +6073,6 @@ class EffectTemplateLibrary:
             ],
         ))
 
-        # Detention Sphere LTB — return exiled cards
-        self._add_card("detention sphere ltb", EffectTemplate(
-            name="Detention Sphere",
-            description="When Detention Sphere leaves the battlefield, return the exiled cards to the battlefield",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "no_action",
-                 "reason": "Detention Sphere LTB: exiled cards return (tracked by exile association)"},
-            ],
-        ))
 
         # Bug 16: Nahiri's Lithoforming — X-cost land replacement
         self._add_card("nahiri's lithoforming", EffectTemplate(
@@ -7088,26 +6091,6 @@ class EffectTemplateLibrary:
             ],
         ))
 
-        # Bug 28: Open the Armory — search for Aura or Equipment
-        self._add_card("open the armory", EffectTemplate(
-            name="Open the Armory",
-            description="Search your library for an Aura or Equipment card, reveal it, put it into your hand, then shuffle",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "search_library", "player": ctrl, "count": 1,
-                 "card_type": "aura_or_equipment",
-                 "reason": "Open the Armory: search for an Aura or Equipment"},
-            ],
-        ))
-
-        self._add_card("steelshaper's gift", EffectTemplate(
-            name="Steelshaper's Gift",
-            description="Search your library for an Equipment card, reveal it, put it into your hand, then shuffle",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "search_library", "player": ctrl, "count": 1,
-                 "card_type": "equipment",
-                 "reason": "Steelshaper's Gift: search for an Equipment"},
-            ],
-        ))
 
         # Bug 29: Embercleave — attach to attacking creature
         self._add_card("embercleave", EffectTemplate(
@@ -7147,30 +6130,6 @@ class EffectTemplateLibrary:
             action_generator=_gen_mantle_of_the_ancients,
         ))
 
-        # Sylvan Awakening — until end of turn, all lands you control become
-        # 2/2 Elemental creatures with reach, indestructible, and haste while
-        # remaining lands. Implementation: animate_land action stamps temporary
-        # creature attributes; on_end_step reverts them.
-        self._add_card("sylvan awakening", EffectTemplate(
-            name="Sylvan Awakening",
-            description="All lands you control become 2/2 creatures with reach, indestructible, haste until EOT",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "animate_land", "player": ctrl, "scope": "all",
-                 "power": 2, "toughness": 2,
-                 "keywords": "reach,indestructible,haste"},
-            ],
-        ))
-
-        # Living Lands — same template family (lands → 1/1, no haste).
-        # (Less common but covered by the same action.)
-        self._add_card("living lands", EffectTemplate(
-            name="Living Lands",
-            description="Forests you control become 1/1 creatures while remaining lands",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "animate_land", "player": ctrl, "scope": "all",
-                 "power": 1, "toughness": 1},
-            ],
-        ))
 
         # Heavenly Blademaster — ETB attach trigger.
         # "When Heavenly Blademaster enters, attach any number of Auras and
@@ -7269,21 +6228,6 @@ class EffectTemplateLibrary:
         # These fire every upkeep but previously escalated to !resolve prompts
         # because no template existed. Added in oracle text order.
 
-        # Search for Azcanta — look at top card, may put in graveyard
-        # May 24 audit fix: was a no_action with "library order not modeled"
-        # reason that leaked dev-language to Discord. The reorder_library
-        # action (mtg/actions.py:704) is mana-curve-aware and does the
-        # right thing for autoplay: keeps a useful card on top when the
-        # controller is mana-light. Modeled as a scry-1 (look at top 1
-        # and reorder). The "may put in graveyard" branch is rare in
-        # practice — most players keep the look at the top of the library.
-        self._add_card("search for azcanta", EffectTemplate(
-            name="Search for Azcanta",
-            description="At beginning of upkeep, look at top card; reorder for best draw",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "reorder_library", "player": ctrl, "amount": 1},
-            ],
-        ))
 
         # Emeria, the Sky Ruin — at upkeep, if you control 7+ Plains, may return
         # a creature from graveyard to battlefield. Now actually checks the count
@@ -7324,26 +6268,6 @@ class EffectTemplateLibrary:
             action_generator=_emeria_gen,
         ))
 
-        # Koma, Cosmos Serpent — create a 3/3 blue Serpent token at each upkeep
-        self._add_card("koma, cosmos serpent", EffectTemplate(
-            name="Koma, Cosmos Serpent",
-            description="At the beginning of each upkeep, create a 3/3 blue Serpent token named Koma's Coil",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "create_token", "player": ctrl, "name": "Koma's Coil",
-                 "power": 3, "toughness": 3, "types": "Creature — Serpent", "count": 1},
-            ],
-        ))
-
-        # Mirri's Guile — look at top 3, put back in any order
-        # May 24 audit fix: was a no_action that leaked dev-language. Now
-        # uses reorder_library (mana-curve-aware heuristic at mtg/actions.py:704).
-        self._add_card("mirri's guile", EffectTemplate(
-            name="Mirri's Guile",
-            description="At beginning of upkeep, look at top 3 cards and reorder them for best draws",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "reorder_library", "player": ctrl, "amount": 3},
-            ],
-        ))
 
         # Sylvan Library — at upkeep, draw 2 extra cards, then choose two of
         # the cards drawn this turn (other than from this) and put them on
@@ -7398,67 +6322,6 @@ class EffectTemplateLibrary:
             action_generator=_inventors_fair_gen,
         ))
 
-        # --- Light Up the Stage (spectacle sorcery) ---
-        # Oracle: "Exile the top two cards of your library. Until the end of your next turn,
-        # you may play those cards." Has spectacle {R}.
-        # Tier 1.5 approximation: "cast from exile until end of next turn" isn't modeled,
-        # so we draw 2 cards as an equivalent-value stand-in. The spectacle-cost alternate
-        # casting is handled by the alt-cost machinery, not this template.
-        self._add_card("light up the stage", EffectTemplate(
-            name="Light Up the Stage",
-            description="Exile top 2 of library, play until end of next turn (approx as draw 2)",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "draw_cards", "player": ctrl, "amount": 2,
-                 "reason": "[TEMPLATE-APPROX] Light Up the Stage: approximated exile-to-play as draw 2"},
-            ],
-        ))
-
-        # Tendershoot Dryad — create a 1/1 green Saproling token at each upkeep
-        self._add_card("tendershoot dryad", EffectTemplate(
-            name="Tendershoot Dryad",
-            description="At the beginning of each upkeep, create a 1/1 green Saproling creature token",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "create_token", "player": ctrl, "name": "Saproling",
-                 "power": 1, "toughness": 1, "types": "Creature — Saproling", "count": 1},
-            ],
-        ))
-
-        # Jorn, God of Winter — ATTACK trigger per Scryfall:
-        # "Whenever Jorn attacks, untap each snow permanent you control."
-        #
-        # May 24 Tier-2 audit fix: the May 20 audit registered this as an
-        # upkeep trigger based on a hallucinated card-text claim. The local
-        # Scryfall cache (data/card_data_cache.json key
-        # "jorn, god of winter") confirms the real text is "Whenever Jorn
-        # attacks". The previous registration sent every Jorn-as-controller
-        # turn through `[DRAIN-ATTACK] Resolving Jorn ... via Tier 3` and
-        # `[RESOLVE-REFUSED] Combat-shaped resolve rejected` — 21 fires in
-        # one snow game, ZERO untaps. The snow deck's signature mechanic
-        # was completely broken.
-        self._add_attack_card("jorn, god of winter", EffectTemplate(
-            name="Jorn, God of Winter (attack)",
-            description="Whenever Jorn attacks, untap each snow permanent you control",
-            action_generator=lambda ctrl, opp, ctx: [
-                # `filter_supertype="snow"` matches the May 24 audit addition
-                # to untap_lands; `include_nonlands=True` extends past basic
-                # snow lands to Coldsteel Heart, Arcum's Astrolabe, snow
-                # creatures, etc. (snow deck has 5+ non-land snow permanents).
-                {"action": "untap_lands", "player": ctrl, "count": 99,
-                 "include_nonlands": True, "filter_supertype": "snow",
-                 "reason": "Jorn attack: untap each snow permanent you control"},
-            ],
-        ))
-
-        # Phyrexian Arena — draw a card and lose 1 life at upkeep
-        # Important: this is a common Commander staple that fires every turn.
-        self._add_card("phyrexian arena", EffectTemplate(
-            name="Phyrexian Arena",
-            description="At the beginning of your upkeep, draw a card and lose 1 life",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "draw_cards", "player": ctrl, "amount": 1},
-                {"action": "lose_life", "player": ctrl, "amount": 1},
-            ],
-        ))
 
         # Keeper of the Accord — "At the beginning of each opponent's upkeep,
         # if that player controls more creatures than you, create a 1/1 white
@@ -7504,32 +6367,6 @@ class EffectTemplateLibrary:
             action_generator=_keeper_of_the_accord_gen,
         ))
 
-        # Grave Titan — "Whenever Grave Titan attacks, create two 2/2 black
-        # Zombie creature tokens." (The ETB side already creates two Zombies
-        # via TOKEN_ETBS above; this handles the recurring attack trigger.)
-        self._add_attack_card("grave titan", EffectTemplate(
-            name="Grave Titan (attack)",
-            description="Whenever Grave Titan attacks, create two 2/2 black Zombie tokens",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "create_token", "player": ctrl, "name": "Zombie",
-                 "power": 2, "toughness": 2, "types": "Creature — Zombie",
-                 "count": 2},
-            ],
-        ))
-
-        # Isochron Scepter — imprint-on-ETB and tap-to-copy activation.
-        # Fully modeling imprint + copy-from-exile is beyond the template tier;
-        # register a silent ETB so the upkeep/ETB scanners don't escalate this
-        # card to Tier 3 every game. The actual imprint selection and the
-        # {2}, Tap activation are handled by the human/AI activation paths.
-        self._add_card("isochron scepter", EffectTemplate(
-            name="Isochron Scepter",
-            description="Imprint an instant card with mana value 2 or less from hand",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "imprint_isochron", "player": ctrl,
-                 "source": "Isochron Scepter"},
-            ],
-        ))
 
         self._add_pattern(
             r"for each creature token you control, create a token that's a copy of that creature",
@@ -7542,22 +6379,6 @@ class EffectTemplateLibrary:
             ),
         )
 
-        # Beastmaster Ascension — combat (attack) trigger.
-        # Oracle: "Whenever a creature you control attacks, put a quest counter on
-        # Beastmaster Ascension. As long as Beastmaster Ascension has seven or more
-        # quest counters on it, creatures you control get +5/+5."
-        # The +5/+5 anthem is wired by the layers engine; this template just tracks
-        # the quest counter additions silently. Returns no message text so we don't
-        # spam Discord on every attack — the static anthem effect is already visible
-        # in P/T totals when the threshold trips.
-        self._add_card("beastmaster ascension", EffectTemplate(
-            name="Beastmaster Ascension",
-            description="Add a quest counter on attack (silent)",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "add_counters", "card": "Beastmaster Ascension",
-                 "counter_type": "quest", "amount": 1, "_silent": True},
-            ],
-        ))
 
         # --- Fix 3: Spell templates (cards showing 'Complex effect:' with no outcome) ---
 
@@ -7676,43 +6497,6 @@ class EffectTemplateLibrary:
         # werewolf-style "at the beginning of each upkeep … transform" text.
         # =====================================================================
 
-        # Duskwatch Recruiter (day side) — transform if no spells cast last turn
-        self._add_card("duskwatch recruiter", EffectTemplate(
-            name="Duskwatch Recruiter",
-            description="At the beginning of each upkeep, if no spells were cast last turn, transform",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "no_action",
-                 "reason": "Duskwatch Recruiter: day/night transform — check if no spells were cast last turn to transform into Krallenhorde Howler (use !fix transform if needed)"},
-            ],
-        ))
-        # Krallenhorde Howler (night side) — transform back if 2+ spells cast last turn
-        self._add_card("krallenhorde howler", EffectTemplate(
-            name="Krallenhorde Howler",
-            description="At the beginning of each upkeep, if a player cast two or more spells last turn, transform",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "no_action",
-                 "reason": "Krallenhorde Howler: day/night transform — check if 2+ spells were cast last turn to transform back into Duskwatch Recruiter (use !fix transform if needed)"},
-            ],
-        ))
-
-        # Lambholt Pacifist (day side)
-        self._add_card("lambholt pacifist", EffectTemplate(
-            name="Lambholt Pacifist",
-            description="At the beginning of each upkeep, if no spells were cast last turn, transform",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "no_action",
-                 "reason": "Lambholt Pacifist: day/night transform — check if no spells were cast last turn to transform into Lambholt Butcher (use !fix transform if needed)"},
-            ],
-        ))
-        # Lambholt Butcher (night side)
-        self._add_card("lambholt butcher", EffectTemplate(
-            name="Lambholt Butcher",
-            description="At the beginning of each upkeep, if a player cast two or more spells last turn, transform",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "no_action",
-                 "reason": "Lambholt Butcher: day/night transform — check if 2+ spells were cast last turn to transform back into Lambholt Pacifist (use !fix transform if needed)"},
-            ],
-        ))
 
         # Huntmaster of the Fells (day side) — ETB / transform-in trigger
         # Apr 30 audit: previous template returned no_action with "use !fix"
@@ -7728,94 +6512,22 @@ class EffectTemplateLibrary:
                 {"action": "gain_life", "player": ctrl, "amount": 2},
             ],
         ))
-        # Ravager of the Fells (night side) — when transformed-into, create wolf token.
-        # The transform-in trigger is what creates the wolf in canonical rules.
-        self._add_card("ravager of the fells", EffectTemplate(
-            name="Ravager of the Fells",
-            description="When this transforms into Ravager of the Fells, create a 2/2 green Wolf creature token",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "create_token", "player": ctrl, "name": "Wolf",
-                 "power": 2, "toughness": 2, "types": "Creature — Wolf", "count": 1},
-            ],
-        ))
 
         # =================================================================
         # APR 14 AUDIT FIXES — Scry/look-at-top cards missing from template library
         # =================================================================
 
-        # Omen of the Sea — Flash enchantment ETB: scry 2, then draw a card
-        # (The generic ETB scry pattern catches the scry part, but misses the draw.
-        #  Named template takes priority and handles both actions together.)
-        self._add_card("omen of the sea", EffectTemplate(
-            name="Omen of the Sea",
-            description="When Omen of the Sea enters, scry 2, then draw a card",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "scry", "player": ctrl, "amount": 2},
-                {"action": "draw_cards", "player": ctrl, "amount": 1},
-            ],
-        ))
-
-        # Azcanta, the Sunken Ruin — transformed side of Search for Azcanta.
-        # Activated ability: {T}, look at top 4 cards of your library; you may put an
-        # instant, sorcery, or land card from among them into your hand; put the rest
-        # on the bottom in any order. Library order not tracked — produce no_action.
-        self._add_card("azcanta, the sunken ruin", EffectTemplate(
-            name="Azcanta, the Sunken Ruin",
-            description="Activated: look at top 4, may put instant/sorcery/land in hand, rest on bottom",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "no_action",
-                 "reason": "Azcanta, the Sunken Ruin: look at top 4, put instant/sorcery/land in hand — library order not tracked"},
-            ],
-        ))
-
-        # Temple of the False God — colorless land, no ETB trigger.
-        # Taps for {C}{C} if you control 5+ lands (mana ability, not a triggered ability).
-        # Adding a no_action template so any mistaken ETB lookup returns cleanly.
-        self._add_card("temple of the false god", EffectTemplate(
-            name="Temple of the False God",
-            description="No ETB trigger (taps for 2 colorless if 5+ lands — mana ability handled by mana system)",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "no_action",
-                 "reason": "Temple of the False God: no ETB effect (tap-for-mana ability, not a trigger)"},
-            ],
-        ))
 
         # =================================================================
         # APR 17 AUDIT FIXES — Gaps flagged by audit
         # =================================================================
 
-        # Night of Souls' Betrayal — static Layer 7c negative anthem.
-        # Creatures get -1/-1. Real registration happens via mtg_game.py's
-        # anthem_patterns oracle scan (which now includes the bare
-        # "creatures get -N/-N" pattern). Template returns no_action so a
-        # stray cast-time lookup returns cleanly rather than escalating.
-        self._add_card("night of souls' betrayal", EffectTemplate(
-            name="Night of Souls' Betrayal",
-            description="Creatures get -1/-1 (static, handled by layers engine)",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "no_action",
-                 "reason": "Night of Souls' Betrayal: static -1/-1 to all creatures handled by layers engine"},
-            ],
-        ))
 
         # Sylvan Awakening template lives at line ~5133 above (in the
         # "Animate-lands family" group with Living Lands). The animate_land
         # action handler is in mtg/actions.py — it stamps temporary creature
         # attributes that revert at end-of-turn cleanup.
 
-        # Leyline of Anticipation — "You may cast spells as though they had flash."
-        # Requires a can_cast_as_flash flag on the controller wired through the
-        # cast-timing check. No such flag exists, and adding one touches the cast
-        # validator in mtg_game.py. Stub returns no_action so autoplay doesn't
-        # escalate to Tier 3 for a static effect it can't yet honor.
-        self._add_card("leyline of anticipation", EffectTemplate(
-            name="Leyline of Anticipation",
-            description="You may cast spells as though they had flash (static; not yet wired into cast-timing check)",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "no_action",
-                 "reason": "Leyline of Anticipation: cast-as-flash flag not yet wired; spells still cast at sorcery speed"},
-            ],
-        ))
 
         # Signet family — all ten guild signets are mana-generating activated
         # abilities. Mana production is handled by mtg_game.py's Signet family
@@ -7855,33 +6567,6 @@ class EffectTemplateLibrary:
         # APR 30 AUDIT FIXES — missing templates from Apr 30 batch
         # =================================================================
 
-        # Maja, Bretagard Protector — landfall: create a 1/1 white Human
-        # Warrior token (printed P/T; the layers engine boosts it to 2/2
-        # via Maja's "other creatures you control get +1/+1" static).
-        # May 7 audit (Bug 2): previous template hardcoded 2/2 to bake in
-        # the anthem, which double-counts whenever the layers engine also
-        # applies the anthem (making the token 3/3). Drop to printed 1/1
-        # and trust the layers system.
-        self._add_card("maja, bretagard protector", EffectTemplate(
-            name="Maja, Bretagard Protector",
-            description="Landfall: create a 1/1 white Human Warrior token",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "create_token", "player": ctrl, "name": "Human Warrior",
-                 "power": 1, "toughness": 1, "types": "Creature — Human Warrior",
-                 "count": 1},
-            ],
-        ))
-
-        # Glacial Chasm — ETB sacrifices a land. Cumulative upkeep-pay-2-life
-        # is enforced separately by the pay-or-sacrifice logic. The ETB-side
-        # sacrifice was the !judge-prompt source.
-        self._add_card("glacial chasm", EffectTemplate(
-            name="Glacial Chasm",
-            description="When Glacial Chasm enters, sacrifice a land",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "sacrifice_land", "player": ctrl},
-            ],
-        ))
 
         # Kolaghan's Command — modal charm with 4 modes:
         #   1. Destroy target artifact
@@ -7896,34 +6581,6 @@ class EffectTemplateLibrary:
             action_generator=lambda ctrl, opp, ctx: self._gen_kolaghans_command(ctrl, opp, ctx),
         ))
 
-        # Gravebreaker Lamia — ETB tutor a creature card into graveyard.
-        # The cost-reduction static ability (creature spells from graveyard
-        # cost {1} less) is handled elsewhere; this template fires the ETB.
-        self._add_card("gravebreaker lamia", EffectTemplate(
-            name="Gravebreaker Lamia",
-            description="When Gravebreaker Lamia enters, search library for a creature card, put it into your graveyard, then shuffle",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "search_library", "player": ctrl, "filter_type": "creature",
-                 "to_zone": "graveyard", "count": 1, "shuffle": True},
-            ],
-        ))
-
-        # Spell Queller LTB — when Spell Queller dies, the exiled spell can
-        # be cast by its owner without paying mana. We approximate by
-        # returning the exiled card to its owner's hand.
-        # May 18 audit: the previous no_action was aspirational — it said
-        # "exiled spell returns to its owner's hand" but no code actually did
-        # that, so Negate exiled by Queller A stayed in exile permanently and
-        # appeared to "end up in graveyard" when audit reconciliation ran.
-        # Now uses release_queller_exile action which looks up the link in
-        # `game._queller_exiles` and actually moves the card back to hand.
-        self._add_card("spell queller_ltb", EffectTemplate(
-            name="Spell Queller (LTB)",
-            description="When Spell Queller leaves, the exiled card returns to its owner's hand (approximation of free-cast LTB)",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "release_queller_exile", "source": "Spell Queller"},
-            ],
-        ))
 
         # =====================================================================
         # May 7, 2026 audit: silent-resolve spell templates (round 2)
@@ -7934,70 +6591,6 @@ class EffectTemplateLibrary:
         # uncovered remainder.
         # =====================================================================
 
-        # --- Lingering Souls: create two 1/1 white Spirit tokens with flying ---
-        # Mirrors Spectral Procession (3 tokens); flashback is a casting
-        # mechanic, not part of the spell effect, so we don't model it here.
-        self._add_card("lingering souls", EffectTemplate(
-            name="Lingering Souls",
-            description="Create two 1/1 white Spirit creature tokens with flying",
-            action_generator=lambda ctrl, opp, ctx: [
-                make_token_action(ctrl, "spirit_1_1_fly", 2),
-            ],
-        ))
-
-        # --- Hellkite Courser: ETB cheat a commander out of the command zone ---
-        # Real card: "When Hellkite Courser enters, you may put a commander you
-        # own from the command zone onto the battlefield. Return that commander
-        # to the command zone at the beginning of the next end step."
-        # The engine's move_card doesn't support command_zone↔battlefield
-        # transitions, so we emit a descriptive no_action rather than silently
-        # producing nothing. (Tier 3 wouldn't reliably do this either.)
-        self._add_card("hellkite courser", EffectTemplate(
-            name="Hellkite Courser",
-            description="ETB: put a commander from the command zone onto the battlefield (returns at end step)",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "no_action",
-                 "reason": "Hellkite Courser: command zone → battlefield not modeled; commander stays in command zone"},
-            ],
-        ))
-
-        # --- Blood on the Snow: X-cost board wipe with snow-mana reanimate kicker ---
-        # Real card: "Destroy all creatures and planeswalkers with mana value
-        # X or less. If {S} was spent to cast this spell, return a creature
-        # or planeswalker card with mana value X or less from your graveyard
-        # to the battlefield."
-        # There's no destroy_by_mana_value action and the engine doesn't track
-        # which colors of mana were spent on a spell, so we emit a no_action
-        # with explanation rather than silently producing nothing.
-        self._add_card("blood on the snow", EffectTemplate(
-            name="Blood on the Snow",
-            description="Destroy creatures/planeswalkers with MV ≤ X; snow kicker: reanimate one with MV ≤ X",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "no_action",
-                 "reason": "Blood on the Snow: destroy-by-mana-value action not supported by engine (X-cost wipe + snow reanimate kicker)"},
-            ],
-        ))
-
-        # --- Living Weapon pattern: Batterskull, Mortarpod, Skinwing family ---
-        # Oracle: "Living weapon (When this Equipment enters, create a 0/0
-        # black Germ creature token, then attach this to it.)"
-        # We model the Germ token creation; the attach step is approximated as
-        # a no_action hint (the equipment lands separately, and the +X/+Y on
-        # attached creature will make the 0/0 Germ viable once the player runs
-        # !equip). Note: Umezawa's Jitte itself doesn't have living weapon —
-        # it's older — so we only register modern living-weapon equipment by
-        # name. The regex pattern below covers the whole family.
-        self._add_card("batterskull", EffectTemplate(
-            name="Batterskull",
-            description="Living weapon: create a 0/0 black Germ creature token, attach Batterskull to it",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "create_token", "player": ctrl, "name": "Germ",
-                 "power": 0, "toughness": 0,
-                 "types": "Creature — Germ", "count": 1},
-                {"action": "no_action",
-                 "reason": "Living weapon: Batterskull should attach to the Germ (use !equip)"},
-            ],
-        ))
 
         # Generic Living Weapon pattern — catches any equipment with the
         # living-weapon keyword (Skinwing, Mortarpod, Bonesplitter variants).
@@ -8177,6 +6770,72 @@ class EffectTemplateLibrary:
     # =========================================================================
     # Helper Methods
     # =========================================================================
+
+    def _load_json_templates(self):
+        """Load the data-driven half of the library from
+        data/card_templates.json (see CARD_TEMPLATES_JSON block comment).
+
+        STRICT on purpose: schema errors, unknown events, malformed actions,
+        and Python/JSON key collisions all raise — the file is repo data, and
+        every pytest run imports this library, so CI fails loudly on a bad
+        edit instead of silently dropping a card's template.
+        """
+        if not CARD_TEMPLATES_JSON.exists():
+            # OSS forks may strip the data file; the Python half still works.
+            print(f"[TEMPLATE-JSON] {CARD_TEMPLATES_JSON} not found — "
+                  f"JSON template half not loaded")
+            return
+        with open(CARD_TEMPLATES_JSON, encoding="utf-8") as f:
+            data = json.load(f)
+        registries = {
+            "etb": self._card_templates,
+            "dies": self._dies_templates,
+            "attack": self._attack_templates,
+        }
+        entries = data.get("templates")
+        if not isinstance(entries, list):
+            raise ValueError(
+                f"{CARD_TEMPLATES_JSON}: top-level 'templates' must be a list")
+        seen = set()
+        for i, entry in enumerate(entries):
+            where = f"{CARD_TEMPLATES_JSON.name} templates[{i}]"
+            if not isinstance(entry, dict):
+                raise ValueError(f"{where}: entry must be an object")
+            missing = {"key", "name", "event", "description", "actions"} - set(entry)
+            if missing:
+                raise ValueError(f"{where}: missing fields {sorted(missing)}")
+            event = entry["event"]
+            if event not in registries:
+                raise ValueError(
+                    f"{where}: unknown event {event!r} "
+                    f"(expected one of {sorted(registries)})")
+            key = entry["key"]
+            if not isinstance(key, str) or not key or key != key.lower().strip():
+                raise ValueError(
+                    f"{where}: key must be a lowercase trimmed string, "
+                    f"got {key!r}")
+            if (event, key) in seen:
+                raise ValueError(f"{where}: duplicate key {key!r} for {event}")
+            seen.add((event, key))
+            registry = registries[event]
+            if key in registry:
+                raise ValueError(
+                    f"{where}: key {key!r} ({event}) is registered in BOTH "
+                    f"Python (_build_library) and JSON — remove one")
+            actions = entry["actions"]
+            if (not isinstance(actions, list) or not actions
+                    or not all(isinstance(a, dict) and isinstance(a.get("action"), str)
+                               for a in actions)):
+                raise ValueError(
+                    f"{where}: actions must be a non-empty list of objects "
+                    f"each with a string 'action' field")
+            registry[key] = EffectTemplate(
+                name=entry["name"],
+                description=entry["description"],
+                action_generator=_make_json_action_generator(actions),
+                needs_target=bool(entry.get("needs_target", False)),
+                mandatory=bool(entry.get("mandatory", True)),
+            )
 
     def _add_card(self, name_lower: str, template: EffectTemplate):
         self._card_templates[name_lower] = template
@@ -8562,7 +7221,15 @@ class EffectTemplateLibrary:
     def _gen_draw_from_match(self, ctrl, opp, ctx) -> List[Dict]:
         match = ctx.get('_match')
         if match:
-            n = self._word_to_num(match.group(1))
+            raw = match.group(1)
+            # July 21 batch audit (R2-3): "draw X cards" (Gadwick) captured
+            # the literal "X", word_to_num silently defaulted it to 1, and
+            # the computed X sat unread in ctx — an X=8 Gadwick drew 1
+            # (game_1529172161636597770). Read the paid X for X-draws.
+            if raw and raw.strip().lower() == 'x':
+                n = int(ctx.get('x_value') or 0) or 1
+            else:
+                n = self._word_to_num(raw)
             return [{"action": "draw_cards", "player": ctrl, "amount": n}]
         return [{"action": "draw_cards", "player": ctrl, "amount": 1}]
     
@@ -9980,6 +8647,28 @@ def build_game_context(game, player, opponent, card=None, entering_creature=None
 
     # Dying creature info (for dies triggers)
     if dying_creature:
+        ctx['_dying_card'] = dying_creature
+        # July 20 audit (Athreos, God of Passage): "Whenever another creature
+        # YOU OWN dies" — the ownership gate needs to know whether the dying
+        # card belongs to the watcher's controller (`player` here is the
+        # trigger source's controller in the dies scan). owner_index when
+        # set (tokens, stolen cards); else the post-death graveyard location
+        # (CR 404.1 — a card dies into its OWNER's graveyard). None when
+        # neither signal is available — consumers should NOT fire on None
+        # (a missed optional trigger beats an inverted one).
+        try:
+            _own_idx = getattr(dying_creature, 'owner_index', None)
+            if _own_idx is not None and 0 <= _own_idx < len(game.players):
+                ctx['dying_owned_by_controller'] = game.players[_own_idx] is player
+            elif dying_creature in getattr(player, 'graveyard', []):
+                ctx['dying_owned_by_controller'] = True
+            elif any(dying_creature in getattr(p, 'graveyard', [])
+                     for p in game.players if p is not player):
+                ctx['dying_owned_by_controller'] = False
+            else:
+                ctx['dying_owned_by_controller'] = None
+        except Exception:
+            ctx['dying_owned_by_controller'] = None
         ctx['dying_name'] = dying_creature.name if hasattr(dying_creature, 'name') else str(dying_creature)
         try:
             ctx['dying_power'] = int(dying_creature.power) if hasattr(dying_creature, 'power') and dying_creature.power else 0

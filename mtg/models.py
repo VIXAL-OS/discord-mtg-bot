@@ -1571,6 +1571,11 @@ class Player:
     # CR 903.4 — identity is a deck-construction constant; recomputing from
     # live card locations broke partner decks when a commander was stolen.
     _commander_identity_cache: Any = field(default=None, repr=False, compare=False)
+    # July 20 audit: pain-land tap damage (City of Brass, Ancient Tomb) was
+    # console-only — 13 invisible life drops in one July 16 game's Discord
+    # log. Tap paths buffer a display line here; cast_spell_async drains
+    # them into effect_messages after payment.
+    _pending_tap_damage_msgs: list = field(default_factory=list, repr=False, compare=False)
 
     # Cards exiled but playable this turn (Chandra 0, Outpost Siege, etc.)
     # List of card IDs that can be played from exile until end of turn
@@ -2130,10 +2135,18 @@ class Player:
             # queue (flushed by the next display pass).
             try:
                 rules_engine = getattr(game, '_rules_engine', None)
-                if rules_engine and hasattr(rules_engine, '_check_dies_triggers_sync'):
-                    dies_msgs, _unhandled = rules_engine._check_dies_triggers_sync(
+                # July 21 batch audit: game._rules_engine holds the
+                # RulesEngine, but the dies scan lives on the GAME engine —
+                # route via engine_ref. (Also: _rules_engine was only ever
+                # assigned in tests until today, so this whole branch was
+                # dead in live games.)
+                _dies_owner = getattr(rules_engine, 'engine_ref', None) or rules_engine
+                if _dies_owner and hasattr(_dies_owner, '_check_dies_triggers_sync'):
+                    dies_msgs, _unhandled = _dies_owner._check_dies_triggers_sync(
                         game, victim, self
                     )
+                    if hasattr(_dies_owner, 'queue_unhandled_dies'):
+                        _dies_owner.queue_unhandled_dies(game, victim, self, _unhandled)
                     if dies_msgs:
                         pq = getattr(game, '_pending_messages', None)
                         if pq is None:
@@ -2182,7 +2195,9 @@ class Player:
             if tap_damage > 0:
                 self.life -= tap_damage
                 self.record_life_loss(tap_damage)
-                print(f"[MANA-DAMAGE] {card.name} deals {tap_damage} damage to {self.name} (life: {self.life})")
+                print(f"[MANA-DAMAGE] {card.name} deals {tap_damage} damage to {self.name} (life: {max(0, self.life)})")
+                self._pending_tap_damage_msgs.append(
+                    f"🩸 {card.name} deals {tap_damage} damage to {self.name} (life: {max(0, self.life)})")
 
             # Apply sac cost for sac-mana lands (Phyrexian Tower). If
             # production reports {B: 2} but no sac target now exists, fall
@@ -2292,6 +2307,53 @@ class Player:
             elif sym.hybrid_generic:
                 hybrid_count += 1
                 hybrid_options.append((i, [sym.hybrid_generic[1].value, 'generic']))
+
+        # === PHASE 0 (July 21, 2026 batch audit): spend FLOATING pool mana ===
+        # The pool holds genuinely-floating mana (Castle Vantress-style
+        # [ACTIVATE-MANA] activations, rituals, Tier-3 add_mana). Before this
+        # phase existed the payer ignored the pool entirely, so floated mana
+        # was advertised (available_mana_detailed seeds from the pool) but
+        # could never actually pay for anything — one half of the Bring Back
+        # divergence in game_1529165073443197190. Spending here is LOGICAL
+        # (recorded in pool_spent, applied in Phase 4) so early-return
+        # failures leave the pool untouched.
+        pool_spent = {}
+        _pool_avail = {k: v for k, v in self.mana_pool.items() if v > 0}
+
+        def _spend_pool(color, amount):
+            take = min(_pool_avail.get(color, 0), amount)
+            if take > 0:
+                _pool_avail[color] -= take
+                pool_spent[color] = pool_spent.get(color, 0) + take
+            return take
+
+        # Strict colored pips (incl. strict {C}) from matching pool colors.
+        for _color in list(color_needs.keys()):
+            used = _spend_pool(_color, color_needs[_color])
+            if used:
+                color_needs[_color] -= used
+                if color_needs[_color] <= 0:
+                    del color_needs[_color]
+        # Hybrid pips: either color pays (prefer the more-abundant pool color).
+        _remaining_hybrids = []
+        for _idx, _options in hybrid_options:
+            _real = [c for c in _options if c != 'generic']
+            _pick = max(_real, key=lambda c: _pool_avail.get(c, 0), default=None)
+            if _pick is not None and _pool_avail.get(_pick, 0) > 0:
+                _spend_pool(_pick, 1)
+                continue
+            _remaining_hybrids.append((_idx, _options))
+        hybrid_options = _remaining_hybrids
+        hybrid_count = len(hybrid_options)
+        # Generic portion — but NOT the {S} part (pool mana can't be verified
+        # snow, so {S} pips must still come from snow-source taps below).
+        _generic_pool_payable = max(0, generic_needed - snow_count)
+        for _color in sorted(_pool_avail, key=lambda c: (c != 'C', -_pool_avail[c])):
+            if _generic_pool_payable <= 0:
+                break
+            used = _spend_pool(_color, min(_pool_avail[_color], _generic_pool_payable))
+            _generic_pool_payable -= used
+            generic_needed -= used
 
         # Gather all untapped sources and their production
         sources = []
@@ -2517,10 +2579,16 @@ class Player:
                 if any_excess < needed - mana_produced.get(color, 0):
                     return False
 
-        # === PHASE 4: Actually tap the sources and add mana to pool ===
-        preferred = ''.join(color_needs.keys()) if color_needs else ''
-        # Track color shortfalls so 'any' mana goes to the right color
-        pool_shortfalls = dict(color_needs)  # Mutable — decremented as colors are added
+        # === PHASE 4: Actually tap the sources and settle the pool ===
+        # July 21, 2026 batch audit: this phase previously added every tapped
+        # source's production to the mana pool WITHOUT ever deducting the
+        # cost — the pool accumulated all mana "produced this phase", so
+        # available_mana_detailed() (which seeds from the pool) over-
+        # advertised by everything already spent, and the July 20 one-tap
+        # gate counted the same phantoms. Now: payment mana never touches
+        # the pool; only true EXCESS (e.g. Sol Ring's second mana covering a
+        # 1-generic remainder) floats, and Phase-0 pool spending is applied.
+        produced_by_color = {}
         for card, production in sources:
             if id(card) in tapped_cards:
                 card.tapped = True
@@ -2529,7 +2597,9 @@ class Player:
                 if tap_damage > 0:
                     self.life -= tap_damage
                     self.record_life_loss(tap_damage)
-                    print(f"[MANA-DAMAGE] {card.name} deals {tap_damage} damage to {self.name} (life: {self.life})")
+                    print(f"[MANA-DAMAGE] {card.name} deals {tap_damage} damage to {self.name} (life: {max(0, self.life)})")
+                    self._pending_tap_damage_msgs.append(
+                        f"🩸 {card.name} deals {tap_damage} damage to {self.name} (life: {max(0, self.life)})")
                 # May 16 audit: pay sac cost for Phyrexian Tower's {B}{B}
                 # ability. If we promised B mana via _get_mana_production
                 # but the player has no sac target right now, degrade to
@@ -2544,19 +2614,50 @@ class Player:
                 _cc = committed_color.get(id(card))
                 if _cc is not None and _cc in production:
                     production = {_cc: production[_cc]}
-                # For non-any sources, decrement shortfalls from their colored production
+                # Accumulate what was actually produced ('any' filed under C —
+                # excess color fidelity for any-sources is not worth tracking).
                 for pc, pv in production.items():
-                    if pc not in ('any', 'C') and pc in pool_shortfalls:
-                        pool_shortfalls[pc] = max(0, pool_shortfalls[pc] - pv)
-                self._add_production_to_pool(production, preferred, pool_shortfalls)
+                    _key = 'C' if pc == 'any' else pc
+                    produced_by_color[_key] = produced_by_color.get(_key, 0) + pv
+
+        # Settle the pool: deduct the cost from what the taps produced;
+        # whatever remains is true excess and floats. Then apply Phase-0
+        # pool spending.
+        _excess = dict(produced_by_color)
+        _deduct = total_cost
+        for _color, _needed in color_needs.items():
+            _take = min(_excess.get(_color, 0), _needed, _deduct)
+            if _take > 0:
+                _excess[_color] -= _take
+                _deduct -= _take
+        for _k in sorted(_excess, key=lambda c: (c != 'C', -_excess[c])):
+            if _deduct <= 0:
+                break
+            _take = min(_excess[_k], _deduct)
+            _excess[_k] -= _take
+            _deduct -= _take
+        for _k, _v in _excess.items():
+            if _v > 0 and _deduct <= 0:
+                self.mana_pool[_k] = self.mana_pool.get(_k, 0) + _v
+        for _k, _v in pool_spent.items():
+            self.mana_pool[_k] = max(0, self.mana_pool.get(_k, 0) - _v)
 
         # Apply Phyrexian life payment
         if phyrexian_life_cost > 0:
             self.life -= phyrexian_life_cost
             self.record_life_loss(phyrexian_life_cost)
             print(f"[MANA-PHYREXIAN] {self.name} pays {phyrexian_life_cost} life for Phyrexian mana (life: {self.life})")
+            # July 21 batch audit (R1-4): console-only before — Gitaxian
+            # Probe's 2 life never reached Discord while the pain-land line
+            # right above did. Same buffered-message drain.
+            self._pending_tap_damage_msgs.append(
+                f"🩸 {self.name} pays {phyrexian_life_cost} life for Phyrexian "
+                f"mana (life: {max(0, self.life)})")
 
+        _pool_note = (f" (+{sum(pool_spent.values())} from floating pool)"
+                      if pool_spent else '')
         print(f"[MANA-ENGINE] Tapped {len(tapped_cards)} sources for {mana_cost_str}"
+              f"{_pool_note}"
               f"{f' + {additional_generic} generic' if additional_generic else ''}"
               f"{f' (X={x_value})' if x_value else ''}"
               f"{f' ({phyrexian_life_cost} life for Phyrexian)' if phyrexian_life_cost else ''}")
@@ -2664,6 +2765,52 @@ class Player:
             self._commander_identity_cache = result
         return result
     
+    def can_pay_printed_alternate_cost(self, card) -> bool:
+        """Predicate twin of the cast-time alternate-cost branches in
+        mtg/spells.py:_compute_alt_costs — can `card` be cast WITHOUT paying
+        its printed mana cost right now?
+
+        July 20 audit: the response-AI affordability filters checked only the
+        printed cost, so Force of Will sat dead in hand for 51 turns in one
+        game ("filtered unaffordable instants: ['Force of Will']" on every
+        priority window) despite blue cards to exile the whole time. This
+        mirrors the branches the payment stage actually takes — it must never
+        say True for a cost the cast path can't complete. Checks only; no
+        mutation.
+        """
+        oracle_lower = (getattr(card, 'oracle_text', '') or '').lower()
+        if not oracle_lower:
+            return False
+        # Force of Will family: "pay 1 life and exile a <color> card from
+        # your hand rather than pay this spell's mana cost"
+        if 'pay 1 life and exile a' in oracle_lower and 'from your hand' in oracle_lower:
+            if self.life <= 1:
+                return False
+            color_map = {'blue': 'U', 'black': 'B', 'red': 'R', 'green': 'G', 'white': 'W'}
+            exile_color = None
+            for color_name, color_code in color_map.items():
+                if color_name in oracle_lower:
+                    exile_color = color_code
+                    break
+            if not exile_color:
+                return False
+            return any(c is not card and c.mana_cost
+                       and exile_color in c.mana_cost.upper()
+                       for c in self.hand)
+        # Fireblast family: "sacrifice two Mountains rather than pay ..."
+        if 'sacrifice' in oracle_lower and 'rather than pay' in oracle_lower:
+            sac_match = re.search(r'sacrifice (\w+) (\w+)', oracle_lower)
+            if sac_match:
+                count_map = {'two': 2, 'three': 3, 'a': 1, 'an': 1, 'one': 1}
+                sac_count = count_map.get(sac_match.group(1), 1)
+                perm_type = sac_match.group(2).rstrip('s')
+                candidates = [c for c in self.battlefield
+                              if perm_type in c.name.lower()
+                              or perm_type in (c.type_line or '').lower()]
+                return len(candidates) >= sac_count
+        # (Pacts pass the normal can_pay_mana_cost check — printed cost {0}.)
+        return False
+
     def can_pay_mana_cost(self, mana_cost: str) -> Tuple[bool, str]:
         """
         Check if player can pay a mana cost (color-aware).
@@ -2683,6 +2830,77 @@ class Player:
         # Structured mana engine — proper color validation
         if HAS_MANA_ENGINE:
             try:
+                # July 20 audit: available_mana_detailed() counts EVERY color an
+                # OR-dual can produce (a W/B land adds 1 to W and 1 to B), so
+                # each per-color number is a true capacity but their TOTAL is
+                # not — 5 physical sources displayed as 12 "available" and
+                # advertised Sun Titan ({4}{W}{W}) as castable off 5 taps
+                # (game_1527451728084074550; the AI then burned whole main
+                # phases in retry loops against tap_sources_for_cost's correct
+                # refusal). A source taps ONCE: gate on the physical one-tap
+                # total (floating pool + max-one-mana per untapped source)
+                # before the color-wise check.
+                _one_tap_total = sum(self.mana_pool.values())
+                for _src in self.untapped_mana_sources():
+                    _prod = self._get_mana_production(_src)
+                    if _prod:
+                        _one_tap_total += max(_prod.values())
+                _parsed_for_total = ManaCost.parse(mana_cost)
+                _required_total = _parsed_for_total.generic_requirement
+                for _sym in _parsed_for_total.symbols:
+                    # Phyrexian symbols can be paid with life — exclude
+                    # them so this gate never over-rejects.
+                    if getattr(_sym, 'phyrexian', False):
+                        continue
+                    if (_sym.color is not None
+                            or getattr(_sym, 'hybrid_colors', None)
+                            or getattr(_sym, 'hybrid_generic', None)
+                            or getattr(_sym, 'is_snow', False)):
+                        _required_total += 1
+                if _one_tap_total < _required_total:
+                    # Keep the "Not enough mana" prefix — downstream reason
+                    # classifiers and the AI retry feedback key on it.
+                    return False, (f"Not enough mana: only {_one_tap_total} "
+                                   f"untapped source(s) for {_required_total} "
+                                   f"total mana")
+                # July 21 batch audit: hybrid pips need units capable of ONE
+                # of their two colors specifically — the per-color pool below
+                # double-counts OR-duals and the one-tap gate above is color-
+                # blind, so {G/W}{G/W}{G/W}{G/W} with 3 G/W-capable sources +
+                # 1 floating {U} advertised as payable and burned retries
+                # (game_1529165073443197190, Bring Back). Necessary-condition
+                # check per hybrid color-pair: pool[A]+pool[B] + sources
+                # producing A or B (or any) must cover the pair's hybrid pips
+                # PLUS strict A/B pips (they draw from the same units). Any
+                # payable state satisfies this, so it never over-rejects;
+                # the tap engine stays the final arbiter.
+                _hybrid_pairs = {}
+                _strict_pips = {}
+                for _sym in _parsed_for_total.symbols:
+                    if getattr(_sym, 'phyrexian', False):
+                        continue
+                    _hc = getattr(_sym, 'hybrid_colors', None)
+                    if _hc:
+                        _pair = frozenset((_hc[0].value, _hc[1].value))
+                        _hybrid_pairs[_pair] = _hybrid_pairs.get(_pair, 0) + 1
+                    elif _sym.color is not None:
+                        _strict_pips[_sym.color.value] = _strict_pips.get(_sym.color.value, 0) + 1
+                for _pair, _pips in _hybrid_pairs.items():
+                    _pcolors = sorted(_pair)
+                    _cap = sum(self.mana_pool.get(_pc, 0) for _pc in _pcolors)
+                    for _src in self.untapped_mana_sources():
+                        _prod = self._get_mana_production(_src)
+                        if not _prod:
+                            continue
+                        if (_prod.get('any', 0) > 0
+                                or any(_prod.get(_pc, 0) > 0 for _pc in _pcolors)):
+                            _cap += 1
+                    _need = _pips + sum(_strict_pips.get(_pc, 0) for _pc in _pcolors)
+                    if _cap < _need:
+                        _pair_str = '/'.join(_pcolors)
+                        return False, (f"Not enough mana: only {_cap} source(s) "
+                                       f"can pay {{{_pair_str}}}-compatible pips "
+                                       f"({_need} needed)")
                 # Build pool from untapped sources + existing pool (not just pool dict)
                 # available_mana_detailed() already does this correctly
                 detailed = self.available_mana_detailed()
@@ -2961,6 +3179,13 @@ class GameState:
     # to_dict is hand-written, so save/load and !undo restore defaults and the
     # engine repopulates). Same convention as Card/Player: declare runtime
     # flags here, don't staple (tests/test_ratchets.py ratchets the count). ----
+    # July 21 batch audit: back-reference to the RulesEngine, consumed by
+    # rules/spell_resolver.py (noncombat damage → replacement effects + SBA)
+    # and Player._apply_sac_cost_at_tap (Phyrexian Tower dies triggers).
+    # Was only ever assigned in TESTS — the May 30 D2 / June 10 C4 wiring
+    # silently no-opped in every live game. GameEngine now stamps it at
+    # game creation and load.
+    _rules_engine: object = field(default=None, repr=False, compare=False)
     # (card, player) tuples queued for dies-trigger processing (SBA loop,
     # board wipes, Living Death F-LD1). Drained by the trigger dispatcher.
     _recently_died: list = field(default_factory=list, repr=False, compare=False)
@@ -2976,6 +3201,29 @@ class GameState:
     # share one ClaudePlayer, so these counters must never live on the client.
     _strategy_rejection_streak: int = field(default=0, repr=False, compare=False)
     _strategy_backoff_turns: int = field(default=0, repr=False, compare=False)
+    # July 20: adaptive strategist degrade. Deadman/hard-cap fires are
+    # counted per game (same shared-client reasoning as above); after 2
+    # fires the game's remaining strategist calls drop reasoning_effort to
+    # "low" ([STRATEGIST-DEGRADE]). The July 12-13 batch had 248 fires vs
+    # the 0-2/batch healthy baseline on a bad-DeepSeek day; the deadman
+    # already caps each hang, this stops paying the 90s tax repeatedly.
+    _strategist_fires: int = field(default=0, repr=False, compare=False)
+    _strategist_degraded: bool = field(default=False, repr=False, compare=False)
+    # Pub/sub slice 2 (July 20, 2026): PERMANENT_ENTERED parity tracking.
+    # Every emit records (card_id, name, kind, via) here; the legacy
+    # creature-enters / enchantment-enters scans record the ids they saw.
+    # triggers.report_entered_parity (called from end_turn) prints
+    # [EVENT-PARITY] for entries the scans missed, then clears all three.
+    # One clean batch = the gate for flipping the scans into subscribers.
+    _entered_events: list = field(default_factory=list, repr=False, compare=False)
+    _entered_scanned_creature_ids: set = field(default_factory=set, repr=False, compare=False)
+    _entered_scanned_ench_ids: set = field(default_factory=set, repr=False, compare=False)
+    # Slice 3a (July 21): CREATURE_DIED shadow parity — (card_id, name)
+    # tuples recorded by the bus subscriber, and the ids the dies
+    # dispatcher actually processed. Diffed + cleared by
+    # report_death_parity (end_turn).
+    _death_events: list = field(default_factory=list, repr=False, compare=False)
+    _death_dispatched_ids: set = field(default_factory=set, repr=False, compare=False)
     _strategy_task: Any = field(default=None, repr=False, compare=False)
     _strategy_memo: str = field(default="", repr=False, compare=False)
     # Cross-system display queue: trigger messages produced by sync helpers
@@ -2989,6 +3237,15 @@ class GameState:
     # cast/activate branches of the two action executors, consumed by their
     # resolve branches to drop redundant/orphan free-text resolves.
     _last_exec_cast_like: Any = field(default=None, repr=False, compare=False)
+    # July 20 batch-3 audit: (turn_number, card_name, msg) of the most recent
+    # FAILED cast_spell_async. Both action executors print the real failure
+    # reason then returned None, so _get_action_error re-derived a reason from
+    # scratch — and for aura/graveyard-target failures (Animate Dead has no
+    # literal "target" in its oracle text) fell through to "unknown reason —
+    # mana looks sufficient", feeding the AI a wrong reason it retried against
+    # (283 of 588 [MANA-DIVERGENCE] lines in the 15289 batch were non-mana
+    # failures). Consumed (and cleared) by _get_action_error.
+    _last_cast_failure: Any = field(default=None, repr=False, compare=False)
     # Spell Queller bookkeeping: source card name → [(exiled_card, owner_name)]
     # (exile_from_stack records; release_queller_exile drains on LTB).
     _queller_exiles: dict = field(default_factory=dict, repr=False, compare=False)

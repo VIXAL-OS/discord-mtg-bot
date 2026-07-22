@@ -47,6 +47,13 @@ from mtg.helpers import (
     get_mdfc_info,
 )
 from mtg.models import Card, Player, GameState, StackEntry, FormatValidator
+from mtg import events
+# Slice 2b (July 21, 2026): importing mtg.triggers registers the
+# PERMANENT_ENTERED bus subscribers (creature watcher dispatch, snow
+# watcher, parity recorder) at module load. The direct scan calls are gone,
+# so an engine used without this import would silently drop every
+# creature-enters trigger — import it eagerly at the hub.
+from mtg import triggers as _triggers_bus_registration  # noqa: F401
 from mtg.rules_engine import RulesEngine
 
 # Optional: visual board renderer
@@ -375,6 +382,7 @@ class GameEngine:
                 game = GameState.from_dict(data)
                 # Only load games that aren't ended
                 if not game.ended:
+                    game._rules_engine = self.rules  # July 21: live wiring (was test-only)
                     self.games[game.thread_id] = game
                     print(f"✅ Loaded game in thread {game.thread_id} "
                           f"(turn {game.turn_number}, {file_age_hours:.1f}h old)")
@@ -470,6 +478,7 @@ class GameEngine:
             turn_number=0,
         )
 
+        game._rules_engine = self.rules  # July 21: live wiring (was test-only)
         self.games[thread_id] = game
         self.save_game(game)  # Persist to disk
         return game
@@ -526,6 +535,26 @@ class GameEngine:
                 matched = False
                 for entry in reversed(game.stack):
                     if getattr(entry, 'priority_id', None) == stack_obj.id:
+                        # July 21 batch audit (CR 608 LIFO gate): the
+                        # PrioritySystem's stack can diverge from game.stack —
+                        # response casts and cast-trigger entries push onto
+                        # game.stack but not always into the ps. In
+                        # game_1529172174773157998 the ps resolved Animate
+                        # Dead (its top) while Disallow (targeting it!) and a
+                        # Talrand trigger sat ABOVE it on game.stack — the
+                        # reanimation resolved, Disallow fizzled, and the
+                        # should-have-been-countered spell stayed. If the
+                        # matched entry is buried, do NOT resolve it — the
+                        # caster's _await_stack_window timeout + LIFO
+                        # extension loop retries once it truly is on top.
+                        if game.stack and game.stack[-1] is not entry:
+                            _top = game.stack[-1]
+                            _top_name = (_top.card.name if getattr(_top, 'card', None)
+                                         else getattr(_top, 'trigger_source', '?'))
+                            print(f"[STACK-LIFO-GUARD] {stack_obj.name} matched but is "
+                                  f"buried under {_top_name} on game.stack — not "
+                                  f"resolving out of order (CR 608)")
+                            return
                         # Check if this is a triggered ability (no resolution_event)
                         if not entry.is_spell:
                             # [TRIGGER-RESOLVE] Resolve triggered ability from stack
@@ -746,8 +775,10 @@ class GameEngine:
                     await ps.player_action(player_name, PriorityAction.pass_priority())
                     return
 
-                # Check affordability
-                affordable = [c for c in instants if player.can_pay_mana_cost(c.mana_cost)[0]]
+                # Check affordability (July 20: alternate-cost aware — FoW class)
+                affordable = [c for c in instants
+                              if player.can_pay_mana_cost(c.mana_cost)[0]
+                              or player.can_pay_printed_alternate_cost(c)]
                 if not affordable:
                     print(f"[STACK-AI] {player_name} has instants but can't afford any — auto-pass")
                     await ps.player_action(player_name, PriorityAction.pass_priority())
@@ -878,7 +909,10 @@ class GameEngine:
         for p in game.players:
             instants = self.claude_ai.has_instant_speed_cards(p) if self.claude_ai else []
             if instants:
-                affordable = [c for c in instants if p.can_pay_mana_cost(c.mana_cost)[0]]
+                # July 20: alternate-cost aware — FoW class
+                affordable = [c for c in instants
+                              if p.can_pay_mana_cost(c.mana_cost)[0]
+                              or p.can_pay_printed_alternate_cost(c)]
                 if affordable:
                     any_instants = True
                     break
@@ -968,6 +1002,7 @@ class GameEngine:
             turn_number=0,
         )
 
+        game._rules_engine = self.rules  # July 21: live wiring (was test-only)
         self.games[thread_id] = game
         self.save_game(game)
         return game
@@ -1120,6 +1155,33 @@ class GameEngine:
         drawn = []
         for _ in range(count):
             if not player.library:
+                # July 21 (unexercised-paths suite): Laboratory Maniac / Jace,
+                # Wielder of Mysteries REPLACE the empty draw with winning —
+                # both print the same sentence. The engine had no win
+                # replacement at all, so Jace WoM's whole reason to exist
+                # lost its controller the game instead (CR 614.12).
+                _win_src = None
+                if game:
+                    for _c in player.battlefield:
+                        _ot = (_c.oracle_text or '').lower().replace('\n', ' ')
+                        if (not getattr(_c, '_phased_out', False)
+                                and 'library has no cards in it, you win the game' in _ot):
+                            _win_src = _c
+                            break
+                if _win_src is not None:
+                    game.ended = True
+                    try:
+                        game.winner = game.players.index(player)
+                    except ValueError:
+                        game.winner = None
+                    print(f"[DRAW-EMPTY-WIN] {player.name} wins — {_win_src.name} "
+                          f"replaces the draw from an empty library")
+                    if not hasattr(game, '_pending_messages') or game._pending_messages is None:
+                        game._pending_messages = []
+                    game._pending_messages.append(
+                        f"🏆 **{player.name}** wins the game! ({_win_src.name} "
+                        f"replaces the draw from an empty library)")
+                    break
                 # CR 104.3c: A player who attempts to draw from an empty library loses the game
                 # at the next state-based action check. Setting life=0 lets the
                 # SBA pipeline handle it (which correctly treats simultaneous
@@ -1214,6 +1276,10 @@ class GameEngine:
         player.battlefield.append(card)
         card.entered_this_turn = True
         player.lands_played_this_turn += 1
+        # Pub/sub slice 2: one PERMANENT_ENTERED per physical entry (snow
+        # lands feed the Marit Lage's Slumber watcher).
+        events.emit(events.PERMANENT_ENTERED, game, card=card,
+                    controller=player, via="land_drop", rules=self.rules)
 
         # Handle land ETB-tapped conditions via consolidated utility
         enters_tapped, etb_msg = self.rules._check_enters_tapped(game, card, player)
@@ -1267,6 +1333,9 @@ class GameEngine:
             card.entered_this_turn = True
             player.battlefield.append(card)
             self.rules.log_event(f"{player.name} casts {card.name} (permanent)")
+            # Pub/sub slice 2: one PERMANENT_ENTERED per physical entry.
+            events.emit(events.PERMANENT_ENTERED, game, card=card,
+                        controller=player, via="cast_sync", rules=self.rules)
 
         return True, f"Cast {card.name}", effect_messages
 
@@ -1303,6 +1372,30 @@ class GameEngine:
             'context': context,
         })
         print(f"[QUEUE-{trigger_type.upper()}] Queued {source_card.name} for async resolution")
+
+    def queue_unhandled_dies(self, game: GameState, dead_card: Card,
+                             dead_player: Player, unhandled) -> None:
+        """Queue the unhandled half of a _check_dies_triggers_sync result for
+        async Tier 3 drain.
+
+        July 21 batch audit (R1-2/R1-3): the main SBA drain did this inline,
+        but FIVE other call sites unpacked the unhandled list into `_` and
+        dropped it — anything without a Tier 1/1.5 match (Judith, the
+        Scourge Diva's dies-damage in game_1529154418816057364) vanished
+        with no display and no Tier 3 fallback. Shared helper so every
+        dies-scan site queues the tail identically.
+        """
+        for trigger_card, trigger_text in (unhandled or []):
+            ctrl_player = dead_player
+            for p in game.players:
+                if trigger_card in p.battlefield:
+                    ctrl_player = p
+                    break
+            self._queue_async_trigger(
+                game, trigger_card, trigger_text, "dies",
+                ctrl_player.name,
+                context=f"{dead_card.name} just died (went to graveyard)",
+            )
 
     async def drain_pending_triggers(self, game: GameState) -> List[str]:
         """Delegates to mtg.triggers.drain_pending_triggers (Phase 2E)."""
@@ -2101,8 +2194,9 @@ class GameEngine:
                     phase_burst: List[str] = []
                     for dead_card, dead_player in recently_died:
                         try:
-                            trigger_msgs, _ = self._check_dies_triggers_sync(game, dead_card, dead_player)
+                            trigger_msgs, _unh = self._check_dies_triggers_sync(game, dead_card, dead_player)
                             phase_burst.extend(trigger_msgs)
+                            self.queue_unhandled_dies(game, dead_card, dead_player, _unh)
                         except Exception as e2:
                             print(f"[DIES-TRIGGER] Error in phase-transition dies trigger: {e2}")
                     # Collapse same-source bursts before extending messages.
@@ -2236,6 +2330,15 @@ class GameEngine:
         return _resolve_suspend_spell(self, game, player, card, opponent)
     def end_turn(self, game: GameState) -> List[str]:
         """End the current turn and start the next. Returns end-step messages (e.g. discard prompts)."""
+        # Pub/sub slice 2: diff PERMANENT_ENTERED emissions against the
+        # legacy ETB scan records for the turn just ending; prints
+        # [EVENT-PARITY] for misses (the next batch greps these — one clean
+        # batch gates flipping the scans into subscribers).
+        from mtg.triggers import report_entered_parity, report_death_parity
+        report_entered_parity(game)
+        # Slice 3a (July 21): CREATURE_DIED shadow parity.
+        report_death_parity(game)
+
         # [TRANSFORM] Save spell count for day/night and werewolf transform tracking
         game.active_player.spells_cast_prev_turn = game.active_player.spells_cast_this_turn
         game.active_player.spells_cast_this_turn = 0
@@ -2605,6 +2708,23 @@ class GameEngine:
                             target = p.find_card(target_name, Zone.BATTLEFIELD)
                             if target:
                                 break
+                    # July 20 audit: graveyard-targeting spells (Animate Dead,
+                    # Dance of the Dead, "return target ... from your
+                    # graveyard") — this resolver never searched graveyards,
+                    # so the AI's declared target silently dropped to None and
+                    # the reanimation fallback picked the highest-power
+                    # creature in ANY graveyard instead
+                    # (game_1527451728084074550: declared Gonti, got the
+                    # opponent's Sun Titan — CR 608.2b violation).
+                    if not target:
+                        _oracle_l = (card.oracle_text or '').lower()
+                        if any(phrase in _oracle_l for phrase in
+                               ('in a graveyard', 'in your graveyard',
+                                'from your graveyard', 'from a graveyard')):
+                            for p in game.players:
+                                target = p.find_card(target_name, Zone.GRAVEYARD)
+                                if target:
+                                    break
                     # Check if targeting a player
                     if not target:
                         for p in game.players:
@@ -2667,9 +2787,26 @@ class GameEngine:
                 # Use async version with spell resolution
                 success, msg, effect_msgs = await self.cast_spell_async(game, player, card, target=target, additional_cost=commander_tax)
                 print(f"[EXECUTE] cast {card_name}: success={success}, msg={msg}")
+                # July 20 batch-3 audit: keep the REAL failure reason for
+                # _get_action_error — returning None below discards it, and
+                # the re-derived reason misclassifies aura/graveyard-target
+                # failures as "unknown reason — mana looks sufficient".
+                if not success and msg:
+                    game._last_cast_failure = (game.turn_number, card.name, msg)
                 if effect_msgs:
                     for em in effect_msgs:
                         print(f"[EXECUTE] effect: {em}")
+                # July 20 audit: a FAILED commander cast left the card
+                # stranded in hand until the periodic CR-903.9 sweep — during
+                # that window it was visible to hand-size/discard effects,
+                # and a discard-to-hand-size could bury it in the graveyard,
+                # which the sweep never scans (game_1526071401499328634
+                # showed the strand; the graveyard hole is the latent trap).
+                # Roll it straight back.
+                if not success and from_command_zone and card in player.hand:
+                    player.hand.remove(card)
+                    player.command_zone.append(card)
+                    print(f"[COMMANDER] {card.name} cast failed — returned to command zone immediately")
                 if success:
                     if from_command_zone:
                         card.times_cast_from_command_zone += 1
@@ -2986,6 +3123,26 @@ class GameEngine:
             if ability_idx < len(abilities):
                 ability = abilities[ability_idx]
 
+                # July 20 batch-3 audit (reviewer V4): the AI's standard equip
+                # shape is {"ability": 0, "target": <own creature>}, but the
+                # abilities list is oracle-line-ordered — Umezawa's Jitte's
+                # charge-counter modal sits at [0] and Equip at [1], so every
+                # equip attempt died at "no charge counter to remove" and
+                # Jitte never equipped for 30+ turns. A request on an
+                # Equipment that names the player's OWN creature as target is
+                # unambiguous equip intent; reroute to the Equip ability.
+                if (not ability.get('is_equip') and target_name
+                        and 'equipment' in (perm.type_line or '').lower()):
+                    _equip_idx = next((i for i, ab in enumerate(abilities)
+                                       if ab.get('is_equip')), None)
+                    if _equip_idx is not None:
+                        _t = player.find_card(target_name, Zone.BATTLEFIELD)
+                        if _t is not None and _t.is_creature():
+                            print(f"[ACTIVATE-CLAUDE] {perm.name}: rerouting ability "
+                                  f"{ability_idx} → {_equip_idx} (equip intent: own-creature target)")
+                            ability_idx = _equip_idx
+                            ability = abilities[_equip_idx]
+
                 # Check if can activate
                 if ability['needs_tap'] and perm.tapped:
                     return None
@@ -3005,6 +3162,26 @@ class GameEngine:
                 # Deduct mana costs from the ability cost string
                 # Parses costs like "{1}", "{2}{G}", "{W}{U}", etc.
                 cost_str = ability['cost']
+                # July 20 batch-3 audit (reviewer V5): equip-cost reducers
+                # (Auriok Steelshaper "Equip costs you pay cost {1} less")
+                # were never applied anywhere — equip always charged the
+                # printed cost. Reduce the generic component (CR 601.2f).
+                if ability.get('is_equip'):
+                    _equip_red = 0
+                    for _src in player.battlefield:
+                        _rm = re.search(r'equip (?:abilities you activate|costs you pay) cost \{(\d+)\} less',
+                                        (_src.oracle_text or '').lower())
+                        if _rm:
+                            _equip_red += int(_rm.group(1))
+                    if _equip_red:
+                        _gm = re.search(r'\{(\d+)\}', cost_str)
+                        if _gm:
+                            _newgen = max(0, int(_gm.group(1)) - _equip_red)
+                            _new_cost = cost_str.replace(
+                                _gm.group(0), f'{{{_newgen}}}' if _newgen else '', 1)
+                            print(f"[ACTIVATE-CLAUDE] {perm.name}: equip cost "
+                                  f"{cost_str} → {_new_cost or '{0}'} (reducers on battlefield)")
+                            cost_str = _new_cost
                 mana_cost = _activation_mana_cost(cost_str)
                 if mana_cost:
                     # June 11 live retest: equip used an amount-only loop that
@@ -3055,8 +3232,10 @@ class GameEngine:
                             try:
                                 from mtg.actions import _fire_sacrifice_triggers
                                 _st_msgs = _fire_sacrifice_triggers(self.rules, game, player, perm) or []
-                                game._recently_died.append((perm, player))
+                                from mtg.triggers import queue_death
+                                queue_death(game, perm, player)
                                 dies_msgs, _unh = self._check_dies_triggers_sync(game, perm, player)
+                                self.queue_unhandled_dies(game, perm, player, _unh)
                                 _all = _st_msgs + (dies_msgs or [])
                                 if _all:
                                     game._pending_messages.extend(_all)
@@ -3121,8 +3300,10 @@ class GameEngine:
                             # Remembrance never fired on Altar of Dementia
                             # sacs while every combat death fired it).
                             if sac_target.is_creature():
-                                game._recently_died.append((sac_target, player))
+                                from mtg.triggers import queue_death
+                                queue_death(game, sac_target, player)
                                 dies_msgs, _unh = self._check_dies_triggers_sync(game, sac_target, player)
+                                self.queue_unhandled_dies(game, sac_target, player, _unh)
                                 if dies_msgs:
                                     game._pending_messages.extend(dies_msgs)
                                     print(f"[ACTIVATE-CLAUDE] Fired {len(dies_msgs)} dies-trigger(s) for {sac_target.name} (sac cost)")
@@ -3402,11 +3583,26 @@ class GameEngine:
                     player.battlefield.append(target_equip)
                     target_equip.entered_this_turn = True
                     print(f"[ACTIVATE-CLAUDE] {perm.name}: cheated {target_equip.name} from hand to battlefield")
+                    # July 20 batch-3 audit (reviewer V1): this path bypassed
+                    # ALL entry plumbing — no static registration, no
+                    # PERMANENT_ENTERED, no ETB resolution. A Stoneforged
+                    # Batterskull entered with no Living Weapon Germ and was
+                    # dead weight for the rest of the game
+                    # (game_1528946322995150848).
+                    game.register_static_keyword_grants(target_equip, player.name)
+                    game.register_static_pt_effects(target_equip, player.name)
+                    game.register_replacement_effects(target_equip, player.name)
+                    events.emit(events.PERMANENT_ENTERED, game, card=target_equip,
+                                controller=player, via="cheat_into_play", rules=self.rules)
+                    from mtg.actions import _fire_noncast_battlefield_entry
+                    entry_msgs = _fire_noncast_battlefield_entry(
+                        self.rules, game, player, target_equip)
                     msgs = []
                     if sacrificed_self:
                         msgs.append(f"💀 **{perm.name}** sacrificed (cost)")
                     msgs.append(f"⚒️ {player.name} puts **{target_equip.name}** onto the battlefield "
                                 f"(via {perm.name})")
+                    msgs.extend(entry_msgs)
                     return "\n".join(msgs)
 
                 # === SNEAK ATTACK STYLE: Put creature onto battlefield ===
@@ -3444,13 +3640,19 @@ class GameEngine:
                     # Mark for end-step sacrifice (Sneak Attack)
                     if 'sacrifice' in effect_text and 'end' in effect_text:
                         target_creature._sneak_attack_sac = True
-                    # Fire ETB triggers
-                    try:
-                        await self._check_creature_etb_triggers(game, player, target_creature)
-                    except Exception as e:
-                        print(f"[ACTIVATE-CLAUDE] Sneak ETB trigger error: {e}")
+                    # Slice 2b (July 21): this sneak-into-play path never
+                    # emitted PERMANENT_ENTERED (an emit-side gap the parity
+                    # recorder structurally couldn't see — scans without
+                    # emits don't diff). The emit now drives the watcher
+                    # dispatch; drain in place.
+                    events.emit(events.PERMANENT_ENTERED, game,
+                                card=target_creature, controller=player,
+                                via="cheat_into_play", rules=self.rules)
+                    from mtg.helpers import drain_pending_messages as _drain_pm
+                    _sneak_watcher_msgs = _drain_pm(game)
                     print(f"[ACTIVATE-CLAUDE] {perm.name}: sneaked {target_creature.name} onto battlefield")
                     msgs = []
+                    msgs.extend(_sneak_watcher_msgs)
                     if sacrificed_self:
                         msgs.append(f"💀 **{perm.name}** sacrificed (cost)")
                     msgs.append(f"🎭 {player.name} puts **{target_creature.name}** ({target_creature.power}/{target_creature.toughness}) onto the battlefield" + (" with haste" if 'haste' in effect_text else ""))
@@ -3788,8 +3990,13 @@ class GameEngine:
 
                 if actions:
                     result_parts = list(messages) if messages else []
-                    events = self.check_state_based_actions(game)
-                    result_parts.extend(f"⚡ {e}" for e in events)
+                    # NOTE: must not be named `events` — that shadows the
+                    # module-level `from mtg import events` across ALL of
+                    # _execute_action (the PERMANENT_ENTERED emit in the
+                    # Stoneforge branch crashed on UnboundLocalError, 5 games
+                    # in the July 21 batch). Pinned by tests/test_july21_batch_audit.py.
+                    sba_events = self.check_state_based_actions(game)
+                    result_parts.extend(f"⚡ {e}" for e in sba_events)
 
                     # Clear matching pending resolves
                     desc_lower = description.lower()
@@ -3843,9 +4050,9 @@ class GameEngine:
                         pr for pr in game.pending_resolves
                         if not any(word in pr.lower() for word in desc_lower.split() if len(word) > 3)
                     ]
-                    events = self.check_state_based_actions(game)
-                    if events:
-                        ruling += "\n" + "\n".join(f"⚡ {e}" for e in events)
+                    sba_events = self.check_state_based_actions(game)
+                    if sba_events:
+                        ruling += "\n" + "\n".join(f"⚡ {e}" for e in sba_events)
                     return ruling
 
                 # No applied changes — suppress the bare "📜 Judge Ruling: No game

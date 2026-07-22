@@ -331,6 +331,9 @@ class _MessagesNamespace:
         # per-purpose counter can break down where calls are coming from.
         # Unknown bucket is "uncategorized" — chase those down to label them.
         purpose = kwargs.pop('purpose', 'uncategorized')
+        # July 20: per-call reasoning_effort override (adaptive strategist
+        # degrade after repeated deadman fires) — beats the adapter default.
+        effort_override = kwargs.pop('reasoning_effort', None)
 
         try:
             # Translate Anthropic 'system' kwarg → OpenAI system message
@@ -353,7 +356,9 @@ class _MessagesNamespace:
                 extra_body['thinking'] = {
                     "type": "enabled" if self._thinking_enabled else "disabled"
                 }
-            if self._reasoning_effort is not None:
+            if effort_override is not None:
+                create_kwargs['reasoning_effort'] = effort_override
+            elif self._reasoning_effort is not None:
                 create_kwargs['reasoning_effort'] = self._reasoning_effort
 
             if json_mode:
@@ -459,6 +464,8 @@ class _MessagesNamespace:
         """
         json_mode = kwargs.pop('json_mode', False)  # strategist defaults free-text
         purpose = kwargs.pop('purpose', 'stream-uncategorized')
+        # July 20: per-call reasoning_effort override (see create()).
+        effort_override = kwargs.pop('reasoning_effort', None)
 
         api_messages = list(messages or [])
         system_text = kwargs.get('system', '')
@@ -481,7 +488,9 @@ class _MessagesNamespace:
             extra_body['thinking'] = {
                 "type": "enabled" if self._thinking_enabled else "disabled"
             }
-        if self._reasoning_effort is not None:
+        if effort_override is not None:
+            create_kwargs['reasoning_effort'] = effort_override
+        elif self._reasoning_effort is not None:
             create_kwargs['reasoning_effort'] = self._reasoning_effort
 
         if json_mode:
@@ -636,7 +645,7 @@ def create_openrouter_adapter(model: str = "openrouter/optimus-alpha",
             log_tag=f"OPENROUTER:{short_name}",
             extra_headers={
                 "HTTP-Referer": "https://github.com/VIXAL-OS/discord-mtg-bot",
-                "X-Title": "the bot MTG Bot",
+                "X-Title": "Discord MTG Bot",
             },
         )
     except ImportError:

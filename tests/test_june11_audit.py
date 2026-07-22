@@ -11,11 +11,8 @@ from types import SimpleNamespace
 import pytest
 
 
-# NOTE (fork): the upstream TestTarotThinkingBlocks class was dropped here —
-# it imports bot._extract_anthropic_text, a helper that lives only in the
-# companion fork's tarot path. This MTG-only fork has no tarot, so the test
-# is not applicable. All other classes below are pure engine tests.
-
+# (TestTarotThinkingBlocks lives upstream only — the tarot feature is not
+# part of this MTG-only fork.)
 
 class TestSmallReviewerObservations:
     def test_oath_of_teferi_returns_at_end_step_not_immediately(self, lib):

@@ -251,14 +251,15 @@ class TestManaPayment:
         assert ok is True, msg
 
     def test_convoke_taps_creatures_to_help_pay(self, make_game, make_card):
-        # Pinned: the pre-gate is not convoke-aware, so full mana must be
-        # AVAILABLE (4 lands here) even though convoke then covers the
-        # generic — payment taps the 3 helpers and only 1 land ({B}).
+        # July 20: the pre-gate is now convoke-aware — ONE land is enough
+        # when three creatures cover the generic portion. (The original pin
+        # documented the latent bug: full printed cost had to be AVAILABLE
+        # even though convoke then paid most of it.)
         game = _ready(make_game())
         rick = game.players[0]
         helpers = [make_card(f"Helper {i}") for i in range(3)]
         rick.battlefield.extend(helpers)
-        lands = _swamps(make_card, 4)
+        lands = _swamps(make_card, 1)
         rick.battlefield.extend(lands)
         spell = make_card("Convoked Giant",
                           type_line="Creature — Giant",
@@ -272,14 +273,15 @@ class TestManaPayment:
         assert sum(l.tapped for l in lands) == 1
 
     def test_delve_exiles_graveyard_cards(self, make_game, make_card):
-        # Pinned: pre-gate is not delve-aware either (4 lands required
-        # available); payment exiles the 3 fodder cards and taps 1 land.
+        # July 20: pre-gate is delve-aware — one land suffices when the
+        # graveyard covers the generic; payment exiles the 3 fodder cards
+        # and taps 1 land. (Original pin documented the latent bug.)
         game = _ready(make_game())
         rick = game.players[0]
         fodder = [make_card(f"Fodder {i}", type_line="Sorcery",
                             power="0", toughness="0") for i in range(3)]
         rick.graveyard.extend(fodder)
-        lands = _swamps(make_card, 4)
+        lands = _swamps(make_card, 1)
         rick.battlefield.extend(lands)
         spell = make_card("Delved Horror",
                           type_line="Creature — Horror",

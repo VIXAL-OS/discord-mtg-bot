@@ -47,6 +47,7 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from mtg.constants import Phase, Zone
+from mtg.helpers import response_text
 from mtg.models import Card, Player, GameState
 
 
@@ -107,7 +108,7 @@ Be specific about:
         )
         if rules.usage_callback and hasattr(response, 'usage'):
             rules.usage_callback(response.usage, rules.model)
-        return response.content[0].text
+        return response_text(response)
     except Exception as e:
         return f"⚠️ Judge error: {e}"
 
@@ -195,7 +196,7 @@ ACTIONS: [your JSON array]"""
         if rules.usage_callback and hasattr(response, 'usage'):
             rules.usage_callback(response.usage, rules.model)
 
-        text = response.content[0].text.strip()
+        text = response_text(response).strip()
         # May 7 audit fix #10: collapse multi-line JSON so the log preview
         # stays one line instead of dumping a 20-line indented block.
         try:
@@ -661,7 +662,7 @@ Respond with ONLY the JSON object, no markdown, no backticks, no preamble."""
         if rules.usage_callback and hasattr(response, 'usage'):
             rules.usage_callback(response.usage, rules.model)
 
-        raw_text = response.content[0].text.strip()
+        raw_text = response_text(response).strip()
         # Strip <think> scratchpad if present (DeepSeek reasoning)
         text = rules._strip_think_tags(raw_text, context="resolve") if '<think>' in raw_text else raw_text
         # Strip markdown code fences if present
@@ -685,7 +686,7 @@ Respond with ONLY the JSON object, no markdown, no backticks, no preamble."""
             )
             if rules.usage_callback and hasattr(response2, 'usage'):
                 rules.usage_callback(response2.usage, rules.model)
-            text = response2.content[0].text.strip()
+            text = response_text(response2).strip()
             if text.startswith("```"):
                 text = re.sub(r'^```(?:json)?\s*', '', text)
                 text = re.sub(r'\s*```$', '', text)

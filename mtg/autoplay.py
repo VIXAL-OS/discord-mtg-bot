@@ -227,6 +227,8 @@ AUTOPLAY_DECKS = {
     "aminatou": "claude_deck_aminatou",
     "baral": "claude_deck_baral",
     "rashmi": "claude_deck_rashmi",
+    "mythic": "mythic_sanity",
+    "mythic_madness": "mythic_madness",
     "tokens": "test_tokens_rhys",
     "graveyard": "test_graveyard_meren",
     "voltron": "test_voltron_sram",
@@ -262,6 +264,7 @@ AUTOPLAY_DECKS = {
     "devotion": "test_devotion_erebos",         # May 20: Theros devotion gods (Erebos) — Layer 4 type-flip when devotion crosses 5
     "combat_keywords": "test_combat_keywords_glissa",  # May 23: Glissa + Bow of Nylea + tramplers — trample+deathtouch CR 702.19c × 702.2c
     "replacement_chain": "test_replacement_chain_gisela",  # May 23: Gisela commander + Furnace of Rath + Dictate + Fiery Emancipation — multi-replacement chain CR 615.5
+    "stifle": "test_stifle_talrand",            # July 21: Talrand + 6 Stifle-shapes — [CAST-TRIGGER-PRIORITY] window (APNAP-5), pacts, FoN alternate, delve
 }
 
 # Full playtest matrix — 85 matchups across 7 phases (from CLAUDE.md)
@@ -424,6 +427,31 @@ AUTOPLAY_MATRIX = [
     (137, "commander", "replacement_chain", "aristocrats",       "Gisela halve+doublers vs Korvold sacrifice — exercises chain on damage from both directions (Korvold attacks trigger doublers; Gisela halve applies to her controller's incoming damage)"),
     (138, "commander", "layers",            "combat_keywords",   "Humility's Layer 7b vs Glissa's first-strike+deathtouch (granted) — does Humility remove DT from Glissa (yes, per Humility) so trample only matters?"),
     (139, "commander", "replacement_chain", "layers",            "Gisela's halve-damage vs Humility — Humility doesn't affect static replacement effects on permanents (CR 614 not creature-typed), so Gisela's halving still applies under Humility"),
+    # Phase 15: July 21 coverage deck — the [CAST-TRIGGER-PRIORITY] window
+    # (APNAP-5, May 20) has never fired in a batch because no test deck held
+    # Stifle-shaped cards. Talrand's own cast trigger means every instant
+    # cast with a Stifle in hand opens the window even without opponent help.
+    (140, "commander", "stifle",            "rashmi",            "Stifle window vs Rashmi cast triggers — [CAST-TRIGGER-PRIORITY] + [CAST-TRIGGER-COUNTERED]; Talrand Drakes vs Rashmi value"),
+    (141, "commander", "rashmi",            "stifle",            "Rashmi (human path) vs stifle deck — reverse direction; response-side stifle windows"),
+    (142, "commander", "stifle",            "aminatou",          "Stifle vs Rhystic Study / Smothering Tithe — opponent-cast triggers as Stifle targets; also pacts + FoN + Spellstutter vs blink"),
+    (143, "commander", "stifle",            "sagas",             "Stifle vs Sythis enchantresses — enchantment-cast triggers and saga chapters as trigger-counter targets"),
+    # Phase 16: July 21 batch-4 follow-up — reverse directions for the
+    # coverage decks' specialty matchups. the player's catch: the newer audit
+    # decks mostly sat in the pretend-human seat (deck0) for their specialty
+    # pairings, so their mechanics never exercised the AI path
+    # (execute_claude_turn / decide_response / decide_attackers) against
+    # those opponents. Asymmetric-path bugs (the whole reason reverses
+    # exist) were invisible there. Both seats now pinned structurally in
+    # tests/test_july21_coverage.py.
+    (144, "commander", "aminatou",          "stifle",            "Blink (human) vs stifle deck (AI path) — reverse of 142; AI-side response windows, pacts, FoN"),
+    (145, "commander", "sagas",             "stifle",            "Sythis enchantresses (human) vs stifle deck (AI path) — reverse of 143"),
+    (146, "commander", "aristocrats",       "devotion",          "Sacrifice (human) vs devotion (AI path) — reverse of 129; AI-side Gray Merchant drain + devotion math"),
+    (147, "commander", "layers",            "devotion",          "Humility (human) vs devotion gods (AI path) — reverse of 130"),
+    (148, "commander", "aristocrats",       "combat_keywords",   "Sacrifice (human) vs Glissa trample+deathtouch (AI path) — reverse of 133; AI declares the DT+trample attacks"),
+    (149, "commander", "tokens",            "combat_keywords",   "Token swarm (human) vs Glissa (AI path) — reverse of 134; AI-side CR 702.19c damage assignment"),
+    (150, "commander", "aristocrats",       "replacement_chain", "Korvold sacrifice (human) vs Gisela + doublers (AI path) — reverse of 137"),
+    (151, "commander", "layers",            "replacement_chain", "Humility (human) vs Gisela + doublers (AI path) — reverse of 139"),
+    (152, "commander", "combat_keywords",   "layers",            "Glissa trample+deathtouch (human) vs Humility (AI path) — reverse of 138"),
 ]
 
 AUTOPLAY_PHASES = {
@@ -440,7 +468,10 @@ AUTOPLAY_PHASES = {
     "may23": (131, 139),   # May 23 audit-coverage-gap decks (trample+DT, multi-replacement chain)
     "combat_keywords": (131, 134),    # Specifically the trample+deathtouch matchups
     "replacement_chain": (135, 139),  # Specifically the multi-replacement matchups
-    "all": (1, 139),
+    "stifle": (140, 145),  # July 21: [CAST-TRIGGER-PRIORITY] window (Talrand + Stifle-shapes) + both-seat reverses
+    "july21": (140, 145),  # Alias for the July 21 coverage deck
+    "reverses": (144, 152),  # July 21 batch-4 follow-up: AI-path reverses for the coverage decks' specialty matchups
+    "all": (1, 152),
 }
 
 
@@ -647,7 +678,11 @@ async def _autoplay_human_turn(cog, thread, game: GameState, player_idx: int):
     # --- COMBAT ---
     # Two passes to get from MAIN1 exit to DECLARE_ATTACKERS (like human !pass !pass)
     if game.phase == Phase.COMBAT_BEGIN and not game.ended:
-        cog.engine.advance_phase(game)  # → DECLARE_ATTACKERS
+        # July 20 display audit: same dropped-return as the Claude path —
+        # beginning-of-combat trigger output was invisible to players.
+        _, _cb_msgs = cog.engine.advance_phase(game)  # → DECLARE_ATTACKERS
+        for _m in (_cb_msgs or []):
+            await cog._autoplay_send(thread, _m)
 
     if game.phase == Phase.DECLARE_ATTACKERS and not game.ended:
         attacker_names = await cog.engine.claude_ai.decide_attackers(game, player_idx)
@@ -1386,6 +1421,12 @@ async def _autoplay_execute_action(cog, thread, game: GameState, player_idx: int
                 player.hand.remove(card)
                 player.command_zone.append(card)
             print(f"[AUTOPLAY] cast failed: {msg}")
+            # July 20 batch-3 audit: same stash as engine.py's _execute_action
+            # cast branch — the None return discards the real reason and
+            # _get_action_error's re-derivation misses aura/graveyard-target
+            # failures ("unknown reason — mana looks sufficient" retry storms).
+            if msg:
+                game._last_cast_failure = (game.turn_number, card.name, msg)
 
     elif action_type == "activate":
         perm_name = action.get("permanent")
@@ -2035,6 +2076,7 @@ async def _run_single_autoplay(cog, channel, game_format: str, deck1_name: str, 
     # when its numbers are polluted by parallel games (all concurrent games
     # share one adapter — see the PARALLEL-MODE CAVEAT near the emit).
     global _ACTIVE_AUTOPLAY_GAMES, _AUTOPLAY_GAMES_STARTED
+    global _AUTOPLAY_SWAP_DEPTH, _AUTOPLAY_TRUE_ORIGINALS
     try:
         _ACTIVE_AUTOPLAY_GAMES += 1
         _AUTOPLAY_GAMES_STARTED += 1
@@ -2075,6 +2117,22 @@ async def _run_single_autoplay(cog, channel, game_format: str, deck1_name: str, 
             'rules_client': cog.engine.rules.client,
             'rules_model': cog.engine.rules.model,
         }
+        # July 20 audit: the swapped clients live on SHARED engine objects, so
+        # under !autoplay-parallel the first game to FINISH used to restore the
+        # original Anthropic client while sibling games were still running —
+        # their remaining calls silently billed Anthropic and, with
+        # claude-sonnet-5 returning thinking blocks, crashed response parsing
+        # ('ThinkingBlock' object has no attribute 'text', 20 games in the
+        # July 16 batch). Reference-count the swap: only the FIRST swap in a
+        # quiescent state captures the true originals, and only the LAST
+        # finishing game restores them (see the finally block).
+        try:
+            _AUTOPLAY_SWAP_DEPTH += 1
+        except NameError:
+            _AUTOPLAY_SWAP_DEPTH = 1
+            _AUTOPLAY_TRUE_ORIGINALS = None
+        if _AUTOPLAY_SWAP_DEPTH == 1:
+            _AUTOPLAY_TRUE_ORIGINALS = dict(_original_clients)
         # Snapshot stats at game start for per-game delta calculation.
         # We snapshot both the actor adapter (V4-Flash) and, if Phase 3 is
         # active, the strategist adapter (V4-Pro) so we can bill them at
@@ -2110,6 +2168,8 @@ async def _run_single_autoplay(cog, channel, game_format: str, deck1_name: str, 
                 and hasattr(cog.engine.spell_resolver, 'effect_executor')
                 and cog.engine.spell_resolver.effect_executor):
             _original_clients['effect_executor_client'] = cog.engine.spell_resolver.effect_executor.claude_client
+            if _AUTOPLAY_SWAP_DEPTH == 1:
+                _AUTOPLAY_TRUE_ORIGINALS['effect_executor_client'] = _original_clients['effect_executor_client']
             cog.engine.spell_resolver.effect_executor.claude_client = use_alt_adapter
 
         # Reset circuit breaker — different provider gets a fresh start
@@ -2481,8 +2541,19 @@ async def _run_single_autoplay(cog, channel, game_format: str, deck1_name: str, 
                     for _m in _p1 + _p2 + _p3:
                         await cog._autoplay_send(thread, _m)
                     # Drain sync-queued triggers via Tier 3 (Meren/Abyss/Emeria/etc.)
-                    for _m in await cog.engine.drain_pending_triggers(game):
-                        await cog._autoplay_send(thread, _m)
+                    # July 20 batch-3 audit (reviewer S1): collapse identical
+                    # consecutive drain lines into one ×N line BEFORE sending —
+                    # Fall of the Thran returning two Forests produced
+                    # byte-identical messages that Layer-1 dedup silently ate.
+                    _drained = await cog.engine.drain_pending_triggers(game)
+                    _runs = []
+                    for _m in _drained:
+                        if _runs and _runs[-1][0] == _m:
+                            _runs[-1][1] += 1
+                        else:
+                            _runs.append([_m, 1])
+                    for _m, _n in _runs:
+                        await cog._autoplay_send(thread, _m if _n == 1 else f"{_m} (×{_n})")
 
                 # Guard against duplicate turn headers: advance_phase may loop
                 # or trigger spurious re-entry; emit each (turn, player) banner once.
@@ -2748,16 +2819,23 @@ async def _run_single_autoplay(cog, channel, game_format: str, deck1_name: str, 
             except Exception:
                 pass
     finally:
-        # Restore original Claude clients if we swapped to Deepseek
+        # Restore original Claude clients if we swapped to Deepseek.
+        # July 20 audit: gated on the swap depth counter — only the LAST
+        # finishing autoplay game restores, and it restores the TRUE originals
+        # captured by the first swap (its own _original_clients may just be
+        # the already-swapped DeepSeek adapter under parallel mode).
         if _original_clients:
-            cog.engine.claude_ai.client = _original_clients['claude_ai_client']
-            cog.engine.claude_ai.model = _original_clients['claude_ai_model']
-            cog.engine.claude_ai.strategist_client = _original_clients['claude_ai_strategist_client']
-            cog.engine.claude_ai.strategist_model = _original_clients['claude_ai_strategist_model']
-            cog.engine.rules.client = _original_clients['rules_client']
-            cog.engine.rules.model = _original_clients['rules_model']
-            if 'effect_executor_client' in _original_clients:
-                cog.engine.spell_resolver.effect_executor.claude_client = _original_clients['effect_executor_client']
+            _AUTOPLAY_SWAP_DEPTH -= 1
+            if _AUTOPLAY_SWAP_DEPTH <= 0 and _AUTOPLAY_TRUE_ORIGINALS:
+                _restore = _AUTOPLAY_TRUE_ORIGINALS
+                cog.engine.claude_ai.client = _restore['claude_ai_client']
+                cog.engine.claude_ai.model = _restore['claude_ai_model']
+                cog.engine.claude_ai.strategist_client = _restore['claude_ai_strategist_client']
+                cog.engine.claude_ai.strategist_model = _restore['claude_ai_strategist_model']
+                cog.engine.rules.client = _restore['rules_client']
+                cog.engine.rules.model = _restore['rules_model']
+                if 'effect_executor_client' in _restore:
+                    cog.engine.spell_resolver.effect_executor.claude_client = _restore['effect_executor_client']
             # Log Deepseek stats — both per-game delta and cumulative.
             # DeepSeek V4 pricing — REAL rates, verified May 30 2026 against the
             # account's own usage export (usage_data_2026_5.zip, `price` column).

@@ -38,6 +38,29 @@ def normalize_card_name(name) -> str:
     return (name or "").strip().lower()
 
 
+def response_text(response) -> str:
+    """Joined text blocks of an Anthropic-style API response.
+
+    Claude 5 models (claude-sonnet-5 is the bot's live default) may lead
+    response.content with thinking blocks that carry no .text attribute, so
+    the old `response.content[0].text` idiom raises AttributeError
+    ('ThinkingBlock' object has no attribute 'text' — 20 games in the
+    July 16 batch after the parallel client-restore race flipped them onto
+    the Anthropic client). Same semantics as bot._extract_anthropic_text
+    (which mtg/ can't import without inverting the dependency direction):
+    concatenate every string .text block, skipping thinking blocks.
+    DeepSeek/OpenRouter adapter responses always have exactly one text
+    block, so this is behavior-identical for them.
+    """
+    return "".join(
+        text for text in (
+            getattr(block, 'text', None)
+            for block in (getattr(response, 'content', None) or [])
+        )
+        if isinstance(text, str)
+    )
+
+
 def names_match(a, b) -> bool:
     """Exact normalized card-name equality.
 
@@ -89,8 +112,14 @@ def format_activate_line(card_name: str, loyalty_cost, ability_text: str,
             # Repeat activation: show a short reminder instead of nothing.
             # June 11 audit: 192/313 PW activations displayed as a bare
             # "[+2] ability" — players read that as an ability with no text.
+            # July 20: truncate at a word boundary — the raw [:69] slice
+            # produced mid-word cuts like "…as though they had …" / "Un…"
+            # on every repeat activation in the July 12+16 logs.
             if len(sanitized) > 72:
-                return f"⚡ **{card_name}** activates {bracket} ability: _{sanitized[:69]}…_"
+                snippet = sanitized[:69]
+                if ' ' in snippet[40:]:
+                    snippet = snippet.rsplit(' ', 1)[0]
+                return f"⚡ **{card_name}** activates {bracket} ability: _{snippet}…_"
             return f"⚡ **{card_name}** activates {bracket} ability: _{sanitized}_"
         shown.add(key)
     if sanitized:
@@ -320,6 +349,77 @@ def sanitize_oracle_for_display(text: str, max_chars: int = 300) -> str:
     if len(cleaned) > max_chars:
         cleaned = cleaned[:max_chars - 1].rstrip() + '…'
     return cleaned
+
+
+def drain_pending_messages(game):
+    """Drain game._pending_messages into a fresh list (slice 2b, July 21).
+
+    PERMANENT_ENTERED subscribers surface display lines via
+    game._pending_messages; former direct-scan call sites call this at the
+    exact position the old scan call occupied so Discord ordering is
+    unchanged. Returns [] when nothing is pending.
+    """
+    pq = getattr(game, '_pending_messages', None)
+    if not pq:
+        return []
+    drained = list(pq)
+    pq.clear()
+    return drained
+
+
+def cmc_of_cost_string(cost: str) -> int:
+    """Mana value of a single-face cost string (CR 202.3).
+
+    Counts {N} at face value, {X} as 0 (CR 202.3b), monocolored hybrid
+    {2/W} at its higher half (CR 202.3f), and every other symbol —
+    {W}, {G/W}, {W/P}, {S} — as 1.
+
+    July 21 batch audit: the adventure/creature-half/split-half CMC
+    recomputes in mtg/spells.py counted only digits + plain single-color
+    pips, so Bring Back ({G/W}{G/W}{G/W}{G/W}) computed CMC 0 and the
+    payment failure printed "needs 0 = 0 total"
+    (game_1529165073443197190).
+    """
+    total = 0
+    for sym in re.findall(r'\{([^}]+)\}', cost or ''):
+        if sym.isdigit():
+            total += int(sym)
+            continue
+        if sym.upper() == 'X':
+            continue
+        parts = sym.split('/')
+        digit_parts = [int(p) for p in parts if p.isdigit()]
+        total += max(digit_parts) if digit_parts else 1
+    return total
+
+
+def loyalty_from_commander_casts(game, player, card) -> int:
+    """Jeska, Thrice Reborn class: "enters with a loyalty counter on her for
+    each time you've cast a commander from the command zone this game."
+
+    July 20 audit (game_1527448352298500096): printed loyalty is 0 and the
+    engine initialized her to exactly that — instant SBA death with Daretti
+    cast twice from the command zone. Counts times_cast_from_command_zone
+    across the player's commander cards wherever they sit; if THIS cast is
+    itself from the command zone the counter hasn't incremented yet, so it
+    adds one (the ruling: her own commander cast counts).
+    """
+    oracle_l = (getattr(card, 'oracle_text', '') or '').lower()
+    if "for each time you've cast a commander" not in oracle_l:
+        return 0
+    total = 0
+    seen = set()
+    zones = [getattr(player, 'battlefield', []), getattr(player, 'command_zone', None) or [],
+             getattr(player, 'graveyard', []), getattr(player, 'hand', []),
+             getattr(player, 'exile', []), getattr(player, 'library', [])]
+    for zone in zones:
+        for c in zone:
+            if getattr(c, 'is_commander', False) and id(c) not in seen:
+                seen.add(id(c))
+                total += getattr(c, 'times_cast_from_command_zone', 0)
+    if getattr(card, 'cast_from_command_zone', False):
+        total += 1
+    return total
 
 
 def get_mdfc_info(card_name: str) -> dict:

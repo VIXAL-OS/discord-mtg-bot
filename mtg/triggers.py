@@ -54,8 +54,9 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from mtg.constants import Phase, Zone, COMMAND_ZONE_FORMATS, MELD_PAIRS
-from mtg.helpers import _collapse_repeated_life_gain, _should_emit_resolve_hint, sanitize_oracle_for_display, format_trigger_line
+from mtg.helpers import _collapse_repeated_life_gain, _should_emit_resolve_hint, sanitize_oracle_for_display, format_trigger_line, names_match
 from mtg.models import Card, Player, GameState, StackEntry
+from mtg import events
 
 
 # Reasons that are pure internal status (templates that intentionally no-op
@@ -181,7 +182,15 @@ def _is_self_etb_trigger_paragraph(card: Card, paragraph: str) -> bool:
     full_name = re.escape((card.name or "").lower())
     short_name = re.escape((card.name or "").split(",", 1)[0].lower())
     subject = rf"(?:this (?:creature|permanent)|{full_name}|{short_name})"
-    return bool(re.match(rf"whenever\s+{subject}\s+enters\b", text))
+    # July 20 batch-3 audit (reviewer V3): allow "X or another <type> you
+    # control" between subject and "enters" — Hammer of Nazahn's own ETB
+    # ("Whenever Hammer of Nazahn or another Equipment you control enters")
+    # never classified as self-ETB, so its self-attach template never ran
+    # (its watcher half for LATER entries is a separate scan, unaffected).
+    # A card entering alongside its "or another" wording does trigger for
+    # itself per CR 603.2.
+    return bool(re.match(
+        rf"whenever\s+{subject}(?:\s+or\s+another\s+[\w\s]+?)?\s+enters\b", text))
 
 
 def _is_self_attack_trigger_paragraph(card: Card, paragraph: str) -> bool:
@@ -306,9 +315,13 @@ def _check_creature_etb_triggers_sync(engine, game: GameState, entering_player: 
     stack via _place_triggers_on_stack instead of resolving inline.
     
     Returns:
-        Tuple of (messages, unhandled_triggers) where unhandled_triggers is 
+        Tuple of (messages, unhandled_triggers) where unhandled_triggers is
         a list of (card, trigger_text) tuples that need async auto-resolution.
     """
+    # Pub/sub slice 2 parity: record that the legacy scan saw this entry so
+    # report_entered_parity can flag PERMANENT_ENTERED events that never
+    # reached it (the historic missed-call-site bug class).
+    game._entered_scanned_creature_ids.add(entering_creature.id)
     messages = []
     messages.extend(_check_permanent_etb_watchers(
         engine, game, entering_player, entering_creature))
@@ -362,6 +375,10 @@ def _check_creature_etb_triggers_sync(engine, game: GameState, entering_player: 
             _etb_collected.append((card, _cp, _ci))
 
     if not _etb_collected:
+        # July 20 batch-3 audit: the meld check must still run on the
+        # no-watchers path (it used to sit below this return, so meld only
+        # worked when a Soul Warden-class watcher was coincidentally in play).
+        messages.extend(_check_meld_completion(game, entering_player, entering_creature))
         return messages, unhandled
 
     # Phase 2: Sort by APNAP (active player first) for stack placement order.
@@ -396,6 +413,9 @@ def _check_creature_etb_triggers_sync(engine, game: GameState, entering_player: 
         if _tinfos:
             stack_msgs = engine._place_triggers_on_stack(game, _tinfos, "enters")
             messages.extend(stack_msgs)
+        # Meld completion also applies on the stack-enabled path (July 20
+        # batch-3 audit — see _check_meld_completion).
+        messages.extend(_check_meld_completion(game, entering_player, entering_creature))
         return messages, unhandled
 
     # Phase 4: Resolve inline. May 20 audit (APNAP-4): iterate in REVERSE of
@@ -551,7 +571,7 @@ def _check_creature_etb_triggers_sync(engine, game: GameState, entering_player: 
                         game_context=ctx,
                     )
                     
-                    if actions is not None and actions:
+                    if actions is not None:  # [] = deliberate template no-op (handled); only None means unhandled → Tier 3
                         any_real_action = False
                         for action in actions:
                             action_type = action.get("action", "")
@@ -604,41 +624,61 @@ def _check_creature_etb_triggers_sync(engine, game: GameState, entering_player: 
                 print(f"[TRIGGER-UNHANDLED] {card.name}: {trigger_text[:150]}")
                 unhandled.append((card, trigger_text))
 
-    # [MELD] Check if entering creature completes a meld pair
-    entering_name = entering_creature.name if entering_creature else ""
-    if entering_name and entering_creature in entering_player.battlefield:
-        for pair_set, melded_data in MELD_PAIRS.items():
-            if entering_name in pair_set:
-                other_name = (pair_set - {entering_name}).pop()
-                other_card = None
-                for c in entering_player.battlefield:
-                    if c.name == other_name and c is not entering_creature:
-                        other_card = c
-                        break
-                if other_card:
-                    game.unregister_static_effects(entering_creature)
-                    game.unregister_static_effects(other_card)
-                    entering_player.battlefield.remove(entering_creature)
-                    entering_player.battlefield.remove(other_card)
-                    entering_player.exile.append(entering_creature)
-                    entering_player.exile.append(other_card)
-                    melded = Card(
-                        name=melded_data["name"],
-                        mana_cost=melded_data.get("mana_cost", ""),
-                        type_line=melded_data.get("type_line", ""),
-                        oracle_text=melded_data.get("oracle_text", ""),
-                        power=melded_data.get("power"),
-                        toughness=melded_data.get("toughness"),
-                        loyalty=melded_data.get("loyalty"),
-                    )
-                    melded.owner_index = entering_creature.owner_index
-                    melded.entered_this_turn = True
-                    entering_player.battlefield.append(melded)
-                    messages.append(f"**{entering_creature.name}** and **{other_card.name}** meld into **{melded.name}**!")
-                    print(f"[MELD] {entering_creature.name} + {other_card.name} -> {melded.name}")
-                    break
+    messages.extend(_check_meld_completion(game, entering_player, entering_creature))
 
     return messages, unhandled
+
+
+def _check_meld_completion(game: 'GameState', entering_player: Player,
+                           entering_creature: Card) -> List[str]:
+    """[MELD] If the entering creature completes a known meld pair, meld them.
+
+    July 20 batch-3 audit, two bugs in the old inline block: (1) pair_set is a
+    frozenset key, and frozenset difference returns a frozenset — which has no
+    .pop(); any meld half entering crashed the whole creature-ETB scan
+    (game_1528960244212961350: Gisela, the Broken Blade). (2) The block sat
+    below the scan's "no watchers collected" early return, so meld only ran
+    when an unrelated Soul Warden-class watcher happened to be on a
+    battlefield. Extracted so every exit path of the scan runs it.
+    """
+    messages: List[str] = []
+    entering_name = entering_creature.name if entering_creature else ""
+    if not entering_name or entering_creature not in entering_player.battlefield:
+        return messages
+    for pair_set, melded_data in MELD_PAIRS.items():
+        if entering_name not in pair_set:
+            continue
+        other_name = next(iter(pair_set - {entering_name}), None)
+        if not other_name:
+            continue
+        other_card = None
+        for c in entering_player.battlefield:
+            if c.name == other_name and c is not entering_creature:
+                other_card = c
+                break
+        if other_card:
+            game.unregister_static_effects(entering_creature)
+            game.unregister_static_effects(other_card)
+            entering_player.battlefield.remove(entering_creature)
+            entering_player.battlefield.remove(other_card)
+            entering_player.exile.append(entering_creature)
+            entering_player.exile.append(other_card)
+            melded = Card(
+                name=melded_data["name"],
+                mana_cost=melded_data.get("mana_cost", ""),
+                type_line=melded_data.get("type_line", ""),
+                oracle_text=melded_data.get("oracle_text", ""),
+                power=melded_data.get("power"),
+                toughness=melded_data.get("toughness"),
+                loyalty=melded_data.get("loyalty"),
+            )
+            melded.owner_index = entering_creature.owner_index
+            melded.entered_this_turn = True
+            entering_player.battlefield.append(melded)
+            messages.append(f"**{entering_creature.name}** and **{other_card.name}** meld into **{melded.name}**!")
+            print(f"[MELD] {entering_creature.name} + {other_card.name} -> {melded.name}")
+            break
+    return messages
 
 
 def _spell_matches_cast_trigger(engine, sentence_lower: str, card: Card,
@@ -798,8 +838,15 @@ async def _check_cast_triggers(engine, game: GameState, caster: Player, card: Ca
             if ('this spell' in sl or card_name_lower in sl):
                 has_self_cast_trigger = True
                 break
-            # If it says "whenever you cast a/an [type] spell" that's an ongoing trigger, skip
-            if re.search(r'whenever you cast (?:or copy )?(?:a|an)\b', sl):
+            # If it says "whenever you cast a/an [type] spell" that's an ongoing trigger, skip.
+            # July 20 batch-3 audit (reviewer V2): Rashmi's "Whenever you cast
+            # your first spell each turn" matched neither the a/an exclusion
+            # nor the self-name check, so the fallback fired her battlefield
+            # trigger off her OWN casting while she was still on the stack
+            # (CR 603.3a — a permanent's triggered ability functions only on
+            # the battlefield unless it says "when you cast this spell").
+            # Cover the other ongoing determiners too.
+            if re.search(r'whenever you cast (?:or copy )?(?:a|an|your|another|the|one or more)\b', sl):
                 continue
             # Fallback: treat as engine-cast trigger
             has_self_cast_trigger = True
@@ -895,13 +942,27 @@ async def _check_cast_triggers(engine, game: GameState, caster: Player, card: Ca
     # Exile cards from top of library until you exile a nonland card with
     # lesser mana value, cast that card for free, bottom the rest randomly.
     # =================================================================
-    if 'cascade' in oracle_lower and not getattr(card, '_cascade_done', False):
+    # July 21 batch audit (R4-1): the old blind `'cascade' in oracle_lower`
+    # substring made Yidris, Maelstrom Wielder SELF-cascade on cast — his
+    # text only GRANTS cascade to other spells ("...as you cast spells from
+    # your hand this turn, they gain cascade"), yet a Counterspell was
+    # exiled off the top and cast free (game_1529168842905882755). Only
+    # KEYWORD LINES count: after stripping reminder text, a line consisting
+    # solely of comma-separated keywords ("Cascade, cascade", "Trample").
+    # Grant clauses ("they gain cascade", "spells you cast have cascade")
+    # never form such a line.
+    _cascade_count = 0
+    if 'cascade' in oracle_lower:
+        _stripped_oracle = re.sub(r'\([^)]*\)', '', oracle_lower)
+        for _line in _stripped_oracle.split('\n'):
+            for _part in _line.split(','):
+                if _part.strip().strip('.').strip() == 'cascade':
+                    _cascade_count += 1
+    if _cascade_count > 0 and not getattr(card, '_cascade_done', False):
         card._cascade_done = True  # Prevent re-entry if _check_cast_triggers called multiple times
-        # Count cascade keyword instances, stripping reminder text to avoid overcounting
         # Apex Devastator: "Cascade, cascade, cascade, cascade" = 4 cascades
         # Maelstrom Wanderer: "Cascade, cascade" = 2 cascades
-        stripped_oracle = re.sub(r'\([^)]*\)', '', oracle_lower)  # Remove reminder text
-        cascade_count = len(re.findall(r'\bcascade\b', stripped_oracle))
+        cascade_count = _cascade_count
         caster_cmc = card.cmc
         print(f"[CASCADE] {card.name} cascading {cascade_count}x (CMC {caster_cmc})")
 
@@ -941,12 +1002,16 @@ async def _check_cast_triggers(engine, game: GameState, caster: Player, card: Ca
                     found_card._from_cascade = True
                     caster.battlefield.append(found_card)
                     messages.append(f"  → **{found_card.name}** enters the battlefield")
-                    # Check ETB triggers for the cascaded creature (other-enters triggers + engine-ETB)
-                    etb_msgs = engine._check_creature_etb_triggers_sync(game, caster, found_card)
-                    if etb_msgs and isinstance(etb_msgs, tuple):
-                        messages.extend(etb_msgs[0])
-                    elif etb_msgs:
-                        messages.extend(etb_msgs)
+                    # Slice 2b (July 21): this cascade free-cast path never
+                    # emitted PERMANENT_ENTERED (emit-side gap invisible to
+                    # the parity net). The emit drives the watcher dispatch
+                    # (_from_cascade set above keeps the Tier-3 guard);
+                    # drain in place.
+                    events.emit(events.PERMANENT_ENTERED, game,
+                                card=found_card, controller=caster,
+                                via="cascade", rules=engine.rules)
+                    from mtg.helpers import drain_pending_messages as _drain_pm
+                    messages.extend(_drain_pm(game))
 
                     # Bug #17: Also try Tier 1.5 templates for engine-ETB on cascaded creatures
                     if found_card.oracle_text and 'enters' in found_card.oracle_text.lower():
@@ -1223,20 +1288,33 @@ async def _check_cast_triggers(engine, game: GameState, caster: Player, card: Ca
                                 )
                             except Exception as _pe:
                                 print(f"[CAST-TRIGGER-PRIORITY] window error: {_pe}")
-                            # If the priority window resulted in the trigger
-                            # being countered, the trigger_entry will have
-                            # been removed from game.stack by the counterspell
-                            # handler. Skip inline resolution in that case.
-                            if trigger_entry not in game.stack:
+                            # July 21 batch audit: "not on the stack anymore"
+                            # is NOT proof of a counter — in
+                            # game_1529172174773157998 the window's async
+                            # timeout fired turns of churn later, the entry
+                            # was long gone for unrelated reasons, and the
+                            # trigger was declared countered with Stifle
+                            # still sitting in Rick's hand (the Drake was
+                            # never created). Only the counterspell handler's
+                            # explicit `countered` flag counts; a vanished
+                            # entry falls through to inline resolution.
+                            if getattr(trigger_entry, 'countered', False):
                                 print(f"[CAST-TRIGGER-COUNTERED] {bf_card.name}'s "
                                       f"trigger was countered during priority "
                                       f"window — skipping inline resolution")
+                                if trigger_entry in game.stack:
+                                    game.stack.remove(trigger_entry)
                                 # Match the existing "one trigger per bf_card
-                                # per cast" pattern at line 1324 — break out
-                                # of the sentence loop so we move to the next
-                                # bf_card rather than process another matching
-                                # sentence.
+                                # per cast" pattern — break out of the
+                                # sentence loop so we move to the next
+                                # bf_card rather than process another
+                                # matching sentence.
                                 break
+                            if trigger_entry not in game.stack:
+                                print(f"[CAST-TRIGGER-VANISHED] {bf_card.name}'s "
+                                      f"trigger entry left the stack without a "
+                                      f"counter (window churn) — resolving inline "
+                                      f"anyway")
 
                 # Try to execute common cast-trigger patterns inline
                 executed_trigger = False
@@ -1280,18 +1358,18 @@ async def _check_cast_triggers(engine, game: GameState, caster: Player, card: Ca
                         t_type = x_token_match.group(3).strip().title()
                         # X = the cast spell's mana value
                         count = max(1, card.cmc or 0)
-                        for _ in range(count):
-                            token = Card(
-                                name=t_type,
-                                type_line=f"Token Creature - {t_type}",
-                                power=str(t_power),
-                                toughness=str(t_tough),
-                                owner_index=game.players.index(caster) if caster in game.players else 0,
-                            )
-                            token.summoning_sick = True
-                            token.entered_this_turn = True
-                            caster.battlefield.append(token)
+                        # July 20 batch-3 audit (reviewer S2): route through the
+                        # create_token action — the inline Card() append skipped
+                        # is_token, the creature-ETB watcher scan, AND the
+                        # PERMANENT_ENTERED emit (invisible to the parity net).
+                        tok_msg = engine.rules._execute_action_on_state(game, {
+                            "action": "create_token", "player": caster.name,
+                            "name": t_type, "power": t_power, "toughness": t_tough,
+                            "types": f"Creature — {t_type}", "count": count,
+                            "source": bf_card.name})
                         messages.append(f"⚡ {bf_card.name} creates {count} {t_power}/{t_tough} {t_type} token(s) (X = {card.name}'s mana value {card.cmc})")
+                        if tok_msg:
+                            messages.append(tok_msg)
                         executed_trigger = True
 
                 # Token creation: "create a/N P/T [type] token(s)" (Talrand, Young Pyromancer)
@@ -1304,18 +1382,19 @@ async def _check_cast_triggers(engine, game: GameState, caster: Player, card: Ca
                         t_power = int(token_match.group(2))
                         t_tough = int(token_match.group(3))
                         t_type = token_match.group(4).strip().title()
-                        for _ in range(count):
-                            token = Card(
-                                name=t_type,
-                                type_line=f"Token Creature - {t_type}",
-                                power=str(t_power),
-                                toughness=str(t_tough),
-                                owner_index=game.players.index(caster) if caster in game.players else 0,
-                            )
-                            token.summoning_sick = True
-                            token.entered_this_turn = True
-                            caster.battlefield.append(token)
+                        # July 20 batch-3 audit (reviewer S2): same routing as
+                        # the X-token branch above — Sigil of the Empty
+                        # Throne's Angels never triggered Aura Shards because
+                        # this inline append bypassed the ETB scan entirely
+                        # (game_1528957318224678980).
+                        tok_msg = engine.rules._execute_action_on_state(game, {
+                            "action": "create_token", "player": caster.name,
+                            "name": t_type, "power": t_power, "toughness": t_tough,
+                            "types": f"Creature — {t_type}", "count": count,
+                            "source": bf_card.name})
                         messages.append(f"⚡ {bf_card.name} creates {count} {t_power}/{t_tough} {t_type} token(s)")
+                        if tok_msg:
+                            messages.append(tok_msg)
                         executed_trigger = True
 
                 # Draw: "draw a card" (Archmage Emeritus, Beast Whisperer)
@@ -1626,8 +1705,154 @@ async def _check_cast_triggers(engine, game: GameState, caster: Player, card: Ca
     return messages
 
 
+def _dispatch_creature_entered(engine, game: GameState, controller: Player,
+                               card: Card) -> List[str]:
+    """Slice 2b (July 21, 2026): the single sync dispatch for a creature
+    entering the battlefield — Tier 1/1.5 watcher scan, Tier 2.5 XMage
+    translation, and Tier-3 QUEUEING (drained async by
+    engine.drain_pending_triggers). This is what the PERMANENT_ENTERED
+    subscriber runs; the former per-call-site scan invocations are gone.
+
+    Behavior delta vs the legacy async wrapper (documented, accepted):
+    Tier 3 creature-enters triggers are queued and drain at the next
+    async boundary instead of resolving inline at ETB time.
+    """
+    messages, unhandled = engine._check_creature_etb_triggers_sync(
+        game, controller, card)
+
+    # Tier 2.5: XMage translator (sync JSON-RPC, ~10-50ms) — same pass the
+    # legacy async wrapper ran.
+    still_unhandled = []
+    if unhandled and engine._xmage_translator:
+        ctrl_idx = game.players.index(controller) if controller in game.players else 0
+        opponent = game.players[1 - ctrl_idx]
+        entering_power = 0
+        try:
+            entering_power = card.get_effective_power(game) if hasattr(card, 'get_effective_power') else 0
+        except (ValueError, TypeError):
+            pass
+        for trigger_card, trigger_text in unhandled:
+            try:
+                ctx = build_game_context(game, controller, opponent,
+                                         card=trigger_card, entering_creature=card)
+                t_actions, t_expl = engine._xmage_translator.translate_trigger(
+                    source_card=trigger_card.name,
+                    ability_text=trigger_text,
+                    controller=controller.name,
+                    opponent=opponent.name,
+                    game_context=ctx,
+                    entering_creature_name=card.name,
+                    entering_creature_power=entering_power,
+                )
+                if t_actions:
+                    resolved_something = False
+                    for action in t_actions:
+                        if action.get("action") == "no_action":
+                            continue
+                        try:
+                            msg = engine.rules._execute_action_on_state(game, action)
+                            if msg:
+                                messages.append(msg)
+                                resolved_something = True
+                        except Exception as e:
+                            print(f"[XMAGE-TRIGGER] Action failed for {trigger_card.name}: {e}")
+                    if resolved_something:
+                        print(f"[XMAGE-TRIGGER] Resolved {trigger_card.name} trigger: {t_expl}")
+                    else:
+                        still_unhandled.append((trigger_card, trigger_text))
+                else:
+                    still_unhandled.append((trigger_card, trigger_text))
+            except Exception as e:
+                print(f"[XMAGE-TRIGGER] Error translating {trigger_card.name}: {e}")
+                still_unhandled.append((trigger_card, trigger_text))
+    else:
+        still_unhandled = unhandled
+
+    # Tier 3: queue for the async drain. Keep the cascade guard — cascade-
+    # cast creatures skip Tier 3 to prevent phantom effects.
+    for trigger_card, trigger_text in still_unhandled:
+        if getattr(card, '_from_cascade', False):
+            print(f"[TRIGGER-AUTO] Skipping Tier 3 for cascade-cast {card.name} (prevents phantom effects)")
+            messages.append(f"⚡ **{trigger_card.name}** triggers on {card.name} ETB (cascade)")
+            continue
+        ctrl_player = controller
+        for p in game.players:
+            if trigger_card in p.battlefield:
+                ctrl_player = p
+                break
+        engine._queue_async_trigger(
+            game, trigger_card, trigger_text, "creature_enters",
+            ctrl_player.name,
+            context=f"{card.name} entered the battlefield under {controller.name}'s control",
+        )
+        messages.append(
+            format_trigger_line("⚡", trigger_card.name, trigger_text, game=game, max_chars=300))
+
+    return _collapse_repeated_life_gain(messages)
+
+
+def _creature_entered_subscriber(game, card=None, controller=None, via=None,
+                                 rules=None, **_):
+    """PERMANENT_ENTERED → creature-enters watcher dispatch (slice 2b).
+
+    Display lines go to game._pending_messages; former call sites drain
+    them at the exact position the old direct scan call occupied, so
+    Discord ordering is unchanged. A payload without a usable engine ref
+    is logged and skipped — the (inverted) parity recorder then flags the
+    entry, because the scan-side id recording never happened.
+    """
+    if card is None or controller is None:
+        return
+    engine = getattr(rules, 'engine_ref', None) if rules is not None else None
+    if engine is None or not hasattr(engine, '_check_creature_etb_triggers_sync'):
+        print(f"[ETB-BUS] {card.name} entered (via={via or '?'}) with no "
+              f"usable engine in payload — creature watcher dispatch skipped")
+        return
+    try:
+        if not card.is_creature(game):
+            return
+    except Exception:
+        return
+    msgs = _dispatch_creature_entered(engine, game, controller, card)
+    if msgs:
+        if not hasattr(game, '_pending_messages') or game._pending_messages is None:
+            game._pending_messages = []
+        game._pending_messages.extend(msgs)
+
+
+def _enchantment_entered_subscriber(game, card=None, controller=None, via=None,
+                                    rules=None, **_):
+    """PERMANENT_ENTERED → constellation watcher dispatch (slice 2b, 2/2).
+
+    Same shape as the creature subscriber: display lines go to
+    game._pending_messages; former call sites drain in place.
+    """
+    if card is None or controller is None:
+        return
+    engine = getattr(rules, 'engine_ref', None) if rules is not None else None
+    if engine is None:
+        print(f"[ETB-BUS] {card.name} entered (via={via or '?'}) with no "
+              f"usable engine in payload — enchantment watcher dispatch skipped")
+        return
+    try:
+        if not card.is_enchantment():
+            return
+    except Exception:
+        return
+    msgs = _check_enchantment_etb_watchers(engine, game, controller, card)
+    if msgs:
+        if not hasattr(game, '_pending_messages') or game._pending_messages is None:
+            game._pending_messages = []
+        game._pending_messages.extend(msgs)
+
+
 async def _check_creature_etb_triggers(engine, game: GameState, entering_player: Player, entering_creature: Card) -> List[str]:
-    """Async version: runs hardcoded + templates + XMage translator + Claude auto-resolve.
+    """LEGACY async version (pre-slice-2b): hardcoded + templates + XMage +
+    INLINE Claude auto-resolve. No live callers since July 21, 2026 — entry
+    dispatch now runs through the PERMANENT_ENTERED subscriber
+    (_dispatch_creature_entered), which queues Tier 3 instead of resolving
+    inline. Kept for backward compat until the wrapper delegators are
+    retired in a later slice.
 
     When game.triggers_use_stack=True, resolved triggers go on the stack as
     StackEntry(is_spell=False) and players get priority to respond before
@@ -1754,6 +1979,8 @@ def _check_enchantment_etb_watchers(engine, game: GameState, controller: Player,
     are "you control"-scoped in practice), resolves the dominant draw shape
     inline (free), and queues anything else for Tier-3 auto-resolve.
     """
+    # Pub/sub slice 2 parity: record that the legacy scan saw this entry.
+    game._entered_scanned_ench_ids.add(entered_card.id)
     messages: List[str] = []
     for bf_card in list(controller.battlefield):
         if getattr(bf_card, '_phased_out', False):
@@ -1836,6 +2063,10 @@ def _check_dies_triggers_sync(engine, game: GameState, dying_card: Card, dying_p
         Tuple of (messages, unhandled_triggers) where unhandled_triggers is
         a list of (card, trigger_text) tuples that need async auto-resolution.
     """
+    # Slice 3a parity (July 21): record that the dispatcher processed this
+    # death so report_death_parity can flag CREATURE_DIED emissions that
+    # never got here.
+    game._death_dispatched_ids.add(dying_card.id)
     messages = []
     unhandled = []
     player_idx = game.players.index(dying_player) if dying_player in game.players else 0
@@ -1999,9 +2230,13 @@ def _check_dies_triggers_sync(engine, game: GameState, dying_card: Card, dying_p
                   f"{ctrl.name} {'gains 1 life' if _gained else 'gain PREVENTED'} (life: {max(0, ctrl.life)})")
             if _gained:
                 _log_life_change(ctrl, _gain_amt, f"dies trigger: {card.name}")
-                messages.append(f"💀 {card.name}: {opp.name} loses 1 life, {ctrl.name} gains 1 life")
+                # July 20 display audit: Zulaport's drain was the sole
+                # recurring life event WITHOUT (life: N) totals in Discord
+                # (4×/game while console had them) — standardized notation.
+                messages.append(f"💀 {card.name}: {opp.name} loses 1 life (life: {max(0, opp.life)}), "
+                                f"{ctrl.name} gains 1 life (life: {max(0, ctrl.life)})")
             else:
-                messages.append(f"💀 {card.name}: {opp.name} loses 1 life (life gain prevented"
+                messages.append(f"💀 {card.name}: {opp.name} loses 1 life (life: {max(0, opp.life)}) (life gain prevented"
                                 f"{': ' + ', '.join(_gain_chain) if _gain_chain else ''})")
             trigger_count += 1
             handled = True
@@ -2082,7 +2317,7 @@ def _check_dies_triggers_sync(engine, game: GameState, dying_card: Card, dying_p
                         opponent=opp.name,
                         game_context=ctx,
                     )
-                    if actions is not None and actions:
+                    if actions is not None:  # [] = deliberate template no-op (handled); only None means unhandled → Tier 3
                         for action in actions:
                             if action.get("action") == "no_action":
                                 reason = action.get("reason", "")
@@ -2151,7 +2386,7 @@ def _check_dies_triggers_sync(engine, game: GameState, dying_card: Card, dying_p
                             opponent=opponent.name,
                             game_context=ctx,
                         )
-                        if actions is not None and actions:
+                        if actions is not None:  # [] = deliberate template no-op (handled); only None means unhandled → Tier 3
                             for action in actions:
                                 if action.get("action") == "no_action":
                                     reason = action.get("reason", "")
@@ -2366,11 +2601,19 @@ def _check_ltb_triggers_sync(engine, game: GameState, leaving_card: Card, leavin
 
     # ---- Self-LTB triggers ----
     # Pattern: "When [this] leaves the battlefield, ..."
+    # July 20 batch-3 audit (reviewer A1): also match the Aura-family
+    # "is put into a graveyard from the battlefield" phrasing (Rancor) —
+    # gated on destination == graveyard so an exiled Rancor doesn't bounce.
+    # Note the aura_invalid SBA handler DOES run this scan; the gap was
+    # only this phrasing gate (game_1528957329452830760: Rancor was
+    # permanently lost after Sythis died).
     has_ltb = False
     ltb_text = ''
     for sentence in oracle.split('.'):
         sl = sentence.lower().strip()
-        if ('leaves the battlefield' in sl or 'leaves play' in sl) and (
+        _gy_from_bf = (destination == 'graveyard'
+                       and 'put into a graveyard from the battlefield' in sl)
+        if ('leaves the battlefield' in sl or 'leaves play' in sl or _gy_from_bf) and (
             'when' in sl or 'whenever' in sl):
             # Make sure it's a engine-referential trigger
             if card_name_lower in sl or 'this' in sl or 'it leaves' in sl:
@@ -2396,6 +2639,23 @@ def _check_ltb_triggers_sync(engine, game: GameState, leaving_card: Card, leavin
             print(f"[LTB-TRIGGER] {leaving_card.name} (reanimation aura) — "
                   f"sacrifice handled by SBA binding, suppressing LTB-trigger display")
             return messages
+
+        # ---- Self-recursion to hand (Rancor family) ----
+        # "…return it to its owner's hand." (July 20 batch-3, reviewer A1)
+        if re.search(r"return (?:it|this card) to its owner's hand", ltb_text.lower()):
+            owner_idx = getattr(leaving_card, 'owner_index', None)
+            owner = (game.players[owner_idx]
+                     if owner_idx is not None and 0 <= owner_idx < len(game.players)
+                     else leaving_player)
+            for _gy_player in game.players:
+                if leaving_card in _gy_player.graveyard:
+                    _gy_player.graveyard.remove(leaving_card)
+                    owner.hand.append(leaving_card)
+                    messages.append(f"↩️ **{leaving_card.name}** returns to {owner.name}'s hand")
+                    print(f"[LTB-TRIGGER] {leaving_card.name}: returned to owner's hand (Rancor-style)")
+                    return messages
+            # Not in a graveyard yet (caller fires the scan pre-move):
+            # leave it for the caller's move + manual !resolve fallback.
 
         # ---- Return exiled cards (Worldgorger Dragon, Oblivion Ring, etc.) ----
         if 'return' in ltb_text.lower() and ('exiled' in ltb_text.lower() or 'exile' in oracle_lower):
@@ -2424,7 +2684,10 @@ def _check_ltb_triggers_sync(engine, game: GameState, leaving_card: Card, leavin
 
         # ---- Create token on LTB (Thragtusk) ----
         if 'create' in ltb_text.lower() and 'token' in ltb_text.lower():
-            import re
+            # (July 20 batch-3: the local `import re` here shadowed the
+            # module-level import and made `re` function-local, so any
+            # EARLIER `re.` use in this function raised UnboundLocalError —
+            # same scoping class as the Apr 6 Swords EventType bug.)
             token_match = re.search(r'create (?:a |an? )?(\d+)/(\d+) ([\w\s]+?)(?:creature )?tokens?', ltb_text.lower())
             if token_match:
                 t_power = int(token_match.group(1))
@@ -2574,7 +2837,7 @@ def _check_attack_triggers_sync(engine, game: GameState, attacker_card: Card, at
                             opponent=opponent.name,
                             game_context=ctx,
                         )
-                        if actions is not None and actions:
+                        if actions is not None:  # [] = deliberate template no-op (handled); only None means unhandled → Tier 3
                             for action in actions:
                                 if action.get("action") == "no_action":
                                     reason = action.get("reason", "")
@@ -2673,7 +2936,7 @@ def _check_attack_triggers_sync(engine, game: GameState, attacker_card: Card, at
                         opponent=opponent.name,
                         game_context=ctx,
                     )
-                    if actions is not None and actions:
+                    if actions is not None:  # [] = deliberate template no-op (handled); only None means unhandled → Tier 3
                         for action in actions:
                             if action.get("action") == "no_action":
                                 reason = action.get("reason", "")
@@ -3199,7 +3462,7 @@ def _check_end_step_triggers_sync(engine, game: GameState) -> Tuple[List[str], L
                         game_context=ctx,
                         event_type="end_step",
                     )
-                    if actions is not None and actions:
+                    if actions is not None:  # [] = deliberate template no-op (handled); only None means unhandled → Tier 3
                         for action in actions:
                             if action.get("action") == "no_action":
                                 reason = action.get("reason", "")
@@ -3341,31 +3604,30 @@ def _handle_etb_triggers(engine, game: GameState, player: Player, card: Card) ->
 
     # Check for "whenever another creature enters" triggers (Terror of the Peaks, etc.)
     if card.is_creature():
-        creature_trigger_msgs, unhandled = engine._check_creature_etb_triggers_sync(game, player, card)
-        messages.extend(creature_trigger_msgs)
-        # Sync context: queue unhandled triggers for async Tier 3 drain.
-        for trigger_card, trigger_text in unhandled:
-            ctrl_player = player
-            for p in game.players:
-                if trigger_card in p.battlefield:
-                    ctrl_player = p
-                    break
-            engine._queue_async_trigger(
-                game, trigger_card, trigger_text, "creature_enters",
-                ctrl_player.name,
-                context=f"{card.name} entered the battlefield under {player.name}'s control",
-            )
-            messages.append(
-                format_trigger_line("⚡", trigger_card.name, trigger_text, game=game, max_chars=300)
-            )
+        # Slice 2b (July 21): the watcher dispatch (scan + XMage + Tier-3
+        # queue) runs in the PERMANENT_ENTERED subscriber — every caller of
+        # this funnel sits downstream of an emit. Drain in place.
+        from mtg.helpers import drain_pending_messages as _drain_pm_f
+        messages.extend(_drain_pm_f(game))
     else:
         messages.extend(_check_permanent_etb_watchers(
             engine, game, player, card))
 
+    # Pub/sub slice 2 (July 20, 2026): the June 10 B9 fix added constellation
+    # watchers to the CAST path only — enchantments entering via this noncast
+    # funnel (move_card, mass_flicker, reanimate) skipped Eidolon of Blossoms
+    # entirely. Same gap, other half. Found while wiring the PERMANENT_ENTERED
+    # parity recorder, which would have flagged it next batch anyway.
+    if card.is_enchantment():
+        # Slice 2b (2/2, July 21): constellation dispatch runs in the
+        # PERMANENT_ENTERED subscriber. Drain in place.
+        from mtg.helpers import drain_pending_messages as _drain_pm_e
+        messages.extend(_drain_pm_e(game))
+
     # Check for engine-ETB triggers on the card itself
     if card.oracle_text:
         oracle_lower = card.oracle_text.lower()
-        
+
         # Guardian Project: "Whenever a nontoken creature enters the battlefield under your control,
         # if it doesn't have the same name as another creature you control, draw a card."
         if "guardian project" in [c.name.lower() for c in player.battlefield if c.name.lower() == "guardian project"]:
@@ -4044,3 +4306,159 @@ def process_attack_triggers(engine, game: GameState, attacking_player_idx: int) 
         messages.extend(stack_msgs)
 
     return messages
+
+
+# =============================================================================
+# Pub/sub slice 2 (July 20, 2026): PERMANENT_ENTERED subscribers
+# =============================================================================
+# Emit sites (mtg/spells.py cast + suspend, mtg/engine.py play_land +
+# cast_spell, mtg/actions.py noncast funnel, mtg/sba.py death-save returns)
+# fire events.PERMANENT_ENTERED once per physical battlefield entry. The
+# legacy creature-enters / enchantment-enters scans stay authoritative this
+# batch; the parity recorder below cross-checks them so one clean batch can
+# gate flipping the scans into subscribers (slice 2b — see mtg/events.py).
+
+
+def _snow_permanent_entered_watcher(game, card=None, controller=None,
+                                    via=None, rules=None, **_):
+    """Marit Lage's Slumber: "Whenever Marit Lage's Slumber or another snow
+    permanent you control enters, scry 1."
+
+    The June 10 deep-dive fixed Slumber's upkeep flip + its own-entry scry
+    (ETB pattern) but deferred the OTHER-snow-permanent half to this slice —
+    there was no snow-permanent-enters watcher class to hang it on. Now
+    there is: this fires on every PERMANENT_ENTERED whose card is snow,
+    for each Slumber its controller already has on the battlefield.
+    Display rides game._pending_messages (flushed by the existing engine
+    flush sites); the scried card is never named in Discord (scry is
+    private information — console may log it).
+    """
+    if card is None or controller is None:
+        return
+    if 'Snow' not in (getattr(card, 'type_line', '') or ''):
+        return
+    for watcher in list(controller.battlefield):
+        if watcher is card or getattr(watcher, '_phased_out', False):
+            continue
+        if not names_match(watcher.name, "Marit Lage's Slumber"):
+            continue
+        # Slumber's own entry is handled by its ETB pattern at cast time —
+        # this watcher only covers OTHER snow permanents entering.
+        if rules is not None and hasattr(rules, '_execute_action_on_state'):
+            msg = rules._execute_action_on_state(game, {
+                "action": "scry", "player": controller.name, "amount": 1,
+            })
+            print(f"[SNOW-WATCHER] Marit Lage's Slumber: {controller.name} "
+                  f"scries 1 ({card.name} entered, via={via})")
+            if msg:
+                if not hasattr(game, '_pending_messages') or game._pending_messages is None:
+                    game._pending_messages = []
+                game._pending_messages.append(
+                    f"❄️ **Marit Lage's Slumber** — {msg.lstrip('🔮 ')}")
+        else:
+            print(f"[SNOW-WATCHER] Marit Lage's Slumber trigger for "
+                  f"{controller.name} ({card.name} entered) — no rules "
+                  f"engine in payload, scry skipped")
+
+
+def queue_death(game, card, player) -> None:
+    """Slice 3a (July 21, 2026): the single choke-point for queueing a death.
+
+    Does the _recently_died append AND emits CREATURE_DIED (shadow mode —
+    the only subscriber is the parity recorder). Every former raw
+    `game._recently_died.append/extend` site routes through here so slice
+    3b can flip the consumer without another call-site hunt.
+    """
+    game._recently_died.append((card, player))
+    events.emit(events.CREATURE_DIED, game, card=card, player=player)
+
+
+def queue_deaths(game, pairs) -> None:
+    """Batch form of queue_death (board wipes, SBA sweeps)."""
+    for card, player in (pairs or []):
+        queue_death(game, card, player)
+
+
+def _record_death_for_parity(game, card=None, player=None, **_):
+    """CREATURE_DIED shadow recorder (slice 3a)."""
+    if card is None:
+        return
+    game._death_events.append((getattr(card, 'id', None), card.name))
+
+
+def report_death_parity(game) -> List[str]:
+    """Diff CREATURE_DIED emissions against dispatcher-processed deaths and
+    clear the per-turn state (called from engine.end_turn, next to
+    report_entered_parity).
+
+    Deaths still sitting in game._recently_died are EXCLUDED — queued but
+    not yet drained is not a miss, just pending (it will be flagged the
+    turn it goes missing for real).
+    """
+    pending_ids = {getattr(c, 'id', None) for c, _p in game._recently_died}
+    misses = []
+    for card_id, name in game._death_events:
+        if card_id in pending_ids:
+            continue
+        if card_id not in game._death_dispatched_ids:
+            misses.append(f"death of {name} never reached the dies dispatcher")
+    for miss in misses:
+        print(f"[EVENT-PARITY-DIES] {miss}")
+    game._death_events.clear()
+    game._death_dispatched_ids.clear()
+    return misses
+
+
+def _record_entered_for_parity(game, card=None, controller=None, via=None, **_):
+    """Parity recorder: every PERMANENT_ENTERED lands here; the legacy scans
+    record what they saw into game._entered_scanned_*_ids. end_turn calls
+    report_entered_parity to diff the two."""
+    if card is None:
+        return
+    kind = None
+    try:
+        if card.is_creature(game):
+            kind = 'creature'
+        elif card.is_enchantment():
+            kind = 'enchantment'
+    except Exception:
+        kind = None
+    game._entered_events.append(
+        (card.id, card.name, kind, via or 'unknown'))
+
+
+def report_entered_parity(game) -> List[str]:
+    """Diff PERMANENT_ENTERED emissions against the legacy scan records and
+    clear the per-turn state. Called from engine.end_turn.
+
+    Returns the miss descriptions (also printed as [EVENT-PARITY] console
+    lines — the next batch greps these; zero across a clean batch is the
+    gate for slice 2b). Only creature and enchantment entries participate:
+    those are the two scan classes this slice shadows. Lands/artifacts are
+    emitted (the snow watcher needs them) but have no legacy scan to miss.
+    """
+    misses = []
+    for card_id, name, kind, via in game._entered_events:
+        if kind == 'creature' and card_id not in game._entered_scanned_creature_ids:
+            misses.append(f"creature {name} (via={via}) never reached the "
+                          f"creature-enters scan")
+        elif kind == 'enchantment' and card_id not in game._entered_scanned_ench_ids:
+            misses.append(f"enchantment {name} (via={via}) never reached the "
+                          f"enchantment-enters scan")
+    for miss in misses:
+        print(f"[EVENT-PARITY] {miss}")
+    game._entered_events.clear()
+    game._entered_scanned_creature_ids.clear()
+    game._entered_scanned_ench_ids.clear()
+    return misses
+
+
+events.subscribe(events.PERMANENT_ENTERED, _snow_permanent_entered_watcher)
+# Slice 2b (July 21, 2026): the creature-enters watcher scan is now DRIVEN
+# BY the bus — registered before the parity recorder so the scan-side id
+# recording (inside _check_creature_etb_triggers_sync) happens first and
+# the recorder's diff flags subscriber skips (the inverted parity net).
+events.subscribe(events.PERMANENT_ENTERED, _creature_entered_subscriber)
+events.subscribe(events.PERMANENT_ENTERED, _enchantment_entered_subscriber)
+events.subscribe(events.PERMANENT_ENTERED, _record_entered_for_parity)
+events.subscribe(events.CREATURE_DIED, _record_death_for_parity)

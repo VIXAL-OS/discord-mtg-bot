@@ -1287,7 +1287,12 @@ async def execute_claude_turn(engine, game: GameState) -> List[str]:
     # ================================================================
     if game.phase == Phase.COMBAT_BEGIN and not game.ended:
         # Advance past COMBAT_BEGIN to DECLARE_ATTACKERS (like human's second !pass)
-        engine.advance_phase(game)  # → DECLARE_ATTACKERS
+        # July 20 display audit: the return was dropped, so beginning-of-
+        # combat trigger output (Luminarch Aspirant's counter — 8 invisible
+        # placements in game_1527462198430138448) never reached Discord.
+        _, _cb_msgs = engine.advance_phase(game)  # → DECLARE_ATTACKERS
+        if _cb_msgs:
+            actions_taken.extend(_cb_msgs)
         print(f"[EXECUTE_CLAUDE] Advanced to DECLARE_ATTACKERS")
 
     if game.phase == Phase.DECLARE_ATTACKERS and not game.ended:
@@ -1684,6 +1689,20 @@ def _get_action_error(engine, game: GameState, player_index: int, action: Dict) 
     
     if action_type == "cast":
         card_name = action.get("card")
+        # July 20 batch-3 audit: if the executor just ran this exact cast and
+        # cast_spell_async returned a real failure reason, surface THAT instead
+        # of re-deriving one. The re-derivation below misses whole failure
+        # classes (aura targeting has no literal "target" in oracle text;
+        # graveyard-zone targets; CR 601.2c gates) and fell through to
+        # "unknown reason — mana looks sufficient" — the AI then re-proposed
+        # the same doomed cast (Animate Dead ×36 in the 15289 batch).
+        _lcf = getattr(game, '_last_cast_failure', None)
+        if _lcf:
+            _lcf_turn, _lcf_name, _lcf_msg = _lcf
+            if (_lcf_turn == game.turn_number and card_name
+                    and _lcf_name.lower() == str(card_name).lower()):
+                game._last_cast_failure = None
+                return _lcf_msg
         adventure_name = action.get("adventure")
         card = player.find_card(card_name, Zone.HAND)
         if not card:
@@ -1993,8 +2012,20 @@ def _get_action_error(engine, game: GameState, player_index: int, action: Dict) 
                 if _c.is_creature() and getattr(_c, 'summoning_sick', False)
                 and player._can_produce_mana(_c)
             )
+            # July 20 audit: the per-color `usable` dict double-counts
+            # OR-duals (a W/B land adds to both W and B), so shortfalls={}
+            # with a failing tap was reading as an engine bug when the real
+            # story was "5 physical sources displayed as 12". Emit the
+            # physical one-tap total so the log tells the truth about
+            # whether the cast was actually payable.
+            _one_tap = sum(player.mana_pool.values())
+            for _src in player.untapped_mana_sources():
+                _prod = player._get_mana_production(_src)
+                if _prod:
+                    _one_tap += max(_prod.values())
             print(f"[MANA-DIVERGENCE] {card_name} ({effective_mana_cost}): "
                   f"req={dict(req)} usable={usable} shortfalls={shortfalls} "
+                  f"one_tap_total={_one_tap} "
                   f"summon_sick_mana_creatures={sick_count}")
         except Exception as _md_e:
             print(f"[MANA-DIVERGENCE] trace failed for {card_name}: {_md_e}")

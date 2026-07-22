@@ -41,6 +41,10 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from mtg.constants import Phase, Zone, COMMAND_ZONE_FORMATS
 from mtg.models import Card, Player, GameState
+from mtg import events
+# Slice 3a (July 21): every death queue goes through the choke-point
+# (append + CREATURE_DIED shadow emit).
+from mtg.triggers import queue_deaths as _queue_deaths_3a
 from mtg.util import maybe_reraise
 
 # Optional: 7-layer continuous effects (CR 613) — used by pump/control/copy actions
@@ -189,6 +193,11 @@ def _fire_noncast_battlefield_entry(rules, game: GameState,
     ``move_card`` / ``reanimate`` actions used to do neither, so Dread Return
     could put Craterhoof onto the battlefield without its pump ever firing
     (June 11 game 1514626089496875188).
+
+    Pub/sub slice 2 note: PERMANENT_ENTERED is emitted at the MUTATION sites
+    (the battlefield.append callers), not here — this helper is trigger
+    processing, is gated on engine_ref, and re-runs under Panharmonicon
+    doubling; none of those should gate or duplicate the entry event.
     """
     engine = getattr(rules, 'engine_ref', None)
     if engine is None:
@@ -231,6 +240,28 @@ def _fire_noncast_battlefield_entry(rules, game: GameState,
     watcher_messages = engine._handle_etb_triggers(game, player, card)
     if watcher_messages:
         messages.extend(watcher_messages)
+    # Living weapon (July 20 batch-3, reviewer V1): the keyword's Tier 1
+    # handler lives only in the cast path (resolve_special_effects) — any
+    # noncast entry (Stoneforge cheat-into-play, reanimation, flicker,
+    # Living Death) put the Equipment onto the battlefield with no Germ,
+    # leaving it dead weight (Batterskull, game_1528946322995150848).
+    # create_token supplies is_token/emit/watcher-scan; attach must follow
+    # immediately so the 0/0 doesn't die to SBA.
+    if (card.is_artifact() and 'living weapon' in (card.oracle_text or '').lower()
+            and not card.attached_to):
+        rules._execute_action_on_state(game, {
+            "action": "create_token", "player": player.name,
+            "name": "Phyrexian Germ", "power": 0, "toughness": 0,
+            "types": "Creature Token — Phyrexian Germ", "colors": "B",
+            "count": 1, "source": card.name})
+        germ = next((c for c in reversed(player.battlefield)
+                     if c.name == "Phyrexian Germ" and not c.attachments), None)
+        if germ is not None:
+            card.attached_to = germ.id
+            germ.attachments.append(card.id)
+            game.recalculate_power_toughness()
+            messages.append(f"⚔️ {card.name} — Living weapon creates a 0/0 Phyrexian Germ token, equipped with {card.name}")
+            print(f"[LIVING-WEAPON] {card.name} -> {germ.name} (noncast entry)")
     has_panharmonicon = (
         (card.is_creature() or card.is_artifact())
         and any(p.name.lower() == 'panharmonicon' and p is not card
@@ -277,9 +308,19 @@ def _fire_sacrifice_triggers(rules, game: GameState, sac_player: Player, sacrifi
     """
     messages: List[str] = []
     try:
-        for source in list(sac_player.battlefield):
-            if source is sacrificed_card:
-                continue
+        # July 21 batch audit (R1-2): the sacrificed permanent's OWN
+        # "whenever you sacrifice" ability triggers for its own sacrifice
+        # (the event happened while it was on the battlefield — same
+        # last-known-info principle as Blood Artist seeing its own death;
+        # official Mayhem Devil rulings confirm). The old `continue` skip,
+        # plus every call site running this scan after battlefield.remove,
+        # meant Korvold sacrificed to Viscera Seer drew no card
+        # (game_1529154418816057364). Self-referential actions like "put a
+        # counter on Korvold" simply fizzle since it's no longer there.
+        scan = list(sac_player.battlefield)
+        if sacrificed_card not in scan:
+            scan.append(sacrificed_card)
+        for source in scan:
             oracle = (getattr(source, 'oracle_text', '') or '').lower()
             if 'whenever you sacrifice' not in oracle and 'whenever a permanent you control is sacrificed' not in oracle:
                 continue
@@ -1108,6 +1149,11 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                             card.loyalty_counters = int(card.loyalty)
                         except (TypeError, ValueError):
                             card.loyalty_counters = 0
+                        # July 20 (Jeska, Thrice Reborn): commander-cast bonus,
+                        # same as the cast path.
+                        from mtg.helpers import loyalty_from_commander_casts
+                        card.loyalty_counters += loyalty_from_commander_casts(
+                            game, player, card)
                         print(f"[MOVE-CARD] {card.name} enters with {card.loyalty_counters} loyalty")
                     # [AURA-ETB] Auto-attach auras entering via non-cast paths (CR 303.4f)
                     # When an Aura enters the battlefield without being cast, controller
@@ -1154,6 +1200,11 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                     game.register_static_keyword_grants(card, player.name)
                     game.register_static_pt_effects(card, player.name)
                     game.register_replacement_effects(card, player.name)
+                    # Pub/sub slice 2: one PERMANENT_ENTERED per physical
+                    # entry — unconditional, unlike the engine_ref-gated
+                    # trigger processing below.
+                    events.emit(events.PERMANENT_ENTERED, game, card=card,
+                                controller=player, via="move_card", rules=rules)
                     # Fire landfall triggers when lands enter via spells
                     # (Nature's Lore, Three Visits, Wood Elves ETB, etc.)
                     if card.is_land() and hasattr(rules, 'engine_ref') and rules.engine_ref:
@@ -1191,12 +1242,19 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                         and 'free' in reason.lower()):
                     msg = f"✨ **{card.name}** is cast for free ({reason})"
                 else:
+                    # July 20 batch-3 audit (reviewer S1): battlefield entries
+                    # carry the controller's name — "📦 **Forest** →
+                    # battlefield" was byte-identical for BOTH players' Fall
+                    # of the Thran returns, so _autoplay_send's Layer-1 dedup
+                    # silently ate 2 of the 4 lines (the drain site also
+                    # collapses same-player duplicates into ×N now).
+                    _who = f" ({player.name})" if actual_to_zone == 'battlefield' else ""
                     if source:
-                        msg = f"📦 **{card.name}** → {actual_to_zone} (from {source})"
+                        msg = f"📦 **{card.name}** → {actual_to_zone}{_who} (from {source})"
                     elif reason:
-                        msg = f"📦 **{card.name}** → {actual_to_zone} ({reason})"
+                        msg = f"📦 **{card.name}** → {actual_to_zone}{_who} ({reason})"
                     else:
-                        msg = f"📦 **{card.name}** → {actual_to_zone}"
+                        msg = f"📦 **{card.name}** → {actual_to_zone}{_who}"
                 if ltb_trigger_msgs:
                     msg += "\n" + "\n".join(ltb_trigger_msgs)
                 if entry_trigger_msgs:
@@ -1393,6 +1451,8 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                 player.battlefield.append(token)
                 created.append(token.name)
                 _fire_noncast_battlefield_entry(rules, game, player, token)
+                events.emit(events.PERMANENT_ENTERED, game, card=token,
+                            controller=player, via="create_token", rules=rules)
         if created:
             return f"🌿 {player.name} creates {len(created)} token copies"
         return None
@@ -1624,23 +1684,22 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                         token.attacking_player = src_atk_player
                 player.battlefield.append(token)
                 created_tokens.append(token)
+                # Pub/sub slice 2: one PERMANENT_ENTERED per token entering.
+                events.emit(events.PERMANENT_ENTERED, game, card=token,
+                            controller=player, via="create_token", rules=rules)
 
             # Fire creature-enters triggers for each token (Aura Shards, Soul Warden, etc.)
             # Cathar's Crusade + Avenger of Zendikar can produce N×N counter messages —
             # collect all msgs first, then collapse identical-prefix counter cascades
             # into one summary line per (counter_type, target) pair.
+            # Slice 2b (July 21): the per-token PERMANENT_ENTERED emits above
+            # ran the creature watcher dispatch (subscriber). Drain here so
+            # the counter-cascade aggregation below still applies.
             token_trigger_msgs = []
-            if 'creature' in types.lower() and hasattr(rules, 'engine_ref') and rules.engine_ref:
-                for token in created_tokens:
-                    try:
-                        etb_msgs = rules.engine_ref._check_creature_etb_triggers_sync(game, player, token)
-                        if etb_msgs and isinstance(etb_msgs, tuple) and etb_msgs[0]:
-                            for msg in etb_msgs[0]:
-                                print(f"[TOKEN-TRIGGER] {msg}")
-                                token_trigger_msgs.append(msg)
-                    except Exception as e:
-                        print(f"[TOKEN-ETB] Error firing triggers for {token_name}: {e}")
-                        maybe_reraise(e)
+            from mtg.helpers import drain_pending_messages as _drain_pm
+            for msg in _drain_pm(game):
+                print(f"[TOKEN-TRIGGER] {msg}")
+                token_trigger_msgs.append(msg)
             if len(token_trigger_msgs) > 12:
                 token_trigger_msgs = rules._aggregate_counter_msgs(token_trigger_msgs)
 
@@ -2297,8 +2356,15 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
             t_str = f"+{pump_toughness}" if pump_toughness >= 0 else str(pump_toughness)
             scope = "All" if len(pump_targets) > 1 else f"{pump_targets[0].name}'s"
             print(f"[PUMP] {scope} creatures get {p_str}/{t_str}{kw_str}: {pumped}")
-            result_msg = (f"💪 {scope} creatures get {p_str}/{t_str}{kw_str} "
-                          f"until end of turn ({len(pumped)} creatures)")
+            if len(pumped) == 1:
+                # July 21 batch audit (R4-3): a single-creature pump phrased
+                # as "<player>'s creatures get..." reads like a team anthem
+                # (Inferno Titan's {R} self-pump, game_1529168842905882755).
+                result_msg = (f"💪 **{pumped[0]}** gets {p_str}/{t_str}{kw_str} "
+                              f"until end of turn")
+            else:
+                result_msg = (f"💪 {scope} creatures get {p_str}/{t_str}{kw_str} "
+                              f"until end of turn ({len(pumped)} creatures)")
             # June 10 (V23): a negative toughness pump can be lethal — refresh
             # P/T and run SBA now (CR 704.5g) instead of waiting for the next
             # sweep (Toxic Deluge left 0/1s alive to block the same turn).
@@ -2592,7 +2658,26 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
             # May 20 audit: clones revert printed characteristics when leaving
             # battlefield (CR 706.10).
             _revert_copy_if_leaving_battlefield(card)
-            owner.graveyard.append(card)
+            # July 21 batch audit (R3-1, CR 903.9a): the single-target destroy
+            # action was the one death path the June 10 C7 sweep missed —
+            # Kambal destroyed by Fleshbag Marauder's edict template sat in
+            # the graveyard for 10 turns until a Bojuka Bog exile finally
+            # bounced him to the command zone (game_1529168824723570750).
+            # Dies triggers below still fire (CR 903.9b — they see the death
+            # regardless of the redirect).
+            _cmd_redirected = False
+            if (getattr(card, 'is_commander', False)
+                    and getattr(game, 'format', '') in ('commander', 'edh', 'brawl', 'oathbreaker')):
+                from mtg.helpers import command_zone_owner
+                _zone_owner = command_zone_owner(game, card, owner)
+                if not hasattr(_zone_owner, 'command_zone'):
+                    _zone_owner.command_zone = []
+                _zone_owner.command_zone.append(card)
+                _cmd_redirected = True
+                print(f"  [CR-903.9] Commander {card.name} redirected from "
+                      f"graveyard → command zone (owner={_zone_owner.name})")
+            else:
+                owner.graveyard.append(card)
             game.recalculate_granted_keywords()
             game.recalculate_power_toughness()
             rules.log_event(f"{card.name} destroyed")
@@ -2606,6 +2691,10 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                     trigger_msgs, _unhandled = rules.engine_ref._check_dies_triggers_sync(game, card, owner)
                     if trigger_msgs:
                         dies_msgs.extend(trigger_msgs)
+                    # July 21 batch audit (R1-3): the unhandled tail was
+                    # dropped here — no display, no Tier 3.
+                    if hasattr(rules.engine_ref, 'queue_unhandled_dies'):
+                        rules.engine_ref.queue_unhandled_dies(game, card, owner, _unhandled)
                 except Exception as e:
                     print(f"[DIES-TRIGGER] Error firing inline dies-triggers for {card.name}: {e}")
                     maybe_reraise(e)
@@ -2613,7 +2702,10 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
             # The creature DID die (dies triggers above are correct); it
             # returns as a new object with the appropriate counter.
             save_msgs = []
-            if card.is_creature() and not is_token:
+            # A CZ-redirected commander never reached the graveyard, so the
+            # undying/persist graveyard-return below can't apply (it would
+            # ValueError on graveyard.remove anyway).
+            if card.is_creature() and not is_token and not _cmd_redirected:
                 _ret_label = None
                 if ((card.has_keyword('Undying') or rules._permanent_grants_undying(game, card, owner))
                         and card.counters.get('+1/+1', 0) == 0):
@@ -2651,6 +2743,9 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                     owner.graveyard.remove(card)
                 msg = f"💨 Token **{card.name}** is destroyed, then ceases to exist"
                 print(f"[TOKEN-SBA] {card.name} destroyed and ceased to exist")
+            elif _cmd_redirected:
+                msg = (f"💀 **{card.name}** destroyed "
+                       f"(👑 returns to the command zone, CR 903.9)")
             else:
                 msg = f"💀 **{card.name}** destroyed"
             if ltb_msgs:
@@ -2849,6 +2944,9 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                                         c._reanimated_by_aura_id = aura.id
                                         print(f"[REANIMATE-BIND] {aura.name} bound to {c.name}")
                                         break
+                            # Pub/sub slice 2: one PERMANENT_ENTERED per entry.
+                            events.emit(events.PERMANENT_ENTERED, game, card=c,
+                                        controller=p, via="reanimate", rules=rules)
                             # June 11 audit: the dedicated reanimate action had
                             # the same trigger hole as move_card; Craterhoof
                             # entered as a vanilla 5/5 after reanimation.
@@ -2899,6 +2997,7 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
         # is reconstructable from the message.
         messages_parts = []
         ld_died_list = []  # May 30 audit (F-LD1): collect sacrificed creatures for dies-triggers
+        ld_returned_list = []  # July 20 batch-3 (M3): returned creatures — ETBs fire after the full wave
         # June 11 audit: triggers dispatch after Living Death finishes, by
         # which point old graveyard creatures have returned. Capture the
         # source set now so those returned permanents cannot see the earlier
@@ -2934,15 +3033,22 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
             for c in gy_creatures:
                 if c in p.graveyard:
                     p.graveyard.remove(c)
+                    # July 20 batch-3 audit (reviewer M3): this loop cleared
+                    # state by hand (missing counters — CR 400.7) and never
+                    # registered statics, emitted PERMANENT_ENTERED, or fired
+                    # ETBs — Avenger of Zendikar returned to a 12-land board
+                    # with zero Plants (game_1528946220087640286). The sibling
+                    # reanimate handler got all of this June 11; mirror it.
+                    c.reset_battlefield_state()
                     c.summoning_sick = True
                     c.entered_this_turn = True
-                    # Clear damage/modifiers from previous time on battlefield
-                    c.damage_marked = 0
-                    c.deathtouch_damage = 0
-                    c.power_modifier = 0
-                    c.toughness_modifier = 0
-                    c.tapped = False
                     p.battlefield.append(c)
+                    game.register_static_keyword_grants(c, p.name)
+                    game.register_static_pt_effects(c, p.name)
+                    game.register_replacement_effects(c, p.name)
+                    events.emit(events.PERMANENT_ENTERED, game, card=c,
+                                controller=p, via="living_death", rules=rules)
+                    ld_returned_list.append((c, p))
             if gy_creatures:
                 gy_names = ', '.join(c.name for c in gy_creatures)
                 messages_parts.append(f"{p.name} returns {len(gy_creatures)} from graveyard: {gy_names}")
@@ -2957,9 +3063,15 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
         if ld_died_list:
             if not hasattr(game, '_recently_died'):
                 game._recently_died = []
-            game._recently_died.extend(ld_died_list)
+            _queue_deaths_3a(game, ld_died_list)
             for dead_card, _dead_player in ld_died_list:
                 game._dies_source_ids_by_dead_id[dead_card.id] = set(ld_source_ids)
+        # July 20 batch-3 (M3): fire entries AFTER all simultaneous returns so
+        # watchers that came back with the wave see their fellow arrivals
+        # (CR 603.3a). Entry messages ride the same bullet list / truncation.
+        for _ret_card, _ret_player in ld_returned_list:
+            for _em in _fire_noncast_battlefield_entry(rules, game, _ret_player, _ret_card):
+                messages_parts.append(_em)
         if messages_parts:
             # [LAYERS] Recalculate after mass creature entry
             game.recalculate_granted_keywords()
@@ -3189,10 +3301,10 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                                     game._recently_resolved_etbs.add(target_card.name)
                         except Exception as e:
                             print(f"[FLICKER-ETB-TEMPLATE] Lookup failed for {target_card.name}: {e}")
-                        # Other-creature creature-enters triggers
-                        sync_result = rules.engine_ref._check_creature_etb_triggers_sync(game, p, target_card)
-                        if sync_result and isinstance(sync_result, tuple) and sync_result[0]:
-                            etb_msgs.extend(sync_result[0])
+                        # Slice 2b (July 21): watcher dispatch ran in the
+                        # PERMANENT_ENTERED subscriber (re-entry emit above).
+                        from mtg.helpers import drain_pending_messages as _drain_pm2
+                        etb_msgs.extend(_drain_pm2(game))
                     except Exception as e:
                         print(f"[FLICKER-ETB] Error firing re-entry triggers for {target_card.name}: {e}")
                         maybe_reraise(e)
@@ -3329,6 +3441,29 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
         source_name = action.get("source", "Snapcaster Mage")
         p = find_player(player_name)
         if p:
+            # July 20 audit (Past in Flames): grant_all covers "EACH instant
+            # and sorcery card in your graveyard" (the single-best pick was a
+            # silent under-grant), and announce_empty makes the empty-
+            # graveyard case visible — Discord showed a full "resolves:"
+            # oracle dump while the console said silent no-op
+            # (game_1527448352298500096). Snapcaster's ETB keeps the silent
+            # default (it fires often and a no-op line every time is spam).
+            if action.get("grant_all"):
+                granted = [c for c in p.graveyard
+                           if c.is_instant() or c.is_sorcery()]
+                if granted:
+                    for c in granted:
+                        p.playable_from_graveyard.append(c.id)
+                    names = ', '.join(c.name for c in granted[:6])
+                    more = f" +{len(granted) - 6} more" if len(granted) > 6 else ""
+                    return (f"⚡ {source_name}: {len(granted)} instant(s)/"
+                            f"sorcery(s) gain flashback until end of turn "
+                            f"({names}{more})")
+                if action.get("announce_empty"):
+                    return (f"📜 {source_name}: no instants or sorceries in "
+                            f"graveyard — no effect")
+                print(f"[GRANT-FLASHBACK] {p.name} ({source_name}): no instant or sorcery in graveyard — silent no-op")
+                return None
             # Pick highest-CMC instant/sorcery — most impactful flashback target
             best = None
             for c in p.graveyard:
@@ -3338,6 +3473,9 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
             if best:
                 p.playable_from_graveyard.append(best.id)
                 return f"⚡ {source_name}: **{best.name}** gains flashback until end of turn"
+            if action.get("announce_empty"):
+                return (f"📜 {source_name}: no instants or sorceries in "
+                        f"graveyard — no effect")
             # Empty-graveyard case: silent no-op so Snapcaster ETB doesn't
             # post a useless line every fire (and Panharmonicon doesn't
             # double it). Console-only signal so audits can still grep.
@@ -3501,15 +3639,117 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
         if died_list:
             if not hasattr(game, '_recently_died'):
                 game._recently_died = []
-            game._recently_died.extend(died_list)
+            _queue_deaths_3a(game, died_list)
         if destroyed:
             game.recalculate_granted_keywords()
             game.recalculate_power_toughness()
             _wipe_msg = f"💥 Board wipe destroys {len(destroyed)} creatures: {_format_destroyed_list(destroyed)}"
+            # July 20 audit (Decree of Pain): "Draw a card for each creature
+            # destroyed this way" — the template dropped the draw clause
+            # entirely (2 cards lost in game_1526071467035459665). Optional
+            # param counts ACTUAL destroys (post shield/totem/indestructible
+            # saves), so the count is CR-correct by construction.
+            _draw_player = action.get("draw_per_destroyed")
+            if _draw_player:
+                _dp = find_player(_draw_player)
+                if _dp:
+                    _drawn = 0
+                    for _ in range(len(destroyed)):
+                        if not _dp.library:
+                            break
+                        _dp.hand.append(_dp.library.pop(0))
+                        _drawn += 1
+                    if _drawn:
+                        _wipe_msg += f"\n🃏 **{_dp.name}** draws {_drawn} card(s) ({_drawn} creature(s) destroyed)"
             if save_return_msgs:
                 _wipe_msg += "\n" + "\n".join(save_return_msgs)
             return _wipe_msg
         return f"💥 Board wipe (no creatures to destroy)"
+
+    elif action_type == "populate":
+        # CR 701.34a: create a token that's a copy of a creature token you
+        # control; if you control none, populate does NOTHING. July 20 audit
+        # (CRITICAL): Song of the Worldsoul escalated to Tier 3, which
+        # fabricated a brand-new Human token out of nothing on an empty
+        # token board (game_1526071401499328634) — the token then blocked
+        # and fed an Athreos misfire. Deterministic handler; never invents.
+        player = find_player(action.get("player", ""))
+        if player:
+            tokens = [c for c in player.battlefield
+                      if getattr(c, 'is_token', False) and c.is_creature()
+                      and not getattr(c, '_phased_out', False)]
+            if not tokens:
+                print(f"[POPULATE] {player.name}: no creature tokens — populate does nothing (CR 701.34a)")
+                return None
+            def _tok_power(c):
+                try:
+                    return c.get_effective_power(game)
+                except (AttributeError, TypeError, ValueError):
+                    try:
+                        return int(c.power or 0)
+                    except (TypeError, ValueError):
+                        return 0
+            best = max(tokens, key=_tok_power)
+            copy_action = {
+                "action": "create_token", "player": player.name,
+                "name": best.name,
+                "power": best.power or 0, "toughness": best.toughness or 0,
+                "types": best.type_line or "Creature — Token",
+                "count": 1,
+                "oracle_text": best.oracle_text or "",
+            }
+            if getattr(best, 'keywords', None):
+                copy_action["keywords"] = list(best.keywords)
+            if getattr(best, 'colors', None):
+                copy_action["colors"] = list(best.colors)
+            msg = execute_action_on_state(rules, game, copy_action)
+            print(f"[POPULATE] {player.name} populates: copy of {best.name}")
+            return msg or f"🐑 **{player.name}** populates — a copy of {best.name}"
+        return None
+
+    elif action_type == "destroy_all_permanents":
+        # Worldslayer / Apocalypse-class: destroy ALL permanents (including
+        # lands), optionally excepting one named card (Worldslayer: "other
+        # than this Equipment"). July 20 audit (CRITICAL): Worldslayer's
+        # entire defining ability had no handler — three combat hits, zero
+        # wipes (game_1526071467035459665). Honors indestructible + shield
+        # counters; creatures that die queue dies-triggers like a board wipe.
+        except_name = (action.get("except_card") or "").lower()
+        destroyed = []
+        died_list = []
+        for p in game.players:
+            for perm in list(p.battlefield):
+                if getattr(perm, '_phased_out', False):
+                    continue
+                if except_name and perm.name.lower() == except_name:
+                    continue
+                if perm.has_keyword('Indestructible'):
+                    continue
+                if perm.counters.get('shield', 0) > 0:
+                    perm.counters['shield'] -= 1
+                    print(f"[SHIELD-COUNTER] {perm.name}: shield removed instead of destroyed (Worldslayer wipe)")
+                    continue
+                game.unregister_static_effects(perm)
+                p.battlefield.remove(perm)
+                if getattr(perm, 'is_token', False):
+                    destroyed.append(perm.name)
+                    continue
+                p.graveyard.append(perm)
+                destroyed.append(perm.name)
+                if perm.is_creature():
+                    died_list.append((perm, p))
+        if died_list:
+            if not hasattr(game, '_recently_died'):
+                game._recently_died = []
+            _queue_deaths_3a(game, died_list)
+        game.recalculate_granted_keywords()
+        game.recalculate_power_toughness()
+        if destroyed:
+            _shown = ', '.join(destroyed[:10])
+            _more = f" +{len(destroyed) - 10} more" if len(destroyed) > 10 else ""
+            _exc = f" (except {action.get('except_card')})" if except_name else ""
+            return f"🌋 **All permanents destroyed**{_exc}: {_shown}{_more}"
+        return None
 
     elif action_type == "destroy_by_power":
         # Dusk // Dawn style: destroy creatures with power >= threshold
@@ -3539,7 +3779,7 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
         if died_list:
             if not hasattr(game, '_recently_died'):
                 game._recently_died = []
-            game._recently_died.extend(died_list)
+            _queue_deaths_3a(game, died_list)
         if destroyed:
             game.recalculate_granted_keywords()
             game.recalculate_power_toughness()
@@ -3575,7 +3815,7 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
         if died_list:
             if not hasattr(game, '_recently_died'):
                 game._recently_died = []
-            game._recently_died.extend(died_list)
+            _queue_deaths_3a(game, died_list)
         if exiled:
             game.recalculate_granted_keywords()
             game.recalculate_power_toughness()
@@ -3620,7 +3860,7 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
         if died_list:
             if not hasattr(game, '_recently_died'):
                 game._recently_died = []
-            game._recently_died.extend(died_list)
+            _queue_deaths_3a(game, died_list)
         if destroyed_names or kept_display:
             game.recalculate_granted_keywords()
             game.recalculate_power_toughness()
@@ -3674,7 +3914,7 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
         if died_list:
             if not hasattr(game, '_recently_died'):
                 game._recently_died = []
-            game._recently_died.extend(died_list)
+            _queue_deaths_3a(game, died_list)
         if destroyed:
             game.recalculate_granted_keywords()
             game.recalculate_power_toughness()
@@ -3714,7 +3954,7 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
         if died_list:
             if not hasattr(game, '_recently_died'):
                 game._recently_died = []
-            game._recently_died.extend(died_list)
+            _queue_deaths_3a(game, died_list)
         if destroyed:
             game.recalculate_granted_keywords()
             game.recalculate_power_toughness()
@@ -4158,7 +4398,7 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
             if victim.is_creature():
                 if not hasattr(game, '_recently_died'):
                     game._recently_died = []
-                game._recently_died.append((victim, p))
+                _queue_deaths_3a(game, [(victim, p)])
 
             # [SACRIFICE-TRIGGER] Scan controller's battlefield for "Whenever you
             # sacrifice a permanent" triggers (Korvold, Mayhem Devil, etc.)
@@ -4361,6 +4601,58 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
             # Sort: ETB permanents first, then by CMC
             candidates.sort(key=lambda x: (not x[1], -(getattr(x[0], 'cmc', 0) or 0)))
             to_flicker = [c for c, _ in candidates[:count]]
+
+            # July 20 audit: Yorion's return is a DELAYED trigger ("Return
+            # those cards to the battlefield at the beginning of the next end
+            # step", CR 603.7) — resolving it immediately let Yorion ↔ Felidar
+            # Guardian re-trigger each other in the same resolution, producing
+            # a 204-flicker / 359-mill storm with duplicate mills that decided
+            # game_1527451733679149057. With delayed_return the cards sit in
+            # exile until the scheduled end-step trigger returns them (same
+            # move_card-from-exile shape as the Oath of Teferi template).
+            # Brago-class immediate flickers don't pass the flag and keep the
+            # instant exile-and-return below.
+            if action.get("delayed_return"):
+                exiled_names = []
+                return_actions = []
+                exile_msgs = []
+                for card in to_flicker:
+                    if card in p.battlefield:
+                        game.unregister_static_effects(card)
+                        exile_msgs.extend(_fire_creature_exiled_watchers(game, card))
+                        p.battlefield.remove(card)
+                        card.tapped = False
+                        card.damage_marked = 0
+                        card.deathtouch_damage = 0
+                        card.power_modifier = 0
+                        card.toughness_modifier = 0
+                        card.temp_keywords = []
+                        card.attachments = []
+                        p.exile.append(card)
+                        exiled_names.append(card.name)
+                        return_actions.append({
+                            "action": "move_card", "card": card.name,
+                            "from_zone": "exile", "to_zone": "battlefield",
+                            "player": p.name})
+                if exiled_names:
+                    game.recalculate_granted_keywords()
+                    game.recalculate_power_toughness()
+                    game.delayed_triggers.append({
+                        "trigger_at": "end_step",
+                        "actions": return_actions,
+                        "source": exclude_self or "Mass flicker",
+                        "controller": p_idx if p_idx is not None else 0,
+                        "once": True,
+                        "turn_delay": 0,
+                        "upkeep_of": None,
+                        "phase_of": None,
+                    })
+                    return (f"✨ Exiled {len(exiled_names)} permanents: "
+                            f"{', '.join(exiled_names)} — returning at the "
+                            f"beginning of the next end step"
+                            + ("\n" + "\n".join(exile_msgs) if exile_msgs else ""))
+                return None
+
             flickered_names = []
             etb_messages = []  # F26: collect ETB-trigger messages for each flickered permanent
             for card in to_flicker:
@@ -4387,6 +4679,10 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                     game.register_static_pt_effects(card, p.name)
                     game.register_replacement_effects(card, p.name)
                     flickered_names.append(card.name)
+                    # Pub/sub slice 2: each flicker re-entry is a new
+                    # physical entry (CR 603.6) — one event per re-entry.
+                    events.emit(events.PERMANENT_ENTERED, game, card=card,
+                                controller=p, via="mass_flicker", rules=rules)
                     # May 25 audit (F26): fire ETB triggers for the re-entering
                     # permanent. Previously mass_flicker (Brago combat trigger,
                     # Yorion ETB) moved each permanent off and back on the

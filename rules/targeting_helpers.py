@@ -264,9 +264,15 @@ def _spell_requires_targets(card):
         return False
     oracle = card.oracle_text or ''
     ol = oracle.lower()
-    # Modal spells may have non-targeted modes
+    # Modal spells may have non-targeted modes — but "Choose two target
+    # creature cards in your graveyard" (Victimize) is a target COUNT, not a
+    # mode choice. July 20 batch-3 audit: the bare substring match let
+    # Victimize skip the CR 601.2c gate and get cast 3× with zero legal
+    # targets (paid, then fizzled at resolution). Real modal wording puts a
+    # dash and mode list after the choose-phrase, never " target" directly.
     if any(p in ol for p in ['choose one', 'choose two', 'choose three', 'choose up to']):
-        return False
+        if not re.search(r'choose (?:one|two|three|up to \w+) target', ol):
+            return False
     # Strip reminder text (in parentheses) before checking for "target"
     stripped = re.sub(r'\([^)]*\)', '', ol)
     return 'target' in stripped
@@ -285,7 +291,13 @@ def _find_any_valid_target(game, card, caster_name):
         src.controller = caster_name
 
         stripped = re.sub(r'\([^)]*\)', '', (card.oracle_text or '').lower())
-        tm = re.search(r'target\s+([\w\s,/-]+?)(?:\.|,|\band\b|\bor\b|$)', stripped)
+        # July 21 batch audit (R2-1): the old non-greedy capture stopped at
+        # the FIRST comma or "or", so Swan Song's "target enchantment,
+        # instant, or sorcery spell" truncated to "target enchantment" and
+        # legal counter-counters were cast-blocked all game
+        # (game_1529172161636597770). Capture the whole phrase to sentence
+        # end so the parser sees the trailing "spell".
+        tm = re.search(r'target\s+([^.\n;]+)', stripped)
         if not tm:
             return True  # Can't parse target phrase -> allow
         restriction = TargetTextParser.parse(tm.group(0).strip().rstrip('.,'))

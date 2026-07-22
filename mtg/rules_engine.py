@@ -29,6 +29,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import anthropic
 
 from mtg.constants import Phase, Zone, COMMAND_ZONE_FORMATS
+from mtg.helpers import response_text
 from mtg.models import Card, Player, GameState
 from mtg.deck_loader import DeckLoader
 from mtg.display import GameDisplay
@@ -227,8 +228,50 @@ class RulesEngine:
             # the same cast machinery, so don't gate on zone — the
             # `_flashback_cost` marker is the authoritative signal.
             mana_cost_to_check = card._flashback_cost
+        # July 20 (queued from the cast-gate characterization pins): the mana
+        # pre-gate is convoke/delve/improvise-aware. The payment stage covers
+        # part of the GENERIC portion by tapping creatures (convoke), exiling
+        # graveyard cards (delve), or tapping noncreature artifacts
+        # (improvise), so demand only the remainder here — a spell castable
+        # via convoke alone used to be rejected up front (the pin comments in
+        # tests/test_cast_gates.py described this; tests updated with the fix).
+        # Generic-only reduction, matching what the payment stage models.
+        _oracle_l = (card.oracle_text or '').lower()
+        if mana_cost_to_check and ('convoke' in _oracle_l or 'delve' in _oracle_l
+                                   or 'improvise' in _oracle_l):
+            helpers = 0
+            if 'convoke' in _oracle_l:
+                helpers += sum(1 for c in player.active_battlefield()
+                               if c.is_creature() and not c.tapped and c is not card)
+            if 'delve' in _oracle_l:
+                helpers += len(player.graveyard)
+            if 'improvise' in _oracle_l:
+                helpers += sum(1 for c in player.active_battlefield()
+                               if c.is_artifact() and not c.is_creature()
+                               and not c.tapped)
+            if helpers > 0:
+                reduced = re.sub(
+                    r'\{(\d+)\}',
+                    lambda m: '{' + str(max(0, int(m.group(1)) - helpers)) + '}',
+                    mana_cost_to_check, count=1)
+                if reduced != mana_cost_to_check:
+                    print(f"[CAST-GATE] {card.name}: convoke/delve/improvise-"
+                          f"aware pre-gate checking {reduced} (printed "
+                          f"{mana_cost_to_check}, {helpers} helper(s))")
+                mana_cost_to_check = reduced
         can_pay, reason = player.can_pay_mana_cost(mana_cost_to_check)
         if not can_pay:
+            # July 20: printed alternate costs (Force of Will's life+exile,
+            # Fireblast's sacrifice) are payable with no mana at all — the
+            # cast stage's _compute_alt_costs takes that path whenever raw
+            # mana is short. Without this waiver the response filter could
+            # offer FoW but the pre-gate would still reject the cast
+            # (doomed-cast retry loop, the exact pattern the June 11
+            # affordability filter was built to prevent).
+            if player.can_pay_printed_alternate_cost(card):
+                print(f"[CAST-GATE] {card.name}: printed alternate cost "
+                      f"available — mana pre-gate waived")
+                return True, "OK (printed alternate cost available)"
             return False, reason
 
         return True, "OK"
@@ -888,7 +931,7 @@ If no triggers, return empty array: []"""
                 self.usage_callback(response.usage, self.model)
 
             # Parse JSON from response
-            text = response.content[0].text.strip()
+            text = response_text(response).strip()
             # Extract JSON if wrapped in code blocks
             if "```" in text:
                 text = re.search(r'```(?:json)?\s*(.*?)\s*```', text, re.DOTALL)

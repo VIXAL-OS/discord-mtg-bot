@@ -24,14 +24,33 @@ MIGRATION PLAN (one slice per audit cycle; batches are the regression net)
       (already the single centralized gain path), consumed by the gain-life
       trigger scan (Vito / Heliod / Pridemate). Existing pytest coverage of
       apply_life_gain now exercises the bus end-to-end.
-  Slice 2: PERMANENT_ENTERED — emit from the cast path, move_card battlefield
-      entry, token creation, reanimate, undying/persist returns, and land
-      drops; migrate the creature-enters + enchantment-enters scans onto it
-      and add the snow-permanent watcher (Marit Lage's Slumber scry — the
-      known-open deferral this unlocks). Keep the old scans as parallel
-      assertions for one batch before deleting.
-  Slice 3: CREATURE_DIED — replace the _recently_died list + drain plumbing.
-      APNAP ordering stays with the CONSUMER (helpers.apnap_order_died).
+  Slice 2 (STARTED July 20, 2026): PERMANENT_ENTERED — emitted from the cast
+      paths (async + sync), play_land, suspend resolution, the noncast entry
+      funnel (move_card / create_token / reanimate / mass_flicker), and
+      undying/persist death-save returns. Consumers so far: the snow-
+      permanent watcher (Marit Lage's Slumber scry — the known-open deferral
+      this unlocked) and the PARITY RECORDER (mtg/triggers.py): the existing
+      creature-enters + enchantment-enters scans stay authoritative and are
+      instrumented to record which entries they saw; engine.end_turn reports
+      `[EVENT-PARITY]` for any creature/enchantment entry the scans missed.
+      One clean batch (zero parity lines) is the gate for flipping the scans
+      into subscribers and deleting the direct calls (slice 2b).
+      GATE STATUS: CLEARED July 21, 2026 — batch game_15291* (143 games,
+      all on >= 6b189ce, strict=1) came back with ZERO [EVENT-PARITY]
+      lines. Slice 2b landed the same day: both scans (creature-enters +
+      enchantment-enters) are now bus subscribers, the ~12 direct call
+      sites drain game._pending_messages in place, and the parity recorder
+      is INVERTED (a line now means a subscriber skipped an entry —
+      unusable engine ref in the payload, [ETB-BUS] tag).
+  Slice 3a (SHADOW, July 21, 2026): CREATURE_DIED emitted by the
+      queue_death choke-point (mtg/triggers.py) that wraps every raw
+      `_recently_died.append/extend`; the only consumer is the death
+      parity recorder ([EVENT-PARITY-DIES], reported from end_turn;
+      deaths still pending in the queue are excluded — not yet drained is
+      not a miss). No consumer changes by construction: the dies
+      dispatcher, wave semantics (_active_dies_batch), and
+      helpers.apnap_order_died are untouched. Slice 3b (replacing the
+      plumbing) waits for 3a's own clean batch.
   Slice 4+: CARD_CAST, COMBAT_DAMAGE_DEALT, PHASE_CHANGED — at which point
       the React frontend's websocket layer is just another subscriber.
 
@@ -53,8 +72,26 @@ from typing import Any, Callable, Dict, List
 
 # Event types — flat string constants, grep-able in logs and code.
 LIFE_GAINED = "life_gained"
-# Planned: PERMANENT_ENTERED, CREATURE_DIED, CARD_CAST, COMBAT_DAMAGE_DEALT,
-# PHASE_CHANGED (see migration plan above).
+# PERMANENT_ENTERED payload: card=<entering Card>, controller=<Player>,
+# via=<entry-path tag: cast/cast_sync/land_drop/suspend/move_card/
+# create_token/living_weapon/reanimate/mass_flicker/death_save_return>,
+# rules=<RulesEngine or None — handlers that execute actions need it>.
+# Emitted ONCE per physical entry (Panharmonicon doubling is a trigger-level
+# concept, not a second entry). The cast emit fires AFTER resolution settles
+# — post aura-fizzle, post clone-copy — never at the raw battlefield append
+# (July 20: a fizzled Draconic Destiny and a Clever Impersonator copying a
+# devotion-gated god both produced false parity lines from an append-time
+# emit on the first live batch).
+PERMANENT_ENTERED = "permanent_entered"
+# CREATURE_DIED payload: card=<dead Card>, player=<controller Player>.
+# Slice 3a (July 21, 2026): SHADOW MODE — emitted by the queue_death
+# choke-point (mtg/triggers.py) alongside every _recently_died append; the
+# only subscriber is the death parity recorder ([EVENT-PARITY-DIES]).
+# Consumers (the dies dispatcher, wave semantics via _active_dies_batch,
+# helpers.apnap_order_died) are UNCHANGED until slice 3b.
+CREATURE_DIED = "creature_died"
+# Planned: CARD_CAST, COMBAT_DAMAGE_DEALT, PHASE_CHANGED
+# (see migration plan above).
 
 _subscribers: Dict[str, List[Callable]] = {}
 
@@ -64,6 +101,13 @@ def subscribe(event_type: str, handler: Callable[..., Any]) -> None:
     handlers = _subscribers.setdefault(event_type, [])
     if handler not in handlers:
         handlers.append(handler)
+
+
+def unsubscribe(event_type: str, handler: Callable[..., Any]) -> None:
+    """Remove a handler. No-op when absent (test-teardown friendly)."""
+    handlers = _subscribers.get(event_type)
+    if handlers and handler in handlers:
+        handlers.remove(handler)
 
 
 def emit(event_type: str, game, **payload) -> None:

@@ -127,19 +127,27 @@ BASIC_LAND_NAMES = {
 # Full lists would be fetched from Scryfall
 BANNED_CARDS = {
     "commander": {
-        # Power Nine + most broken
+        # Power Nine + most broken. NOTE: Timetwister is deliberately NOT
+        # here — it is the one Power Nine card that has always been LEGAL
+        # in Commander (July 21, 2026 audit; Scryfall legalities are the
+        # ground truth).
         "ancestral recall", "black lotus", "mox emerald", "mox jet",
-        "mox pearl", "mox ruby", "mox sapphire", "time walk", "timetwister",
-        # Commander banlist
-        "balance", "biorhythm", "braids, cabal minion", "channel",
-        "coalition victory", "emrakul, the aeons torn", "erayo, soratami ascendant",
-        "falling star", "fastbond", "flash", "gifts ungiven", "golos, tireless pilgrim",
+        "mox pearl", "mox ruby", "mox sapphire", "time walk",
+        # Commander banlist. July 21, 2026 audit: pruned the 2024-2025
+        # unbans (Gifts Ungiven, Braids, Coalition Victory, Lutri,
+        # Panoptic Mirror, Sway of the Stars, Biorhythm, Worldfire) after
+        # the new deck-list pin caught the validator stripping a LEGAL
+        # Worldfire from mythic_madness every load. Verified against
+        # data/scryfall_oracle_cards.json legalities.
+        "balance", "channel",
+        "emrakul, the aeons torn", "erayo, soratami ascendant",
+        "falling star", "fastbond", "flash", "golos, tireless pilgrim",
         "griselbrand", "hullbreacher", "iona, shield of emeria", "karakas",
         "leovold, emissary of trest", "library of alexandria", "limited resources",
-        "lutri, the spellchaser", "mana crypt", "panoptic mirror", "paradox engine",
+        "mana crypt", "paradox engine",
         "primeval titan", "prophet of kruphix", "recurring nightmare", "rofellos, llanowar emissary",
-        "shahrazad", "sundering titan", "sway of the stars", "sylvan primordial",
-        "tinker", "tolarian academy", "trade secrets", "upheaval", "worldfire",
+        "shahrazad", "sundering titan", "sylvan primordial",
+        "tinker", "tolarian academy", "trade secrets", "upheaval",
         "yawgmoth's bargain", "dockside extortionist",
     },
     # Modern banlist as of late 2024 / 2025. Power Nine and pre-8th-edition
@@ -175,7 +183,7 @@ BANNED_CARDS = {
         "hermit druid", "imperial seal", "library of alexandria", "mana crypt",
         "mana drain", "mana vault", "memory jar", "mind twist", "mind's desire",
         "mishra's workshop", "mystical tutor", "necropotence", "oath of druids",
-        "shannon's trifecta", "skullclamp", "sol ring", "strip mine",
+        "skullclamp", "sol ring", "strip mine",
         "survival of the fittest", "time vault", "tinker", "tolarian academy",
         "treasure cruise", "vampiric tutor", "wheel of fortune", "windfall",
         "yawgmoth's bargain", "yawgmoth's will",

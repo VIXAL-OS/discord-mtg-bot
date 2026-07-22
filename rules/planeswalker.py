@@ -531,6 +531,66 @@ class PlaneswalkerManager:
         # format_activate_line() which never sets cost_str, and the except-only
         # assignment crashed 6.3% of games when activations refunded.
         cost_str = f"+{ability.loyalty_cost}" if ability.loyalty_cost > 0 else str(ability.loyalty_cost)
+
+        # Execute the ability effect FIRST — the display header is built only
+        # on the success path below. July 20 audit: building the header before
+        # the refund check recorded the oracle-shown dedup key
+        # (format_activate_line side effect) for a header the refund branch
+        # then DISCARDED — a refunded first attempt permanently poisoned the
+        # "first use shows full text" slot, so Aminatou's -1 text was never
+        # shown all game (game_1526059766965604602).
+        effects_applied = []
+        try:
+            effect_messages = await self._execute_ability(game, player, card, ability, targets)
+        except Exception as e:
+            effect_messages = [f"⚠️ Effect execution error: {e}"]
+
+        # May 7 audit (Bug 1): if the ability resolved with no real game effect
+        # (template returned no_action because there were no legal targets, or
+        # the template emitted nothing at all), refund the loyalty cost so we
+        # don't silently bleed loyalty on illegal activations. Heuristic: a
+        # "real" effect message is one that's not a 📍 no-action prefix and
+        # not the 🎯 "needs a target" hint. July 20: gated on the execution
+        # tracker too — a template can execute real state changes whose
+        # actions return no display text (Aminatou -1 flickering Rhystic
+        # Study), and those were being refunded as "no effect" — a FREE
+        # activation (effect applied + loyalty back) that also lied to the
+        # player about a legal target existing.
+        if (self._activation_had_no_effect(effect_messages)
+                and not getattr(self, '_last_ability_executed_state_change', False)):
+            card.loyalty_counters = old_loyalty
+            # Roll back the per-turn activation counter too — refunded
+            # activations don't count toward Oath of Teferi's "twice per turn".
+            try:
+                cur = self._activations_this_turn[game_id].get(card.id, 0)
+                if cur > 0:
+                    self._activations_this_turn[game_id][card.id] = cur - 1
+            except KeyError:
+                pass
+            # July 20 (found by the poisoning regression pin): the per-CARD
+            # once-per-turn attributes were NOT rolled back, so a refunded
+            # activation still blocked the walker for the rest of the turn
+            # ("already activated an ability this turn") even though the
+            # manager-side counter said it didn't count.
+            if getattr(card, '_pw_activations_this_turn', 0) > 0:
+                card._pw_activations_this_turn -= 1
+            # July 20: neutral wording — the old "has no legal target" was a
+            # guess that contradicted the 📍 reason line that follows when
+            # the real cause was e.g. an empty hand (Daretti +2).
+            messages = [
+                f"📍 {card.name}'s [{cost_str}] ability had no effect — activation refunded (loyalty stays at {old_loyalty})"
+            ]
+            if effect_messages:
+                messages.extend(effect_messages)
+            print(f"[PW-REFUND] {card.name} [{cost_str}]: loyalty refunded ({old_loyalty} → {card.loyalty_counters}); no effect")
+            return ActivationResult(
+                success=False,
+                messages=messages,
+                effects_applied=[],
+            )
+
+        # Success path — NOW build the header (and record the oracle-shown
+        # dedup key, since this header is actually displayed).
         try:
             from mtg.helpers import format_activate_line
             header_line = format_activate_line(card.name, ability.loyalty_cost,
@@ -543,44 +603,8 @@ class PlaneswalkerManager:
             header_line,
             f"   Loyalty: {old_loyalty} → {card.loyalty_counters}"
         ]
-
-        # Execute the ability effect
-        effects_applied = []
-        try:
-            effect_messages = await self._execute_ability(game, player, card, ability, targets)
-            messages.extend(effect_messages)
-            effects_applied = effect_messages
-        except Exception as e:
-            messages.append(f"⚠️ Effect execution error: {e}")
-
-        # May 7 audit (Bug 1): if the ability resolved with no real game effect
-        # (template returned no_action because there were no legal targets, or
-        # the template emitted nothing at all), refund the loyalty cost so we
-        # don't silently bleed loyalty on illegal activations. Heuristic: a
-        # "real" effect message is one that's not a 📍 no-action prefix and
-        # not the 🎯 "needs a target" hint. We also keep the inline "no legal
-        # target" prose visible so the player sees why nothing happened.
-        if self._activation_had_no_effect(effect_messages):
-            card.loyalty_counters = old_loyalty
-            # Roll back the per-turn activation counter too — refunded
-            # activations don't count toward Oath of Teferi's "twice per turn".
-            try:
-                cur = self._activations_this_turn[game_id].get(card.id, 0)
-                if cur > 0:
-                    self._activations_this_turn[game_id][card.id] = cur - 1
-            except KeyError:
-                pass
-            messages = [
-                f"📍 {card.name}'s [{cost_str}] ability has no legal target — activation refunded (loyalty stays at {old_loyalty})"
-            ]
-            if effect_messages:
-                messages.extend(effect_messages)
-            print(f"[PW-REFUND] {card.name} [{cost_str}]: loyalty refunded ({old_loyalty} → {card.loyalty_counters}); no effect")
-            return ActivationResult(
-                success=False,
-                messages=messages,
-                effects_applied=[],
-            )
+        messages.extend(effect_messages)
+        effects_applied = effect_messages
 
         return ActivationResult(
             success=True,
@@ -635,6 +659,12 @@ class PlaneswalkerManager:
         """
         messages = []
         text = ability.text.lower()
+        # July 20 audit: activate()'s refund heuristic treats an EMPTY message
+        # list as "no effect", but a template can execute real state changes
+        # whose actions return no display text (Aminatou -1 flickering
+        # Rhystic Study — no ETB to narrate). Track actual execution so a
+        # silent-but-real effect is never refunded as "no legal target".
+        self._last_ability_executed_state_change = False
 
         # === TIER 1.5: Check effect template library for PW abilities ===
         # This catches Chandra ToD +1, Garruk Beast tokens, Daretti loot, Elspeth soldiers, etc.
@@ -713,6 +743,10 @@ class PlaneswalkerManager:
                                     messages.append(f"📍 {reason}")
                                 continue
                             msg = rules_engine._execute_action_on_state(game, act)
+                            # Executed a real action — even if it produced no
+                            # display text, the game state changed (July 20:
+                            # message-less flicker was refunded as no-effect).
+                            self._last_ability_executed_state_change = True
                             if msg:
                                 messages.append(msg)
                     else:
@@ -826,10 +860,23 @@ class PlaneswalkerManager:
             amount = int(damage_match.group(1))
             target = targets[0]
 
-            if hasattr(target, 'life'):
+            # Planeswalker check must come BEFORE the creature branch: every
+            # Card carries both damage_marked and loyalty_counters fields, so
+            # hasattr() dispatch routed PW targets into the creature branch and
+            # never deducted loyalty (CR 306.8). July 20 audit: Wrenn and Six's
+            # [-1] hit Jace, the Mind Sculptor and Jace kept all 5 loyalty.
+            _is_pw_target = ('planeswalker' in
+                             (getattr(target, 'type_line', '') or '').lower())
+            if hasattr(target, 'life') and not hasattr(target, 'type_line'):
                 # It's a player
                 target.life -= amount
                 messages.append(f"🔥 {card.name} deals {amount} damage to {target.name} (Life: {target.life})")
+            elif _is_pw_target:
+                # It's a planeswalker — damage removes that many loyalty counters
+                target.loyalty_counters = max(0, target.loyalty_counters - amount)
+                messages.append(f"🔥 {card.name} deals {amount} damage to {target.name} (Loyalty: {target.loyalty_counters})")
+                if target.loyalty_counters <= 0:
+                    messages.append(f"💀 {target.name} will be destroyed (0 loyalty)")
             elif hasattr(target, 'damage_marked'):
                 # It's a creature
                 target.damage_marked += amount
@@ -843,12 +890,6 @@ class PlaneswalkerManager:
                             messages.append(f"💀 {target.name} has lethal damage marked")
                     except ValueError:
                         pass
-            elif hasattr(target, 'loyalty_counters'):
-                # It's a planeswalker
-                target.loyalty_counters -= amount
-                messages.append(f"🔥 {card.name} deals {amount} damage to {target.name} (Loyalty: {target.loyalty_counters})")
-                if target.loyalty_counters <= 0:
-                    messages.append(f"💀 {target.name} will be destroyed (0 loyalty)")
         
         # === DISCARD HAND + EXILE TOP X (Chandra, Heart of Fire +1) ===
         # "Discard your hand, then exile the top three cards of your library. Until end of turn, you may play cards exiled this way."

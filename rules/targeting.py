@@ -555,6 +555,15 @@ class TargetTextParser:
         # Handle compound types first (e.g., "artifact or enchantment")
         if "any target" in text:
             restriction.target_types = {TargetType.ANY}
+        elif "spell" in text and "spellbook" not in text:
+            # July 21 batch audit (R2-1): must come BEFORE the permanent-type
+            # checks. Counterspell wordings name spell TYPES ("counter target
+            # enchantment, instant, or sorcery spell", "target noncreature
+            # spell") — the old elif order collapsed these to the permanent
+            # type ({ENCHANTMENT} for Swan Song, {CREATURE} for "noncreature"
+            # via substring), blocking every legal counter. Whenever "spell"
+            # appears in a target phrase, the target IS a spell on the stack.
+            restriction.target_types = {TargetType.SPELL}
         elif "nonland permanent" in text:
             restriction.target_types = {TargetType.NONLAND_PERMANENT}
         elif "artifact or enchantment" in text or "enchantment or artifact" in text:

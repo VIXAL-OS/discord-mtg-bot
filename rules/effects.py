@@ -804,7 +804,9 @@ Respond in a concise, bullet-point format."""
                 max_tokens=500,
                 messages=[{"role": "user", "content": prompt}]
             )
-            return [f"🧙 Claude interprets: {response.content[0].text}"]
+            # claude-sonnet-5 may lead content with thinking blocks (no .text)
+            from mtg.helpers import response_text
+            return [f"🧙 Claude interprets: {response_text(response)}"]
         except Exception as e:
             return [f"⚠️ Error resolving effect: {e}"]
 

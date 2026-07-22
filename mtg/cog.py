@@ -662,7 +662,7 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
 
         Usage:
             !deck https://archidekt.com/decks/123456  - Load from Archidekt
-            !deck surrak                           - Load from data/ folder
+            !deck surrak                               - Load from data/ folder
             !deck                                      - Upload a JSON file
         """
         # Check for attachment
@@ -723,7 +723,7 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
         
         Usage:
             !mydeck https://archidekt.com/decks/123456  - Load from Archidekt
-            !mydeck surrak                              - Load from data/ folder
+            !mydeck surrak                               - Load from data/ folder
             !mydeck                                       - Upload a JSON file
         """
         user_id = ctx.author.id
@@ -846,7 +846,7 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
         Usage:
             !coverage              - Your loaded deck (via !mydeck)
             !coverage mythic       - An autoplay deck by short name
-            !coverage surrak   - Any autoplay deck name
+            !coverage surrak       - Any autoplay deck name
         """
         from mtg.coverage import classify_deck, format_coverage_report
 
@@ -4735,13 +4735,24 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
         if not game.ended:
             game.phase = Phase.MAIN2
 
-    async def _autoplay_send(self, thread, content=None, embed=None):
-        """Send a message to the autoplay thread, with rate limiting and logging."""
+    async def _autoplay_send(self, thread, content=None, embed=None,
+                             _is_chunk=False):
+        """Send a message to the autoplay thread, with rate limiting and logging.
+
+        _is_chunk: set by the 1900-char splitter below for the pieces of ONE
+        logical message. July 20 display audit: chunks used to re-enter the
+        full pipeline, where the per-turn burst dedup could swallow a
+        later chunk as a "repeat" of similar earlier content — a Yorion
+        flicker-cascade turn lost a real life-total line this way
+        (game_1526059786242752615: engine-confirmed life 39 never reached
+        Discord). Chunks skip the suppression layers; the whole message
+        already went through them once.
+        """
         # May 17 audit: final defense-in-depth strip of dangling-article
         # artifacts ("The .", trailing " The") that leak through from
         # judge.py / triggers.py / spells.py sanitizers. This catches the
         # long tail without having to chase down every emit site.
-        if content and embed is None:
+        if content and embed is None and not _is_chunk:
             try:
                 from mtg.helpers import strip_dangling_articles
                 content = strip_dangling_articles(content)
@@ -4754,7 +4765,7 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
         # "☠️ Plant dies" (the per-creature combat DAMAGE lines already collapse
         # upstream; the death/trigger lines did not). Group consecutive
         # byte-identical non-empty lines into "<line> _(×N)_".
-        if content and embed is None and '\n' in content:
+        if content and embed is None and '\n' in content and not _is_chunk:
             _lines = content.split('\n')
             _collapsed = []
             _i = 0
@@ -4775,7 +4786,7 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
         # with duplicate consecutive bot messages. Track the most recent
         # send per-thread and either skip exact duplicates or collapse them
         # into a "(×N)" suffix when a third identical hit arrives.
-        if content and embed is None:
+        if content and embed is None and not _is_chunk:
             tid = getattr(thread, 'id', None)
             if tid is not None:
                 if not hasattr(self, '_dedup_state'):
@@ -4839,13 +4850,23 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
             chunks = []
             current = ""
             for line in content.split("\n"):
-                # Single line too long? Hard-split it.
+                # Single line too long? Hard-split it — at a space when one
+                # exists in the tail window (July 20: the raw 1900-slice cut
+                # "🃏 **Claude** draws 2 card(s)" mid-phrase in a giant
+                # single-line flicker cascade).
                 if len(line) > 1900:
                     if current:
                         chunks.append(current)
                         current = ""
-                    for i in range(0, len(line), 1900):
-                        chunks.append(line[i:i + 1900])
+                    _rest = line
+                    while len(_rest) > 1900:
+                        _cut = _rest.rfind(' ', 1500, 1900)
+                        if _cut <= 0:
+                            _cut = 1900
+                        chunks.append(_rest[:_cut])
+                        _rest = _rest[_cut:].lstrip()
+                    if _rest:
+                        chunks.append(_rest)
                     continue
                 if len(current) + len(line) + 1 > 1900:
                     chunks.append(current)
@@ -4858,7 +4879,8 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
                 # Only attach the embed to the LAST chunk so it shows
                 # below the full text rather than after the first split.
                 chunk_embed = embed if i == len(chunks) - 1 else None
-                await self._autoplay_send(thread, chunk, embed=chunk_embed)
+                await self._autoplay_send(thread, chunk, embed=chunk_embed,
+                                          _is_chunk=True)
             return
 
         for attempt in range(3):

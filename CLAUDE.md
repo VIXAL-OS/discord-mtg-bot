@@ -168,3 +168,74 @@ Highlights (full detail lives in the upstream repo's June 10 sections):
 Run autoplay batches with `MTG_STRICT=1` exported — several swallow sites
 now carry `maybe_reraise`, so strict batches detect what production
 swallows.
+## July 21, 2026 upstream sync — July 16/20/21 audit sprints (suite 309 → 452)
+
+Brings the fork current with ~40 upstream commits spanning four audited
+batches. Engine files are byte-identical to upstream except the four
+intentional divergences (see "What stays different" below).
+
+**Engine fixes ported** (highlights — see upstream commit messages for the
+per-finding stories):
+- **Cast path**: `cast_spell_async` decomposed into `_validate_cast` /
+  `_compute_alt_costs` / `_pay_costs` / `_await_stack_window` /
+  `_dispatch_resolution` with a ~108-line orchestrator; the mana pre-gate
+  is now convoke/delve/improvise-aware (`[CAST-GATE]`), and printed
+  alternate costs (Force of Will, Fireblast) are visible to the response
+  filters instead of reading as dead cards.
+- **Stack correctness**: counterspell responses can target spells on the
+  stack again (a July regression blocked every explicit-target counter);
+  `on_stack_resolve` refuses to resolve an entry buried on `game.stack`
+  (`[STACK-LIFO-GUARD]`, CR 608), and a cast-trigger window only counts a
+  trigger countered when the `countered` flag is actually set.
+- **Mana honesty**: hybrid pips now count toward mana value (CR 202.3);
+  payability advertisement does a per-color-pair union-capacity check so
+  OR-duals stop being double-counted; the pool no longer accumulates spent
+  payment mana, and genuinely-floating mana is actually spendable.
+- **Rules**: planeswalker damage deducts loyalty (CR 306.8); commanders
+  destroyed by the single-target `destroy` action go to the command zone
+  (CR 903.9a); Yorion's return is a delayed end-step trigger (CR 603.7);
+  cascade only fires from real keyword lines (grant clauses like Yidris no
+  longer self-cascade); a permanent's own "whenever you sacrifice" sees its
+  own sacrifice; unhandled dies-triggers queue for Tier 3 instead of being
+  dropped at five call sites; generic ETB patterns no longer match
+  activated-ability text; draw-from-empty-library WIN replacement
+  (CR 614.12) implemented.
+- **Wiring**: `game._rules_engine` is stamped at game creation — it had
+  only ever been assigned in tests, so the spell-damage SBA routing and the
+  Phyrexian Tower dies dispatch were dead in production.
+- **Infra**: `mtg/helpers.py:response_text()` at all response-parse sites
+  (thinking-block-safe), swap-depth refcount on the shared-client restore
+  under parallel batches, adaptive strategist degrade after repeated
+  deadman fires.
+
+**Template migration (the contribution path)**: 159 fixed templates now
+live in `data/card_templates.json` (144 etb / 6 dies / 9 attack). Adding a
+simple card is a JSON entry, not Python. The loader is strict — schema
+errors and Python/JSON key collisions raise at import, so every pytest run
+is the schema check.
+
+**Pub/sub**: slice 2 (`PERMANENT_ENTERED`) and slice 2b are live — the
+creature-enters and enchantment-enters watcher scans are now bus
+subscribers rather than ~12 hand-wired call sites; slice 3a
+(`CREATURE_DIED`) is in shadow mode behind a `queue_death` choke-point.
+Plan in `mtg/events.py`.
+
+**Fork-side fixes found during the sync** (not upstream ports):
+- 17 matrix matchups referenced a `mythic` deck that was never ported at
+  fork time — they would have failed at runtime. The two Daretti lists now
+  ship as `mythic_sanity.json` / `mythic_madness.json` with scrubbed names,
+  and every matrix reference resolves against the deck registry.
+- `test_aura_equipment_combo.json` carried Mana Crypt + Karakas (banned in
+  Commander, silently stripped at load) → Worn Powerstone + Secluded
+  Steppe.
+- `X-Title` was the scrub artifact `"the bot MTG Bot"` → `"Discord MTG Bot"`.
+
+**What stays different from upstream (by design):**
+- `bot.py` — fork-own (no distress/memory/tarot systems).
+- `rules/llm_adapter.py` — OpenRouter `HTTP-Referer` / `X-Title` point at
+  this repo.
+- Deck naming — `surrak`/`surrak_stompy` in place of the upstream persona
+  deck; `mythic_sanity` / `mythic_madness` in place of the personal ones.
+- Help text and code comments are genericized (`@Player`, "the player").
+- `rules/tarot_visuals.py` and its test class are upstream-only.
+- Suite is 452 vs upstream 453 — the difference is that tarot test.

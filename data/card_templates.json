@@ -1,0 +1,2451 @@
+{
+  "_comment": [
+    "Tier 1.5 FIXED card templates (refactor #2 second half, July 20 2026).",
+    "One entry per registry key; $controller/$opponent are substituted",
+    "into every string at resolution time. Adding a simple card = adding",
+    "an entry here. Schema is enforced by",
+    "rules/effect_templates.py:_load_json_templates (raises on any pytest",
+    "run) and card names by tools/validate_card_names.py in CI.",
+    "Generator-style templates (context reads, branching) stay in",
+    "rules/effect_templates.py."
+  ],
+  "templates": [
+    {
+      "key": "armored skyhunter",
+      "name": "Armored Skyhunter (attack)",
+      "event": "attack",
+      "description": "Look at top 6 cards, put an Aura or Equipment onto the battlefield",
+      "actions": [
+        {
+          "action": "no_action",
+          "reason": "$controller looks at top 6 cards for Aura/Equipment (autoplay: no equipment found)"
+        }
+      ]
+    },
+    {
+      "key": "brago, king eternal",
+      "name": "Brago, King Eternal (combat damage)",
+      "event": "attack",
+      "description": "Exile any number of target nonland permanents you control, return them",
+      "actions": [
+        {
+          "action": "mass_flicker",
+          "player": "$controller",
+          "filter": "nonland",
+          "reason": "Brago, King Eternal blinks nonland permanents"
+        }
+      ]
+    },
+    {
+      "key": "cavalry pegasus",
+      "name": "Cavalry Pegasus (attack)",
+      "event": "attack",
+      "description": "Each attacking Knight and each other attacking Pegasus gain flying until end of turn",
+      "actions": [
+        {
+          "action": "grant_keywords",
+          "player": "$controller",
+          "keywords": [
+            "Flying"
+          ],
+          "duration": "end_of_turn",
+          "filter": "attacking_knights_and_other_pegasi",
+          "reason": "Cavalry Pegasus grants flying to attacking Knights and other attacking Pegasi"
+        }
+      ]
+    },
+    {
+      "key": "etali, primal storm",
+      "name": "Etali, Primal Storm",
+      "event": "attack",
+      "description": "Whenever Etali attacks, exile top card of each library and cast nonlands for free",
+      "actions": [
+        {
+          "action": "etali_trigger",
+          "player": "$controller",
+          "reason": "Exile top of each library, may cast nonland cards without paying mana costs"
+        }
+      ]
+    },
+    {
+      "key": "goblin rabblemaster",
+      "name": "Goblin Rabblemaster (attack)",
+      "event": "attack",
+      "description": "Create a 1/1 red Goblin tapped attacking; other Goblins get +1/+1 until EOT",
+      "actions": [
+        {
+          "action": "create_token",
+          "player": "$controller",
+          "name": "Goblin",
+          "power": 1,
+          "toughness": 1,
+          "types": "Creature â€” Goblin",
+          "count": 1,
+          "tapped": true,
+          "attacking": true,
+          "colors": [
+            "R"
+          ],
+          "attacking_player": "$opponent"
+        },
+        {
+          "action": "pump_all_creatures",
+          "player": "$controller",
+          "subtype": "Goblin",
+          "exclude": "Goblin Rabblemaster",
+          "power": 1,
+          "toughness": 1,
+          "source": "Goblin Rabblemaster attack anthem"
+        }
+      ]
+    },
+    {
+      "key": "grave titan",
+      "name": "Grave Titan (attack)",
+      "event": "attack",
+      "description": "Whenever Grave Titan attacks, create two 2/2 black Zombie tokens",
+      "actions": [
+        {
+          "action": "create_token",
+          "player": "$controller",
+          "name": "Zombie",
+          "power": 2,
+          "toughness": 2,
+          "types": "Creature â€” Zombie",
+          "count": 2
+        }
+      ]
+    },
+    {
+      "key": "jorn, god of winter",
+      "name": "Jorn, God of Winter (attack)",
+      "event": "attack",
+      "description": "Whenever Jorn attacks, untap each snow permanent you control",
+      "actions": [
+        {
+          "action": "untap_lands",
+          "player": "$controller",
+          "count": 99,
+          "include_nonlands": true,
+          "filter_supertype": "snow",
+          "reason": "Jorn attack: untap each snow permanent you control"
+        }
+      ]
+    },
+    {
+      "key": "kogla, the titan ape",
+      "name": "Kogla, the Titan Ape (attack)",
+      "event": "attack",
+      "description": "Destroy target artifact or enchantment defending player controls",
+      "actions": [
+        {
+          "action": "destroy",
+          "card": "BEST_ARTIFACT_OR_ENCHANTMENT",
+          "target_controller": "$opponent"
+        }
+      ],
+      "needs_target": true
+    },
+    {
+      "key": "lightning reaver",
+      "name": "Lightning Reaver (combat damage)",
+      "event": "attack",
+      "description": "Whenever this creature deals combat damage to a player, put a charge counter on it",
+      "actions": [
+        {
+          "action": "add_counters",
+          "card": "Lightning Reaver",
+          "counter_type": "charge",
+          "amount": 1
+        }
+      ]
+    },
+    {
+      "key": "geralf's messenger",
+      "name": "Geralf's Messenger",
+      "event": "dies",
+      "description": "Undying handled by SBA engine; ETB drain does not re-fire on death",
+      "actions": [
+        {
+          "action": "no_action",
+          "reason": "Undying is handled mechanically by the SBA engine"
+        }
+      ]
+    },
+    {
+      "key": "meren of clan nel toth",
+      "name": "Meren of Clan Nel Toth (dies guard)",
+      "event": "dies",
+      "description": "Experience counter tracked by the engine; the graveyard return fires at end step only",
+      "actions": [
+        {
+          "action": "no_action",
+          "reason": "Meren: experience counter tracked by engine; return resolves at end step"
+        }
+      ]
+    },
+    {
+      "key": "midnight reaper",
+      "name": "Midnight Reaper",
+      "event": "dies",
+      "description": "Whenever a nontoken creature you control dies, Midnight Reaper deals 1 damage to you and you draw a card",
+      "actions": [
+        {
+          "action": "draw_cards",
+          "player": "$controller",
+          "amount": 1
+        },
+        {
+          "action": "lose_life",
+          "player": "$controller",
+          "amount": 1,
+          "source": "Midnight Reaper"
+        }
+      ]
+    },
+    {
+      "key": "pattern of rebirth",
+      "name": "Pattern of Rebirth",
+      "event": "dies",
+      "description": "When enchanted creature dies, search library for a creature, put it onto the battlefield",
+      "actions": [
+        {
+          "action": "search_library",
+          "player": "$controller",
+          "card_type": "Creature",
+          "to_zone": "battlefield",
+          "count": 1,
+          "reason": "Pattern of Rebirth: enchanted creature died, tutor any creature"
+        }
+      ]
+    },
+    {
+      "key": "protean hulk",
+      "name": "Protean Hulk",
+      "event": "dies",
+      "description": "When Protean Hulk dies, search library for creatures with total MV â‰¤ 6, put them onto the battlefield",
+      "actions": [
+        {
+          "action": "search_library",
+          "player": "$controller",
+          "card_type": "Creature",
+          "max_mv": 6,
+          "to_zone": "battlefield",
+          "count": 1,
+          "reason": "Protean Hulk: tutor creature(s) totaling MV<=6"
+        }
+      ]
+    },
+    {
+      "key": "solemn simulacrum",
+      "name": "Solemn Simulacrum",
+      "event": "dies",
+      "description": "When Solemn Simulacrum dies, draw a card",
+      "actions": [
+        {
+          "action": "draw_cards",
+          "player": "$controller",
+          "amount": 1
+        }
+      ]
+    },
+    {
+      "key": "altar of the brood",
+      "name": "Altar of the Brood",
+      "event": "etb",
+      "description": "Each opponent mills 1 card",
+      "actions": [
+        {
+          "action": "mill",
+          "player": "$opponent",
+          "amount": 1
+        }
+      ]
+    },
+    {
+      "key": "archon of sun's grace",
+      "name": "Archon of Sun's Grace",
+      "event": "etb",
+      "description": "Create a 1/1 white/black Spirit with flying when an enchantment enters",
+      "actions": [
+        {
+          "action": "create_token",
+          "player": "$controller",
+          "name": "Spirit",
+          "power": 1,
+          "toughness": 1,
+          "types": "Creature â€” Spirit",
+          "count": 1,
+          "keywords": [
+            "Flying"
+          ]
+        }
+      ]
+    },
+    {
+      "key": "aurelia, the warleader",
+      "name": "Aurelia, the Warleader",
+      "event": "etb",
+      "description": "First attack each turn: untap all creatures, get extra combat + main phase",
+      "actions": [
+        {
+          "action": "no_action",
+          "reason": "Aurelia: extra combat phase! Untap all creatures, additional combat + main (use !fix)"
+        }
+      ]
+    },
+    {
+      "key": "azcanta, the sunken ruin",
+      "name": "Azcanta, the Sunken Ruin",
+      "event": "etb",
+      "description": "Activated: look at top 4, may put instant/sorcery/land in hand, rest on bottom",
+      "actions": [
+        {
+          "action": "no_action",
+          "reason": "Azcanta, the Sunken Ruin: look at top 4, put instant/sorcery/land in hand â€” library order not tracked"
+        }
+      ]
+    },
+    {
+      "key": "batterskull",
+      "name": "Batterskull",
+      "event": "etb",
+      "description": "Living weapon: create a 0/0 black Germ creature token, attach Batterskull to it",
+      "actions": [
+        {
+          "action": "create_token",
+          "player": "$controller",
+          "name": "Germ",
+          "power": 0,
+          "toughness": 0,
+          "types": "Creature â€” Germ",
+          "count": 1
+        },
+        {
+          "action": "no_action",
+          "reason": "Living weapon: Batterskull should attach to the Germ (use !equip)"
+        }
+      ]
+    },
+    {
+      "key": "beastmaster ascension",
+      "name": "Beastmaster Ascension",
+      "event": "etb",
+      "description": "Add a quest counter on attack (silent)",
+      "actions": [
+        {
+          "action": "add_counters",
+          "card": "Beastmaster Ascension",
+          "counter_type": "quest",
+          "amount": 1,
+          "_silent": true
+        }
+      ]
+    },
+    {
+      "key": "bitterblossom",
+      "name": "Bitterblossom",
+      "event": "etb",
+      "description": "At the beginning of your upkeep, lose 1 life and create a 1/1 Faerie Rogue token with flying",
+      "actions": [
+        {
+          "action": "lose_life",
+          "player": "$controller",
+          "amount": 1
+        },
+        {
+          "action": "create_token",
+          "player": "$controller",
+          "name": "Faerie Rogue",
+          "power": 1,
+          "toughness": 1,
+          "types": "Creature â€” Faerie Rogue",
+          "count": 1,
+          "keywords": "Flying",
+          "colors": "B"
+        }
+      ]
+    },
+    {
+      "key": "blood on the snow",
+      "name": "Blood on the Snow",
+      "event": "etb",
+      "description": "Destroy creatures/planeswalkers with MV â‰¤ X; snow kicker: reanimate one with MV â‰¤ X",
+      "actions": [
+        {
+          "action": "no_action",
+          "reason": "Blood on the Snow: destroy-by-mana-value action not supported by engine (X-cost wipe + snow reanimate kicker)"
+        }
+      ]
+    },
+    {
+      "key": "bogardan hellkite",
+      "name": "Bogardan Hellkite",
+      "event": "etb",
+      "description": "Deal 5 damage divided among targets",
+      "actions": [
+        {
+          "action": "deal_damage",
+          "amount": 5,
+          "target_player": "$opponent"
+        }
+      ]
+    },
+    {
+      "key": "brainstorm",
+      "name": "Brainstorm",
+      "event": "etb",
+      "description": "Draw 3 cards, put 2 back on top of library",
+      "actions": [
+        {
+          "action": "draw_cards",
+          "player": "$controller",
+          "amount": 3
+        },
+        {
+          "action": "put_back_from_hand",
+          "player": "$controller",
+          "count": 2,
+          "reason": "Brainstorm: put 2 cards from hand on top of library"
+        }
+      ]
+    },
+    {
+      "key": "buried alive",
+      "name": "Buried Alive",
+      "event": "etb",
+      "description": "Search library for up to 3 creature cards, put into graveyard",
+      "actions": [
+        {
+          "action": "search_library_to_graveyard",
+          "player": "$controller",
+          "count": 3,
+          "card_type": "creature",
+          "reason": "Buried Alive: put 3 creatures from library into graveyard"
+        }
+      ]
+    },
+    {
+      "key": "cast off",
+      "name": "Cast Off",
+      "event": "etb",
+      "description": "Destroy all non-Giant creatures",
+      "actions": [
+        {
+          "action": "destroy_all_creatures",
+          "exclude_types": [
+            "Giant"
+          ],
+          "reason": "Cast Off: destroy all non-Giant creatures"
+        }
+      ]
+    },
+    {
+      "key": "cathartic reunion",
+      "name": "Cathartic Reunion",
+      "event": "etb",
+      "description": "Discard 2 cards, draw 3 cards",
+      "actions": [
+        {
+          "action": "discard",
+          "player": "$controller",
+          "card": "random"
+        },
+        {
+          "action": "discard",
+          "player": "$controller",
+          "card": "random"
+        },
+        {
+          "action": "draw_cards",
+          "player": "$controller",
+          "amount": 3
+        }
+      ]
+    },
+    {
+      "key": "courser of kruphix",
+      "name": "Courser of Kruphix",
+      "event": "etb",
+      "description": "Landfall: gain 1 life when a land enters",
+      "actions": [
+        {
+          "action": "gain_life",
+          "player": "$controller",
+          "amount": 1
+        }
+      ]
+    },
+    {
+      "key": "cryptic command",
+      "name": "Cryptic Command",
+      "event": "etb",
+      "description": "Choose two: counter / bounce / tap all / draw. Default: counter + draw.",
+      "actions": [
+        {
+          "action": "counter_spell",
+          "player": "$controller",
+          "target": "stack_top"
+        },
+        {
+          "action": "draw_cards",
+          "player": "$controller",
+          "amount": 1
+        }
+      ]
+    },
+    {
+      "key": "decree of pain",
+      "name": "Decree of Pain",
+      "event": "etb",
+      "description": "Destroy all creatures; they cannot be regenerated. Draw a card for each creature destroyed this way",
+      "actions": [
+        {
+          "action": "destroy_all_creatures",
+          "draw_per_destroyed": "$controller"
+        }
+      ]
+    },
+    {
+      "key": "delay",
+      "name": "Delay",
+      "event": "etb",
+      "description": "Counter target spell; exile it with three time counters (suspended)",
+      "actions": [
+        {
+          "action": "counter_spell",
+          "player": "$controller",
+          "target": "stack_top",
+          "countered_to": "exile_suspend"
+        }
+      ]
+    },
+    {
+      "key": "demon's disciple",
+      "name": "Demon's Disciple",
+      "event": "etb",
+      "description": "Each player sacrifices a creature or planeswalker",
+      "actions": [
+        {
+          "action": "edict_sacrifice",
+          "types": "creature_or_planeswalker"
+        }
+      ]
+    },
+    {
+      "key": "demonic tutor",
+      "name": "Demonic Tutor",
+      "event": "etb",
+      "description": "Search library for any card, put into hand",
+      "actions": [
+        {
+          "action": "search_library",
+          "player": "$controller",
+          "card_type": "Any",
+          "to_zone": "hand"
+        }
+      ]
+    },
+    {
+      "key": "detention sphere ltb",
+      "name": "Detention Sphere",
+      "event": "etb",
+      "description": "When Detention Sphere leaves the battlefield, return the exiled cards to the battlefield",
+      "actions": [
+        {
+          "action": "no_action",
+          "reason": "Detention Sphere LTB: exiled cards return (tracked by exile association)"
+        }
+      ]
+    },
+    {
+      "key": "dig through time",
+      "name": "Dig Through Time",
+      "event": "etb",
+      "description": "Look at top seven, put two into hand (simplified as draw 2)",
+      "actions": [
+        {
+          "action": "draw_cards",
+          "player": "$controller",
+          "amount": 2
+        }
+      ]
+    },
+    {
+      "key": "dispel",
+      "name": "Dispel",
+      "event": "etb",
+      "description": "Counter target instant spell",
+      "actions": [
+        {
+          "action": "counter_spell",
+          "player": "$controller",
+          "target": "stack_top"
+        }
+      ]
+    },
+    {
+      "key": "divination",
+      "name": "Divination",
+      "event": "etb",
+      "description": "Draw two cards",
+      "actions": [
+        {
+          "action": "draw_cards",
+          "player": "$controller",
+          "amount": 2
+        }
+      ]
+    },
+    {
+      "key": "draconic destiny",
+      "name": "Draconic Destiny",
+      "event": "etb",
+      "description": "Static +3/+3 aura â€” handled via layers, not an ETB action",
+      "actions": [
+        {
+          "action": "no_action",
+          "reason": "Draconic Destiny: static pump handled by layers engine"
+        }
+      ]
+    },
+    {
+      "key": "dramatic reversal",
+      "name": "Dramatic Reversal",
+      "event": "etb",
+      "description": "Untap all nonland permanents you control",
+      "actions": [
+        {
+          "action": "untap_lands",
+          "player": "$controller",
+          "include_nonlands": true,
+          "exclude_lands": true,
+          "reason": "Dramatic Reversal untaps nonlands"
+        }
+      ]
+    },
+    {
+      "key": "dusk",
+      "name": "Dusk",
+      "event": "etb",
+      "description": "Destroy all creatures with power 3 or greater",
+      "actions": [
+        {
+          "action": "destroy_by_power",
+          "min_power": 3
+        }
+      ]
+    },
+    {
+      "key": "dusk // dawn",
+      "name": "Dusk // Dawn",
+      "event": "etb",
+      "description": "Destroy all creatures with power 3 or greater",
+      "actions": [
+        {
+          "action": "destroy_by_power",
+          "min_power": 3
+        }
+      ]
+    },
+    {
+      "key": "duskwatch recruiter",
+      "name": "Duskwatch Recruiter",
+      "event": "etb",
+      "description": "At the beginning of each upkeep, if no spells were cast last turn, transform",
+      "actions": [
+        {
+          "action": "no_action",
+          "reason": "Duskwatch Recruiter: day/night transform â€” check if no spells were cast last turn to transform into Krallenhorde Howler (use !fix transform if needed)"
+        }
+      ]
+    },
+    {
+      "key": "eidolon of blossoms",
+      "name": "Eidolon of Blossoms",
+      "event": "etb",
+      "description": "Constellation: Whenever Eidolon of Blossoms or another enchantment enters under your control, draw a card",
+      "actions": [
+        {
+          "action": "draw_cards",
+          "player": "$controller",
+          "amount": 1
+        }
+      ]
+    },
+    {
+      "key": "eladamri's call",
+      "name": "Eladamri's Call",
+      "event": "etb",
+      "description": "Search library for a creature card, put into hand",
+      "actions": [
+        {
+          "action": "search_library",
+          "player": "$controller",
+          "card_type": "Creature",
+          "to_zone": "hand"
+        }
+      ]
+    },
+    {
+      "key": "enlightened tutor",
+      "name": "Enlightened Tutor",
+      "event": "etb",
+      "description": "Search library for an artifact or enchantment card, put on top",
+      "actions": [
+        {
+          "action": "search_library",
+          "player": "$controller",
+          "card_type": "Artifact or Enchantment",
+          "to_zone": "library_top"
+        }
+      ]
+    },
+    {
+      "key": "entomb",
+      "name": "Entomb",
+      "event": "etb",
+      "description": "Search library for a card and put it into your graveyard",
+      "actions": [
+        {
+          "action": "search_library",
+          "player": "$controller",
+          "card_type": "Any",
+          "to_zone": "graveyard"
+        }
+      ]
+    },
+    {
+      "key": "fact or fiction",
+      "name": "Fact or Fiction",
+      "event": "etb",
+      "description": "Reveal top 5, split into piles (simplified: draw 3, mill 2)",
+      "actions": [
+        {
+          "action": "draw_cards",
+          "player": "$controller",
+          "amount": 3
+        },
+        {
+          "action": "mill",
+          "player": "$controller",
+          "amount": 2
+        }
+      ]
+    },
+    {
+      "key": "faithless looting",
+      "name": "Faithless Looting",
+      "event": "etb",
+      "description": "Draw 2, then discard 2",
+      "actions": [
+        {
+          "action": "draw_cards",
+          "player": "$controller",
+          "amount": 2
+        },
+        {
+          "action": "discard",
+          "player": "$controller",
+          "card": "random"
+        },
+        {
+          "action": "discard",
+          "player": "$controller",
+          "card": "random"
+        }
+      ]
+    },
+    {
+      "key": "fertile footsteps",
+      "name": "Fertile Footsteps",
+      "event": "etb",
+      "description": "Search library for a basic land card and put it onto the battlefield",
+      "actions": [
+        {
+          "action": "search_library_land",
+          "player": "$controller",
+          "basic_only": true
+        }
+      ]
+    },
+    {
+      "key": "flame rift",
+      "name": "Flame Rift",
+      "event": "etb",
+      "description": "Flame Rift deals 4 damage to each player",
+      "actions": [
+        {
+          "action": "deal_damage",
+          "amount": 4,
+          "target_player": "$controller"
+        },
+        {
+          "action": "deal_damage",
+          "amount": 4,
+          "target_player": "$opponent"
+        }
+      ]
+    },
+    {
+      "key": "flawless maneuver",
+      "name": "Flawless Maneuver",
+      "event": "etb",
+      "description": "Creatures you control gain indestructible until end of turn",
+      "actions": [
+        {
+          "action": "grant_keywords",
+          "player": "$controller",
+          "keywords": [
+            "Indestructible"
+          ],
+          "target": "all_own_creatures"
+        }
+      ]
+    },
+    {
+      "key": "geralf's messenger",
+      "name": "Geralf's Messenger",
+      "event": "etb",
+      "description": "ETB: target opponent loses 2 life (undying still SBA-handled)",
+      "actions": [
+        {
+          "action": "lose_life",
+          "player": "$opponent",
+          "amount": 2
+        }
+      ]
+    },
+    {
+      "key": "gitaxian probe",
+      "name": "Gitaxian Probe",
+      "event": "etb",
+      "description": "Target player reveals their hand. Draw a card.",
+      "actions": [
+        {
+          "action": "draw_cards",
+          "player": "$controller",
+          "amount": 1
+        }
+      ]
+    },
+    {
+      "key": "glacial chasm",
+      "name": "Glacial Chasm",
+      "event": "etb",
+      "description": "When Glacial Chasm enters, sacrifice a land",
+      "actions": [
+        {
+          "action": "sacrifice_land",
+          "player": "$controller"
+        }
+      ]
+    },
+    {
+      "key": "goblin chainwhirler",
+      "name": "Goblin Chainwhirler",
+      "event": "etb",
+      "description": "When Goblin Chainwhirler enters, it deals 1 damage to each opponent and each creature and planeswalker they control",
+      "actions": [
+        {
+          "action": "deal_damage",
+          "amount": 1,
+          "target_player": "$opponent"
+        }
+      ]
+    },
+    {
+      "key": "goldspan dragon",
+      "name": "Goldspan Dragon",
+      "event": "etb",
+      "description": "Whenever Goldspan Dragon attacks, create a Treasure token",
+      "actions": [
+        {
+          "action": "create_token",
+          "player": "$controller",
+          "name": "Treasure",
+          "power": 0,
+          "toughness": 0,
+          "types": "Artifact â€” Treasure",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "key": "granted",
+      "name": "Granted",
+      "event": "etb",
+      "description": "Wishboard fetch (not modeled â€” sideboard not tracked)",
+      "actions": [
+        {
+          "action": "no_action",
+          "reason": "Granted: wishboard not modeled"
+        }
+      ]
+    },
+    {
+      "key": "gravebreaker lamia",
+      "name": "Gravebreaker Lamia",
+      "event": "etb",
+      "description": "When Gravebreaker Lamia enters, search library for a creature card, put it into your graveyard, then shuffle",
+      "actions": [
+        {
+          "action": "search_library",
+          "player": "$controller",
+          "filter_type": "creature",
+          "to_zone": "graveyard",
+          "count": 1,
+          "shuffle": true
+        }
+      ]
+    },
+    {
+      "key": "halimar depths",
+      "name": "Halimar Depths",
+      "event": "etb",
+      "description": "Look at the top 3 cards of your library, put them back in any order (scry 3)",
+      "actions": [
+        {
+          "action": "scry",
+          "player": "$controller",
+          "amount": 3
+        }
+      ]
+    },
+    {
+      "key": "hallowed burial",
+      "name": "Hallowed Burial",
+      "event": "etb",
+      "description": "Put all creatures on the bottom of their owners' libraries",
+      "actions": [
+        {
+          "action": "tuck_all_creatures"
+        }
+      ]
+    },
+    {
+      "key": "harmonize",
+      "name": "Harmonize",
+      "event": "etb",
+      "description": "Draw three cards",
+      "actions": [
+        {
+          "action": "draw_cards",
+          "player": "$controller",
+          "amount": 3
+        }
+      ]
+    },
+    {
+      "key": "heart's desire",
+      "name": "Heart's Desire",
+      "event": "etb",
+      "description": "Create a 1/1 white Human creature token named Heart's Desire",
+      "actions": [
+        {
+          "action": "create_token",
+          "player": "$controller",
+          "name": "Heart's Desire",
+          "power": 1,
+          "toughness": 1,
+          "types": "Creature â€” Human",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "key": "hellkite courser",
+      "name": "Hellkite Courser",
+      "event": "etb",
+      "description": "ETB: put a commander from the command zone onto the battlefield (returns at end step)",
+      "actions": [
+        {
+          "action": "no_action",
+          "reason": "Hellkite Courser: command zone â†’ battlefield not modeled; commander stays in command zone"
+        }
+      ]
+    },
+    {
+      "key": "helm of the host",
+      "name": "Helm of the Host",
+      "event": "etb",
+      "description": "At the beginning of combat, create a token copy of equipped creature",
+      "actions": [
+        {
+          "action": "create_copy_token",
+          "player": "$controller",
+          "target": "best_creature",
+          "filter": "own",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "key": "heroic intervention",
+      "name": "Heroic Intervention",
+      "event": "etb",
+      "description": "Your permanents gain hexproof and indestructible until end of turn",
+      "actions": [
+        {
+          "action": "grant_keywords",
+          "player": "$controller",
+          "keywords": [
+            "Hexproof",
+            "Indestructible"
+          ],
+          "target": "all_own_permanents"
+        }
+      ]
+    },
+    {
+      "key": "icebreaker kraken",
+      "name": "Icebreaker Kraken",
+      "event": "etb",
+      "description": "Tap each artifact and creature target opponent controls â€” they don't untap next turn",
+      "actions": [
+        {
+          "action": "tap",
+          "scope": "creatures_and_artifacts",
+          "target_player": "$opponent",
+          "skip_next_untap": true,
+          "source": "Icebreaker Kraken"
+        }
+      ]
+    },
+    {
+      "key": "idyllic tutor",
+      "name": "Idyllic Tutor",
+      "event": "etb",
+      "description": "Search library for an enchantment card, put into hand",
+      "actions": [
+        {
+          "action": "search_library",
+          "player": "$controller",
+          "card_type": "Enchantment",
+          "to_zone": "hand"
+        }
+      ]
+    },
+    {
+      "key": "isochron scepter",
+      "name": "Isochron Scepter",
+      "event": "etb",
+      "description": "Imprint an instant card with mana value 2 or less from hand",
+      "actions": [
+        {
+          "action": "imprint_isochron",
+          "player": "$controller",
+          "source": "Isochron Scepter"
+        }
+      ]
+    },
+    {
+      "key": "jarad's orders",
+      "name": "Jarad's Orders",
+      "event": "etb",
+      "description": "Search library for two creature cards: one to hand, one to graveyard, shuffle",
+      "actions": [
+        {
+          "action": "search_library",
+          "player": "$controller",
+          "filter_type": "creature",
+          "to_zone": "hand",
+          "count": 1,
+          "shuffle": false
+        },
+        {
+          "action": "search_library",
+          "player": "$controller",
+          "filter_type": "creature",
+          "to_zone": "graveyard",
+          "count": 1,
+          "shuffle": true
+        }
+      ]
+    },
+    {
+      "key": "kambal, consul of allocation",
+      "name": "Kambal, Consul of Allocation",
+      "event": "etb",
+      "description": "Whenever an opponent casts a noncreature spell, that player loses 2 life and you gain 2 life",
+      "actions": [
+        {
+          "action": "lose_life",
+          "player": "$opponent",
+          "amount": 2
+        },
+        {
+          "action": "gain_life",
+          "player": "$controller",
+          "amount": 2
+        }
+      ]
+    },
+    {
+      "key": "koma, cosmos serpent",
+      "name": "Koma, Cosmos Serpent",
+      "event": "etb",
+      "description": "At the beginning of each upkeep, create a 3/3 blue Serpent token named Koma's Coil",
+      "actions": [
+        {
+          "action": "create_token",
+          "player": "$controller",
+          "name": "Koma's Coil",
+          "power": 3,
+          "toughness": 3,
+          "types": "Creature â€” Serpent",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "key": "korvold, fae-cursed king",
+      "name": "Korvold, Fae-Cursed King",
+      "event": "etb",
+      "description": "When Korvold enters or attacks, sacrifice another permanent",
+      "actions": [
+        {
+          "action": "sacrifice_permanent",
+          "player": "$controller",
+          "exclude": "Korvold, Fae-Cursed King",
+          "reason": "Korvold, Fae-Cursed King: sacrifice another permanent"
+        }
+      ]
+    },
+    {
+      "key": "korvold, fae-cursed king sacrifice",
+      "name": "Korvold Sacrifice Trigger",
+      "event": "etb",
+      "description": "Whenever you sacrifice a permanent, put a +1/+1 counter on Korvold and draw a card",
+      "actions": [
+        {
+          "action": "add_counters",
+          "card": "Korvold, Fae-Cursed King",
+          "counter_type": "+1/+1",
+          "amount": 1
+        },
+        {
+          "action": "draw_cards",
+          "player": "$controller",
+          "amount": 1
+        }
+      ]
+    },
+    {
+      "key": "krallenhorde howler",
+      "name": "Krallenhorde Howler",
+      "event": "etb",
+      "description": "At the beginning of each upkeep, if a player cast two or more spells last turn, transform",
+      "actions": [
+        {
+          "action": "no_action",
+          "reason": "Krallenhorde Howler: day/night transform â€” check if 2+ spells were cast last turn to transform back into Duskwatch Recruiter (use !fix transform if needed)"
+        }
+      ]
+    },
+    {
+      "key": "lambholt butcher",
+      "name": "Lambholt Butcher",
+      "event": "etb",
+      "description": "At the beginning of each upkeep, if a player cast two or more spells last turn, transform",
+      "actions": [
+        {
+          "action": "no_action",
+          "reason": "Lambholt Butcher: day/night transform â€” check if 2+ spells were cast last turn to transform back into Lambholt Pacifist (use !fix transform if needed)"
+        }
+      ]
+    },
+    {
+      "key": "lambholt pacifist",
+      "name": "Lambholt Pacifist",
+      "event": "etb",
+      "description": "At the beginning of each upkeep, if no spells were cast last turn, transform",
+      "actions": [
+        {
+          "action": "no_action",
+          "reason": "Lambholt Pacifist: day/night transform â€” check if no spells were cast last turn to transform into Lambholt Butcher (use !fix transform if needed)"
+        }
+      ]
+    },
+    {
+      "key": "leyline of anticipation",
+      "name": "Leyline of Anticipation",
+      "event": "etb",
+      "description": "You may cast spells as though they had flash (static; not yet wired into cast-timing check)",
+      "actions": [
+        {
+          "action": "no_action",
+          "reason": "Leyline of Anticipation: cast-as-flash flag not yet wired; spells still cast at sorcery speed"
+        }
+      ]
+    },
+    {
+      "key": "light up the stage",
+      "name": "Light Up the Stage",
+      "event": "etb",
+      "description": "Exile top 2 of library, play until end of next turn (approx as draw 2)",
+      "actions": [
+        {
+          "action": "draw_cards",
+          "player": "$controller",
+          "amount": 2,
+          "reason": "[TEMPLATE-APPROX] Light Up the Stage: approximated exile-to-play as draw 2"
+        }
+      ]
+    },
+    {
+      "key": "lingering souls",
+      "name": "Lingering Souls",
+      "event": "etb",
+      "description": "Create two 1/1 white Spirit creature tokens with flying",
+      "actions": [
+        {
+          "action": "create_token",
+          "player": "$controller",
+          "name": "Spirit",
+          "power": 1,
+          "toughness": 1,
+          "types": "Creature â€” Spirit",
+          "count": 2,
+          "keywords": "Flying",
+          "colors": "W"
+        }
+      ]
+    },
+    {
+      "key": "living death",
+      "name": "Living Death",
+      "event": "etb",
+      "description": "All players sacrifice all creatures, then return all creature cards from graveyards",
+      "actions": [
+        {
+          "action": "living_death",
+          "reason": "Living Death: swap battlefield creatures with graveyard creatures"
+        }
+      ]
+    },
+    {
+      "key": "living lands",
+      "name": "Living Lands",
+      "event": "etb",
+      "description": "Forests you control become 1/1 creatures while remaining lands",
+      "actions": [
+        {
+          "action": "animate_land",
+          "player": "$controller",
+          "scope": "all",
+          "power": 1,
+          "toughness": 1
+        }
+      ]
+    },
+    {
+      "key": "long-term plans",
+      "name": "Long-Term Plans",
+      "event": "etb",
+      "description": "Search library for a card, shuffle, place third from top (approximated as tutor-to-hand)",
+      "actions": [
+        {
+          "action": "search_library",
+          "player": "$controller",
+          "count": 1,
+          "reason": "Long-Term Plans (third-from-top approximated as tutor-to-hand)"
+        }
+      ]
+    },
+    {
+      "key": "maja, bretagard protector",
+      "name": "Maja, Bretagard Protector",
+      "event": "etb",
+      "description": "Landfall: create a 1/1 white Human Warrior token",
+      "actions": [
+        {
+          "action": "create_token",
+          "player": "$controller",
+          "name": "Human Warrior",
+          "power": 1,
+          "toughness": 1,
+          "types": "Creature â€” Human Warrior",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "key": "memory lapse",
+      "name": "Memory Lapse",
+      "event": "etb",
+      "description": "Counter target spell; put it on top of its owner's library",
+      "actions": [
+        {
+          "action": "counter_spell",
+          "player": "$controller",
+          "target": "stack_top",
+          "countered_to": "library_top"
+        }
+      ]
+    },
+    {
+      "key": "mesmeric glare",
+      "name": "Mesmeric Glare",
+      "event": "etb",
+      "description": "Counter target spell with mana value 3 or less",
+      "actions": [
+        {
+          "action": "counter_spell",
+          "max_mv": 3,
+          "reason": "Mesmeric Glare: counter spell with MV â‰¤ 3"
+        }
+      ]
+    },
+    {
+      "key": "mirri's guile",
+      "name": "Mirri's Guile",
+      "event": "etb",
+      "description": "At beginning of upkeep, look at top 3 cards and reorder them for best draws",
+      "actions": [
+        {
+          "action": "reorder_library",
+          "player": "$controller",
+          "amount": 3
+        }
+      ]
+    },
+    {
+      "key": "mystical tutor",
+      "name": "Mystical Tutor",
+      "event": "etb",
+      "description": "Search library for an instant or sorcery card, put on top",
+      "actions": [
+        {
+          "action": "search_library",
+          "player": "$controller",
+          "card_type": "Instant or Sorcery",
+          "to_zone": "library_top"
+        }
+      ]
+    },
+    {
+      "key": "night of souls' betrayal",
+      "name": "Night of Souls' Betrayal",
+      "event": "etb",
+      "description": "Creatures get -1/-1 (static, handled by layers engine)",
+      "actions": [
+        {
+          "action": "no_action",
+          "reason": "Night of Souls' Betrayal: static -1/-1 to all creatures handled by layers engine"
+        }
+      ]
+    },
+    {
+      "key": "nightpack ambusher",
+      "name": "Nightpack Ambusher",
+      "event": "etb",
+      "description": "At end step, if you cast no spells this turn, create a 2/2 green Wolf token",
+      "actions": [
+        {
+          "action": "create_token",
+          "player": "$controller",
+          "name": "Wolf",
+          "power": 2,
+          "toughness": 2,
+          "types": "Creature â€” Wolf",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "key": "obscura storefront",
+      "name": "Obscura Storefront",
+      "event": "etb",
+      "description": "Sacrifice, search for basic Plains/Island/Swamp tapped, gain 1 life",
+      "actions": [
+        {
+          "action": "destroy",
+          "card": "Obscura Storefront"
+        },
+        {
+          "action": "search_library_land",
+          "player": "$controller",
+          "basic_only": true,
+          "enters_tapped": true
+        },
+        {
+          "action": "gain_life",
+          "player": "$controller",
+          "amount": 1
+        }
+      ]
+    },
+    {
+      "key": "omen of the sea",
+      "name": "Omen of the Sea",
+      "event": "etb",
+      "description": "When Omen of the Sea enters, scry 2, then draw a card",
+      "actions": [
+        {
+          "action": "scry",
+          "player": "$controller",
+          "amount": 2
+        },
+        {
+          "action": "draw_cards",
+          "player": "$controller",
+          "amount": 1
+        }
+      ]
+    },
+    {
+      "key": "on alert",
+      "name": "On Alert",
+      "event": "etb",
+      "description": "Up to two target Knights get +2/+1 until end of turn",
+      "actions": [
+        {
+          "action": "pump_all_creatures",
+          "player": "$controller",
+          "power": 2,
+          "toughness": 1,
+          "source": "On Alert"
+        }
+      ]
+    },
+    {
+      "key": "open the armory",
+      "name": "Open the Armory",
+      "event": "etb",
+      "description": "Search your library for an Aura or Equipment card, reveal it, put it into your hand, then shuffle",
+      "actions": [
+        {
+          "action": "search_library",
+          "player": "$controller",
+          "count": 1,
+          "card_type": "aura_or_equipment",
+          "reason": "Open the Armory: search for an Aura or Equipment"
+        }
+      ]
+    },
+    {
+      "key": "open the vaults",
+      "name": "Open the Vaults",
+      "event": "etb",
+      "description": "Return all artifact and enchantment cards from all graveyards to the battlefield under their owners' control",
+      "actions": [
+        {
+          "action": "open_the_vaults",
+          "player": "$controller",
+          "reason": "Open the Vaults: return all artifacts and enchantments from all graveyards"
+        }
+      ]
+    },
+    {
+      "key": "opt",
+      "name": "Opt",
+      "event": "etb",
+      "description": "Scry 1. Draw a card.",
+      "actions": [
+        {
+          "action": "scry",
+          "player": "$controller",
+          "amount": 1
+        },
+        {
+          "action": "draw_cards",
+          "player": "$controller",
+          "amount": 1
+        }
+      ]
+    },
+    {
+      "key": "pact of negation",
+      "name": "Pact of Negation",
+      "event": "etb",
+      "description": "Counter target spell. At next upkeep, pay {3}{U}{U} or lose the game.",
+      "actions": [
+        {
+          "action": "counter_spell",
+          "player": "$controller",
+          "target": "stack_top"
+        },
+        {
+          "action": "schedule_delayed_trigger",
+          "trigger_at": "upkeep",
+          "turn_delay": 0,
+          "upkeep_of": "$controller",
+          "actions": [
+            {
+              "action": "pay_or_lose",
+              "player": "$controller",
+              "cost": "{3}{U}{U}",
+              "source": "Pact of Negation",
+              "reason": "failed to pay Pact of Negation cost"
+            }
+          ],
+          "source": "Pact of Negation"
+        }
+      ]
+    },
+    {
+      "key": "past in flames",
+      "name": "Past in Flames",
+      "event": "etb",
+      "description": "Each instant/sorcery in your graveyard gains flashback until EOT",
+      "actions": [
+        {
+          "action": "grant_flashback",
+          "player": "$controller",
+          "source": "Past in Flames",
+          "reason": "Past in Flames: instants/sorceries gain flashback",
+          "grant_all": true,
+          "announce_empty": true
+        }
+      ]
+    },
+    {
+      "key": "peregrine drake",
+      "name": "Peregrine Drake",
+      "event": "etb",
+      "description": "Untap up to five lands",
+      "actions": [
+        {
+          "action": "untap_lands",
+          "player": "$controller",
+          "count": 5
+        }
+      ]
+    },
+    {
+      "key": "phyrexian arena",
+      "name": "Phyrexian Arena",
+      "event": "etb",
+      "description": "At the beginning of your upkeep, draw a card and lose 1 life",
+      "actions": [
+        {
+          "action": "draw_cards",
+          "player": "$controller",
+          "amount": 1
+        },
+        {
+          "action": "lose_life",
+          "player": "$controller",
+          "amount": 1
+        }
+      ]
+    },
+    {
+      "key": "plaguecrafter",
+      "name": "Plaguecrafter",
+      "event": "etb",
+      "description": "Each player sacrifices a creature or planeswalker. Can't? Discard.",
+      "actions": [
+        {
+          "action": "edict_sacrifice",
+          "types": "creature_or_planeswalker",
+          "fallback": "discard"
+        }
+      ]
+    },
+    {
+      "key": "ponder",
+      "name": "Ponder",
+      "event": "etb",
+      "description": "Look at top 3, reorder, may shuffle. Draw 1",
+      "actions": [
+        {
+          "action": "draw_cards",
+          "player": "$controller",
+          "amount": 1
+        }
+      ]
+    },
+    {
+      "key": "preordain",
+      "name": "Preordain",
+      "event": "etb",
+      "description": "Scry 2, then draw a card.",
+      "actions": [
+        {
+          "action": "scry",
+          "player": "$controller",
+          "amount": 2
+        },
+        {
+          "action": "draw_cards",
+          "player": "$controller",
+          "amount": 1
+        }
+      ]
+    },
+    {
+      "key": "primeval titan",
+      "name": "Primeval Titan",
+      "event": "etb",
+      "description": "Search library for two lands, put onto battlefield tapped",
+      "actions": [
+        {
+          "action": "no_action",
+          "reason": "$controller searches for 2 lands (use !fix to add them)"
+        }
+      ]
+    },
+    {
+      "key": "prismatic vista",
+      "name": "Prismatic Vista",
+      "event": "etb",
+      "description": "Pay 1 life, sacrifice: search for a basic land (untapped)",
+      "actions": [
+        {
+          "action": "lose_life",
+          "player": "$controller",
+          "amount": 1
+        },
+        {
+          "action": "search_library_land",
+          "player": "$controller",
+          "basic_only": true,
+          "enters_tapped": false
+        }
+      ]
+    },
+    {
+      "key": "ravager of the fells",
+      "name": "Ravager of the Fells",
+      "event": "etb",
+      "description": "When this transforms into Ravager of the Fells, create a 2/2 green Wolf creature token",
+      "actions": [
+        {
+          "action": "create_token",
+          "player": "$controller",
+          "name": "Wolf",
+          "power": 2,
+          "toughness": 2,
+          "types": "Creature â€” Wolf",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "key": "recruiter of the guard",
+      "name": "Recruiter of the Guard",
+      "event": "etb",
+      "description": "Search library for a creature with toughness 2 or less, put into hand",
+      "actions": [
+        {
+          "action": "search_library",
+          "player": "$controller",
+          "card_type": "Creature",
+          "max_toughness": 2,
+          "to_zone": "hand"
+        }
+      ]
+    },
+    {
+      "key": "replenish",
+      "name": "Replenish",
+      "event": "etb",
+      "description": "Return all enchantment cards from your graveyard to the battlefield",
+      "actions": [
+        {
+          "action": "replenish",
+          "player": "$controller",
+          "reason": "Replenish: return all enchantments from your graveyard"
+        }
+      ]
+    },
+    {
+      "key": "rest in peace",
+      "name": "Rest in Peace",
+      "event": "etb",
+      "description": "When Rest in Peace enters, exile all cards from all graveyards",
+      "actions": [
+        {
+          "action": "exile_all_graveyards"
+        }
+      ]
+    },
+    {
+      "key": "rise of the dark realms",
+      "name": "Rise of the Dark Realms",
+      "event": "etb",
+      "description": "Put all creature cards from all graveyards onto the battlefield under your control",
+      "actions": [
+        {
+          "action": "rise_of_dark_realms",
+          "player": "$controller",
+          "reason": "Rise of the Dark Realms: reanimate all creatures from all graveyards"
+        }
+      ]
+    },
+    {
+      "key": "rootborn defenses",
+      "name": "Rootborn Defenses",
+      "event": "etb",
+      "description": "Populate. Creatures you control gain indestructible until end of turn.",
+      "actions": [
+        {
+          "action": "populate",
+          "player": "$controller"
+        },
+        {
+          "action": "grant_keywords",
+          "player": "$controller",
+          "keywords": [
+            "Indestructible"
+          ],
+          "target": "all_own_creatures"
+        }
+      ]
+    },
+    {
+      "key": "satyr wayfinder",
+      "name": "Satyr Wayfinder",
+      "event": "etb",
+      "description": "Reveal top 4, put a land into hand, rest into graveyard (simplified as draw 1)",
+      "actions": [
+        {
+          "action": "draw_cards",
+          "player": "$controller",
+          "amount": 1
+        }
+      ]
+    },
+    {
+      "key": "scute swarm",
+      "name": "Scute Swarm",
+      "event": "etb",
+      "description": "Landfall: create a 1/1 green Insect creature token",
+      "actions": [
+        {
+          "action": "create_token",
+          "player": "$controller",
+          "name": "Insect",
+          "power": 1,
+          "toughness": 1,
+          "types": "Creature â€” Insect",
+          "count": 1,
+          "colors": "G"
+        }
+      ]
+    },
+    {
+      "key": "search for azcanta",
+      "name": "Search for Azcanta",
+      "event": "etb",
+      "description": "At beginning of upkeep, look at top card; reorder for best draw",
+      "actions": [
+        {
+          "action": "reorder_library",
+          "player": "$controller",
+          "amount": 1
+        }
+      ]
+    },
+    {
+      "key": "seasonal ritual",
+      "name": "Seasonal Ritual",
+      "event": "etb",
+      "description": "Add one mana of any color",
+      "actions": [
+        {
+          "action": "add_mana",
+          "player": "$controller",
+          "color": "G",
+          "amount": 1,
+          "reason": "Seasonal Ritual (default green; can be any color)"
+        }
+      ]
+    },
+    {
+      "key": "serum visions",
+      "name": "Serum Visions",
+      "event": "etb",
+      "description": "Draw a card, then scry 2.",
+      "actions": [
+        {
+          "action": "draw_cards",
+          "player": "$controller",
+          "amount": 1
+        },
+        {
+          "action": "scry",
+          "player": "$controller",
+          "amount": 2
+        }
+      ]
+    },
+    {
+      "key": "setessan champion",
+      "name": "Setessan Champion",
+      "event": "etb",
+      "description": "Constellation: Whenever an enchantment enters under your control, +1/+1 counter on Setessan Champion and draw a card",
+      "actions": [
+        {
+          "action": "add_counters",
+          "card": "Setessan Champion",
+          "counter_type": "+1/+1",
+          "amount": 1
+        },
+        {
+          "action": "draw_cards",
+          "player": "$controller",
+          "amount": 1
+        }
+      ]
+    },
+    {
+      "key": "settle the wreckage",
+      "name": "Settle the Wreckage",
+      "event": "etb",
+      "description": "Exile all attacking creatures. Controller searches for that many basics tapped.",
+      "actions": [
+        {
+          "action": "no_action",
+          "reason": "Settle the Wreckage: exile attacking creatures, search for basics tapped (complex)"
+        }
+      ]
+    },
+    {
+      "key": "single combat",
+      "name": "Single Combat",
+      "event": "etb",
+      "description": "Each player chooses a creature or planeswalker. Destroy all others.",
+      "actions": [
+        {
+          "action": "single_combat_wipe",
+          "player": "$controller",
+          "reason": "Single Combat: each player keeps their best creature/PW, destroy the rest"
+        }
+      ]
+    },
+    {
+      "key": "skyshroud claim",
+      "name": "Skyshroud Claim",
+      "event": "etb",
+      "description": "Search for up to two Forest cards, put onto battlefield untapped",
+      "actions": [
+        {
+          "action": "search_library",
+          "player": "$controller",
+          "card_type": "Forest",
+          "destination": "battlefield",
+          "tapped": false
+        },
+        {
+          "action": "search_library",
+          "player": "$controller",
+          "card_type": "Forest",
+          "destination": "battlefield",
+          "tapped": false
+        }
+      ]
+    },
+    {
+      "key": "snapcaster mage",
+      "name": "Snapcaster Mage",
+      "event": "etb",
+      "description": "Target instant or sorcery in your graveyard gains flashback",
+      "actions": [
+        {
+          "action": "grant_flashback",
+          "player": "$controller"
+        }
+      ]
+    },
+    {
+      "key": "species specialist",
+      "name": "Species Specialist",
+      "event": "etb",
+      "description": "As Species Specialist enters, choose a creature type",
+      "actions": [
+        {
+          "action": "choose_creature_type",
+          "player": "$controller",
+          "card": "Species Specialist"
+        }
+      ]
+    },
+    {
+      "key": "spectral procession",
+      "name": "Spectral Procession",
+      "event": "etb",
+      "description": "Create three 1/1 white Spirit creature tokens with flying",
+      "actions": [
+        {
+          "action": "create_token",
+          "player": "$controller",
+          "name": "Spirit",
+          "power": 1,
+          "toughness": 1,
+          "types": "Creature â€” Spirit",
+          "count": 3,
+          "keywords": "Flying",
+          "colors": "W"
+        }
+      ]
+    },
+    {
+      "key": "spell queller",
+      "name": "Spell Queller",
+      "event": "etb",
+      "description": "When Spell Queller enters, exile target spell with MV 4 or less",
+      "actions": [
+        {
+          "action": "exile_from_stack",
+          "controller": "$controller",
+          "max_mv": 4
+        }
+      ]
+    },
+    {
+      "key": "spell queller_ltb",
+      "name": "Spell Queller (LTB)",
+      "event": "etb",
+      "description": "When Spell Queller leaves, the exiled card returns to its owner's hand (approximation of free-cast LTB)",
+      "actions": [
+        {
+          "action": "release_queller_exile",
+          "source": "Spell Queller"
+        }
+      ]
+    },
+    {
+      "key": "sphinx of uthuun",
+      "name": "Sphinx of Uthuun",
+      "event": "etb",
+      "description": "When Sphinx of Uthuun enters, reveal top 5, opponent splits, you choose a pile",
+      "actions": [
+        {
+          "action": "draw_cards",
+          "player": "$controller",
+          "amount": 3
+        }
+      ]
+    },
+    {
+      "key": "steelshaper's gift",
+      "name": "Steelshaper's Gift",
+      "event": "etb",
+      "description": "Search your library for an Equipment card, reveal it, put it into your hand, then shuffle",
+      "actions": [
+        {
+          "action": "search_library",
+          "player": "$controller",
+          "count": 1,
+          "card_type": "equipment",
+          "reason": "Steelshaper's Gift: search for an Equipment"
+        }
+      ]
+    },
+    {
+      "key": "stitcher's supplier",
+      "name": "Stitcher's Supplier",
+      "event": "etb",
+      "description": "Mill three cards",
+      "actions": [
+        {
+          "action": "mill",
+          "player": "$controller",
+          "amount": 3
+        }
+      ]
+    },
+    {
+      "key": "stoneforge mystic",
+      "name": "Stoneforge Mystic",
+      "event": "etb",
+      "description": "Search library for an Equipment card, put into hand",
+      "actions": [
+        {
+          "action": "search_library",
+          "player": "$controller",
+          "card_type": "Equipment",
+          "to_zone": "hand"
+        }
+      ]
+    },
+    {
+      "key": "supreme verdict",
+      "name": "Supreme Verdict",
+      "event": "etb",
+      "description": "Destroy all creatures (can't be countered)",
+      "actions": [
+        {
+          "action": "destroy_all_creatures"
+        }
+      ]
+    },
+    {
+      "key": "swan song",
+      "name": "Swan Song",
+      "event": "etb",
+      "description": "Counter target enchantment/instant/sorcery, controller gets 2/2 Bird",
+      "actions": [
+        {
+          "action": "counter_spell",
+          "player": "$controller",
+          "target": "stack_top"
+        },
+        {
+          "action": "create_token",
+          "player": "$opponent",
+          "name": "Bird",
+          "power": 2,
+          "toughness": 2,
+          "types": "Creature â€” Bird",
+          "count": 1,
+          "colors": "U"
+        }
+      ]
+    },
+    {
+      "key": "sylvan awakening",
+      "name": "Sylvan Awakening",
+      "event": "etb",
+      "description": "All lands you control become 2/2 creatures with reach, indestructible, haste until EOT",
+      "actions": [
+        {
+          "action": "animate_land",
+          "player": "$controller",
+          "scope": "all",
+          "power": 2,
+          "toughness": 2,
+          "keywords": "reach,indestructible,haste"
+        }
+      ]
+    },
+    {
+      "key": "syr konrad, the grim",
+      "name": "Syr Konrad, the Grim",
+      "event": "etb",
+      "description": "Whenever another creature dies or a creature card enters/leaves graveyard, deal 1 to each opponent",
+      "actions": [
+        {
+          "action": "deal_damage",
+          "amount": 1,
+          "target_player": "$opponent"
+        }
+      ]
+    },
+    {
+      "key": "sythis, harvest's hand",
+      "name": "Sythis, Harvest's Hand",
+      "event": "etb",
+      "description": "Whenever you cast an enchantment spell, you gain 1 life and draw a card",
+      "actions": [
+        {
+          "action": "gain_life",
+          "player": "$controller",
+          "amount": 1
+        },
+        {
+          "action": "draw_cards",
+          "player": "$controller",
+          "amount": 1
+        }
+      ]
+    },
+    {
+      "key": "tatyova, benthic druid",
+      "name": "Tatyova, Benthic Druid",
+      "event": "etb",
+      "description": "Whenever a land enters under your control, draw a card and gain 1 life",
+      "actions": [
+        {
+          "action": "draw_cards",
+          "player": "$controller",
+          "amount": 1
+        },
+        {
+          "action": "gain_life",
+          "player": "$controller",
+          "amount": 1
+        }
+      ]
+    },
+    {
+      "key": "teferi's protection",
+      "name": "Teferi's Protection",
+      "event": "etb",
+      "description": "Phase out all permanents you control, protection from everything until next turn",
+      "actions": [
+        {
+          "action": "phase_out_all",
+          "player": "$controller",
+          "reason": "Teferi's Protection phases out all permanents until next turn"
+        },
+        {
+          "action": "prevent_all_damage",
+          "player": "$controller",
+          "duration": "until_next_turn",
+          "lock_life_total": true,
+          "reason": "Teferi's Protection: life total can't change, protection from everything"
+        }
+      ]
+    },
+    {
+      "key": "temple of the false god",
+      "name": "Temple of the False God",
+      "event": "etb",
+      "description": "No ETB trigger (taps for 2 colorless if 5+ lands â€” mana ability handled by mana system)",
+      "actions": [
+        {
+          "action": "no_action",
+          "reason": "Temple of the False God: no ETB effect (tap-for-mana ability, not a trigger)"
+        }
+      ]
+    },
+    {
+      "key": "tendershoot dryad",
+      "name": "Tendershoot Dryad",
+      "event": "etb",
+      "description": "At the beginning of each upkeep, create a 1/1 green Saproling creature token",
+      "actions": [
+        {
+          "action": "create_token",
+          "player": "$controller",
+          "name": "Saproling",
+          "power": 1,
+          "toughness": 1,
+          "types": "Creature â€” Saproling",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "key": "terminus",
+      "name": "Terminus",
+      "event": "etb",
+      "description": "Put all creatures on the bottom of their owners' libraries",
+      "actions": [
+        {
+          "action": "tuck_all_creatures"
+        }
+      ]
+    },
+    {
+      "key": "thoughtseize",
+      "name": "Thoughtseize",
+      "event": "etb",
+      "description": "Target player discards a nonland card. You lose 2 life.",
+      "actions": [
+        {
+          "action": "discard",
+          "player": "$opponent",
+          "card": "best_nonland"
+        },
+        {
+          "action": "lose_life",
+          "player": "$controller",
+          "amount": 2
+        }
+      ]
+    },
+    {
+      "key": "thousand-faced shadow",
+      "name": "Thousand-Faced Shadow",
+      "event": "etb",
+      "description": "When Thousand-Faced Shadow enters attacking via ninjutsu, create a copy of another attacking creature",
+      "actions": [
+        {
+          "action": "create_copy_token",
+          "player": "$controller",
+          "target": "best_attacking_creature",
+          "filter": "attacking",
+          "count": 1
+        }
+      ]
+    },
+    {
+      "key": "thrill of possibility",
+      "name": "Thrill of Possibility",
+      "event": "etb",
+      "description": "Discard a card, then draw 2",
+      "actions": [
+        {
+          "action": "discard",
+          "player": "$controller",
+          "card": "random"
+        },
+        {
+          "action": "draw_cards",
+          "player": "$controller",
+          "amount": 2
+        }
+      ]
+    },
+    {
+      "key": "tooth and nail",
+      "name": "Tooth and Nail",
+      "event": "etb",
+      "description": "Search for 2 creatures and put them onto the battlefield",
+      "actions": [
+        {
+          "action": "search_library",
+          "player": "$controller",
+          "count": 2,
+          "card_type": "creature",
+          "to_zone": "battlefield",
+          "reason": "Tooth and Nail (entwined): 2 creatures to battlefield"
+        }
+      ]
+    },
+    {
+      "key": "torrential gearhulk",
+      "name": "Torrential Gearhulk",
+      "event": "etb",
+      "description": "When Torrential Gearhulk enters, you may cast an instant from your graveyard without paying its mana cost",
+      "actions": [
+        {
+          "action": "grant_flashback",
+          "player": "$controller",
+          "source": "Torrential Gearhulk"
+        }
+      ]
+    },
+    {
+      "key": "traverse the ulvenwald",
+      "name": "Traverse the Ulvenwald",
+      "event": "etb",
+      "description": "Search library for a creature or land card",
+      "actions": [
+        {
+          "action": "search_library",
+          "player": "$controller",
+          "count": 1,
+          "card_type": "creature_or_land",
+          "reason": "Traverse the Ulvenwald: tutor creature or land"
+        }
+      ]
+    },
+    {
+      "key": "treasure cruise",
+      "name": "Treasure Cruise",
+      "event": "etb",
+      "description": "Draw three cards",
+      "actions": [
+        {
+          "action": "draw_cards",
+          "player": "$controller",
+          "amount": 3
+        }
+      ]
+    },
+    {
+      "key": "treats to share",
+      "name": "Treats to Share",
+      "event": "etb",
+      "description": "Create a Food token",
+      "actions": [
+        {
+          "action": "create_token",
+          "player": "$controller",
+          "name": "Food",
+          "power": 0,
+          "toughness": 0,
+          "types": "Artifact â€” Food",
+          "count": 1,
+          "oracle_text": "{2}, {T}, Sacrifice this artifact: You gain 3 life."
+        }
+      ]
+    },
+    {
+      "key": "tribute mage",
+      "name": "Tribute Mage",
+      "event": "etb",
+      "description": "Search library for an artifact card with MV exactly 2, put into hand",
+      "actions": [
+        {
+          "action": "search_library",
+          "player": "$controller",
+          "card_type": "Artifact",
+          "exact_mv": 2,
+          "to_zone": "hand"
+        }
+      ]
+    },
+    {
+      "key": "trinket mage",
+      "name": "Trinket Mage",
+      "event": "etb",
+      "description": "Search library for an artifact card with MV 1 or less, put into hand",
+      "actions": [
+        {
+          "action": "search_library",
+          "player": "$controller",
+          "card_type": "Artifact",
+          "max_mv": 1,
+          "to_zone": "hand"
+        }
+      ]
+    },
+    {
+      "key": "trophy mage",
+      "name": "Trophy Mage",
+      "event": "etb",
+      "description": "Search library for an artifact card with MV exactly 3, put into hand",
+      "actions": [
+        {
+          "action": "search_library",
+          "player": "$controller",
+          "card_type": "Artifact",
+          "exact_mv": 3,
+          "to_zone": "hand"
+        }
+      ]
+    },
+    {
+      "key": "trostani discordant",
+      "name": "Trostani Discordant",
+      "event": "etb",
+      "description": "When Trostani Discordant enters, create two 1/1 white Soldier tokens with lifelink.",
+      "actions": [
+        {
+          "action": "create_token",
+          "player": "$controller",
+          "name": "Soldier",
+          "power": 1,
+          "toughness": 1,
+          "types": "Creature â€” Soldier",
+          "count": 2,
+          "keywords": "lifelink"
+        }
+      ]
+    },
+    {
+      "key": "trostani discordant endstep",
+      "name": "Trostani Discordant",
+      "event": "etb",
+      "description": "At the beginning of your end step, each player gains control of all creatures they own",
+      "actions": [
+        {
+          "action": "no_action",
+          "reason": "Trostani Discordant: creatures return to their owners' control (no stolen creatures to return)"
+        }
+      ]
+    },
+    {
+      "key": "vampiric tutor",
+      "name": "Vampiric Tutor",
+      "event": "etb",
+      "description": "Search library for any card, put on top; lose 2 life",
+      "actions": [
+        {
+          "action": "search_library",
+          "player": "$controller",
+          "card_type": "Any",
+          "to_zone": "library_top"
+        },
+        {
+          "action": "lose_life",
+          "player": "$controller",
+          "amount": 2
+        }
+      ]
+    },
+    {
+      "key": "vindictive vampire",
+      "name": "Vindictive Vampire",
+      "event": "etb",
+      "description": "Whenever another creature you control dies, each opponent loses 1 life and you gain 1 life",
+      "actions": [
+        {
+          "action": "lose_life",
+          "player": "$opponent",
+          "amount": 1
+        },
+        {
+          "action": "gain_life",
+          "player": "$controller",
+          "amount": 1
+        }
+      ]
+    },
+    {
+      "key": "wash away",
+      "name": "Wash Away",
+      "event": "etb",
+      "description": "Counter target spell not cast from its owner's hand",
+      "actions": [
+        {
+          "action": "counter_spell",
+          "player": "$controller",
+          "target": "stack_top"
+        }
+      ]
+    },
+    {
+      "key": "welcome home",
+      "name": "Welcome Home",
+      "event": "etb",
+      "description": "Create three 2/2 green Bear creature tokens",
+      "actions": [
+        {
+          "action": "create_token",
+          "player": "$controller",
+          "name": "Bear",
+          "power": 2,
+          "toughness": 2,
+          "types": "Creature â€” Bear",
+          "count": 3
+        }
+      ]
+    },
+    {
+      "key": "wilderness reclamation",
+      "name": "Wilderness Reclamation",
+      "event": "etb",
+      "description": "At the beginning of your end step, untap all lands you control",
+      "actions": [
+        {
+          "action": "untap_lands",
+          "player": "$controller",
+          "count": 99
+        }
+      ]
+    },
+    {
+      "key": "worldly tutor",
+      "name": "Worldly Tutor",
+      "event": "etb",
+      "description": "Search library for a creature card, put on top",
+      "actions": [
+        {
+          "action": "search_library",
+          "player": "$controller",
+          "card_type": "Creature",
+          "to_zone": "library_top"
+        }
+      ]
+    },
+    {
+      "key": "yawgmoth's will",
+      "name": "Yawgmoth's Will",
+      "event": "etb",
+      "description": "Until end of turn, you may play lands and cast spells from your graveyard",
+      "actions": [
+        {
+          "action": "grant_flashback",
+          "player": "$controller",
+          "duration": "end_of_turn",
+          "source": "Yawgmoth's Will",
+          "reason": "Yawgmoth's Will: cast spells from graveyard this turn"
+        }
+      ]
+    },
+    {
+      "key": "yorion, sky nomad",
+      "name": "Yorion, Sky Nomad",
+      "event": "etb",
+      "description": "Exile any number of other nonland permanents you own, return at next end step",
+      "actions": [
+        {
+          "action": "mass_flicker",
+          "player": "$controller",
+          "count": 5,
+          "exclude_lands": true,
+          "exclude_self": "Yorion, Sky Nomad",
+          "delayed_return": true
+        }
+      ]
+    }
+  ]
+}

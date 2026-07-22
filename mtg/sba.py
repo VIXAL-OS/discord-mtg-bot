@@ -36,6 +36,7 @@ import random
 from typing import Any, Dict, List, Optional, Tuple
 
 from mtg.constants import Phase, Zone, COMMAND_ZONE_FORMATS
+from mtg import events
 from mtg.helpers import command_zone_owner
 from mtg.models import Card, Player, GameState
 
@@ -304,6 +305,10 @@ def _finalize_death_save_return(rules, game: GameState, player: Player,
     Returns extra display messages.
     """
     msgs: List[str] = []
+    # Pub/sub slice 2: the undying/persist return is a NEW battlefield entry
+    # (CR 702.92a / 400.7) — one PERMANENT_ENTERED per physical entry.
+    events.emit(events.PERMANENT_ENTERED, game, card=card,
+                controller=player, via="death_save_return", rules=rules)
     # 1. Strip combat state — the new object is not attacking or blocking.
     was_attacking = bool(getattr(card, 'attacking', False))
     card.attacking = False
@@ -347,6 +352,41 @@ def _finalize_death_save_return(rules, game: GameState, player: Player,
         print(f"[{save_label}-ETB] self-ETB re-fire failed for {card.name}: {etb_err}")
         from mtg.util import maybe_reraise
         maybe_reraise(etb_err)
+    # 4. Run the creature-enters WATCHER scan for the re-entry (CR 603.6a —
+    # each separate entry triggers "whenever a/another creature enters"
+    # abilities afresh; Soul Warden was missing every undying/persist
+    # return). July 20, pub/sub slice 2 follow-up: found while wiring the
+    # PERMANENT_ENTERED parity recorder. Deliberately the NARROW scan, not
+    # _handle_etb_triggers — that helper also re-resolves self-ETB observers,
+    # which step 3 above already fired (double-fire risk). Same
+    # is_creature(game) gate as the cast path (a devotion-gated god
+    # re-entering below threshold isn't a creature, CR 603.2a).
+    engine = getattr(rules, 'engine_ref', None)
+    if engine is not None:
+        try:
+            from mtg.triggers import (_check_permanent_etb_watchers,
+                                      _check_enchantment_etb_watchers)
+            from mtg.helpers import format_trigger_line
+            if card.is_creature(game):
+                # Slice 2b (July 21): the creature watcher dispatch now runs
+                # in the PERMANENT_ENTERED subscriber (fired by the emit at
+                # the top of this function). Drain its display lines here —
+                # the position the direct scan call used to occupy.
+                from mtg.helpers import drain_pending_messages
+                msgs.extend(drain_pending_messages(game))
+            else:
+                msgs.extend(_check_permanent_etb_watchers(
+                    engine, game, player, card))
+            if card.is_enchantment():
+                # Slice 2b (2/2, July 21): constellation dispatch runs in
+                # the PERMANENT_ENTERED subscriber (emit at the top of this
+                # function). Drain in place.
+                from mtg.helpers import drain_pending_messages as _drain_pm_e
+                msgs.extend(_drain_pm_e(game))
+        except Exception as scan_err:
+            print(f"[{save_label}-ETB] watcher scan failed for {card.name}: {scan_err}")
+            from mtg.util import maybe_reraise
+            maybe_reraise(scan_err)
     return msgs
 
 
@@ -1011,7 +1051,8 @@ def process_state_based_actions(rules, game: GameState) -> List[str]:
     # dies-triggers (Bastion of Remembrance, Grave Pact, Blood Artist).
     if not hasattr(game, '_recently_died') or game._recently_died is None:
         game._recently_died = []
-    game._recently_died.extend(recently_died)
+    from mtg.triggers import queue_deaths
+    queue_deaths(game, recently_died)
 
     return messages
 
