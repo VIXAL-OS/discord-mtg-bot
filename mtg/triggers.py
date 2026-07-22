@@ -1193,10 +1193,24 @@ async def _check_cast_triggers(engine, game: GameState, caster: Player, card: Ca
         if bf_card.is_planeswalker() and not bf_card.is_creature():
             continue
         bf_oracle = bf_card.oracle_text or ''
-        bf_oracle_lower = bf_oracle.lower()
+        # July 22, 2026: scan with reminder text (parentheticals) STRIPPED.
+        # Reminder text only ever restates a keyword — it never carries a
+        # distinct triggered ability — but Prowess's reminder
+        # ("(Whenever you cast a noncreature spell, this creature gets
+        # +1/+1 until end of turn.)") matched the generic scanner, whose
+        # self-pump handler then deliberately skips Prowess cards (the
+        # dedicated PROWESS block below owns them), leaving the trigger to
+        # fall through to a wasteful Tier-3 queue. Monastery Swiftspear was
+        # 12 of 18 [CAST-TRIGGER-UNHANDLED] tags in the July 21 batch: it
+        # got correctly pumped by the dedicated block AND redundantly
+        # escalated. Stripping parens makes a Prowess-only card skip this
+        # scan entirely, while cards with a REAL un-parenthesized cast
+        # trigger (Monastery Mentor's token half) still match.
+        bf_oracle_scan = re.sub(r'\([^)]*\)', '', bf_oracle)
+        bf_oracle_lower = bf_oracle_scan.lower()
         if 'whenever you cast' in bf_oracle_lower or 'whenever a player casts' in bf_oracle_lower:
             # Check if this trigger matches the spell type
-            for sentence in bf_oracle.split('.'):
+            for sentence in bf_oracle_scan.split('.'):
                 sentence_lower = sentence.lower().strip()
                 if 'whenever you cast' not in sentence_lower and 'whenever a player casts' not in sentence_lower:
                     continue
