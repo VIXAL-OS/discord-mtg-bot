@@ -84,7 +84,11 @@ Add a template here for any card whose effect resolves to a clear JSON-action se
 ### Tier 2.5 — XMage bridge
 Java subprocess running XMage's card database (87,000+ cards) via JSON-RPC. `rules/xmage_bridge.py` is the Python client; `rules/XMageRulesBridge.java` is the bridge itself. Catches triggers the Python regex missed; gracefully degrades if Java/JAR is missing.
 
-To rebuild: `cd rules/xmage-bridge && mvn package`
+To rebuild: `cd rules/xmage-bridge && mvn package` — but note this only
+works once XMage itself has been built from source into your local `~/.m2`
+(`org.mage:*:1.4.58` is not on Maven Central). See the README's
+[XMage bridge section](README.md#the-xmage-bridge-optional-tier-25) for the
+full prerequisite.
 
 ### Tier 3 — LLM judge
 `mtg/judge.py:resolve_effect`. Sends game state + effect description to Claude; gets back structured JSON `{"explanation": ..., "actions": [...]}`. The actions go through `mtg/actions.py:execute_action_on_state` for execution.

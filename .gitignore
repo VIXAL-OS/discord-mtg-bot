@@ -67,3 +67,11 @@ data/scryfall_oracle_cards.part
 # YouTube transcripts (may contain private content from links shared in DMs/server)
 data/transcripts/
 
+
+# Keep the bind-mount targets present in a fresh clone so Docker doesn't
+# create them root-owned on first run (breaks rootless Docker). The dirs
+# stay ignored; only the placeholders are tracked.
+!logs/.gitkeep
+!db/.gitkeep
+!rules/xmage-bridge/target/.gitkeep
+!rules/xmage-bridge/db/.gitkeep

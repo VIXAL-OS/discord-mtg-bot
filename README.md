@@ -29,8 +29,9 @@ python -m venv venv
 source venv/bin/activate    # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 
-# 3. (Optional) Build the XMage bridge for ~10x more card coverage
-cd rules/xmage-bridge && mvn package && cd ../..
+# 3. (Optional) XMage bridge — extra card coverage, but it needs XMage
+#    itself built from source first. See "The XMage bridge" below.
+#    Skip this: the engine works fine without it.
 
 # 4. Run it
 python bot.py
@@ -88,6 +89,120 @@ The rules engine resolves effects through a tiered cascade — start fast/cheap,
 | **Tier 4** | Manual: `!judge`, `!resolve`, `!fix`, `!undo` | Human | Last resort |
 
 Run `!coverage <deckname>` to see how the engine will classify each card in a deck before you play. See [ARCHITECTURE.md](ARCHITECTURE.md) for the deeper tech overview, the `mtg/` and `rules/` package layouts, the effect-action JSON format, and the per-batch audit playbook contributors use to catch regressions.
+
+## The XMage bridge (optional, Tier 2.5)
+
+The engine can consult [XMage](https://github.com/magefree/mage)'s card
+database (87,000+ cards) for effects the templates and regex passes miss. It's
+genuinely optional — without it the engine falls back to template + LLM
+resolution and nothing crashes, it just leans on Tier 3 slightly more often.
+
+**Building it is more work than the rest of the project**, so here's the honest
+version. `rules/xmage-bridge/pom.xml` depends on `org.mage:mage`,
+`mage-server`, and `mage-sets` at version 1.4.58. **Those artifacts are not
+published to Maven Central.** You have to build XMage from source first so
+they land in your local `~/.m2`:
+
+```bash
+git clone --depth 1 --branch xmage_1.4.58 https://github.com/magefree/mage.git
+cd mage && mvn install -DskipTests
+```
+
+That's a large multi-module Java build — budget real time and a few GB of RAM.
+Only then does the bridge build work:
+
+```bash
+cd rules/xmage-bridge && mvn package
+```
+
+That produces `target/xmage-bridge-1.0.0.jar` (~90MB, XMage shaded in). The bot
+picks it up automatically on next start; you'll see `[XMAGE]` lines in the
+console. First start after building rescans the card DB (~13s) and writes a
+~250MB cache under `db/` and `rules/xmage-bridge/db/`.
+
+If you'd rather not: skip it. Run `!coverage <deck>` to see what your decks
+actually need — most Commander decks are covered by Tier 1.5 templates.
+
+## Deploying (running it 24/7)
+
+The bot is a normal long-running Python process; `docker compose` is the
+turnkey path. A small VPS is plenty — 2GB RAM is fine without the XMage
+bridge, 4GB if you want it. These instructions were walked end-to-end on a
+fresh Ubuntu 24.04 box; if something here is wrong, that's a bug worth an
+issue.
+
+```bash
+curl -fsSL https://get.docker.com | sh
+```
+
+```bash
+git clone https://github.com/VIXAL-OS/discord-mtg-bot.git && cd discord-mtg-bot
+```
+
+```bash
+cp config.json.example config.json && cp .env.example .env
+```
+
+Now edit `.env` (Discord token, Anthropic key, optional DeepSeek key) and
+`config.json` (channel IDs).
+
+> **Create those two files before your first `docker compose up`.**
+> `docker-compose.yml` bind-mounts `config.json` as a *file*. If it doesn't
+> exist yet, Docker helpfully creates a **directory** with that name and the
+> bot then fails in a way that doesn't mention the real problem. If you hit it:
+> `docker compose down && rm -rf config.json`, then copy the example properly.
+
+```bash
+docker compose up -d --build
+```
+
+```bash
+docker compose logs -f
+```
+
+You're waiting for the Discord ready line. Then sanity-check in Discord:
+`!card Lightning Bolt` (Scryfall works), `!game claude commander` +
+`!mydeck surrak` (deck loading works), `!state` (rendering works). If you set
+`DEEPSEEK_API_KEY`, a single `!autoplay commander surrak aminatou` exercises
+the engine, both LLM adapters, logging, and Discord rate limiting end-to-end
+for about a penny — it's the best one-shot integration test.
+
+State lives in host bind mounts (`data/`, `logs/`, `config.json`), so
+`docker compose down` and rebuilds don't lose your decks, saved games, or
+lifetime cost tracking. To update: `git pull && docker compose up -d --build`.
+
+### Log growth
+
+Two separate things grow, and they want different treatments.
+
+**The container's stdout** is capped in `docker-compose.yml` (`max-size: 10m`,
+`max-file: 5` → 50MB ceiling). Nothing to do.
+
+**The bot's per-game logs** under `logs/` are not. Autoplay writes two files
+per game, so a full 143-game batch lands ~286 files. They're small
+individually and they never grow after the game ends — which is exactly why
+**`logrotate` is the wrong tool here**. logrotate is built for a few
+*continuously growing* files (`app.log` → `app.log.1.gz`), with machinery for
+signalling a process to reopen its file handles. This bot's logs are many
+small *immutable* files, so all that machinery buys nothing and the wildcard
+config is fussier than the one-liner it replaces.
+
+A cron job that deletes by age fits the actual shape:
+
+```bash
+(crontab -l 2>/dev/null; echo "0 4 * * * find ~/discord-mtg-bot/logs -name 'game_*.log' -mtime +14 -delete") | crontab -
+```
+
+If you'd rather keep the history, compress instead of deleting — game logs are
+text and shrink hard:
+
+```bash
+(crontab -l 2>/dev/null; echo "0 4 * * * find ~/discord-mtg-bot/logs -name 'game_*.log' -mtime +2 -exec gzip {} +") | crontab -
+```
+
+Use logrotate anyway if you already run it everywhere and want one policy
+across all your services — it'll work with a `logs/*.log` glob and
+`copytruncate`. It's just more config for less fit.
 
 ## Discord setup checklist
 

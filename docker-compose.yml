@@ -24,3 +24,11 @@ services:
       - ./rules/xmage-bridge/target:/app/rules/xmage-bridge/target
       - ./rules/xmage-bridge/db:/app/rules/xmage-bridge/db
       - ./db:/app/db
+    # Docker's own json-file driver is unbounded by default — a long-running
+    # bot's stdout will eat the disk on a small VPS. The bot's per-game logs
+    # under ./logs are separate; see the README's Deploying section for those.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
