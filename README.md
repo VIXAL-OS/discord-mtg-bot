@@ -123,6 +123,19 @@ console. First start after building rescans the card DB (~13s) and writes a
 If you'd rather not: skip it. Run `!coverage <deck>` to see what your decks
 actually need — most Commander decks are covered by Tier 1.5 templates.
 
+### Licensing note
+
+XMage is [MIT licensed](https://github.com/magefree/mage/blob/master/LICENSE.txt),
+so a JAR that shades it can be redistributed — provided XMage's copyright and
+license notice travel with it. The build bundles that notice at
+`META-INF/LICENSE-xmage.txt`; if you distribute a built JAR, don't strip it.
+
+Note also that the bundle includes XMage's card implementations (~42,000
+classes named after Magic cards). Magic: The Gathering and card names are
+Wizards of the Coast property; this project is unaffiliated fan tooling, as is
+XMage. Nothing here is legal advice — if you plan to redistribute builds
+publicly rather than run your own, that's worth your own look.
+
 ## Deploying (running it 24/7)
 
 The bot is a normal long-running Python process; `docker compose` is the
@@ -176,33 +189,39 @@ lifetime cost tracking. To update: `git pull && docker compose up -d --build`.
 Two separate things grow, and they want different treatments.
 
 **The container's stdout** is capped in `docker-compose.yml` (`max-size: 10m`,
-`max-file: 5` → 50MB ceiling). Nothing to do.
+`max-file: 5` → a 50MB ceiling). Nothing to do.
 
-**The bot's per-game logs** under `logs/` are not. Autoplay writes two files
-per game, so a full 143-game batch lands ~286 files. They're small
-individually and they never grow after the game ends — which is exactly why
-**`logrotate` is the wrong tool here**. logrotate is built for a few
-*continuously growing* files (`app.log` → `app.log.1.gz`), with machinery for
-signalling a process to reopen its file handles. This bot's logs are many
-small *immutable* files, so all that machinery buys nothing and the wildcard
-config is fussier than the one-liner it replaces.
+**The bot's per-game logs** under `logs/` are not capped, and they add up fast
+if you run autoplay batches: two files per game, and one full 143-game batch is
+**~286MB**. They're plain text, so they compress about **10x**.
 
-A cron job that deletes by age fits the actual shape:
+The simplest policy that keeps everything is a nightly job that gzips anything
+older than 30 days:
 
 ```bash
-(crontab -l 2>/dev/null; echo "0 4 * * * find ~/discord-mtg-bot/logs -name 'game_*.log' -mtime +14 -delete") | crontab -
+(crontab -l 2>/dev/null; echo "0 4 * * * find ~/discord-mtg-bot/logs -name 'game_*.log' -mtime +30 -exec gzip {} +") | crontab -
 ```
 
-If you'd rather keep the history, compress instead of deleting — game logs are
-text and shrink hard:
+That turns a batch's 286MB into ~28MB while keeping every line greppable
+(`zgrep` reads them directly). Recent logs stay uncompressed so the audit
+workflow's normal `grep` still works on them.
+
+Note this still grows without bound, just 10x slower — which is usually the
+right trade for a personal bot, since old game logs are the raw material for
+debugging regressions. If you'd rather have a hard cap, delete instead:
 
 ```bash
-(crontab -l 2>/dev/null; echo "0 4 * * * find ~/discord-mtg-bot/logs -name 'game_*.log' -mtime +2 -exec gzip {} +") | crontab -
+(crontab -l 2>/dev/null; echo "0 4 * * * find ~/discord-mtg-bot/logs -name 'game_*.log*' -mtime +90 -delete") | crontab -
 ```
 
-Use logrotate anyway if you already run it everywhere and want one policy
-across all your services — it'll work with a `logs/*.log` glob and
-`copytruncate`. It's just more config for less fit.
+The two compose fine — gzip at 30 days, delete at 90.
+
+**Why cron rather than logrotate?** logrotate is built for a handful of
+*continuously growing* files, and most of its machinery exists to rotate a file
+a process is still writing to. These are many small files that are final the
+moment a game ends, so none of that applies and a `find` one-liner is a better
+fit. Use logrotate anyway if you already run it across all your services and
+want one policy everywhere — a `logs/*.log` glob with `copytruncate` works.
 
 ## Discord setup checklist
 
