@@ -1,0 +1,41 @@
+name: Rules / gameplay bug
+description: The engine resolved something incorrectly
+labels: ["bug", "rules"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. The most useful thing you can include is the
+        **console log** — `logs/game_<id>_console.log`. It has the engine
+        detail; the `_discord.log` only has what players saw.
+  - type: input
+    id: cards
+    attributes:
+      label: Card(s) involved
+      placeholder: "Glen Elendra Archmage, Persist"
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What should have happened
+      description: A Comprehensive Rules citation helps a lot if you have one (e.g. CR 702.19c).
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: What actually happened
+    validations:
+      required: true
+  - type: input
+    id: format
+    attributes:
+      label: Format and decks
+      placeholder: "commander, surrak vs aminatou"
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log lines
+      description: Paste from logs/game_<id>_console.log. Tags like [ETB-TEMPLATE], [COMBAT-DAMAGE], [REPLACEMENT-APPLY] are the useful ones.
+      render: text

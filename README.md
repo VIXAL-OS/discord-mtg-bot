@@ -4,7 +4,7 @@ A Discord bot that plays **Magic: The Gathering** with you — full Commander / 
 
 Includes:
 
-- A **tiered rules engine** that handles ~370 card-specific templates plus pattern-based fallback for the long tail
+- A **tiered rules engine** with ~500 card-specific templates (160 of them plain JSON) plus ~90 oracle-text pattern families for the long tail
 - An **XMage card-database bridge** (87,000+ cards) for novel-card support
 - An **LLM-backed judge** for genuinely complex interactions
 - An **`!undo` snapshot stack** so bugs in obscure rules don't ruin your game
@@ -81,7 +81,7 @@ The rules engine resolves effects through a tiered cascade — start fast/cheap,
 | Tier | What | Cost | Coverage |
 |---|---|---|---|
 | **Tier 1** | Hardcoded handlers in `mtg/triggers.py` + `mtg/spells.py` | Free, instant | ~15 specific cards |
-| **Tier 1.5** | Templates + oracle-text patterns in `rules/effect_templates.py` | Free, instant | ~370 cards + 80 pattern families |
+| **Tier 1.5** | Templates in `data/card_templates.json` + patterns in `rules/effect_templates.py` | Free, instant | ~500 cards + ~90 pattern families |
 | **Tier 2** | `SpellResolver` (regex → JSON action) | Free, instant | ~40% of remaining oracle text |
 | **Tier 2.5** | XMage bridge (Java subprocess, 87k-card DB) | ~10-50ms | Catches what regex misses |
 | **Tier 3** | LLM judge (`mtg/judge.py`) | Tokens + ~2s | Genuinely novel effects |
@@ -116,10 +116,15 @@ Roughly per usage pattern:
 |---|---|
 | Casual chat in game threads (Sonnet) | $0.003 per message round-trip |
 | One Commander MTG game (Claude on both sides) | $0.15-$0.30 |
-| One Commander game with DeepSeek actor + Claude strategist | $0.40-$0.60 |
+| One Commander game, DeepSeek on both sides (autoplay default when `DEEPSEEK_API_KEY` is set) | ~$0.01 |
 | One Modern / Pauper game | $0.10-$0.20 |
 
 `!cost` shows the lifetime running total; persisted in `data/api_costs.json`.
+
+The DeepSeek figure is measured, not projected: a full 143-game regression
+batch (every matchup in the autoplay matrix) cost **$1.57** end to end, at a
+72.7% prompt-cache hit rate. That's what makes batch playtesting practical —
+the same batch on Claude both sides would run $20-40.
 
 ## Project status
 
@@ -127,12 +132,19 @@ Pre-1.0. The rules engine is well-exercised — the [post-batch audit playbook](
 
 ## Contributing
 
-PRs welcome. Before opening one:
+PRs welcome — and **adding support for a card needs no API keys and no
+Discord bot.** Most cards resolve from a name-keyed template table, so
+contributing one is an entry in [`data/card_templates.json`](data/card_templates.json)
+plus `python -m pytest tests -q` (~450 tests, runs offline in a few
+seconds). The loader is strict, so the test suite doubles as the schema
+check, and CI validates every card name against Scryfall.
 
-1. `python -m py_compile bot.py mtg/*.py rules/*.py` should pass
-2. If you're adding a card template, run `!autoplay-all` (or at least a few matchups containing the card) and check the logs for `[ETB-UNHANDLED]` / `[TRIGGER-UNHANDLED]` regressions
-3. For engine changes, run at least one of the rules-engine stress matchups (`layers`, `replacement_chain`, `death_replacement`, `combat_keywords`, `devotion`) and confirm `[REPLACEMENT-APPLY]` / `[DEVOTION-CHECK]` / `[COMBAT-DAMAGE]` log tags look right
+Engine changes are the other path: write a failing test first, keep the
+suite green, and mind the debt ratchets in `tests/test_ratchets.py`.
+
+Full details, the template schema, and the PR checklist are in
+[CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
-MIT. See [LICENSE](LICENSE) if present, otherwise treat as MIT until one is added.
+MIT — see [LICENSE](LICENSE).

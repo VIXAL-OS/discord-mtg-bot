@@ -1,0 +1,27 @@
+name: Card not supported
+description: A card does nothing, or falls through to the LLM judge when it shouldn't
+labels: ["card-support"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before filing: many of these are a one-line JSON entry you can send as
+        a PR yourself — no API keys needed. See
+        [CONTRIBUTING.md](../blob/main/CONTRIBUTING.md).
+  - type: input
+    id: card
+    attributes:
+      label: Card name (exactly as printed)
+    validations:
+      required: true
+  - type: dropdown
+    id: tier
+    attributes:
+      label: What does `!coverage <deck>` report for it?
+      options: ["template", "pattern", "tier3", "unknown", "haven't checked"]
+  - type: textarea
+    id: behavior
+    attributes:
+      label: What the card did (or didn't do) in game
+    validations:
+      required: true
