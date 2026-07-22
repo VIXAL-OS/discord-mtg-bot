@@ -206,15 +206,32 @@ That turns a batch's 286MB into ~28MB while keeping every line greppable
 (`zgrep` reads them directly). Recent logs stay uncompressed so the audit
 workflow's normal `grep` still works on them.
 
-Note this still grows without bound, just 10x slower — which is usually the
-right trade for a personal bot, since old game logs are the raw material for
-debugging regressions. If you'd rather have a hard cap, delete instead:
+**Archiving whole batches compresses better and matters more than it looks.**
+Batch logs are highly similar to each other, so a single `tar.gz` per batch
+beats per-file gzip (~12.7x vs ~10.3x measured), and — the bigger win — it
+collapses hundreds of files into one. File *count* is the real cost on any
+filesystem with large allocation units: on a 1MB-cluster volume, 12,829 log
+files averaging 57KB occupied **13GB** for **721MB** of actual content, and
+per-file gzip would have saved almost nothing because each compressed file
+still burns a full cluster. Archiving those same logs to one tarball per batch
+brought it to 429MB.
+
+```bash
+cd ~/discord-mtg-bot/logs && for p in $(ls game_*.log | sed -E 's/game_([0-9]{5}).*//' | sort -u); do
+  tar -czf "archives/batch_${p}.tar.gz" game_${p}*.log && rm game_${p}*.log
+done
+```
+
+(Verify the archive before deleting if you're scripting this unattended —
+check `tar -tzf` entry count against the original file count first.)
+
+Note that either policy still grows without bound, just far more slowly —
+usually the right trade for a personal bot, since old game logs are the raw
+material for debugging regressions. For a hard cap, delete instead:
 
 ```bash
 (crontab -l 2>/dev/null; echo "0 4 * * * find ~/discord-mtg-bot/logs -name 'game_*.log*' -mtime +90 -delete") | crontab -
 ```
-
-The two compose fine — gzip at 30 days, delete at 90.
 
 **Why cron rather than logrotate?** logrotate is built for a handful of
 *continuously growing* files, and most of its machinery exists to rotate a file
