@@ -1,0 +1,65 @@
+# fly.toml — optional Fly.io deployment for discord-mtg-bot.
+#
+# Quickstart (see README "Deploying to Fly.io" for the full walkthrough):
+#
+#   fly launch --no-deploy --copy-config      # create the app, keep this file
+#   fly secrets set DISCORD_TOKEN=... ANTHROPIC_API_KEY=...
+#   fly volumes create mtg_games --size 1     # same region as primary_region
+#   fly deploy
+#
+# ---------------------------------------------------------------------------
+# WHY THERE IS NO [http_service] BLOCK
+# ---------------------------------------------------------------------------
+# This bot exposes no ports. It dials OUT to the Discord gateway over a
+# WebSocket it holds open for its whole life. Two consequences:
+#
+#   1. Fly's autostop/autostart is a PROXY feature — it only applies to apps
+#      that serve requests. With no services there is nothing to scale to
+#      zero, so the machine just stays up, which is exactly what a bot needs.
+#      The flip side: Fly's usual "scale to zero when idle" savings do not
+#      apply here. You are paying for an always-on machine, so price this
+#      against a small always-on VPS rather than against Fly's idle pricing.
+#
+#   2. `fly launch` will offer to add an http_service and an HTTP health
+#      check. DECLINE BOTH. A health check against a port nothing listens on
+#      fails forever and restart-loops the bot.
+# ---------------------------------------------------------------------------
+
+app = "CHANGEME-discord-mtg-bot"
+primary_region = "iad"          # `fly platform regions` — pick one near you
+
+[build]
+  dockerfile = "Dockerfile"
+
+# NEVER run more than one machine. Each instance opens its OWN Discord gateway
+# session, so two machines means every command is answered twice and every
+# autoplay game runs twice. Keep `fly scale count 1`.
+#
+# "immediate" replaces the machine in place. The default rolling strategy
+# briefly runs the old and new machines together — which, for a gateway
+# client, is precisely the double-answer state above, during every deploy.
+[deploy]
+  strategy = "immediate"
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  # 512mb runs the bot comfortably WITHOUT the XMage bridge (the default: the
+  # bridge JAR isn't in git, and the engine falls back to template + LLM
+  # resolution with no crash). Bump to "1gb" if you bake the JAR in — the
+  # bridge runs a JVM alongside Python and scans a large card DB at startup.
+  memory = "512mb"
+
+# Saved games only.
+#
+# Do NOT mount at /app/data. That directory ships 39 files in git (decks, card
+# templates, the Scryfall cache) and an empty volume mounted over it would
+# hide every one of them — the bot would come up with no decks and the failure
+# doesn't obviously point at the mount. data/games is untracked and is the one
+# path that genuinely needs to survive a redeploy.
+#
+# Everything else is disposable by design: the card cache re-fetches from
+# Scryfall, and per-game logs go to stdout where `fly logs` picks them up.
+[[mounts]]
+  source = "mtg_games"
+  destination = "/app/data/games"

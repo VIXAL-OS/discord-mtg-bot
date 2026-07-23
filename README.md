@@ -187,6 +187,78 @@ State lives in host bind mounts (`data/`, `logs/`, `config.json`), so
 `docker compose down` and rebuilds don't lose your decks, saved games, or
 lifetime cost tracking. To update: `git pull && docker compose up -d --build`.
 
+### Deploying to Fly.io (no VPS to manage)
+
+If you'd rather not run a box, [Fly.io](https://fly.io) works well here and the
+repo ships a [`fly.toml`](fly.toml). It builds the same `Dockerfile`, so you get
+the same image — you're just swapping who runs it.
+
+```bash
+fly launch --no-deploy --copy-config
+```
+
+**Decline the HTTP service and health check when it offers them.** This bot
+listens on no ports — it dials *out* to the Discord gateway. A health check
+against a port nothing serves will fail forever and restart-loop the bot.
+
+Secrets are environment variables (the same ones `.env` holds), so they go in
+Fly's secret store rather than a file:
+
+```bash
+fly secrets set DISCORD_TOKEN=xxx ANTHROPIC_API_KEY=xxx DEEPSEEK_API_KEY=xxx
+```
+
+Saved games need a volume — one gigabyte is plenty, and it must be in the same
+region as `primary_region`:
+
+```bash
+fly volumes create mtg_games --size 1
+```
+
+```bash
+fly deploy
+```
+
+```bash
+fly logs
+```
+
+Then run the same Discord sanity checks as the Docker path above.
+
+**Four things worth knowing before you commit to it:**
+
+**You are paying for an always-on machine.** Fly's headline "scale to zero when
+idle" is a proxy feature for apps that serve requests. A Discord bot holds a
+persistent gateway connection and must never suspend, so those savings don't
+apply — price this against a small always-on VPS, not against Fly's idle tier.
+
+**Never scale past one machine.** Each instance opens its own gateway session,
+so two machines answer every command twice and run every `!autoplay` twice.
+`fly.toml` sets `strategy = "immediate"` for this reason: the default rolling
+deploy briefly runs old and new together, which is that same double-answer
+state on every deploy. Keep `fly scale count 1`.
+
+**Don't mount a volume at `/app/data`.** That path ships 39 files in git —
+decks, card templates, the Scryfall cache — and an empty volume mounted over it
+hides all of them, leaving you with a bot that has no decks and an error that
+doesn't mention mounts. `fly.toml` mounts `/app/data/games` instead, which is
+untracked and is the only path that actually needs to survive a redeploy. The
+card cache re-fetches from Scryfall, and logs go to stdout for `fly logs`.
+
+**`config.json` won't be in the image** — it's `.dockerignore`d, so the bot
+starts on defaults and responds only to @-mentions. That's a fine first deploy.
+To pin it to a channel, delete the `config.json` line from `.dockerignore` and
+redeploy so it gets baked in. That's safe *in this fork specifically* because
+`config.json` holds no secrets — just `bot_persona`, `mtg_channel_id`, and
+`excluded_channels`; every credential lives in an environment variable.
+
+**The XMage bridge (Tier 2.5) is the awkward part.** Its card DB is hundreds of
+megabytes that the Dockerfile deliberately keeps out of the image, and on a VPS
+you just `scp` it into a bind mount. On Fly you'd have to bake it in (a much
+larger image) or seed a second volume. The engine degrades gracefully without
+it — you lose one resolution tier, not the bot — so the simplest Fly deploy
+skips it. If you want the bridge, a VPS is the easier home.
+
 ### Log growth
 
 Two separate things grow, and they want different treatments.
