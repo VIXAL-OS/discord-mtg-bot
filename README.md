@@ -259,6 +259,67 @@ larger image) or seed a second volume. The engine degrades gracefully without
 it — you lose one resolution tier, not the bot — so the simplest Fly deploy
 skips it. If you want the bridge, a VPS is the easier home.
 
+### Running on a game-server / bot-hosting panel
+
+Plenty of hosts that are best known for Minecraft also sell Discord bot
+hosting — PebbleHost, Sparked Host and BisectHosting all do, and
+`bot-hosting.net` has a free tier that's popular for small bots. Railway and
+Render occupy similar ground as PaaS. Any of them will run this.
+
+Rather than name plans that go stale, here's the checklist that actually
+decides fit. **The one that matters most is root:**
+
+| Need | Why | If you don't have it |
+|---|---|---|
+| Python 3.11+ | Everything in `requirements.txt` is a pure-pip wheel — no compilers needed | — |
+| **root or Docker** | The XMage bridge needs a JRE (`apt-get install openjdk`) | **No Tier 2.5.** The engine falls back to templates + LLM. Graceful, not fatal |
+| Disk that survives restarts | `data/` holds saved games and the card-image cache | Saves vanish on restart; images re-download |
+| Always-on (no idle sleep) | The bot holds a persistent gateway WebSocket | It drops offline and misses commands |
+| ~1GB RAM | See sizing below | Rendering spikes can OOM you |
+
+So: a locked-down panel where you upload code and pick a Python version runs
+the **whole bot except the XMage bridge**. That's the honest dividing line. If
+you want Tier 2.5, you want root — a VPS or their VPS tier.
+
+On a panel you skip Docker entirely: clone, `pip install -r requirements.txt`,
+set `DISCORD_TOKEN` / `ANTHROPIC_API_KEY` (and optionally `DEEPSEEK_API_KEY`)
+in the panel's environment-variable UI, and run `python bot.py`. Panels are
+genuinely *well* shaped for this — they're built around always-on processes
+with restart-on-crash, so you avoid the scale-to-zero trap that makes
+serverless platforms awkward for a gateway client.
+
+#### Sizing for real use
+
+**Size for concurrent games, not for autoplay batches.** `!autoplay` is a
+development harness — the numbers in *Log growth* below (~286MB for a 143-game
+batch) describe testing the engine, not people playing on your server. Normal
+play produces a tiny fraction of that.
+
+What production actually looks like: games are keyed by Discord thread, so any
+number can run at once across any number of servers. Concurrency is cheap on
+CPU, because a game spends nearly all its time waiting on the Discord and LLM
+APIs. Three things do scale, though:
+
+- **Memory.** Budget a couple hundred MB of baseline (Python, `discord.py`, the
+  in-memory card cache) plus a few MB per live game — then leave headroom for
+  board rendering, which allocates in bursts. 512MB works for a quiet server;
+  1GB is the comfortable number once several games overlap.
+- **Disk, via card images.** `data/card_images/` caches every card art the
+  renderer has ever fetched. It grows with the *variety* of cards played, not
+  the number of games, and it's the one directory that quietly gets large on a
+  busy multi-server bot. It's pure cache — safe to delete, it re-downloads.
+- **CPU, only for rendering.** Board images are composited with Pillow on the
+  event loop, so a heavy `!state` render briefly pauses *every* game in the
+  process. On a throttled shared-CPU plan that's the thing you'd notice first.
+
+**Multi-server caveat:** `mtg_channel_id` is a single global setting, not
+per-guild. The bot auto-responds without being mentioned in that one channel;
+everywhere else — including every other server — it needs an @-mention. That
+works fine, it's just worth knowing before you invite it to a second server.
+
+The practical ceiling is almost never the host. It's your LLM API spend and
+rate limits, which are identical wherever you run.
+
 ### Log growth
 
 Two separate things grow, and they want different treatments.

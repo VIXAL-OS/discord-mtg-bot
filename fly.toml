@@ -44,10 +44,14 @@ primary_region = "iad"          # `fly platform regions` — pick one near you
 [[vm]]
   cpu_kind = "shared"
   cpus = 1
-  # 512mb runs the bot comfortably WITHOUT the XMage bridge (the default: the
+  # 512mb suits a quiet server without the XMage bridge (the default: the
   # bridge JAR isn't in git, and the engine falls back to template + LLM
-  # resolution with no crash). Bump to "1gb" if you bake the JAR in — the
-  # bridge runs a JVM alongside Python and scans a large card DB at startup.
+  # resolution with no crash). Bump to "1gb" if either applies:
+  #   - you bake the JAR in — the bridge runs a JVM alongside Python and
+  #     scans a large card DB at startup, or
+  #   - several games run at once across servers — board rendering allocates
+  #     in bursts, and that's what pushes a small machine over.
+  # See "Sizing for real use" in the README.
   memory = "512mb"
 
 # Saved games only.
