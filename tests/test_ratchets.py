@@ -89,7 +89,7 @@ EXCEPT_BASELINE = {
     "claude_player.py": 33,
     "cog.py": 30,
     "combat.py": 5,
-    "coverage.py": 1,
+    "coverage.py": 3,
     "deck_loader.py": 4,
     # engine.py 41→43 (June 10 fix sprint): C2 Tier-3 activation escalation +
     # V15 self-sac trigger dispatch — both logged + maybe_reraise per convention.

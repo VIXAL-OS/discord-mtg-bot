@@ -2330,10 +2330,21 @@ async def _run_single_autoplay(cog, channel, game_format: str, deck1_name: str, 
                 t3_extra = max(0, len(set(cov["by_tier"]["tier3"])) - len(t3_sample))
                 if t3_extra:
                     sample_str += f" (+{t3_extra} more)"
+                # July 22: report every subsystem, not just Tier 1.5. The old
+                # line lumped Tier 1 hardcodes, Tier 2 SpellResolver, and
+                # no-resolution cards (vanilla creatures, lands, mana rocks)
+                # into tier3, overstating it ~2x. `free=` is the honest
+                # headline: cards that cost nothing and resolve instantly.
+                from mtg.coverage import FREE_TIERS
+                free = sum(counts.get(t, 0) for t in FREE_TIERS)
                 print(
                     f"[DECK-COVERAGE] deck{idx}={dname}: "
-                    f"templates={counts['template']} "
+                    f"free={free} "
+                    f"(templates={counts['template']} "
                     f"patterns={counts['pattern']} "
+                    f"hardcoded={counts.get('hardcoded', 0)} "
+                    f"spell_resolver={counts.get('spell_resolver', 0)} "
+                    f"no_resolution={counts.get('no_resolution', 0)}) "
                     f"tier3={counts['tier3']} "
                     f"unknown={counts['unknown']} | "
                     f"tier3_sample=[{sample_str}]"
