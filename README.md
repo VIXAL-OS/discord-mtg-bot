@@ -304,10 +304,11 @@ APIs. Three things do scale, though:
   in-memory card cache) plus a few MB per live game — then leave headroom for
   board rendering, which allocates in bursts. 512MB works for a quiet server;
   1GB is the comfortable number once several games overlap.
-- **Disk, via card images.** `data/card_images/` caches every card art the
-  renderer has ever fetched. It grows with the *variety* of cards played, not
-  the number of games, and it's the one directory that quietly gets large on a
-  busy multi-server bot. It's pure cache — safe to delete, it re-downloads.
+- **Disk, via card images.** `data/card_cache/` holds a PNG of every card art
+  the renderer has ever fetched. It grows with the *variety* of cards played,
+  not the number of games, and it's the one directory that quietly gets large
+  on a busy multi-server bot. It's pure cache — safe to delete, it
+  re-downloads.
 - **CPU, only for rendering.** Board images are composited with Pillow on the
   event loop, so a heavy `!state` render briefly pauses *every* game in the
   process. On a throttled shared-CPU plan that's the thing you'd notice first.
