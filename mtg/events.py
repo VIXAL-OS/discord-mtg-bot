@@ -49,8 +49,23 @@ MIGRATION PLAN (one slice per audit cycle; batches are the regression net)
       deaths still pending in the queue are excluded — not yet drained is
       not a miss). No consumer changes by construction: the dies
       dispatcher, wave semantics (_active_dies_batch), and
-      helpers.apnap_order_died are untouched. Slice 3b (replacing the
-      plumbing) waits for 3a's own clean batch.
+      helpers.apnap_order_died are untouched.
+      GATE STATUS: CLEARED July 23, 2026 — batch game_15296* (152 games,
+      all on >= fd86e3d, strict=1) came back with ZERO [EVENT-PARITY-DIES]
+      lines.
+  Slice 3b (DONE, July 23, 2026): the dies queue is now BUS-FED. queue_death
+      dropped its direct `_recently_died.append` and is emit-only; the append
+      moved into `_accumulate_death_subscriber` (mtg/triggers.py) — the sole
+      sanctioned appender, registered on CREATURE_DIED before the parity
+      recorder. The subscriber only ACCUMULATES (never resolves inline)
+      because the dies consumer has batch-level semantics a per-event handler
+      can't carry: wave separation (the dispatcher resets _recently_died to []
+      before draining, so a wave's collateral deaths land in the fresh list as
+      the next wave) and APNAP batch ordering. The dispatcher, _active_dies_batch,
+      apnap_order_died, and _dies_source_ids_by_dead_id (call-site-populated) are
+      all UNCHANGED. The parity recorder stays in place with INVERTED meaning (a
+      line now means the bus->subscriber->dispatcher path skipped a death); one
+      clean [EVENT-PARITY-DIES]=0 batch gates removing it (slice 3c cleanup).
   Slice 4+: CARD_CAST, COMBAT_DAMAGE_DEALT, PHASE_CHANGED — at which point
       the React frontend's websocket layer is just another subscriber.
 
@@ -84,11 +99,13 @@ LIFE_GAINED = "life_gained"
 # emit on the first live batch).
 PERMANENT_ENTERED = "permanent_entered"
 # CREATURE_DIED payload: card=<dead Card>, player=<controller Player>.
-# Slice 3a (July 21, 2026): SHADOW MODE — emitted by the queue_death
-# choke-point (mtg/triggers.py) alongside every _recently_died append; the
-# only subscriber is the death parity recorder ([EVENT-PARITY-DIES]).
-# Consumers (the dies dispatcher, wave semantics via _active_dies_batch,
-# helpers.apnap_order_died) are UNCHANGED until slice 3b.
+# Slice 3b (July 23, 2026): the dies queue is BUS-FED — queue_death
+# (mtg/triggers.py) is emit-only and _accumulate_death_subscriber does the
+# _recently_died append (synchronously, in registration order, so callers see
+# the queue populated the instant queue_death returns). The dies dispatcher,
+# wave semantics (_active_dies_batch), and helpers.apnap_order_died remain the
+# CONSUMER — the subscriber only accumulates. The parity recorder
+# ([EVENT-PARITY-DIES]) stays until slice 3c after a clean batch.
 CREATURE_DIED = "creature_died"
 # Planned: CARD_CAST, COMBAT_DAMAGE_DEALT, PHASE_CHANGED
 # (see migration plan above).

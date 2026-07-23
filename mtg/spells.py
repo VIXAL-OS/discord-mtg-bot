@@ -1187,6 +1187,14 @@ async def _await_stack_window(engine, game: GameState, player: Player,
                 player.library.insert(0, card)
                 print(f"[STACK] {card.name} was countered — put on top of its owner's library")
                 effect_messages.append(f"❌ **{card.name}** is put on top of its owner's library!")
+            elif _countered_to == "exile":
+                # July 23 audit (#8): Force of Negation — "exile it instead of
+                # putting it into its owner's graveyard" (CR 614 zone-change
+                # replacement). Was falling through to the graveyard branch,
+                # leaving the countered spell recoverable.
+                player.exile.append(card)
+                print(f"[STACK] {card.name} was countered — exiled instead of graveyard")
+                effect_messages.append(f"❌ **{card.name}** was countered — exiled!")
             elif (getattr(card, 'is_commander', False)
                   and game.format in COMMAND_ZONE_FORMATS):
                 # CR 903.9b: a countered commander may go to the command zone

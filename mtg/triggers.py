@@ -2424,6 +2424,24 @@ def _check_dies_triggers_sync(engine, game: GameState, dying_card: Card, dying_p
                 for paragraph in dying_card.oracle_text.split('\n'):
                     p_lower = paragraph.lower().strip()
                     if "dies" in p_lower and "when" in p_lower:
+                        # July 23 audit (#4): Persist and Undying are KEYWORD
+                        # abilities the death-save chain resolves mechanically
+                        # (SBA, single-target destroy, board wipe, and — as of
+                        # this audit — sacrifice), each gated on the -1/-1 /
+                        # +1/+1 counter per CR 702.77b / 702.92b. Their reminder
+                        # text ("When this creature dies, if it had no ...
+                        # counters on it, return it to the battlefield ...")
+                        # matches this self-death extraction, so queueing it for
+                        # Tier 3 made the judge return the creature a SECOND
+                        # time, ungated — a free-life loop across repeat deaths
+                        # (game_1529674672545988631, Kitchen Finks). Keep
+                        # scanning: a card can carry a real dies trigger in a
+                        # later paragraph.
+                        if p_lower.startswith('persist') or p_lower.startswith('undying'):
+                            print(f"[DIES-KEYWORD] {dying_card.name}: "
+                                  f"{p_lower.split('(')[0].strip()} handled by the "
+                                  f"death-save chain — not escalating to Tier 3")
+                            continue
                         trigger_text = paragraph.strip()
                         break
                 if trigger_text:
@@ -4376,14 +4394,20 @@ def _snow_permanent_entered_watcher(game, card=None, controller=None,
 
 
 def queue_death(game, card, player) -> None:
-    """Slice 3a (July 21, 2026): the single choke-point for queueing a death.
+    """Slice 3b (July 23, 2026): the single choke-point for queueing a death is
+    now the CREATURE_DIED emit.
 
-    Does the _recently_died append AND emits CREATURE_DIED (shadow mode —
-    the only subscriber is the parity recorder). Every former raw
-    `game._recently_died.append/extend` site routes through here so slice
-    3b can flip the consumer without another call-site hunt.
+    The physical `_recently_died` append moved into
+    `_accumulate_death_subscriber` (the bus subscriber below), so the legacy
+    dies queue is now BUS-FED: emit -> subscriber -> _recently_died, all
+    synchronous (events.emit dispatches in registration order, in-line), so
+    every caller still sees _recently_died populated the instant queue_death
+    returns — behavior-identical to the 3a direct append. The dies dispatcher,
+    wave semantics (_active_dies_batch), APNAP ordering
+    (helpers.apnap_order_died), and _dies_source_ids_by_dead_id (populated at
+    the call sites) are all UNCHANGED — only the queue's INPUT flipped from a
+    direct append here to the subscriber.
     """
-    game._recently_died.append((card, player))
     events.emit(events.CREATURE_DIED, game, card=card, player=player)
 
 
@@ -4393,8 +4417,42 @@ def queue_deaths(game, pairs) -> None:
         queue_death(game, card, player)
 
 
+def _accumulate_death_subscriber(game, card=None, player=None, **_):
+    """Slice 3b (July 23, 2026): the CREATURE_DIED subscriber that feeds the
+    legacy dies queue.
+
+    This is now the ONE sanctioned `_recently_died` appender (structural test
+    `test_no_raw_queue_mutations_outside_the_choke_point` enforces it). It only
+    ACCUMULATES — it never resolves triggers inline — because the dies consumer
+    has batch-level semantics a per-event subscriber can't carry:
+      - wave separation (_active_dies_batch): the dispatcher resets
+        _recently_died to [] before draining a wave, so deaths caused by that
+        wave's triggers land in a FRESH _recently_died via THIS subscriber and
+        become the next wave (CR — a source that died in wave 1 doesn't see
+        wave-2 deaths). Firing on emit would destroy that separation.
+      - APNAP ordering (helpers.apnap_order_died) sorts a whole batch (CR
+        603.3b, NAP first) — a batch operation, impossible per-event.
+    So the explicit drain (engine.py / actions.py / models.py) still owns
+    resolution; this subscriber just makes the bus the source of truth for
+    "a creature died." _recently_died is a declared field (default []), so no
+    init guard is needed.
+    """
+    if card is None:
+        return
+    game._recently_died.append((card, player))
+
+
 def _record_death_for_parity(game, card=None, player=None, **_):
-    """CREATURE_DIED shadow recorder (slice 3a)."""
+    """CREATURE_DIED parity recorder (slice 3b — INVERTED meaning).
+
+    Records every emitted death; report_death_parity diffs these against the
+    deaths the dispatcher actually processed. Pre-3b (shadow mode) a miss meant
+    "the direct-append queue and the shadow emit diverged"; post-3b the bus is
+    AUTHORITATIVE (the subscriber above populates _recently_died from the
+    emit), so a miss now means the bus -> subscriber -> dispatcher path SKIPPED
+    a death — the same inversion slice 2b applied to [EVENT-PARITY]. Registered
+    AFTER _accumulate_death_subscriber so the append happens first.
+    """
     if card is None:
         return
     game._death_events.append((getattr(card, 'id', None), card.name))
@@ -4405,9 +4463,12 @@ def report_death_parity(game) -> List[str]:
     clear the per-turn state (called from engine.end_turn, next to
     report_entered_parity).
 
-    Deaths still sitting in game._recently_died are EXCLUDED — queued but
-    not yet drained is not a miss, just pending (it will be flagged the
-    turn it goes missing for real).
+    Slice 3b: [EVENT-PARITY-DIES] now means a death the bus emitted whose
+    subscriber-fed queue entry the dispatcher never drained (bus authoritative)
+    — one clean batch gates removing this recorder entirely (slice 3c cleanup).
+    Deaths still sitting in game._recently_died are EXCLUDED — queued but not
+    yet drained is pending, not a miss (it will be flagged the turn it goes
+    missing for real).
     """
     pending_ids = {getattr(c, 'id', None) for c, _p in game._recently_died}
     misses = []
@@ -4475,4 +4536,8 @@ events.subscribe(events.PERMANENT_ENTERED, _snow_permanent_entered_watcher)
 events.subscribe(events.PERMANENT_ENTERED, _creature_entered_subscriber)
 events.subscribe(events.PERMANENT_ENTERED, _enchantment_entered_subscriber)
 events.subscribe(events.PERMANENT_ENTERED, _record_entered_for_parity)
+# Slice 3b (July 23, 2026): the dies queue is now bus-fed — the accumulator
+# subscriber (the sole sanctioned _recently_died appender) is registered
+# BEFORE the parity recorder so the append lands before the diff records it.
+events.subscribe(events.CREATURE_DIED, _accumulate_death_subscriber)
 events.subscribe(events.CREATURE_DIED, _record_death_for_parity)

@@ -330,14 +330,34 @@ def _fire_sacrifice_triggers(rules, game: GameState, sac_player: Player, sacrifi
                 # rules/ not available — silently skip
                 continue
             try:
-                # Find the trigger sentence
-                trigger_text = ''
-                for sentence in (source.oracle_text or '').split('.'):
+                # Find the trigger sentence(s). July 23 audit (#16): a single
+                # card can carry SEVERAL color-qualified sacrifice triggers
+                # (Savra, Queen of the Golgari: black -> edict, green -> gain 2
+                # life). The old code took only the FIRST matching sentence and
+                # never checked the sacrificed creature's color, so sacrificing
+                # a green Sakura-Tribe Elder tried to resolve Savra's BLACK
+                # clause while her green one never fired at all
+                # (game_1529677634588377108). Collect every clause and gate each
+                # on the sacrificed creature's colors. Split on newlines too —
+                # separate abilities are separate lines, not sentences.
+                _color_words = {'white': 'W', 'blue': 'U', 'black': 'B',
+                                'red': 'R', 'green': 'G'}
+                _sac_colors = set(getattr(sacrificed_card, 'colors', []) or [])
+                trigger_texts = []
+                for sentence in (source.oracle_text or '').replace('\n', '.').split('.'):
                     sl = sentence.lower().strip()
-                    if 'whenever you sacrifice' in sl or 'whenever a permanent you control is sacrificed' in sl:
-                        trigger_text = sentence.strip()
-                        break
-                if not trigger_text:
+                    if ('whenever you sacrifice' not in sl
+                            and 'whenever a permanent you control is sacrificed' not in sl):
+                        continue
+                    _req = next((sym for word, sym in _color_words.items()
+                                 if f'a {word} creature' in sl), None)
+                    if _req and _req not in _sac_colors:
+                        print(f"[SAC-TRIGGER] {source.name}: skipping "
+                              f"{_req}-qualified clause — {sacrificed_card.name} "
+                              f"is {sorted(_sac_colors) or 'colorless'}")
+                        continue
+                    trigger_texts.append(sentence.strip())
+                if not trigger_texts:
                     continue
                 opp = next((p for p in game.players if p is not sac_player), sac_player)
                 lib = get_effect_library()
@@ -345,28 +365,32 @@ def _fire_sacrifice_triggers(rules, game: GameState, sac_player: Player, sacrifi
                 ctx['sacrificed_card_name'] = sacrificed_card.name
                 # Try the dedicated "korvold sacrifice" template by appending suffix
                 key_with_suffix = source.name.lower() + " sacrifice"
-                if key_with_suffix in getattr(lib, '_card_templates', {}):
-                    template = lib._card_templates[key_with_suffix]
-                    actions = template.action_generator(sac_player.name, opp.name, ctx)
-                else:
-                    actions, _desc = lib.resolve_etb(
-                        card_name=source.name,
-                        oracle_text=trigger_text,
-                        controller=sac_player.name,
-                        opponent=opp.name,
-                        game_context=ctx,
-                    )
-                if actions:
-                    for action in actions:
-                        if action.get('action') == 'no_action':
-                            continue
-                        try:
-                            msg = rules._execute_action_on_state(game, action)
-                            if msg:
-                                messages.append(f"⚡ {source.name}: {msg}")
-                        except Exception as e:
-                            print(f"[SAC-TRIGGER] Action failed for {source.name}: {e}")
-                    print(f"[SAC-TRIGGER] {source.name} fired from {sac_player.name} sacrificing {sacrificed_card.name}")
+                for trigger_text in trigger_texts:
+                    if key_with_suffix in getattr(lib, '_card_templates', {}):
+                        template = lib._card_templates[key_with_suffix]
+                        actions = template.action_generator(sac_player.name, opp.name, ctx)
+                    else:
+                        actions, _desc = lib.resolve_etb(
+                            card_name=source.name,
+                            oracle_text=trigger_text,
+                            controller=sac_player.name,
+                            opponent=opp.name,
+                            game_context=ctx,
+                        )
+                    if actions:
+                        for action in actions:
+                            if action.get('action') == 'no_action':
+                                continue
+                            try:
+                                msg = rules._execute_action_on_state(game, action)
+                                if msg:
+                                    messages.append(f"⚡ {source.name}: {msg}")
+                            except Exception as e:
+                                print(f"[SAC-TRIGGER] Action failed for {source.name}: {e}")
+                        print(f"[SAC-TRIGGER] {source.name} fired from {sac_player.name} sacrificing {sacrificed_card.name}")
+                    # A dedicated suffix template resolves the whole card once.
+                    if key_with_suffix in getattr(lib, '_card_templates', {}):
+                        break
             except Exception as e:
                 print(f"[SAC-TRIGGER] Error processing {source.name}: {e}")
     except Exception as e:
@@ -534,10 +558,14 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                         return f"🛡️ {amount} damage to **{player.name}** blocked ({reason})"
                 # Damage prevention flag (Teferi's Protection, Fog, etc.)
                 if getattr(player, '_damage_prevented', False):
+                    from mtg.helpers import damage_prevention_disabled
                     expires = getattr(player, '_damage_prevented_expires_turn', float('inf'))
                     if game.turn_number >= expires:
                         player._damage_prevented = False
                         print(f"  [DAMAGE-PREVENTED] Expired for {player.name}")
+                    elif damage_prevention_disabled(game):
+                        print(f"  [DAMAGE-PREVENTED] Overridden for {player.name} — "
+                              f"damage can't be prevented this turn (Insult // Injury)")
                     else:
                         print(f"  [DAMAGE-PREVENTED] {source_name} → {player.name}: {amount} damage prevented")
                         return f"🛡️ {amount} damage to **{player.name}** prevented"
@@ -3209,6 +3237,26 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                     creatures = [c for c in p.battlefield if c.is_creature()]
                     if creatures:
                         target_card = creatures[0]
+            # July 23 audit (#1): Aminatou's -1 is "exile another target
+            # permanent YOU OWN" (CR 208: a reanimated/stolen permanent stays
+            # owned by its original owner even while another player controls
+            # it). The generic flicker handler otherwise resolves targets on
+            # p.battlefield by control alone, so honoring an AI-declared target
+            # (or the heuristic) could flicker — and permanently keep — an
+            # opponent-owned reanimated creature (game_1529666152597426327:
+            # Aminatou -1 flickered Rick's Animate-Dead'd Korvold). require_own
+            # is Aminatou-only; other flicker sources (Ephemerate, Momentary
+            # Blink, Ghostly Flicker) are "you control" and never set it.
+            if action.get("require_own") and target_card is not None:
+                _pidx = game.players.index(p) if p in game.players else 0
+                if getattr(target_card, 'owner_index', _pidx) != _pidx:
+                    _owned = [c for c in p.battlefield
+                              if getattr(c, 'owner_index', _pidx) == _pidx
+                              and c.name.lower() != (source_name or '').lower()]
+                    target_card = _owned[0] if _owned else None
+                    if target_card is None:
+                        print(f"[FLICKER] require_own: {player_name} owns no legal "
+                              f"target — fizzling (was a controlled-not-owned permanent)")
             if target_card and target_card in p.battlefield:
                 # Deregister continuous/replacement effects before flicker — re-register
                 # below treats this as a fresh ETB. Otherwise stale effects accumulate
@@ -3226,6 +3274,28 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                 target_card.toughness_modifier = 0
                 target_card.temp_keywords = []
                 target_card.attachments = []
+                # July 23 audit (#3, CR 400.7): clearing the creature's OWN
+                # attachments list left the auras/equipment still pointing AT it
+                # via attached_to, and the P/T layer walks permanents checking
+                # `attached_to == self.id` — so Animate Dead's -1/-0 followed
+                # Korvold through every flicker (his lethal swing came in at 9
+                # instead of base 4 + 6 counters) and 704.5m never saw those
+                # auras as unattached. The returned permanent is a NEW object:
+                # auras fall off (then die to the aura SBA), equipment detaches.
+                for _att_p in game.players:
+                    for _att in _att_p.battlefield:
+                        if getattr(_att, 'attached_to', None) == target_card.id:
+                            _att.attached_to = None
+                # July 23 audit (#2, CR 400.7): a permanent that leaves and
+                # returns is a NEW object with no relationship to its previous
+                # existence — counters do not carry over, exactly like the
+                # tapped/damage/keyword/attachment resets above. Without this,
+                # repeated Aminatou/Thassa flickers let +1/+1 counters climb
+                # monotonically (game_1529666152597426327: Korvold accrued
+                # 1→2→…→6 across flickers and became the lethal threat). The
+                # re-ETB scan below re-applies any "enters with N counters".
+                if hasattr(target_card, 'counters'):
+                    target_card.counters = {}
                 p.battlefield.append(target_card)
                 # [LAYERS] Re-register static effects and recalculate after flicker
                 game.register_static_keyword_grants(target_card, p.name)
@@ -3533,6 +3603,58 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                     p.hand.append(c)
                     return f"🔄 {card_name} rebounds from exile! Cast it for free."
         return None
+
+    elif action_type == "register_turn_damage_doubler":
+        # Insult // Injury (front half): "Damage can't be prevented this turn.
+        # If a source you control would deal damage this turn, it deals double
+        # that damage instead."
+        # July 23 audit (#15): a turn-scoped CONTINUOUS replacement. Tier 3
+        # correctly declined it ("sets up a continuous effect for the turn; no
+        # immediate state change") so the doubling simply never happened and
+        # that turn's combat damage landed undoubled
+        # (game_1529677634588377108). Registered through the real replacement
+        # engine rather than a bespoke flag so it inherits CR 616.1
+        # controller-choice ordering when it stacks with Gisela / Furnace of
+        # Rath. The condition closes over the turn number, so the effect
+        # self-expires at end of turn — no cleanup pass or extra state needed.
+        player_name = action.get("player")
+        src_name = action.get("source") or "Insult // Injury"
+        p = find_player(player_name)
+        engine_r = getattr(game, 'replacement_engine', None)
+        if p is None or engine_r is None:
+            return None
+        try:
+            from rules.replacement import ReplacementEffect, EventType as _RepEvent
+        except ImportError:
+            return None
+        _turn = game.turn_number
+        _sid = f"{src_name}_turn{_turn}_doubler"
+        engine_r.add_effect(ReplacementEffect(
+            id=_sid,
+            source_name=src_name,
+            source_id=_sid,
+            controller=p.name,
+            replaces_event=_RepEvent.DAMAGE,
+            condition_text=f"{src_name}: damage from your sources doubled this turn",
+            replacement_type="double_damage",
+            multiply_amount=2.0,
+            # Same "source you control" gate Fiery Emancipation uses, plus the
+            # turn clamp that makes it expire on its own.
+            condition=lambda ev, _g=game, _t=_turn, _ctrl=p.name: (
+                _g.turn_number == _t
+                and bool(ev.source_controller)
+                and ev.source_controller == _ctrl
+            ),
+        ))
+        # Insult's OTHER clause: "Damage can't be prevented this turn." Same
+        # self-expiring trick — an exact turn match, checked by
+        # helpers.damage_prevention_disabled at every prevention gate, so Fog /
+        # Teferi's Protection / Glacial Chasm can't blank the doubled damage.
+        game._damage_prevention_off_turn = _turn
+        print(f"[REPLACEMENT] {src_name}: registered turn-scoped damage doubler "
+              f"for {p.name} + damage prevention off (turn {_turn})")
+        return (f"⚡ **{src_name}** — damage from {p.name}'s sources is doubled "
+                f"this turn, and damage can't be prevented")
 
     elif action_type == "schedule_delayed_trigger":
         # Schedule a trigger for a future phase (end_step, upkeep, etc.)
@@ -4352,15 +4474,35 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
         allow_commander = bool(action.get("allow_commander", False))
         p = find_player(player_name)
         if p:
-            candidates = [c for c in p.battlefield
-                          if c.name.lower() != exclude_name
-                          and (allow_commander
-                               or not getattr(c, 'is_commander', False))]
+            base = [c for c in p.battlefield if c.name.lower() != exclude_name]
             if type_filter:
-                candidates = [c for c in candidates if type_filter in (c.type_line or '').lower()]
+                # July 23 audit (#6): a "sacrifice a creature" edict (Grave
+                # Pact, Dictate of Erebos) must use the devotion-aware
+                # is_creature(game), not a substring match on the printed
+                # type_line — otherwise a devotion-gated god (Erebos at
+                # devotion < 5) counts as a creature and gets sacrificed even
+                # though CR 205.4b / 704 make it not a creature right then
+                # (game_1529674672545988631: Erebos sacrificed to Dictate at
+                # devotion 2).
+                if type_filter == "creature":
+                    base = [c for c in base if c.is_creature(game)]
+                else:
+                    base = [c for c in base if type_filter in (c.type_line or '').lower()]
             if only_preferred:
-                candidates = [c for c in candidates
-                              if c.name.lower() == preferred_card]
+                base = [c for c in base if c.name.lower() == preferred_card]
+            # July 23 audit (#10): prefer non-commanders, but a MANDATORY edict
+            # ("each other player sacrifices a creature of their choice") can
+            # force a commander when it's the only legal choice — CR 903.9a only
+            # grants the OPTION to redirect it to the command zone afterward, it
+            # doesn't exempt the commander from being chosen. The old hard
+            # exclusion reported "no permanent to sacrifice" while Gisela (a
+            # plain commander creature) sat untouched on the battlefield
+            # (game_1529677634588377108: Grave Pact + Dictate both whiffed).
+            if allow_commander:
+                candidates = base
+            else:
+                non_cmd = [c for c in base if not getattr(c, 'is_commander', False)]
+                candidates = non_cmd or base
             if not candidates:
                 return f"⚠️ {p.name} has no permanent to sacrifice"
             # Prefer tokens → lowest CMC non-land → lowest CMC land
@@ -4403,6 +4545,41 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
             # [SACRIFICE-TRIGGER] Scan controller's battlefield for "Whenever you
             # sacrifice a permanent" triggers (Korvold, Mayhem Devil, etc.)
             sac_msgs = _fire_sacrifice_triggers(rules, game, p, victim)
+            # July 23 audit (#4): undying / persist return on SACRIFICE
+            # (CR 702.92 / 702.77). The SBA, single-target destroy, and board
+            # wipe paths all had this save-chain; sacrifice did NOT, so a
+            # sacrificed Kitchen Finks could only come back via the Tier-3 dies
+            # escalation — which has no counter gate and re-returned it on every
+            # death (game_1529674672545988631, free-life loop). Mirrors the
+            # destroy block, counter gates included. A CZ-redirected commander
+            # never reached the graveyard, so the save can't apply.
+            save_msgs = []
+            if (victim.is_creature() and not getattr(victim, 'is_token', False)
+                    and not moved_to_command_zone and victim in p.graveyard):
+                _ret_label = _ret_counter = None
+                if ((victim.has_keyword('Undying')
+                     or rules._permanent_grants_undying(game, victim, p))
+                        and victim.counters.get('+1/+1', 0) == 0):
+                    _ret_label, _ret_counter = 'UNDYING', '+1/+1'
+                elif victim.has_keyword('Persist') and victim.counters.get('-1/-1', 0) == 0:
+                    _ret_label, _ret_counter = 'PERSIST', '-1/-1'
+                if _ret_label:
+                    p.graveyard.remove(victim)
+                    victim.damage_marked = 0
+                    victim.deathtouch_damage = 0
+                    victim.summoning_sick = True
+                    victim.counters[_ret_counter] = victim.counters.get(_ret_counter, 0) + 1
+                    p.battlefield.append(victim)
+                    print(f"[{_ret_label}] {victim.name} returned to battlefield with "
+                          f"{_ret_counter} counter (sacrifice)")
+                    save_msgs.append(
+                        f"♻️ {victim.name} returns with {_ret_label.lower()} ({_ret_counter} counter)!")
+                    game.register_static_keyword_grants(victim, p.name)
+                    game.register_static_pt_effects(victim, p.name)
+                    from mtg.sba import _finalize_death_save_return
+                    save_msgs.extend(_finalize_death_save_return(rules, game, p, victim, _ret_label))
+                    game.recalculate_granted_keywords()
+                    game.recalculate_power_toughness()
             base_msg = f"💀 {p.name} sacrifices **{victim.name}**"
             if moved_to_command_zone:
                 base_msg += " → command zone"
@@ -4413,7 +4590,7 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                 result = rules._execute_action_on_state(game, followup)
                 if result:
                     followup_msgs.append(result)
-            all_msgs = list(sac_msgs or []) + followup_msgs
+            all_msgs = list(sac_msgs or []) + save_msgs + followup_msgs
             if all_msgs:
                 return base_msg + "\n" + "\n".join(all_msgs)
             return base_msg

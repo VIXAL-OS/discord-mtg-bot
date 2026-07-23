@@ -931,15 +931,29 @@ class EffectTemplateLibrary:
             return [{"action": "counter_spell", "player": ctrl, "target": "stack_top"}]
 
         def _counter_and_draw(ctrl, opp, ctx):
-            # Arcane Denial: counter target spell. Its controller draws 2, you draw 1 (at next upkeep).
-            # Simplified to immediate draws. If counter fizzles (no target), no draws happen.
+            # Arcane Denial: "Counter target spell. Its controller may draw up
+            # to two cards at the beginning of the next turn's upkeep. You draw
+            # a card at the beginning of the next turn's upkeep."
+            # July 23 audit (#9): both draws are DELAYED triggered abilities
+            # (CR 603.7) — the previous shape resolved them inline at counter
+            # resolution, handing both players a turn's worth of cards early
+            # (game_1529677587935396020). upkeep_of=None means "the next upkeep,
+            # whoever's it is" (engine._process_delayed_triggers only gates when
+            # upkeep_of is set), which is exactly "the next turn's upkeep";
+            # Pact of Negation's caster-only variant is the gated counterpart.
+            # If the counter fizzles (no target), no draws happen.
             target = ctx.get('stack_top_spell')
             if not target:
                 return [{"action": "no_action", "reason": "Arcane Denial: no spell to counter (fizzled)"}]
             return [
                 {"action": "counter_spell", "player": ctrl, "target": "stack_top"},
-                {"action": "draw_cards", "player": opp, "amount": 2},
-                {"action": "draw_cards", "player": ctrl, "amount": 1},
+                {"action": "schedule_delayed_trigger",
+                 "trigger_at": "upkeep", "turn_delay": 0, "upkeep_of": None,
+                 "source": "Arcane Denial",
+                 "actions": [
+                     {"action": "draw_cards", "player": opp, "amount": 2},
+                     {"action": "draw_cards", "player": ctrl, "amount": 1},
+                 ]},
             ]
 
         def _counter_and_drain(ctrl, opp, ctx):
@@ -1020,12 +1034,28 @@ class EffectTemplateLibrary:
                 return [{"action": "no_action", "reason": "Fizzle — target is a creature spell (noncreature counter)"}]
             return [{"action": "counter_spell", "player": ctrl, "target": "stack_top"}]
 
-        NONCREATURE_COUNTERS = ['negate', 'stubborn denial', 'force of negation', "dovin's veto"]
+        NONCREATURE_COUNTERS = ['negate', 'stubborn denial', "dovin's veto"]
         for name in NONCREATURE_COUNTERS:
             self._add_card(name, EffectTemplate(
                 name=name.title(), description="Counter target noncreature spell",
                 action_generator=_noncreature_counter,
             ))
+
+        # July 23 audit (#8): Force of Negation is a noncreature counter with a
+        # zone-replacement rider — "exile it instead of putting it into its
+        # owner's graveyard." countered_to="exile" routes the countered card to
+        # exile (the cast pipeline's _countered_to dispatch), instead of the
+        # default graveyard drop that let the countered Rhystic Study sit
+        # recoverable (game_1529677587935396020).
+        def _force_of_negation(ctrl, opp, ctx):
+            if ctx.get('stack_top_is_creature', False):
+                return [{"action": "no_action", "reason": "Fizzle — target is a creature spell (noncreature counter)"}]
+            return [{"action": "counter_spell", "player": ctrl, "target": "stack_top",
+                     "countered_to": "exile"}]
+        self._add_card('force of negation', EffectTemplate(
+            name="Force of Negation", description="Counter target noncreature spell; exile it instead of graveyard",
+            action_generator=_force_of_negation,
+        ))
 
 
         # Creature-only counterspells
@@ -3719,6 +3749,40 @@ class EffectTemplateLibrary:
             )
         )
 
+        # July 23 audit (#12/#13): combined "draw + lose life" / "gain life +
+        # draw" dies triggers. These MUST precede the single-clause patterns
+        # below (first registered wins), or Dark Prophecy ("you draw a card and
+        # you lose 1 life") matches Dies-Draw and silently drops the life loss,
+        # and Moldervine Reclamation ("you gain 1 life and draw a card") matches
+        # Dies-Gain-Life and silently drops the draw
+        # (game_1529677634588377108: ~12 Dark Prophecy + 3 Moldervine triggers,
+        # each half-resolved).
+        # "Whenever a creature you control dies, you draw a card and you lose N life" (Dark Prophecy)
+        self._add_pattern(
+            r"whenever (?:a|another) .*?creature.*?dies.*?draw a card and you lose (\d+) life",
+            EffectTemplate(
+                name="Dies Draw + Lose Life",
+                description="Draw a card and lose life when a creature dies",
+                action_generator=lambda ctrl, opp, ctx: [
+                    {"action": "draw_cards", "player": ctrl, "amount": 1},
+                    {"action": "lose_life", "player": ctrl, "amount": int(ctx['_match'].group(1))},
+                ]
+            )
+        )
+
+        # "Whenever a creature you control dies, you gain N life and draw a card" (Moldervine Reclamation)
+        self._add_pattern(
+            r"whenever (?:a|another) .*?creature.*?dies.*?gain (\d+) life and draw a card",
+            EffectTemplate(
+                name="Dies Gain Life + Draw",
+                description="Gain life and draw a card when a creature dies",
+                action_generator=lambda ctrl, opp, ctx: [
+                    {"action": "gain_life", "player": ctrl, "amount": int(ctx['_match'].group(1))},
+                    {"action": "draw_cards", "player": ctrl, "amount": 1},
+                ]
+            )
+        )
+
         # "Whenever a/another creature dies, you gain N life"
         self._add_pattern(
             r"whenever (?:a|another) .*?creature.*?dies.*?you gain (\d+) life",
@@ -4686,6 +4750,52 @@ class EffectTemplateLibrary:
             ],
         ))
 
+        # --- Volcanic Geyser: deal X damage to any target ---
+        # July 23 audit (#11): this X-damage spell had no template and escalated
+        # to Tier 3, which DROPPED the AI's declared creature target and hit the
+        # opponent's face instead (game_1529677634588377108: cast with
+        # target=Savra x=2, resolved as 2 to Rick's face, Savra survived). Honor
+        # the declared creature target (CR 608.2b) with the chosen X; fall back
+        # to face only when the target isn't a creature.
+        self._add_card("volcanic geyser", EffectTemplate(
+            name="Volcanic Geyser",
+            description="Deal X damage to any target",
+            action_generator=lambda ctrl, opp, ctx: (
+                [{"action": "deal_damage",
+                  "amount": max(0, int(ctx.get('x_value', 0) or 0)),
+                  "target_card": ctx.get('explicit_target_name') or ctx.get('best_opponent_creature', ''),
+                  "target_controller": opp}]
+                if ((ctx.get('explicit_target_name') or ctx.get('best_opponent_creature'))
+                    and ctx.get('explicit_target_is_creature', False))
+                else [{"action": "deal_damage",
+                       "amount": max(0, int(ctx.get('x_value', 0) or 0)),
+                       "target_player": opp}]
+            ),
+        ))
+
+        # --- Insult // Injury (front half): turn-scoped damage doubler ---
+        # July 23 audit (#15): Tier 3 correctly declined this as "a continuous
+        # effect for the turn; no immediate state change", so the doubling never
+        # happened and that turn's combat damage landed at base values. The
+        # action registers a real, self-expiring replacement effect (see
+        # mtg/actions.py register_turn_damage_doubler) so it stacks with
+        # Gisela / Furnace under CR 616.1 ordering.
+        # Both clauses are modeled: the action also sets the turn-scoped
+        # "damage can't be prevented" flag (helpers.damage_prevention_disabled,
+        # honored at every prevention gate) so Fog / Teferi's Protection /
+        # Glacial Chasm can't blank the doubled damage — which matters here,
+        # since the replacement_chain and replacement_fog decks both run Fog
+        # effects alongside the doublers.
+        for _insult_key in ("insult // injury", "insult"):
+            self._add_card(_insult_key, EffectTemplate(
+                name="Insult // Injury",
+                description="Damage from your sources is doubled this turn",
+                action_generator=lambda ctrl, opp, ctx: [
+                    {"action": "register_turn_damage_doubler", "player": ctrl,
+                     "source": "Insult // Injury"}
+                ],
+            ))
+
         # --- Shard Volley: sacrifice a land, deal 3 damage to any target ---
         def _shard_volley(ctrl, opp, ctx):
             # Find a land to sacrifice (prefer non-fetch, cheapest)
@@ -5109,13 +5219,25 @@ class EffectTemplateLibrary:
         # producing a meaningless "no creature to flicker" line after charging
         # loyalty. PlaneswalkerManager.activate() detects the no_action /
         # empty-action pattern and refunds the loyalty cost (Bug 1, May 7).
+        # July 23 audit (#1): honor the AI-declared target FIRST (matches every
+        # other targeted template, e.g. the Momentary Blink family at line 1646)
+        # — the previous generator ignored explicit_target_name entirely and
+        # always substituted its heuristic pick, so an explicitly-targeted
+        # activation flickered the wrong permanent
+        # (game_1529666152597426327: AI declared Animate Dead, engine flickered
+        # Rick's reanimated Korvold). require_own tells the flicker handler to
+        # enforce Aminatou's "permanent you own" restriction (CR 208) so a
+        # controlled-but-not-owned permanent can't be flickered and kept.
         self._pw_ability_templates[("aminatou", "exile another target permanent")] = EffectTemplate(
             name="Aminatou -1 Flicker",
             description="Exile another permanent you own, then return it to the battlefield",
             action_generator=lambda ctrl, opp, ctx: (
                 [{"action": "flicker", "player": ctrl,
-                  "target": ctx.get('best_own_etb_creature') or ctx.get('best_own_creature') or ''}]
-                if (ctx.get('best_own_etb_creature') or ctx.get('best_own_creature'))
+                  "target": (ctx.get('explicit_target_name')
+                             or ctx.get('best_own_etb_creature')
+                             or ctx.get('best_own_creature') or ''),
+                  "require_own": True}]
+                if (ctx.get('explicit_target_name') or ctx.get('best_own_etb_creature') or ctx.get('best_own_creature'))
                 else [{"action": "no_action",
                        "reason": "Aminatou's -1 has no legal target (no other permanent you own)"}]
             ),

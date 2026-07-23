@@ -29,23 +29,35 @@ class TestQueueDeathChokePoint:
         assert game._death_events[-1][1] == "Bear"
 
     def test_no_raw_queue_mutations_outside_the_choke_point(self):
-        # The call-site-hunt bug class this slice retires: every append to
-        # _recently_died must go through queue_death (its own body is the
-        # one allowed site).
+        # The call-site-hunt bug class this slice retires: every death goes
+        # through the queue_death choke-point (the CREATURE_DIED emit). Slice 3b
+        # moved the physical _recently_died append out of queue_death and into
+        # the bus subscriber _accumulate_death_subscriber, which is now the ONE
+        # sanctioned appender.
         offenders = []
         for pydir in ('mtg', 'rules'):
             for path in sorted((REPO / pydir).glob('*.py')):
-                src = path.read_text(encoding='utf-8')
-                for i, line in enumerate(src.splitlines(), 1):
+                lines = path.read_text(encoding='utf-8').splitlines()
+                for i, line in enumerate(lines, 1):
                     if line.strip().startswith('#'):
                         continue
                     if re.search(r'_recently_died\.(append|extend)\(', line):
-                        if path.name == 'triggers.py' and 'queue_death' in src[
-                                max(0, src.find(line) - 800):src.find(line)]:
-                            continue  # the choke-point body itself
-                        offenders.append(f"{path.name}:{i}")
+                        # Robustly identify the enclosing function by scanning
+                        # upward for the nearest `def` at a shallower indent
+                        # (independent of docstring length — the 3b subscriber's
+                        # docstring is long enough to break a char-window check).
+                        indent = len(line) - len(line.lstrip())
+                        enclosing = None
+                        for j in range(i - 2, -1, -1):
+                            m = re.match(r'(\s*)def (\w+)', lines[j])
+                            if m and len(m.group(1)) < indent:
+                                enclosing = m.group(2)
+                                break
+                        if path.name == 'triggers.py' and enclosing == '_accumulate_death_subscriber':
+                            continue  # the sole sanctioned appender (3b bus subscriber)
+                        offenders.append(f"{path.name}:{i} (in {enclosing})")
         assert not offenders, (
-            "raw _recently_died mutation outside queue_death: "
+            "raw _recently_died mutation outside _accumulate_death_subscriber: "
             + "; ".join(offenders))
 
     def test_parity_reports_undrained_death_after_dispatch_gap(

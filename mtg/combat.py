@@ -510,11 +510,15 @@ def apply_combat_damage_to_player(rules, game: GameState, player: 'PlayerState',
         return 0
     # Damage prevention flag (Teferi's Protection, Fog, etc.)
     if getattr(player, '_damage_prevented', False):
+        from mtg.helpers import damage_prevention_disabled
         # Check turn-based expiration (Teferi's = next untap, Fog = end of turn)
         expires = getattr(player, '_damage_prevented_expires_turn', float('inf'))
         if game.turn_number >= expires:
             player._damage_prevented = False
             print(f"  [DAMAGE-PREVENTED] Expired for {player.name} (set turn expired)")
+        elif damage_prevention_disabled(game):
+            print(f"  [DAMAGE-PREVENTED] Overridden for {player.name} — damage "
+                  f"can't be prevented this turn (Insult // Injury)")
         else:
             print(f"  [DAMAGE-PREVENTED] {source_card.name} → {player.name}: {amount} damage prevented")
             return 0
@@ -656,10 +660,14 @@ def apply_noncombat_damage_to_player(rules, game: GameState, player: 'PlayerStat
         return 0
     # Fallback damage prevention flag (when replacement engine not available)
     if getattr(player, '_damage_prevented', False):
+        from mtg.helpers import damage_prevention_disabled
         expires = getattr(player, '_damage_prevented_expires_turn', float('inf'))
         if game.turn_number >= expires:
             player._damage_prevented = False
             print(f"  [DAMAGE-PREVENTED] Expired for {player.name} (set turn expired)")
+        elif damage_prevention_disabled(game):
+            print(f"  [DAMAGE-PREVENTED] Overridden for {player.name} — damage "
+                  f"can't be prevented this turn (Insult // Injury)")
         else:
             print(f"  [DAMAGE-PREVENTED] {source_name} → {player.name}: {amount} noncombat damage prevented")
             return 0

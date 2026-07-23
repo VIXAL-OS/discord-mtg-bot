@@ -382,7 +382,19 @@ def build_sba_state(game, rules_engine=None):
                 is_enchantment=card.is_enchantment(),
                 is_land=card.is_land(),
                 is_legendary='legendary' in tl_lower,
-                is_aura='aura' in tl_lower,
+                # July 23 audit (#14): "Enchant player" Auras (Curses —
+                # Curse of Bloodletting et al.) attach to a PLAYER, which this
+                # object-only SBA model has no slot for, so they always looked
+                # unattached and 704.5m destroyed them the turn they resolved
+                # (game_1529677634588377108: a {3}{R}{R} damage doubler with
+                # zero effect). CR 704.5m only destroys an Aura attached to an
+                # illegal object OR player, or attached to nothing — a player
+                # attachment is legal, so exempt curses from the object check.
+                # Their replacement effects are already controller-relative
+                # (rules/replacement.py "curse of bloodletting"), so nothing
+                # downstream needs the attach target.
+                is_aura=('aura' in tl_lower
+                         and 'enchant player' not in (card.oracle_text or '').lower()),
                 is_equipment='equipment' in tl_lower,
                 is_saga='saga' in tl_lower,
                 is_world='world' in tl_lower and 'enchantment' in tl_lower,

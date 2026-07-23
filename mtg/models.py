@@ -3307,6 +3307,12 @@ class GameState:
     #           "controller": player_idx, "once": True, "turn_delay": 0}]
     delayed_triggers: List[Dict] = field(default_factory=list)
 
+    # July 23 follow-up: turn number on which "damage can't be prevented this
+    # turn" is active (Insult // Injury's first clause). -1 = never. Checked by
+    # helpers.damage_prevention_disabled at every prevention gate; self-expires
+    # because it only matches an exact turn number.
+    _damage_prevention_off_turn: int = field(default=-1, repr=False, compare=False)
+
     # Combat flow: when Claude attacks a human, we pause for the human to declare blocks
     waiting_for_human_blocks: bool = False
 

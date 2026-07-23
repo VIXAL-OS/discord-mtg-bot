@@ -2281,8 +2281,16 @@ class GameEngine:
                 # must not consume turn_delay.
                 upkeep_of = dt.get('upkeep_of')
                 phase_of = dt.get('phase_of', upkeep_of)
+                # July 23 follow-up: end_step is gate-able too, so "at the
+                # beginning of YOUR next end step" (Necropotence) can't fire on
+                # the opponent's end step when the ability is activated at
+                # instant speed during their turn. Opt-in via phase_of —
+                # end_step triggers that set neither key (Yorion's delayed
+                # return, Oath of Teferi, Eerie Interlude) resolve to None and
+                # stay ungated, i.e. "the next end step", which is correct for
+                # them.
                 owner_gate = (upkeep_of if phase_name == 'upkeep'
-                              else phase_of if phase_name == 'main_phase'
+                              else phase_of if phase_name in ('main_phase', 'end_step')
                               else None)
                 if owner_gate is not None:
                     try:
@@ -3872,6 +3880,66 @@ class GameEngine:
                             if _dmsg:
                                 inline_msgs.append(_dmsg)
                     print(f"[ACTIVATE-CLAUDE-INLINE] {perm.name}: drew {sac_power_snapshot} (sac power)")
+
+                # (d) Plain "Draw N card(s)" as the ENTIRE effect — Erebos, God
+                # of the Dead ({1}{B}, Pay 2 life: Draw a card), Arguel's Blood
+                # Fast, etc. July 23 audit (#5): escalating these to Tier 3
+                # double-charged the life cost — the judge sees the full
+                # "Pay N life: Draw a card" oracle in the game-state dump and
+                # re-emits the life loss on top of the cost the engine already
+                # paid above (game_1529674672545988631: Erebos charged 4 life).
+                # Anchored to the whole effect so loots ("draw two, then
+                # discard") still fall through to Tier 3.
+                elif re.match(r'draw (a|one|two|three|four|five|\d+) cards?\.?\s*$',
+                              effect_lower2.strip()):
+                    _drm = re.match(r'draw (a|one|two|three|four|five|\d+) cards?',
+                                    effect_lower2.strip())
+                    _wordnum = {'a': 1, 'one': 1, 'two': 2, 'three': 3, 'four': 4, 'five': 5}
+                    _dn = _wordnum.get(_drm.group(1)) or (
+                        int(_drm.group(1)) if _drm.group(1).isdigit() else 1)
+                    if _dn > 0:
+                        _dmsg = self.rules._execute_action_on_state(game, {
+                            "action": "draw_cards", "player": player.name, "amount": _dn})
+                        if _dmsg:
+                            inline_msgs.append(_dmsg)
+                        print(f"[ACTIVATE-CLAUDE-INLINE] {perm.name}: drew {_dn} (plain draw)")
+
+                # (e) Necropotence-class: "Exile the top card of your library
+                # face down. Put that card into your hand at the beginning of
+                # your next end step." July 23 audit (#7): no handler existed
+                # anywhere and Tier 3 has no vocabulary for a delayed
+                # exile->hand, so it returned no_action every time and the
+                # ability silently became "pay 1 life for nothing" for a whole
+                # game (game_1529674672545988631: six activations, zero cards).
+                # The delayed-trigger scheduler already exists (Pact of
+                # Negation, Mana Drain); this passes phase_of so "your next end
+                # step" is owner-gated (see _process_delayed_triggers) rather
+                # than firing on whichever end step comes first.
+                elif ('exile the top card of your library' in effect_lower2
+                      and 'into your hand' in effect_lower2
+                      and 'end step' in effect_lower2):
+                    if player.library:
+                        _exiled = player.library.pop(0)
+                        player.exile.append(_exiled)
+                        self.rules._execute_action_on_state(game, {
+                            "action": "schedule_delayed_trigger",
+                            "trigger_at": "end_step", "turn_delay": 0,
+                            # "your next end step" — gated so an instant-speed
+                            # activation on the opponent's turn waits for the
+                            # caster's own end step (CR 603.7).
+                            "phase_of": player.name,
+                            "source": perm.name,
+                            "actions": [{"action": "move_card", "card": _exiled.name,
+                                         "from_zone": "exile", "to_zone": "hand",
+                                         "player": player.name}]})
+                        # The exiled card is face down — never name it in Discord.
+                        inline_msgs.append(
+                            f"🕳️ **{player.name}** exiles the top card face down "
+                            f"(returns to hand at the next end step)")
+                        print(f"[ACTIVATE-CLAUDE-INLINE] {perm.name}: exiled "
+                              f"{_exiled.name} face down → hand at next end step")
+                    else:
+                        inline_msgs.append(f"📍 **{perm.name}**: library is empty")
 
                 if inline_msgs:
                     return "\n".join(cost_msgs + inline_msgs)

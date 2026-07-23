@@ -351,6 +351,22 @@ def sanitize_oracle_for_display(text: str, max_chars: int = 300) -> str:
     return cleaned
 
 
+def damage_prevention_disabled(game) -> bool:
+    """True while "damage can't be prevented this turn" is active.
+
+    Insult // Injury's first clause (July 23 follow-up). Set by the
+    register_turn_damage_doubler action; matched on an exact turn number so it
+    self-expires with no cleanup pass, the same trick the paired damage-doubler
+    replacement uses. Consulted at every damage-prevention gate (mtg/combat.py
+    x2, mtg/actions.py, mtg/rules_engine.py) so Fog / Teferi's Protection /
+    Glacial Chasm can't blank the doubled damage.
+    """
+    if game is None:
+        return False
+    return (getattr(game, '_damage_prevention_off_turn', -1)
+            == getattr(game, 'turn_number', -2))
+
+
 def drain_pending_messages(game):
     """Drain game._pending_messages into a fresh list (slice 2b, July 21).
 
