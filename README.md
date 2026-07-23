@@ -29,9 +29,9 @@ python -m venv venv
 source venv/bin/activate    # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 
-# 3. (Optional) XMage bridge — extra card coverage, but it needs XMage
-#    itself built from source first. See "The XMage bridge" below.
-#    Skip this: the engine works fine without it.
+# 3. (Optional) XMage bridge — 87k-card coverage via a prebuilt JAR.
+#    One curl, no Java build. See "The XMage bridge" below.
+#    Skip it if you like: the engine works fine without it.
 
 # 4. Run it
 python bot.py
@@ -97,11 +97,22 @@ database (87,000+ cards) for effects the templates and regex passes miss. It's
 genuinely optional — without it the engine falls back to template + LLM
 resolution and nothing crashes, it just leans on Tier 3 slightly more often.
 
-**Building it is more work than the rest of the project**, so here's the honest
-version. `rules/xmage-bridge/pom.xml` depends on `org.mage:mage`,
-`mage-server`, and `mage-sets` at version 1.4.58. **Those artifacts are not
-published to Maven Central.** You have to build XMage from source first so
-they land in your local `~/.m2`:
+**The easy way — download the prebuilt JAR** (no Java build required):
+
+```bash
+mkdir -p rules/xmage-bridge/target
+curl -L -o rules/xmage-bridge/target/xmage-bridge-1.0.0.jar https://github.com/VIXAL-OS/discord-mtg-bot/releases/download/xmage-bridge-v1.0.0/xmage-bridge-1.0.0.jar
+```
+
+Restart the bot and you'll see `[XMAGE]` lines in the console. First start
+rescans the card DB (~13s) and writes a ~250MB cache under `db/`. You need a
+JRE 11+ on PATH — the Docker image already bundles one.
+
+**Building it yourself is a chore**, which is why the JAR is published.
+`rules/xmage-bridge/pom.xml` depends on `org.mage:mage`, `mage-server`, and
+`mage-sets` at version 1.4.58, and **those artifacts are not published to
+Maven Central.** You'd have to build XMage from source first so they land in
+your local `~/.m2`:
 
 ```bash
 git clone --depth 1 --branch xmage_1.4.58 https://github.com/magefree/mage.git
@@ -109,16 +120,8 @@ cd mage && mvn install -DskipTests
 ```
 
 That's a large multi-module Java build — budget real time and a few GB of RAM.
-Only then does the bridge build work:
-
-```bash
-cd rules/xmage-bridge && mvn package
-```
-
-That produces `target/xmage-bridge-1.0.0.jar` (~90MB, XMage shaded in). The bot
-picks it up automatically on next start; you'll see `[XMAGE]` lines in the
-console. First start after building rescans the card DB (~13s) and writes a
-~250MB cache under `db/` and `rules/xmage-bridge/db/`.
+Only then does `cd rules/xmage-bridge && mvn package` work, producing the same
+~90MB shaded JAR the release gives you for free.
 
 If you'd rather not: skip it. Run `!coverage <deck>` to see what your decks
 actually need — most Commander decks are covered by Tier 1.5 templates.
