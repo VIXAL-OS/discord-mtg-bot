@@ -49,6 +49,11 @@ data/card_images/
 data/card_cache/
 data/api_costs.json
 
+# Saved games — per-deployment runtime state, and they embed player names and
+# Discord thread IDs. GameEngine mkdirs this on startup (mtg/engine.py:307),
+# so ignoring it is safe on a fresh clone.
+data/games/
+
 # Bot memories (private context — the memories/*.json pattern above didn't
 # cover this path)
 data/memories.json
