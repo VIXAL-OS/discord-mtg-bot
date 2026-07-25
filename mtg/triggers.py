@@ -318,10 +318,8 @@ def _check_creature_etb_triggers_sync(engine, game: GameState, entering_player: 
         Tuple of (messages, unhandled_triggers) where unhandled_triggers is
         a list of (card, trigger_text) tuples that need async auto-resolution.
     """
-    # Pub/sub slice 2 parity: record that the legacy scan saw this entry so
-    # report_entered_parity can flag PERMANENT_ENTERED events that never
-    # reached it (the historic missed-call-site bug class).
-    game._entered_scanned_creature_ids.add(entering_creature.id)
+    # (Slice 2c, July 24: the parity recorder that shadowed this scan was
+    # retired after two clean batches — [EVENT-PARITY]=0 in 15296 and 15299.)
     messages = []
     messages.extend(_check_permanent_etb_watchers(
         engine, game, entering_player, entering_creature))
@@ -810,6 +808,11 @@ async def _check_cast_triggers(engine, game: GameState, caster: Player, card: Ca
     before it resolves. Common on Eldrazi ("When you cast Oblivion Sower...").
     These fire even if the spell is countered.
     """
+    # Pub/sub slice 4a parity: record that the scan saw this cast so
+    # report_cast_parity can flag CARD_CAST emissions that never reached it.
+    # A LIST, not a set — the same card object can be cast twice in a turn
+    # (adventure half then creature half) and each cast needs its own record.
+    game._cast_scanned_ids.append(card.id)
     messages = []
     oracle = card.oracle_text or ''
     oracle_lower = oracle.lower()
@@ -1167,6 +1170,10 @@ async def _check_cast_triggers(engine, game: GameState, caster: Player, card: Ca
                 # CR 702.85a — cascade puts the spell on the stack as if cast.
                 # Fire cast-triggers (Eidolon, Rhystic Study, Esper Sentinel, prowess,
                 # magecraft, recursive cascade) for the cascaded-into card.
+                # Pub/sub slice 4a: CARD_CAST shadow emit for the cascade
+                # free-cast (the second of the two live cast funnels).
+                events.emit(events.CARD_CAST, game, card=found_card,
+                            caster=caster, via="cascade", engine=engine)
                 try:
                     cascade_cast_msgs = await _check_cast_triggers(engine, game, caster, found_card)
                     if cascade_cast_msgs:
@@ -1362,6 +1369,28 @@ async def _check_cast_triggers(engine, game: GameState, caster: Player, card: Ca
                         )
                         executed_trigger = True
 
+                # July 24 batch-6 audit (reviewer S2, CRITICAL): both token
+                # branches below stopped the regex at "token(s)" and never
+                # forwarded a trailing "with flying[, ...]" clause — every
+                # Talrand Drake in game_1529988360263827656 was a vanilla 2/2
+                # all game (blocked by ground creatures, blocked ground
+                # attackers; CR 702.9b). Sibling of the May 17 ETB-path fix
+                # (make_token_action forwards tok.keywords); the create_token
+                # handler already accepts a keywords list.
+                def _token_keywords(sent: str) -> list:
+                    m = re.search(r'tokens? with ([\w\s,\'-]+?)(?:\.|$)', sent)
+                    if not m:
+                        return []
+                    KNOWN = {
+                        'flying', 'deathtouch', 'vigilance', 'trample',
+                        'haste', 'lifelink', 'first strike', 'double strike',
+                        'menace', 'reach', 'defender', 'flash', 'hexproof',
+                        'indestructible', 'prowess',
+                    }
+                    parts = re.split(r',\s*|\s+and\s+', m.group(1))
+                    return [p.strip().title() for p in parts
+                            if p.strip() in KNOWN]
+
                 # Token creation: "create X P/T [type] token(s), where X is that spell's mana value"
                 # (Endrek Sahr, Master Breeder)
                 if not executed_trigger and "where x is" in sentence_lower and "mana value" in sentence_lower:
@@ -1380,6 +1409,7 @@ async def _check_cast_triggers(engine, game: GameState, caster: Player, card: Ca
                             "action": "create_token", "player": caster.name,
                             "name": t_type, "power": t_power, "toughness": t_tough,
                             "types": f"Creature — {t_type}", "count": count,
+                            "keywords": _token_keywords(sentence_lower),
                             "source": bf_card.name})
                         messages.append(f"⚡ {bf_card.name} creates {count} {t_power}/{t_tough} {t_type} token(s) (X = {card.name}'s mana value {card.cmc})")
                         if tok_msg:
@@ -1405,6 +1435,7 @@ async def _check_cast_triggers(engine, game: GameState, caster: Player, card: Ca
                             "action": "create_token", "player": caster.name,
                             "name": t_type, "power": t_power, "toughness": t_tough,
                             "types": f"Creature — {t_type}", "count": count,
+                            "keywords": _token_keywords(sentence_lower),
                             "source": bf_card.name})
                         messages.append(f"⚡ {bf_card.name} creates {count} {t_power}/{t_tough} {t_type} token(s)")
                         if tok_msg:
@@ -1993,8 +2024,6 @@ def _check_enchantment_etb_watchers(engine, game: GameState, controller: Player,
     are "you control"-scoped in practice), resolves the dominant draw shape
     inline (free), and queues anything else for Tier-3 auto-resolve.
     """
-    # Pub/sub slice 2 parity: record that the legacy scan saw this entry.
-    game._entered_scanned_ench_ids.add(entered_card.id)
     messages: List[str] = []
     for bf_card in list(controller.battlefield):
         if getattr(bf_card, '_phased_out', False):
@@ -2077,10 +2106,8 @@ def _check_dies_triggers_sync(engine, game: GameState, dying_card: Card, dying_p
         Tuple of (messages, unhandled_triggers) where unhandled_triggers is
         a list of (card, trigger_text) tuples that need async auto-resolution.
     """
-    # Slice 3a parity (July 21): record that the dispatcher processed this
-    # death so report_death_parity can flag CREATURE_DIED emissions that
-    # never got here.
-    game._death_dispatched_ids.add(dying_card.id)
+    # (Slice 3c, July 24: the death parity recorder that shadowed this
+    # dispatcher was retired — [EVENT-PARITY-DIES]=0 in the post-3b batch.)
     messages = []
     unhandled = []
     player_idx = game.players.index(dying_player) if dying_player in game.players else 0
@@ -2563,10 +2590,29 @@ def collapse_trigger_burst(messages: List[str]) -> List[str]:
         if len(run_msgs) == 1:
             out.append(run_msgs[0])
         else:
-            # Use the LAST message in the run as the representative — it has
-            # the cumulative life total / counter value that reflects the
-            # final state after all fires.
-            out.append(f"{run_msgs[-1]} (×{len(run_msgs)} fires)")
+            # July 24 batch-6 (reviewer A1, MAJOR): when each fire names a
+            # DIFFERENT sacrificed object, the last-message representative
+            # hides real events — "💀 Grave Pact: Claude sacrifices Mother
+            # of Runes (×2 fires)" made Kor Soldier's sacrifice invisible
+            # (game_1529979552258855062). Enumerate the distinct objects for
+            # the sacrifice shape; cumulative-value shapes (Syr Konrad's
+            # running life total) keep the last-message form.
+            _sac_names = []
+            for m in run_msgs:
+                sm = re.search(r'sacrifices\s+(.+?)(?:\s*\(|\s*$)', m)
+                _sac_names.append(sm.group(1).strip() if sm else None)
+            if all(_sac_names) and len(set(_sac_names)) > 1:
+                names = ', '.join(dict.fromkeys(_sac_names))
+                combined = re.sub(
+                    r'(sacrifices\s+).+?(\s*\(|\s*$)',
+                    lambda m2: m2.group(1) + names + m2.group(2),
+                    run_msgs[-1], count=1)
+                out.append(f"{combined} (×{len(run_msgs)} fires)")
+            else:
+                # Use the LAST message in the run as the representative — it
+                # has the cumulative life total / counter value that reflects
+                # the final state after all fires.
+                out.append(f"{run_msgs[-1]} (×{len(run_msgs)} fires)")
 
     for msg in messages:
         key = _trigger_source_key(msg) if isinstance(msg, str) else None
@@ -4442,102 +4488,122 @@ def _accumulate_death_subscriber(game, card=None, player=None, **_):
     game._recently_died.append((card, player))
 
 
-def _record_death_for_parity(game, card=None, player=None, **_):
-    """CREATURE_DIED parity recorder (slice 3b — INVERTED meaning).
+def queue_cast_triggers_sync(engine, game, caster, card, via: str = "sync") -> int:
+    """Sync-context cast-trigger bridge (July 24, 2026 — slice 4b groundwork).
 
-    Records every emitted death; report_death_parity diffs these against the
-    deaths the dispatcher actually processed. Pre-3b (shadow mode) a miss meant
-    "the direct-append queue and the shadow emit diverged"; post-3b the bus is
-    AUTHORITATIVE (the subscriber above populates _recently_died from the
-    emit), so a miss now means the bus -> subscriber -> dispatcher path SKIPPED
-    a death — the same inversion slice 2b applied to [EVENT-PARITY]. Registered
-    AFTER _accumulate_death_subscriber so the append happens first.
+    Suspend resolution, Etali free casts, template "cast … for free" moves,
+    and the legacy sync cast are real CR 601 casts (a suspended Rift Bolt
+    should make Talrand a Drake), but they run in SYNC contexts that can't
+    await _check_cast_triggers — the documented sync-trigger-gap class, so
+    battlefield cast triggers never fired for them at all. Scan both
+    battlefields for "whenever you cast / whenever a player casts" sources
+    whose spell-filter matches this cast and queue each for the async Tier-3
+    drain (engine._queue_async_trigger — the same mechanism the unhandled
+    cast-trigger tail uses). Prowess and self-cast ("when you cast this
+    spell") triggers remain out of scope here — they need inline resolution
+    semantics the queue can't carry.
+
+    Also emits CARD_CAST and records the cast in the slice-4a parity ledger,
+    so these sites participate in the shadow without breaking the zero gate.
+    Returns the number of triggers queued.
+    """
+    events.emit(events.CARD_CAST, game, card=card, caster=caster,
+                via=via, engine=engine)
+    game._cast_scanned_ids.append(card.id)
+    if engine is None or not hasattr(engine, '_queue_async_trigger'):
+        return 0
+    queued = 0
+    for p in game.players:
+        for bf_card in list(p.battlefield):
+            if getattr(bf_card, '_phased_out', False):
+                continue
+            oracle = (bf_card.oracle_text or '')
+            ol = oracle.lower()
+            if 'whenever you cast' not in ol and 'whenever a player casts' not in ol:
+                continue
+            for sentence in oracle.replace('\n', '.').split('.'):
+                sl = sentence.lower().strip()
+                if not sl:
+                    continue
+                if p is caster:
+                    if ('whenever you cast' not in sl
+                            and 'whenever a player casts' not in sl):
+                        continue
+                else:
+                    # An opponent's permanent only sees this cast through
+                    # the any-player phrasing.
+                    if 'whenever a player casts' not in sl:
+                        continue
+                # Skip activated-ability cost lines ("{2}: ...").
+                if re.match(r'^[+−\-]?\d+\s*:', sentence.strip()):
+                    continue
+                try:
+                    if not engine._spell_matches_cast_trigger(sl, card, caster, game):
+                        continue
+                except (AttributeError, TypeError):
+                    continue
+                engine._queue_async_trigger(
+                    game, bf_card, sentence.strip(), "cast_trigger", p.name,
+                    context=f"{caster.name} cast {card.name} (via {via})")
+                queued += 1
+                print(f"[CAST-TRIGGER-SYNC] {bf_card.name} queued for Tier 3 "
+                      f"({caster.name} cast {card.name} via {via})")
+    return queued
+
+
+def _record_cast_for_parity(game, card=None, caster=None, via=None, **_):
+    """CARD_CAST parity recorder (slice 4a — SHADOW mode).
+
+    Records every emitted cast; report_cast_parity diffs these against the
+    casts _check_cast_triggers actually scanned. Shadow semantics (like
+    slice 3a): the direct scan calls stay authoritative — a miss means an
+    emit whose adjacent scan didn't run (or a future cast path that emits
+    without scanning). One clean batch gates slice 4b (flip the scan into
+    a subscriber + close the sync-cast-site gaps).
     """
     if card is None:
         return
-    game._death_events.append((getattr(card, 'id', None), card.name))
+    game._cast_events.append((getattr(card, 'id', None), card.name,
+                              via or 'unknown'))
 
 
-def report_death_parity(game) -> List[str]:
-    """Diff CREATURE_DIED emissions against dispatcher-processed deaths and
-    clear the per-turn state (called from engine.end_turn, next to
-    report_entered_parity).
-
-    Slice 3b: [EVENT-PARITY-DIES] now means a death the bus emitted whose
-    subscriber-fed queue entry the dispatcher never drained (bus authoritative)
-    — one clean batch gates removing this recorder entirely (slice 3c cleanup).
-    Deaths still sitting in game._recently_died are EXCLUDED — queued but not
-    yet drained is pending, not a miss (it will be flagged the turn it goes
-    missing for real).
-    """
-    pending_ids = {getattr(c, 'id', None) for c, _p in game._recently_died}
+def report_cast_parity(game) -> List[str]:
+    """Diff CARD_CAST emissions against scan records and clear the per-turn
+    state (called from engine.end_turn). Multiplicity-aware: two casts of
+    the same card object need two scan records (adventure half + creature
+    half in one turn must each be scanned)."""
+    from collections import Counter
+    scanned = Counter(game._cast_scanned_ids)
     misses = []
-    for card_id, name in game._death_events:
-        if card_id in pending_ids:
+    for card_id, name, via in game._cast_events:
+        if scanned.get(card_id, 0) > 0:
+            scanned[card_id] -= 1
             continue
-        if card_id not in game._death_dispatched_ids:
-            misses.append(f"death of {name} never reached the dies dispatcher")
+        misses.append(f"cast of {name} (via={via}) never reached the "
+                      f"cast-trigger scan")
     for miss in misses:
-        print(f"[EVENT-PARITY-DIES] {miss}")
-    game._death_events.clear()
-    game._death_dispatched_ids.clear()
-    return misses
-
-
-def _record_entered_for_parity(game, card=None, controller=None, via=None, **_):
-    """Parity recorder: every PERMANENT_ENTERED lands here; the legacy scans
-    record what they saw into game._entered_scanned_*_ids. end_turn calls
-    report_entered_parity to diff the two."""
-    if card is None:
-        return
-    kind = None
-    try:
-        if card.is_creature(game):
-            kind = 'creature'
-        elif card.is_enchantment():
-            kind = 'enchantment'
-    except Exception:
-        kind = None
-    game._entered_events.append(
-        (card.id, card.name, kind, via or 'unknown'))
-
-
-def report_entered_parity(game) -> List[str]:
-    """Diff PERMANENT_ENTERED emissions against the legacy scan records and
-    clear the per-turn state. Called from engine.end_turn.
-
-    Returns the miss descriptions (also printed as [EVENT-PARITY] console
-    lines — the next batch greps these; zero across a clean batch is the
-    gate for slice 2b). Only creature and enchantment entries participate:
-    those are the two scan classes this slice shadows. Lands/artifacts are
-    emitted (the snow watcher needs them) but have no legacy scan to miss.
-    """
-    misses = []
-    for card_id, name, kind, via in game._entered_events:
-        if kind == 'creature' and card_id not in game._entered_scanned_creature_ids:
-            misses.append(f"creature {name} (via={via}) never reached the "
-                          f"creature-enters scan")
-        elif kind == 'enchantment' and card_id not in game._entered_scanned_ench_ids:
-            misses.append(f"enchantment {name} (via={via}) never reached the "
-                          f"enchantment-enters scan")
-    for miss in misses:
-        print(f"[EVENT-PARITY] {miss}")
-    game._entered_events.clear()
-    game._entered_scanned_creature_ids.clear()
-    game._entered_scanned_ench_ids.clear()
+        print(f"[EVENT-PARITY-CAST] {miss}")
+    game._cast_events.clear()
+    game._cast_scanned_ids.clear()
     return misses
 
 
 events.subscribe(events.PERMANENT_ENTERED, _snow_permanent_entered_watcher)
-# Slice 2b (July 21, 2026): the creature-enters watcher scan is now DRIVEN
-# BY the bus — registered before the parity recorder so the scan-side id
-# recording (inside _check_creature_etb_triggers_sync) happens first and
-# the recorder's diff flags subscriber skips (the inverted parity net).
+# Slice 2b (July 21, 2026): the creature-enters watcher scan is DRIVEN BY
+# the bus. Slice 2c (July 24, 2026): the parity recorder that shadowed the
+# migration was retired after two clean batches ([EVENT-PARITY]=0 in 15296
+# and 15299) — [ETB-BUS] remains the emit-side net (a subscriber that gets
+# an unusable engine ref logs it), and tests/test_slice2b_bus_dispatch.py
+# pins the end-to-end dispatch.
 events.subscribe(events.PERMANENT_ENTERED, _creature_entered_subscriber)
 events.subscribe(events.PERMANENT_ENTERED, _enchantment_entered_subscriber)
-events.subscribe(events.PERMANENT_ENTERED, _record_entered_for_parity)
-# Slice 3b (July 23, 2026): the dies queue is now bus-fed — the accumulator
-# subscriber (the sole sanctioned _recently_died appender) is registered
-# BEFORE the parity recorder so the append lands before the diff records it.
+# Slice 3b (July 23, 2026): the dies queue is bus-fed — the accumulator
+# subscriber is the sole sanctioned _recently_died appender. Slice 3c
+# (July 24, 2026): the death parity recorder retired after the post-3b
+# batch (game_15299*) returned [EVENT-PARITY-DIES]=0; the structural pin in
+# tests/test_slice3a_death_shadow.py (no raw _recently_died mutations
+# outside the accumulator) remains as the permanent net.
 events.subscribe(events.CREATURE_DIED, _accumulate_death_subscriber)
-events.subscribe(events.CREATURE_DIED, _record_death_for_parity)
+# Slice 4a (July 24, 2026): CARD_CAST in SHADOW mode — the recorder is the
+# only subscriber; _check_cast_triggers stays the directly-called consumer.
+events.subscribe(events.CARD_CAST, _record_cast_for_parity)

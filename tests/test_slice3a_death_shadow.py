@@ -1,10 +1,11 @@
-"""Pub/sub slice 3a (July 21, 2026) — CREATURE_DIED in shadow mode.
+"""Pub/sub slice 3 (July 21-24, 2026) — CREATURE_DIED via the bus.
 
 queue_death/queue_deaths (mtg/triggers.py) is the single choke-point for
-the _recently_died queue: it appends exactly as before AND emits
-CREATURE_DIED, whose only subscriber is the parity recorder. Consumers
-(the dies dispatcher, wave semantics, apnap_order_died) are unchanged by
-construction — slice 3b flips them only after 3a's own clean batch.
+the _recently_died queue: it emits CREATURE_DIED and the accumulator
+subscriber does the append. The parity recorder that shadowed the 3a/3b
+migration was retired in slice 3c (the post-3b batch game_15299* returned
+[EVENT-PARITY-DIES]=0); the structural no-raw-mutations pin below is the
+PERMANENT net, not migration scaffolding.
 """
 import re
 from pathlib import Path
@@ -22,11 +23,20 @@ class TestQueueDeathChokePoint:
         game = make_game()
         rick = game.players[0]
         bear = make_card("Bear", power="2", toughness="2")
-        queue_death(game, bear, rick)
+        captured = []
+
+        def _capture(g, card=None, player=None, **_):
+            captured.append(card)
+
+        events.subscribe(events.CREATURE_DIED, _capture)
+        try:
+            queue_death(game, bear, rick)
+        finally:
+            events.unsubscribe(events.CREATURE_DIED, _capture)
         assert (bear, rick) in game._recently_died, (
-            "shadow mode: the legacy queue must be fed exactly as before")
-        assert game._death_events, "the CREATURE_DIED shadow emit must record"
-        assert game._death_events[-1][1] == "Bear"
+            "the accumulator subscriber must feed the queue")
+        assert captured and captured[-1] is bear, (
+            "queue_death must emit CREATURE_DIED on the bus")
 
     def test_no_raw_queue_mutations_outside_the_choke_point(self):
         # The call-site-hunt bug class this slice retires: every death goes
@@ -60,38 +70,6 @@ class TestQueueDeathChokePoint:
             "raw _recently_died mutation outside _accumulate_death_subscriber: "
             + "; ".join(offenders))
 
-    def test_parity_reports_undrained_death_after_dispatch_gap(
-            self, make_game, make_card, capsys):
-        from mtg.triggers import queue_death, report_death_parity
-        game = make_game()
-        rick = game.players[0]
-        bear = make_card("Bear", power="2", toughness="2")
-        queue_death(game, bear, rick)
-        # Simulate the drain CLAIMING the queue without dispatching (the
-        # miss class): empty the queue, never call the dies scan.
-        game._recently_died.clear()
-        misses = report_death_parity(game)
-        assert misses and "Bear" in misses[0]
-        assert "[EVENT-PARITY-DIES]" in capsys.readouterr().out
-
-    def test_pending_death_is_not_a_miss(self, make_game, make_card):
-        from mtg.triggers import queue_death, report_death_parity
-        game = make_game()
-        rick = game.players[0]
-        bear = make_card("Bear", power="2", toughness="2")
-        queue_death(game, bear, rick)
-        # Still sitting in the queue at end_turn — queued-not-yet-drained
-        # is pending, not a miss.
-        assert report_death_parity(game) == []
-
-    def test_dispatched_death_is_clean(self, make_game, make_card, rules):
-        from mtg.engine import GameEngine
-        from mtg.triggers import queue_death, report_death_parity
-        engine = GameEngine(None)
-        game = make_game()
-        rick = game.players[0]
-        bear = make_card("Bear", power="2", toughness="2")
-        queue_death(game, bear, rick)
-        game._recently_died.clear()
-        engine._check_dies_triggers_sync(game, bear, rick)
-        assert report_death_parity(game) == []
+    # (Slice 3c, July 24, 2026: the three parity-recorder tests were deleted
+    # with the recorder they covered. The choke-point emit + the structural
+    # pin above are the permanent guarantees.)

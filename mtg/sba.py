@@ -229,7 +229,7 @@ def check_sba_inline_fallback(rules, game: GameState) -> List[Dict]:
             if eff_t <= 0:
                 # 0 toughness — can't be saved by shield counters or indestructible
                 actions.append({'type': 'creature_dies', 'card_id': creature.id, 'card_name': creature.name, 'player_index': i, 'reason': 'zero or less toughness'})
-            elif creature.deathtouch_damage > 0 and not creature.has_keyword('Indestructible'):
+            elif creature.deathtouch_damage > 0 and not creature.has_keyword('Indestructible', game=game):
                 # [SHIELD-COUNTER] If creature has shield counters, remove one instead of dying
                 if creature.counters.get('shield', 0) > 0:
                     creature.counters['shield'] -= 1
@@ -244,7 +244,7 @@ def check_sba_inline_fallback(rules, game: GameState) -> List[Dict]:
                     actions.append({'type': 'totem_armor', 'card_id': creature.id, 'card_name': creature.name, 'aura_name': aura.name if aura else '?', 'player_index': i, 'reason': f'totem armor ({aura.name if aura else "?"}) destroyed instead'})
                 else:
                     actions.append({'type': 'creature_dies', 'card_id': creature.id, 'card_name': creature.name, 'player_index': i, 'reason': 'deathtouch damage'})
-            elif creature.damage_marked >= eff_t and not creature.has_keyword('Indestructible'):
+            elif creature.damage_marked >= eff_t and not creature.has_keyword('Indestructible', game=game):
                 # [SHIELD-COUNTER] If creature has shield counters, remove one instead of dying
                 if creature.counters.get('shield', 0) > 0:
                     creature.counters['shield'] -= 1

@@ -482,6 +482,23 @@ def _validate_cast(engine, game: GameState, player: Player, card: Card,
             return ((False, f"{card.name} requires a target spell on the stack", []),
                     _cast_from_graveyard, target)
 
+    # July 24 batch-6 audit (reviewer S2): ability-ONLY counters (Stifle,
+    # Trickbind — "Counter target activated or triggered ability", no spell
+    # clause) were castable with only SPELLS on the stack; the counter_ability
+    # fallback then illegally countered the spell (Stifle beat a Scroll Rack
+    # SPELL, game_1529988360263827656). CR 601.2c: no legal target, no cast.
+    # Voidslime/Disallow/Tale's End name spells in their text and skip this.
+    if ('counter target' in oracle_lower
+            and ('activated' in oracle_lower or 'triggered' in oracle_lower)
+            and 'spell' not in oracle_lower):
+        stack_has_ability = any(
+            not getattr(entry, 'is_spell', True)
+            for entry in getattr(game, 'stack', []))
+        if not stack_has_ability and not card.is_creature():
+            return ((False, f"{card.name} requires a target activated or "
+                            f"triggered ability on the stack", []),
+                    _cast_from_graveyard, target)
+
     # July 20 audit (Diabolic Intent): "As an additional cost to cast this
     # spell, sacrifice a creature" — the plan-validate path checked this, but
     # the decide_action_inline fallback didn't, so the cast went through,
@@ -899,6 +916,92 @@ def _pay_costs(engine, game: GameState, player: Player, card: Card,
     return None
 
 
+def _force_stack_above(engine, game: GameState, stack_entry,
+                       effect_messages: List[str]) -> bool:
+    """LIFO-order rescue for a buried entry whose extension cap ran out.
+
+    July 24 batch-6 audit (reviewer S2, CRITICAL): the cap-hit branch used to
+    resolve the buried entry anyway — Smothering Tithe resolved BENEATH the
+    An Offer You Can't Refuse targeting it, and 4/4 cap-hits in
+    game_1529988360263827656 were CR 608 violations that defeated correctly
+    cast counterspells. Instead of resolving out of order, act on the stack
+    ABOVE us: resolve stalled TRIGGER entries inline (the same template path
+    on_stack_resolve uses), then wake the topmost SPELL entry's
+    resolution_event so its own coroutine resolves it (that is the normal
+    contract — the event means "your turn to resolve", and a counter
+    resolving will mark us countered). Returns True if anything was acted on.
+    """
+    from mtg.util import maybe_reraise
+    try:
+        idx = game.stack.index(stack_entry)
+    except ValueError:
+        return False
+    acted = False
+    # Resolve stalled trigger entries above us, top-down.
+    for i in range(len(game.stack) - 1, idx, -1):
+        entry = game.stack[i]
+        if getattr(entry, 'is_spell', True):
+            continue
+        src_name = getattr(entry, 'trigger_source', None) or '?'
+        if getattr(entry, 'countered', False):
+            effect_messages.append(
+                f"🚫 **{src_name}**'s triggered ability is countered!")
+        elif HAS_EFFECT_TEMPLATES and getattr(entry, 'trigger_text', None):
+            try:
+                ctrl_idx = getattr(entry, 'controller_index', 0)
+                ctrl = game.players[ctrl_idx]
+                opp = game.players[1 - ctrl_idx]
+                ctx = build_game_context(game, ctrl, opp, card=entry.card)
+                lib = get_effect_library()
+                actions, explanation = lib.resolve_etb(
+                    card_name=src_name, oracle_text=entry.trigger_text,
+                    controller=ctrl.name, opponent=opp.name, game_context=ctx)
+                for act in (actions or []):
+                    if act.get("action") == "no_action":
+                        continue
+                    try:
+                        msg = engine.rules._execute_action_on_state(game, act)
+                        if msg:
+                            effect_messages.append(msg)
+                    except (ValueError, KeyError, AttributeError,
+                            TypeError, IndexError) as te:
+                        print(f"[STACK-LIFO-FORCE] trigger action failed: {te}")
+                        maybe_reraise(te)
+                print(f"[STACK-LIFO-FORCE] resolved stalled trigger "
+                      f"{src_name} above the cap-hit entry")
+            except (ValueError, KeyError, AttributeError,
+                    TypeError, IndexError) as te:
+                print(f"[STACK-LIFO-FORCE] trigger resolve failed for "
+                      f"{src_name}: {te}")
+                maybe_reraise(te)
+        del game.stack[i]
+        _pid = getattr(entry, 'priority_id', None)
+        ps = getattr(game, '_priority_system', None)
+        if _pid and ps and hasattr(ps, 'remove_stack_entry_by_priority_id'):
+            try:
+                ps.remove_stack_entry_by_priority_id(_pid)
+            except (ValueError, KeyError, AttributeError):
+                pass
+        acted = True
+    # Wake the topmost SPELL entry still above us — its awaiting coroutine
+    # owns the resolution (it may counter us).
+    try:
+        idx = game.stack.index(stack_entry)
+    except ValueError:
+        return acted
+    for i in range(len(game.stack) - 1, idx, -1):
+        entry = game.stack[i]
+        ev = getattr(entry, 'resolution_event', None)
+        if ev is not None and not ev.is_set():
+            _e_name = (entry.card.name if getattr(entry, 'card', None) else '?')
+            print(f"[STACK-LIFO-FORCE] waking buried-above spell {_e_name} "
+                  f"to resolve in LIFO order")
+            ev.set()
+            acted = True
+            break
+    return acted
+
+
 async def _await_stack_window(engine, game: GameState, player: Player,
                               card: Card, target: Any,
                               effect_messages: List[str]
@@ -978,6 +1081,13 @@ async def _await_stack_window(engine, game: GameState, player: Player,
         except Exception as e:
             print(f"[STACK] Early cast announcement failed: {e}")
 
+    # Pub/sub slice 4a (July 24, 2026): CARD_CAST shadow emit — once per
+    # cast, at announcement time (CR 601.2i; cast triggers fire even if the
+    # spell is later countered). This funnel carries every cast_spell_async
+    # cast: hand, response, adventure half, flashback, commander, signature.
+    # The scan below stays authoritative; the recorder diffs at end_turn.
+    events.emit(events.CARD_CAST, game, card=card, caster=player,
+                via="cast", engine=engine)
     # Cast triggers fire when spell is put on stack (before resolution/countering)
     # This is correct for Rhystic Study, Esper Sentinel, etc. — they trigger on cast
     cast_trigger_msgs = await engine._check_cast_triggers(game, player, card)
@@ -1134,10 +1244,39 @@ async def _await_stack_window(engine, game: GameState, player: Player,
                                 break
                             print(f"[STACK] {card.name} still buried under {game.stack[-1].card.name if game.stack[-1].card else '?'} — extending again ({extensions_used}/{max_lifo_extensions})")
                     else:
-                        # Hit the safety cap. Resolve to prevent a deadlock,
-                        # but loudly log so an audit can spot a real LIFO stall.
+                        # Hit the safety cap while still buried. July 24
+                        # batch-6 audit (reviewer S2, CRITICAL): resolving
+                        # anyway here defeated counterspells — Smothering
+                        # Tithe resolved beneath the An Offer You Can't
+                        # Refuse targeting it (CR 608). Force the stack
+                        # above us to act first (stalled triggers resolve
+                        # inline; the topmost buried spell's coroutine is
+                        # woken), then grant short extra wait cycles for
+                        # those resolutions — a counter above will mark us
+                        # countered. Resolve-anyway remains only as the
+                        # true-deadlock last resort.
                         print(f"[STACK] LIFO extension cap ({max_lifo_extensions}) hit for {card.name}; "
-                              f"resolving anyway to prevent deadlock")
+                              f"forcing the stack above to act first (CR 608)")
+                        for _rescue in range(3):
+                            if (stack_entry.countered
+                                    or not game.stack
+                                    or game.stack[-1] is stack_entry
+                                    or stack_entry not in game.stack):
+                                break
+                            _force_stack_above(engine, game, stack_entry,
+                                               effect_messages)
+                            try:
+                                await asyncio.wait_for(
+                                    stack_entry.resolution_event.wait(),
+                                    timeout=min(resolution_timeout, 3.0))
+                                break
+                            except asyncio.TimeoutError:
+                                continue
+                        if (not stack_entry.countered and game.stack
+                                and stack_entry in game.stack
+                                and game.stack[-1] is not stack_entry):
+                            print(f"[STACK] LIFO rescue exhausted for {card.name}; "
+                                  f"resolving anyway to prevent deadlock")
                     if stack_entry in game.stack and stack_entry is game.stack[-1]:
                         game.stack.remove(stack_entry)
                         _drop_from_priority_stack()
@@ -1393,6 +1532,16 @@ async def _dispatch_resolution(engine, game: GameState, player: Player,
         engine.rules.log_event(f"{player.name} casts {card.adventure_name} (adventure of {card.name})")
         return True, f"Cast {card.adventure_name}", effect_messages
 
+    # July 24 batch-6 anomaly (reviewer A1 #5, root-caused): the PERMANENT
+    # branch's Tier-1 rebind (effect_messages = resolve_special_effects(...))
+    # discarded everything already appended — the cast-trigger draw message
+    # ("⚡ Sram — Claude draws a card") AND the aura's own "✨ enchants" line
+    # both vanished whenever a permanent spell had self-ETB text (state was
+    # correct; display only). Saved in the permanent branch below, restored
+    # at the shared tail. The instant/sorcery branch has had its own
+    # save/restore since May (cast_trigger_msgs_saved) and is unaffected.
+    _perm_msgs_saved = None
+
     if card.is_instant() or card.is_sorcery():
         # [TARGETING] Set resolution source context so _execute_action_on_state
         # can enforce hexproof/protection/shroud on targeted actions.
@@ -1451,6 +1600,20 @@ async def _dispatch_resolution(engine, game: GameState, player: Player,
                                 # set it too for templates that don't supply one.
                                 if action.get('action') == 'deal_damage' and not action.get('source'):
                                     action['source'] = card.name
+                            # July 24 batch-6 audit (reviewer S2): counter
+                            # templates hardcode "stack_top", so a counter
+                            # resolving late acted on whatever spell happened
+                            # to be top (a stale Spell Pierce extracted a {2}
+                            # payment from An Offer You Can't Refuse, which
+                            # has no unless-clause at all). Thread the
+                            # DECLARED target through; the handlers fizzle
+                            # per CR 608.2b when it has left the stack.
+                            if (action.get('action') in ('counter_spell',
+                                                         'counter_unless_pays',
+                                                         'counter_ability')
+                                    and not action.get('target_name')
+                                    and getattr(target, 'name', None)):
+                                action['target_name'] = target.name
                             try:
                                 msg = engine.rules._execute_action_on_state(game, action)
                                 actions_executed += 1
@@ -2048,7 +2211,27 @@ async def _dispatch_resolution(engine, game: GameState, player: Player,
                         own_creatures = [c for c in valid_targets if c in player.battlefield]
                         opp_creatures = [c for c in valid_targets if c not in player.battlefield]
                         if is_detrimental and opp_creatures:
-                            target_card = opp_creatures[0]
+                            # July 24 batch-6 (reviewer D1): despite the name,
+                            # opp_creatures is "opponent's legal permanents in
+                            # enumeration order" for enchant-PERMANENT auras —
+                            # Faith's Fetters auto-picked a basic Swamp (a
+                            # total non-effect) while the two creatures dealing
+                            # lethal every turn sat in the same list
+                            # (game_1529985418743910420). Prefer real creatures
+                            # (biggest threat first), then nonland permanents;
+                            # a land only as last resort.
+                            _real_creatures = [c for c in opp_creatures
+                                               if c.is_creature(game)]
+                            if _real_creatures:
+                                target_card = max(
+                                    _real_creatures,
+                                    key=lambda c: c.get_effective_power(game)
+                                    if hasattr(c, 'get_effective_power') else 0)
+                            else:
+                                _nonlands = [c for c in opp_creatures
+                                             if not c.is_land()]
+                                target_card = (_nonlands[0] if _nonlands
+                                               else opp_creatures[0])
                         elif is_detrimental and not opp_creatures:
                             # Detrimental aura with no opponent creature — fizzle
                             # rather than punish caster.
@@ -2061,6 +2244,14 @@ async def _dispatch_resolution(engine, game: GameState, player: Player,
                             # fizzle rather than buff opponent.
                             print(f"[AURA] {card.name} is beneficial but only opponent targets — fizzling")
                             target_card = None
+                            # July 24 batch-6 (reviewer D1, MINOR): the fizzle
+                            # message downstream said "no creature you control
+                            # on battlefield", hiding that a legal target WAS
+                            # found and declined strategically (Bear Umbra vs
+                            # an opponent-only board).
+                            game._aura_fizzle_note = (
+                                "declined — the only legal targets are "
+                                "opponent-controlled")
                         if target_card:
                             print(f"[AURA] Auto-selected target {target_card.name} for {card.name} (detrimental={is_detrimental})")
 
@@ -2091,8 +2282,13 @@ async def _dispatch_resolution(engine, game: GameState, player: Player,
                     if hint_target:
                         effect_messages.append(f"💨 {card.name} fizzles (no valid target). Try `!play {card.name} target {hint_target}`")
                     else:
-                        kind = "opponent creature" if is_detrimental else "creature you control"
-                        effect_messages.append(f"💨 {card.name} fizzles (no valid target — no {kind} on battlefield)")
+                        _note = getattr(game, '_aura_fizzle_note', None)
+                        if _note:
+                            game._aura_fizzle_note = None
+                            effect_messages.append(f"💨 {card.name} fizzles ({_note})")
+                        else:
+                            kind = "opponent creature" if is_detrimental else "creature you control"
+                            effect_messages.append(f"💨 {card.name} fizzles (no valid target — no {kind} on battlefield)")
                     return True, f"Cast {card.name}", effect_messages
         
         # Handle Living Weapon (Batterskull, etc.)
@@ -2286,6 +2482,13 @@ async def _dispatch_resolution(engine, game: GameState, player: Player,
                     etb_paragraphs.append(paragraph.strip())
             
             if etb_paragraphs:
+                # Save everything appended so far (cast-trigger draws, the
+                # aura's "✨ enchants" line) — the rebind below discards the
+                # list, and the restore happens at the shared tail, NOT here,
+                # because the downstream tier gates key on "did Tier 1
+                # produce output" via `if effect_messages` (see the
+                # function-top comment, July 24 batch-6 anomaly #5).
+                _perm_msgs_saved = list(effect_messages)
                 # Tier 1: Check special effects (handles ramp creatures like Wood Elves)
                 effect_messages = engine.resolve_special_effects(game, player, card, target)
 
@@ -2650,6 +2853,11 @@ async def _dispatch_resolution(engine, game: GameState, player: Player,
         game.recalculate_granted_keywords()
         game.recalculate_power_toughness()
 
+    # Restore the messages the permanent branch's Tier-1 rebind discarded
+    # (cast-trigger draws, aura attach lines) — see the function-top comment.
+    if _perm_msgs_saved:
+        effect_messages = _perm_msgs_saved + (effect_messages or [])
+
     # Flush draw-trigger side-channel (Smothering Tithe, Consecrated Sphinx)
     engine._flush_pending_messages(game, effect_messages)
     return True, f"Cast {card.name}", effect_messages
@@ -2875,10 +3083,19 @@ def _process_suspend_upkeep(engine, game: GameState) -> List[str]:
         card.suspended = False
         if 'time' in card.counters:
             del card.counters['time']
-        
+
         # Move from exile
         player.exile.remove(card)
         oracle = card.oracle_text.lower() if card.oracle_text else ""
+
+        # July 24 (slice 4b groundwork): coming off suspend IS a cast
+        # (CR 702.62e) — battlefield cast triggers (Talrand, Rhystic-class)
+        # never fired for it because this path is sync. Queue them for the
+        # async Tier-3 drain + emit CARD_CAST (parity-paired inside the
+        # helper). Lands aren't cast (they're put onto the battlefield).
+        if not card.is_land():
+            from mtg.triggers import queue_cast_triggers_sync
+            queue_cast_triggers_sync(engine, game, player, card, via="suspend")
         
         if card.is_creature():
             # Creatures from suspend have haste

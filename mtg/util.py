@@ -50,6 +50,31 @@ def maybe_reraise(exc: BaseException) -> None:
         raise exc
 
 
+_GIT_SHA_CACHE: Optional[str] = None
+
+
+def git_sha() -> str:
+    """Short git SHA of the running checkout, cached after first call.
+
+    July 24, 2026: stamped into [GAME-INIT] so batch-vintage checking is one
+    grep instead of snowflake-timestamp archaeology (every audit round used
+    to re-derive "which commit was the bot running?" from game-ID decode +
+    corroborating log tags). Returns "unknown" outside a git checkout.
+    """
+    global _GIT_SHA_CACHE
+    if _GIT_SHA_CACHE is None:
+        import subprocess
+        try:
+            _GIT_SHA_CACHE = subprocess.run(
+                ["git", "rev-parse", "--short", "HEAD"],
+                cwd=Path(__file__).resolve().parent.parent,
+                capture_output=True, text=True, timeout=5,
+            ).stdout.strip() or "unknown"
+        except (OSError, subprocess.SubprocessError, ValueError):
+            _GIT_SHA_CACHE = "unknown"
+    return _GIT_SHA_CACHE
+
+
 class GameLogger:
     """Logs game console output and Discord messages to per-game files."""
 

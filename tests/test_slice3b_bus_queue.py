@@ -11,14 +11,15 @@ from mtg.triggers import queue_death, _accumulate_death_subscriber
 
 
 class TestSlice3bBusFedQueue:
-    def test_accumulator_registered_before_parity_recorder(self):
+    def test_accumulator_is_registered(self):
+        # (Slice 3c: the parity recorder this test originally ordered
+        # against was retired; the accumulator being subscribed is the
+        # remaining registration invariant.)
         import mtg.triggers  # noqa: F401 — registration happens at import
         subs = events._subscribers.get(events.CREATURE_DIED, [])
         names = [getattr(s, "__name__", "") for s in subs]
-        assert "_accumulate_death_subscriber" in names
-        assert "_record_death_for_parity" in names
-        assert names.index("_accumulate_death_subscriber") < names.index("_record_death_for_parity"), (
-            "the accumulator must append before the parity recorder diffs")
+        assert "_accumulate_death_subscriber" in names, (
+            "the sole sanctioned _recently_died appender must be subscribed")
 
     def test_queue_death_feeds_via_the_bus_not_a_direct_append(self, make_game, make_card):
         game = make_game()

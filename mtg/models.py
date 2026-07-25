@@ -3209,21 +3209,16 @@ class GameState:
     # already caps each hang, this stops paying the 90s tax repeatedly.
     _strategist_fires: int = field(default=0, repr=False, compare=False)
     _strategist_degraded: bool = field(default=False, repr=False, compare=False)
-    # Pub/sub slice 2 (July 20, 2026): PERMANENT_ENTERED parity tracking.
-    # Every emit records (card_id, name, kind, via) here; the legacy
-    # creature-enters / enchantment-enters scans record the ids they saw.
-    # triggers.report_entered_parity (called from end_turn) prints
-    # [EVENT-PARITY] for entries the scans missed, then clears all three.
-    # One clean batch = the gate for flipping the scans into subscribers.
-    _entered_events: list = field(default_factory=list, repr=False, compare=False)
-    _entered_scanned_creature_ids: set = field(default_factory=set, repr=False, compare=False)
-    _entered_scanned_ench_ids: set = field(default_factory=set, repr=False, compare=False)
-    # Slice 3a (July 21): CREATURE_DIED shadow parity — (card_id, name)
-    # tuples recorded by the bus subscriber, and the ids the dies
-    # dispatcher actually processed. Diffed + cleared by
-    # report_death_parity (end_turn).
-    _death_events: list = field(default_factory=list, repr=False, compare=False)
-    _death_dispatched_ids: set = field(default_factory=set, repr=False, compare=False)
+    # (Slices 2c + 3c, July 24, 2026: the PERMANENT_ENTERED and CREATURE_DIED
+    # parity-tracking fields were retired with their recorders — clean
+    # post-flip batches at [EVENT-PARITY]=0 and [EVENT-PARITY-DIES]=0.)
+    # Slice 4a (July 24, 2026): CARD_CAST shadow parity — (card_id, name,
+    # via) tuples recorded by the bus subscriber, and the per-cast ids the
+    # _check_cast_triggers scan saw (a LIST — the same card object can be
+    # cast twice in one turn). Diffed + cleared by report_cast_parity
+    # (end_turn). One clean batch gates slice 4b.
+    _cast_events: list = field(default_factory=list, repr=False, compare=False)
+    _cast_scanned_ids: list = field(default_factory=list, repr=False, compare=False)
     _strategy_task: Any = field(default=None, repr=False, compare=False)
     _strategy_memo: str = field(default="", repr=False, compare=False)
     # Cross-system display queue: trigger messages produced by sync helpers
@@ -3246,6 +3241,11 @@ class GameState:
     # (283 of 588 [MANA-DIVERGENCE] lines in the 15289 batch were non-mana
     # failures). Consumed (and cleared) by _get_action_error.
     _last_cast_failure: Any = field(default=None, repr=False, compare=False)
+    # July 24 batch-6: aura auto-target fizzle context — set when a beneficial
+    # aura declines an opponent-only legal-target board so the fizzle message
+    # can say "declined" instead of the misleading "no creature you control".
+    # Consumed (and cleared) at the fizzle-message emit in mtg/spells.py.
+    _aura_fizzle_note: Any = field(default=None, repr=False, compare=False)
     # Spell Queller bookkeeping: source card name → [(exiled_card, owner_name)]
     # (exile_from_stack records; release_queller_exile drains on LTB).
     _queller_exiles: dict = field(default_factory=dict, repr=False, compare=False)

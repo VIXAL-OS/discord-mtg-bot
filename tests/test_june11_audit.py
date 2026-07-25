@@ -934,7 +934,8 @@ class TestVictimizeAndGreaterGoodCosts:
         result = rules._execute_action_on_state(
             game, self._victimize_actions(lib)[0])
 
-        assert "no permanent to sacrifice" in result
+        # July 24: message now names the restriction ("no creature ...")
+        assert "no creature to sacrifice" in result
         assert all(card in game.players[0].graveyard for card in targets)
         assert game.players[0].battlefield == []
 

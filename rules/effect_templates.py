@@ -1295,6 +1295,21 @@ class EffectTemplateLibrary:
             action_generator=lambda ctrl, opp, ctx: self._gonti_etb(ctrl, opp, ctx),
         ))
 
+        # July 24 batch-6 audit (reviewer D1, CRITICAL): Puppeteer Clique had
+        # NO template, so Tier 2's generic EXILE regex matched its "exile it"
+        # clause and exiled the CASTER'S OWN best creature immediately —
+        # Woodfall Primus vanished the moment Clique entered
+        # (game_1529985418743910420; the reanimation clause was dropped and
+        # both the zone and controller restrictions of CR 601.2c violated).
+        self._add_card("puppeteer clique", EffectTemplate(
+            name="Puppeteer Clique",
+            description=("Return target creature card from an opponent's "
+                         "graveyard to the battlefield under your control "
+                         "with haste; exile it at your next end step"),
+            action_generator=lambda ctrl, opp, ctx: self._puppeteer_clique_etb(
+                ctrl, opp, ctx),
+        ))
+
         # --- Spell templates (instants/sorceries) ---
         self._add_card("rishkar's expertise", EffectTemplate(
             name="Rishkar's Expertise",
@@ -7097,10 +7112,17 @@ class EffectTemplateLibrary:
 
     def _force_sacrifice_creature(self, ctrl, opp, ctx) -> List[Dict]:
         """Force opponent to sacrifice their weakest creature (Grave Pact, Dictate of Erebos)."""
+        # July 24 batch-6 (reviewer A1 #7): name the actual trigger source so
+        # the Discord line reads "💀 Butcher of Malakir: 💀 Claude sacrifices
+        # X" instead of an unattributed sacrifice (the hardcoded Grave Pact/
+        # Dictate path already prefixed its own; this template path didn't).
+        _src_card = ctx.get('_source_card')
+        _src = (ctx.get('_source_card_name')
+                or (getattr(_src_card, 'name', '') if _src_card else ''))
         if ctx.get('worst_opponent_creature') or ctx.get('best_opponent_creature'):
             return [{"action": "sacrifice_permanent", "player": opp,
-                     "type_filter": "creature",
-                     "reason": "Grave Pact / Dictate / Butcher dies trigger"}]
+                     "type_filter": "creature", "source": _src,
+                     "reason": f"{_src or 'Grave Pact / Dictate / Butcher'} dies trigger"}]
         return [{"action": "no_action", "reason": f"{opp} has no creatures to sacrifice"}]
 
     def _avenger_tokens(self, ctrl, opp, ctx) -> List[Dict]:
@@ -7272,6 +7294,37 @@ class EffectTemplateLibrary:
 
         return actions
 
+    def _puppeteer_clique_etb(self, ctrl, opp, ctx) -> List[Dict]:
+        """Puppeteer Clique: put target creature card from an OPPONENT's
+        graveyard onto the battlefield under YOUR control, it gains haste,
+        and at the beginning of YOUR next end step, exile it (CR 603.7
+        delayed trigger — rides schedule_delayed_trigger's phase_of gate,
+        same machinery as Necropotence)."""
+        opp_player = ctx.get('_opponent_player')
+        opp_gy = list(getattr(opp_player, 'graveyard', []) or [])
+        best = None
+        best_cmc = -1
+        for c in opp_gy:
+            tl = (getattr(c, 'type_line', '') or '').lower()
+            if 'creature' not in tl:
+                continue
+            cmc = int(c.cmc) if getattr(c, 'cmc', None) else 0
+            if cmc > best_cmc:
+                best_cmc = cmc
+                best = c
+        if best is None:
+            return [{"action": "no_action",
+                     "reason": f"no creature card in {opp}'s graveyard"}]
+        return [
+            {"action": "reanimate", "player": ctrl, "card": best.name,
+             "from_player": opp, "haste": True},
+            {"action": "schedule_delayed_trigger", "trigger_at": "end_step",
+             "turn_delay": 0, "phase_of": ctrl, "source": "Puppeteer Clique",
+             "actions": [{"action": "move_card", "card": best.name,
+                          "from_zone": "battlefield", "to_zone": "exile",
+                          "player": ctrl}]},
+        ]
+
     def _gonti_etb(self, ctrl, opp, ctx) -> List[Dict]:
         """Gonti, Lord of Luxury: look at top 4 of opponent's library, exile one face down, rest on bottom.
 
@@ -7299,13 +7352,20 @@ class EffectTemplateLibrary:
             best_card = looked_at[0]
 
         actions = []
-        # Exile the chosen card face down
-        actions.append({"action": "move_card", "card": best_card.name, "from_zone": "library", "to_zone": "exile", "player": opp})
+        # Exile the chosen card face down. July 24 batch-6 audit (reviewer L1):
+        # the display named the exiled card ("📦 **Cathars' Crusade** → exile")
+        # — hidden information; only Gonti's controller may see it. Same for
+        # the bottomed cards (neither player learns which of the four went
+        # where). hide_card_name redacts the player-facing line; console
+        # log_event keeps the true names for audits.
+        actions.append({"action": "move_card", "card": best_card.name, "from_zone": "library", "to_zone": "exile", "player": opp,
+                        "hide_card_name": True, "source": "Gonti, Lord of Luxury"})
         # Put the rest on the bottom of the library
         for c in looked_at:
             if c is not best_card:
                 # Move from library top to library bottom (remove then append)
-                actions.append({"action": "move_card", "card": c.name, "from_zone": "library", "to_zone": "library", "player": opp})
+                actions.append({"action": "move_card", "card": c.name, "from_zone": "library", "to_zone": "library", "player": opp,
+                                "hide_card_name": True})
 
         return actions
 
@@ -7373,15 +7433,29 @@ class EffectTemplateLibrary:
         """Generic destroy from oracle text pattern."""
         match = ctx.get('_match')
         target_type = match.group(1).strip() if match else "permanent"
-        
+
+        # July 24 batch-6 audit (reviewer D1, CRITICAL): 'creature' is a
+        # SUBSTRING of 'noncreature', so Woodfall Primus's "destroy target
+        # noncreature permanent" destroyed a CREATURE (Doomed Traveler,
+        # game_1529985418743910420 — CR 601.2c) while legal artifact/
+        # enchantment targets sat on the board. Credit a type only when it
+        # isn't negated by a 'non' prefix.
+        def _wants(t: str) -> bool:
+            return t in target_type and f"non{t}" not in target_type
+
         # Try to find a target on opponent's board from context
-        if "creature" in target_type:
+        if _wants("creature"):
             target = ctx.get('best_opponent_creature')
-        elif "artifact" in target_type or "enchantment" in target_type:
+        elif (_wants("artifact") or _wants("enchantment")
+                or "noncreature" in target_type):
+            # "noncreature permanent" restrictions route here too — the
+            # artifact/enchantment pick is the best noncreature choice we
+            # have a ctx key for (no opponent-land key; lands are legal
+            # targets but blowing up lands is not modeled here).
             target = ctx.get('best_opponent_artifact_enchantment')
         else:
             target = ctx.get('best_opponent_nonland')
-        
+
         if target:
             return [{"action": "destroy", "card": target}]
         return [{"action": "no_action", "reason": f"No valid {target_type} target"}]
@@ -7573,8 +7647,18 @@ class EffectTemplateLibrary:
                     weakest = name
             if weakest:
                 actions.append({"action": "destroy", "card": weakest})
-            elif not any(a.get('action') == 'destroy' for a in actions):
-                # If no other creature available, sacrifice the source itself
+            else:
+                # July 24 batch-6 audit (reviewer D1): the old guard here was
+                # `elif not any(a.get('action') == 'destroy' ...)` — but the
+                # OPPONENT's forced sacrifice was already in the list, so the
+                # controller's own MANDATORY sacrifice was silently skipped
+                # whenever the opponent had a creature (Fleshbag Marauder
+                # survived its own edict, game_1529985418743910420 —
+                # CR 701.20). When the source is the controller's only
+                # creature, IT is the sacrifice. (Known simplification: the
+                # destroy action honors indestructible, a true sacrifice
+                # wouldn't — acceptable until a sacrifice-typed action
+                # serves this generator.)
                 source = ctx.get('_source_card_name', '')
                 if source:
                     actions.append({"action": "destroy", "card": source})

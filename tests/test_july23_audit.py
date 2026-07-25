@@ -108,7 +108,8 @@ class TestSacrificeEdict:
         msg = rules._execute_action_on_state(game, {
             "action": "sacrifice_permanent", "player": "Claude",
             "type_filter": "creature", "reason": "Dictate of Erebos"})
-        assert "no permanent to sacrifice" in (msg or "").lower()
+        # July 24: message now names the restriction ("no creature ...")
+        assert "no creature to sacrifice" in (msg or "").lower()
         assert erebos in claude.battlefield
 
     def test_real_creature_still_sacrificed(self, rules, make_game, make_card):

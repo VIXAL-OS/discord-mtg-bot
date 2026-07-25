@@ -244,8 +244,13 @@ def resolve_combat_damage(rules, game: GameState) -> List[str]:
     messages.extend(sba_messages)
 
     # Fire combat damage triggers (Ancient Bronze Dragon, Quartzwood Crasher, etc.)
+    # July 24 batch-6 anomaly (reviewer S2 #5): the SBA call above can END the
+    # game (PLAYER_LOSES_ZERO_LIFE) — Brago's combat-damage trigger then ran
+    # a full mass-flicker (library search, draws, Altar mills) ~20 lines after
+    # the loss fired (game_1529988360263827656). CR 104.2a: once a player has
+    # lost, no further game actions occur.
     combat_damage_dealt = getattr(game, '_combat_damage_to_player', [])
-    if combat_damage_dealt and HAS_EFFECT_TEMPLATES:
+    if combat_damage_dealt and HAS_EFFECT_TEMPLATES and not game.ended:
         for attacker, attacker_owner, damage_amount in combat_damage_dealt:
             # Ohran Frostfang is a battlefield watcher, not an ability on the
             # attacking creature. The prior attacker-only scan missed every

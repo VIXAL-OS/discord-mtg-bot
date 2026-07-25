@@ -125,7 +125,7 @@ def convert_sba_results(rules_results, game, rules=None):
                                     'player_index': pi, 'reason': desc})
                     continue
                 # Indestructible blocks damage-based dies entirely.
-                if card_obj.has_keyword('Indestructible'):
+                if card_obj.has_keyword('Indestructible', game=game):
                     continue
                 # Shield counters absorb the damage instead of destroying.
                 if card_obj.counters.get('shield', 0) > 0:
@@ -408,7 +408,13 @@ def build_sba_state(game, rules_engine=None):
                 attachments=list(card.attachments),
                 enchanting=card.attached_to if 'aura' in tl_lower else None,
                 is_token=getattr(card, 'is_token', False),
-                has_indestructible=card.has_keyword('Indestructible'),
+                # July 24 batch-6 audit (reviewer L1, CRITICAL): without
+                # game=, has_keyword skips its Humility branch and reads the
+                # PRINTED keyword list — Athreos survived exactly-lethal
+                # damage for ~30 turns while Humility should have stripped
+                # its Indestructible (CR 613.6 layer 6; 704.5g). The sibling
+                # field above (is_creature) already threads game.
+                has_indestructible=card.has_keyword('Indestructible', game=game),
             )
             sba_state.battlefield[card.id] = perm
 

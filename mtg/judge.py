@@ -357,6 +357,49 @@ async def resolve_effect(rules, game: GameState, effect_description: str,
     Returns:
         Tuple of (display_messages, actions_executed)
     """
+    # July 24 batch-6 audit (reviewer D1, CRITICAL): type-restricted graveyard
+    # returns resolve deterministically instead of via the LLM. Bruna, the
+    # Fading Light's "return target Angel or Human creature card from your
+    # graveyard" came back from Tier 3 naming Balan (a Cat Knight) while three
+    # legal Humans sat in the same graveyard (game_1529985418743910420,
+    # CR 601.2c). Same shortcut shape as the Hidetsugu guard below: compute
+    # the choice ourselves, bypass the hallucination class entirely. Sits
+    # BEFORE the no-client return — it needs no LLM.
+    _gy_ret = re.search(
+        r'return (?:up to \w+ )?target ([\w\s\']*?)\s*creature card'
+        r'(?:s)? from your graveyard (?:on)?to the battlefield',
+        (effect_description or "").lower())
+    if _gy_ret and controller:
+        _ctrl_p = next((p for p in game.players if p.name == controller), None)
+        if _ctrl_p is not None:
+            _restrict = [t.strip() for t in
+                         re.split(r'\s+or\s+|,\s*', _gy_ret.group(1))
+                         if t.strip() and t.strip() not in ('a', 'an', 'another', 'target')]
+            _best = None
+            _best_cmc = -1
+            for _c in _ctrl_p.graveyard:
+                _tl = (_c.type_line or '').lower()
+                if 'creature' not in _tl:
+                    continue
+                if _restrict and not any(t in _tl for t in _restrict):
+                    continue
+                _cmc = int(_c.cmc) if getattr(_c, 'cmc', None) else 0
+                if _cmc > _best_cmc:
+                    _best_cmc = _cmc
+                    _best = _c
+            _r_desc = ' or '.join(_restrict) if _restrict else 'creature'
+            if _best is not None:
+                print(f"[RESOLVE-GY-RETURN] {source_card}: returning {_best.name} "
+                      f"(restriction: {_r_desc}) deterministically — Tier 3 bypassed")
+                return ([], [{"action": "reanimate", "player": controller,
+                              "card": _best.name, "own_graveyard": True,
+                              "allow_types": _restrict or ["creature"],
+                              "_source_card_name": source_card}])
+            print(f"[RESOLVE-GY-RETURN] {source_card}: no legal {_r_desc} "
+                  f"creature card in {controller}'s graveyard — declining")
+            return ([f"📜 {source_card or 'Effect'}: no {_r_desc} creature "
+                     f"card in graveyard to return"], [])
+
     if not rules.client:
         return [f"⚠️ Unresolved effect: {effect_description}"], []
 
@@ -437,6 +480,7 @@ async def resolve_effect(rules, game: GameState, effect_description: str,
                 f"⚠️ **{source_card}**: cannot equip/attach **{_equip_name}** — "
                 f"it's not on the battlefield. Cast it first."
             ], [])
+
 
     # May 25 audit (F28): hardcoded shortcuts for specific cards where Tier 3
     # has been observed to hallucinate the rules (rounding direction, target

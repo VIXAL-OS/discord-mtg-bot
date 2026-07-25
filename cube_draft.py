@@ -505,7 +505,9 @@ async def claude_make_pick(
         if usage_callback and hasattr(response, 'usage'):
             usage_callback(response.usage, "claude-sonnet-5")
 
-        text = response.content[0].text.strip()
+        # claude-sonnet-5 may lead content with thinking blocks (no .text)
+        from mtg.helpers import response_text
+        text = response_text(response).strip()
         # Parse the number from Claude's response
         match = re.search(r'(\d+)', text)
         if match:
@@ -2055,12 +2057,14 @@ class CubeDraftCog(commands.Cog, name="Cube Draft"):
             try:
                 fp_name = game.players[first_player].name
                 # June 11: strict= stamp — see the autoplay [GAME-INIT] twin.
-                from mtg.util import strict_mode
+                # July 24: sha= stamp, same twin.
+                from mtg.util import strict_mode, git_sha
                 print(
                     f"[GAME-INIT] format=cube life=20/20 "
                     f"deck0=draft(40) deck1=draft(40) "
                     f"first_player={fp_name} "
-                    f"strict={1 if strict_mode() else 0}"
+                    f"strict={1 if strict_mode() else 0} "
+                    f"sha={git_sha()}"
                 )
             except Exception as _init_err:
                 print(f"[AUTO-DRAFT] GAME-INIT emit failed: {_init_err}")
@@ -2298,7 +2302,9 @@ class CubeDraftCog(commands.Cog, name="Cube Draft"):
                 result["winner"] = winner.name
                 await self._autodraft_send(thread,
                     f"🏆 **{winner.name} wins!**\n"
-                    f"• Final life: {winner.name} {winner.life} / {loser.name} {loser.life}\n"
+                    # May 19 display-clamp convention: never show negative life
+                    # (state keeps the true value per CR 119.3).
+                    f"• Final life: {winner.name} {max(0, winner.life)} / {loser.name} {max(0, loser.life)}\n"
                     f"• Turns: {game.turn_number}\n"
                     f"• Draft rounds: {result['draft_rounds']}, picks: {result['draft_picks']}")
             elif result.get("error"):
@@ -2329,8 +2335,21 @@ class CubeDraftCog(commands.Cog, name="Cube Draft"):
             # skip them, and before the log tee detaches below. (May 23 hook
             # was at the try-tail; one June 10 game still missed it.)
             try:
-                actor_adapter = getattr(self.engine, '_deepseek_actor_adapter', None) \
-                    or getattr(self.engine, '_openrouter_adapter', None)
+                # July 21 batch-4 audit: the adapters live on the GAME COG
+                # (cog._deepseek_adapter actor / _deepseek_reasoner_adapter
+                # strategist), NOT the engine — '_deepseek_actor_adapter' is
+                # assigned nowhere in the codebase, so the old guard was
+                # always False and this emit silently skipped for EVERY cube
+                # game. That made the autodraft (#100) the one game of 143
+                # without a [STATS-GAME] line, so any batch summary keyed on
+                # that tag counted 142 and game 100 "seemed missing". Read
+                # the cog first, keep the engine attrs as a fallback, and
+                # never skip silently again.
+                _gc = getattr(self, 'game_cog', None)
+                actor_adapter = ((getattr(_gc, '_deepseek_adapter', None) if _gc else None)
+                                 or (getattr(_gc, '_openrouter_adapter', None) if _gc else None)
+                                 or getattr(self.engine, '_deepseek_actor_adapter', None)
+                                 or getattr(self.engine, '_openrouter_adapter', None))
                 if actor_adapter is not None and hasattr(actor_adapter, 'get_stats'):
                     stats = actor_adapter.get_stats()
                     print(f"[STATS-GAME] cube_draft: calls={stats.get('calls', 0)} "
@@ -2340,6 +2359,11 @@ class CubeDraftCog(commands.Cog, name="Cube Draft"):
                     print(f"[CALL-BREAKDOWN-FINAL] cube_draft: "
                           f"calls={stats.get('calls', 0)} "
                           f"purpose_counts={stats.get('purpose_counts', {})}")
+                else:
+                    # The silent-guard gap WAS the bug — always leave a line.
+                    print("[STATS-GAME] cube_draft: no actor adapter found — "
+                          "token stats unavailable for this game")
+                    print("[CALL-BREAKDOWN-FINAL] cube_draft: no actor adapter found")
             except Exception as _cb_err:
                 print(f"[CALL-BREAKDOWN-FINAL] cube_draft emit failed: {_cb_err}")
             # Cleanup logging and game state

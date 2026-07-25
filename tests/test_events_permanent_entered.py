@@ -252,48 +252,9 @@ class TestSnowWatcher:
         assert rick.library[0] is top_land
 
 
-class TestEnteredParity:
-    def test_scanned_entry_produces_no_miss(self, game, make_card):
-        from mtg.triggers import report_entered_parity
-
-        bear = make_card("Charging Bear")
-        game._entered_events.append((bear.id, bear.name, 'creature', 'cast'))
-        game._entered_scanned_creature_ids.add(bear.id)
-
-        assert report_entered_parity(game) == []
-        assert game._entered_events == []
-
-    def test_unscanned_creature_entry_is_reported(self, game, make_card):
-        from mtg.triggers import report_entered_parity
-
-        bear = make_card("Charging Bear")
-        game._entered_events.append((bear.id, bear.name, 'creature', 'move_card'))
-
-        misses = report_entered_parity(game)
-        assert len(misses) == 1
-        assert "Charging Bear" in misses[0] and "move_card" in misses[0]
-        # State cleared for the next turn's window.
-        assert game._entered_events == []
-        assert report_entered_parity(game) == []
-
-    def test_unscanned_enchantment_entry_is_reported(self, game, make_card):
-        from mtg.triggers import report_entered_parity
-
-        omen = make_card("Omen of the Sea", type_line="Enchantment",
-                         power=None, toughness=None)
-        game._entered_events.append((omen.id, omen.name, 'enchantment', 'mass_flicker'))
-
-        misses = report_entered_parity(game)
-        assert len(misses) == 1
-        assert "Omen of the Sea" in misses[0]
-
-    def test_lands_do_not_participate_in_parity(self, game, make_card):
-        from mtg.triggers import report_entered_parity
-
-        # kind=None entries (lands, artifacts) are emitted for watchers like
-        # the snow scry but have no legacy scan to miss.
-        game._entered_events.append(("id1", "Snow-Covered Island", None, 'land_drop'))
-        assert report_entered_parity(game) == []
+# (Slice 2c, July 24, 2026: TestEnteredParity was deleted with the parity
+# recorder it covered — two clean batches at [EVENT-PARITY]=0. The dispatch
+# behavior itself is pinned in tests/test_slice2b_bus_dispatch.py.)
 
 
 class TestDeathSaveWatcherScan:
@@ -325,24 +286,9 @@ class TestDeathSaveWatcherScan:
         assert messenger.counters.get("+1/+1", 0) == 1
         assert claude.life == life_before + 1
 
-    def test_parity_recorder_sees_the_death_save_scan(self, game, make_card):
-        # With the fix, via=death_save_return entries pair with a scan
-        # record — the next batch's [EVENT-PARITY] expectation is ZERO
-        # lines, full stop.
-        from mtg.actions import execute_action_on_state
-        from mtg.triggers import report_entered_parity
-
-        engine = _engine()
-        claude = game.players[1]
-        messenger = make_card(
-            "Geralf's Messenger", keywords=["Undying"],
-            power="3", toughness="2", oracle_text="Undying")
-        claude.battlefield.append(messenger)
-
-        execute_action_on_state(engine.rules, game, {
-            "action": "destroy", "card": "Geralf's Messenger"})
-
-        assert report_entered_parity(game) == []
+    # (Slice 2c: the parity-recorder companion test was deleted with the
+    # recorder; test_undying_return_triggers_soul_warden above pins the
+    # CR 603.6a behavior the recorder originally caught.)
 
 
 class TestNoncastFunnelEnchantmentWatchers:

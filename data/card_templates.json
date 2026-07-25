@@ -1132,6 +1132,20 @@
       ]
     },
     {
+      "key": "mayhem devil sacrifice",
+      "name": "Mayhem Devil Sacrifice Trigger",
+      "event": "etb",
+      "description": "Whenever a player sacrifices a permanent, Mayhem Devil deals 1 damage to any target",
+      "actions": [
+        {
+          "action": "deal_damage",
+          "amount": 1,
+          "target_player": "$opponent",
+          "source": "Mayhem Devil"
+        }
+      ]
+    },
+    {
       "key": "krallenhorde howler",
       "name": "Krallenhorde Howler",
       "event": "etb",

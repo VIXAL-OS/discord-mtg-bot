@@ -42,6 +42,10 @@ MIGRATION PLAN (one slice per audit cycle; batches are the regression net)
       sites drain game._pending_messages in place, and the parity recorder
       is INVERTED (a line now means a subscriber skipped an entry —
       unusable engine ref in the payload, [ETB-BUS] tag).
+  Slice 2c (DONE July 24, 2026): the ETB parity recorder retired after a
+      SECOND clean batch post-flip (game_15299*, 152 games, strict=1,
+      [EVENT-PARITY]=0). [ETB-BUS] remains the emit-side net;
+      tests/test_slice2b_bus_dispatch.py pins end-to-end dispatch.
   Slice 3a (SHADOW, July 21, 2026): CREATURE_DIED emitted by the
       queue_death choke-point (mtg/triggers.py) that wraps every raw
       `_recently_died.append/extend`; the only consumer is the death
@@ -63,11 +67,33 @@ MIGRATION PLAN (one slice per audit cycle; batches are the regression net)
       before draining, so a wave's collateral deaths land in the fresh list as
       the next wave) and APNAP batch ordering. The dispatcher, _active_dies_batch,
       apnap_order_died, and _dies_source_ids_by_dead_id (call-site-populated) are
-      all UNCHANGED. The parity recorder stays in place with INVERTED meaning (a
-      line now means the bus->subscriber->dispatcher path skipped a death); one
-      clean [EVENT-PARITY-DIES]=0 batch gates removing it (slice 3c cleanup).
-  Slice 4+: CARD_CAST, COMBAT_DAMAGE_DEALT, PHASE_CHANGED — at which point
-      the React frontend's websocket layer is just another subscriber.
+      all UNCHANGED. The parity recorder stayed in place with INVERTED meaning
+      (a line meant the bus->subscriber->dispatcher path skipped a death).
+  Slice 3c (DONE July 24, 2026): the death parity recorder retired — the
+      post-3b batch (game_15299*, 152 games, strict=1, vintage verified on
+      >= 2d93819) returned [EVENT-PARITY-DIES]=0. The structural pin
+      (tests/test_slice3a_death_shadow.py: no raw _recently_died mutations
+      outside _accumulate_death_subscriber) remains as the permanent net.
+  Slice 4a (SHADOW, July 24, 2026): CARD_CAST emitted at the two live cast
+      funnels — _await_stack_window (mtg/spells.py, via="cast": every
+      cast_spell_async cast — hand, response, adventure half, flashback,
+      commander, signature spell) and the cascade free-cast
+      (mtg/triggers.py, via="cascade"). The only consumer is the parity
+      recorder ([EVENT-PARITY-CAST], reported from end_turn); the
+      _check_cast_triggers scan stays authoritative and records what it
+      saw. Emission counts are compared PER CAST (a card object cast twice
+      in one turn — adventure half then creature — needs two scan records).
+      SYNC CAST SITES (same day, 7ba7ad6): suspend resolution, Etali free
+      casts, template "cast ... for free" moves, and the legacy sync cast
+      now go through triggers.queue_cast_triggers_sync — battlefield cast
+      triggers queue for the async Tier-3 drain ([CAST-TRIGGER-SYNC]; a
+      suspended Rift Bolt finally makes Talrand a Drake), and the helper
+      emits CARD_CAST with a PAIRED parity record, so the zero gate holds.
+      That closes the '4b sync gaps' item early. One clean
+      [EVENT-PARITY-CAST]=0 batch gates 4b, which is now JUST the flip
+      (_check_cast_triggers becomes a subscriber).
+  Slice 4b+: COMBAT_DAMAGE_DEALT, PHASE_CHANGED — at which point the React
+      frontend's websocket layer is just another subscriber.
 
 CONTRACTS
 ---------
@@ -104,11 +130,22 @@ PERMANENT_ENTERED = "permanent_entered"
 # _recently_died append (synchronously, in registration order, so callers see
 # the queue populated the instant queue_death returns). The dies dispatcher,
 # wave semantics (_active_dies_batch), and helpers.apnap_order_died remain the
-# CONSUMER — the subscriber only accumulates. The parity recorder
-# ([EVENT-PARITY-DIES]) stays until slice 3c after a clean batch.
+# CONSUMER — the subscriber only accumulates. (Slice 3c, July 24: the parity
+# recorder retired after the post-3b batch came back clean.)
 CREATURE_DIED = "creature_died"
-# Planned: CARD_CAST, COMBAT_DAMAGE_DEALT, PHASE_CHANGED
-# (see migration plan above).
+# CARD_CAST payload: card=<cast Card>, caster=<Player>, via=<"cast" (the
+# cast_spell_async funnel: hand/response/adventure/flashback/commander/
+# signature) | "cascade" (the cascade free-cast) | "suspend" |
+# "etali_free_cast" | "free_cast_move" | "cast_sync" (the four sync sites,
+# emitted by triggers.queue_cast_triggers_sync with a paired parity
+# record)>, engine=<GameEngine — threaded now so the 4b consumer flip
+# needs no emit-site changes>. Emitted ONCE per cast at announcement time
+# (CR 601.2i — before the counter window; cast triggers fire even if the
+# spell is countered). Slice 4a (July 24, 2026): SHADOW — the only
+# subscriber is the parity recorder; _check_cast_triggers remains the
+# directly-called consumer (sync sites consume via the Tier-3 queue).
+CARD_CAST = "card_cast"
+# Planned: COMBAT_DAMAGE_DEALT, PHASE_CHANGED (see migration plan above).
 
 _subscribers: Dict[str, List[Callable]] = {}
 

@@ -563,7 +563,7 @@ class SpellResolver:
         messages = []
         
         for target in ctx.targets:
-            if hasattr(target, 'has_keyword') and target.has_keyword('Indestructible'):
+            if hasattr(target, 'has_keyword') and target.has_keyword('Indestructible', game=game):
                 messages.append(f"⚠️ {target.name} is indestructible!")
                 continue
             

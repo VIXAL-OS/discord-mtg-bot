@@ -317,13 +317,31 @@ def _fire_sacrifice_triggers(rules, game: GameState, sac_player: Player, sacrifi
         # meant Korvold sacrificed to Viscera Seer drew no card
         # (game_1529154418816057364). Self-referential actions like "put a
         # counter on Korvold" simply fizzle since it's no longer there.
-        scan = list(sac_player.battlefield)
-        if sacrificed_card not in scan:
-            scan.append(sacrificed_card)
-        for source in scan:
-            oracle = (getattr(source, 'oracle_text', '') or '').lower()
-            if 'whenever you sacrifice' not in oracle and 'whenever a permanent you control is sacrificed' not in oracle:
+        scan = [(c, sac_player) for c in sac_player.battlefield]
+        if sacrificed_card not in sac_player.battlefield:
+            scan.append((sacrificed_card, sac_player))
+        # July 24 batch-6 audit (reviewer A1, MAJOR): "Whenever a PLAYER
+        # sacrifices a permanent" (Mayhem Devil) fires on ANY player's
+        # sacrifice — the old scan covered only sac_player's battlefield
+        # and only the "you sacrifice" phrasings, so Mayhem Devil never
+        # triggered once across 7 qualifying sacrifices while on the
+        # battlefield (game_1529979552258855062).
+        for _other in game.players:
+            if _other is sac_player:
                 continue
+            scan.extend((c, _other) for c in _other.battlefield)
+        for source, src_controller in scan:
+            oracle = (getattr(source, 'oracle_text', '') or '').lower()
+            if src_controller is sac_player:
+                if ('whenever you sacrifice' not in oracle
+                        and 'whenever a permanent you control is sacrificed' not in oracle
+                        and 'whenever a player sacrifices' not in oracle):
+                    continue
+            else:
+                # An opponent's permanent only sees this sacrifice through
+                # the any-player phrasing.
+                if 'whenever a player sacrifices' not in oracle:
+                    continue
             try:
                 from rules.effect_templates import get_effect_library, build_game_context
             except ImportError:
@@ -347,7 +365,11 @@ def _fire_sacrifice_triggers(rules, game: GameState, sac_player: Player, sacrifi
                 for sentence in (source.oracle_text or '').replace('\n', '.').split('.'):
                     sl = sentence.lower().strip()
                     if ('whenever you sacrifice' not in sl
-                            and 'whenever a permanent you control is sacrificed' not in sl):
+                            and 'whenever a permanent you control is sacrificed' not in sl
+                            and 'whenever a player sacrifices' not in sl):
+                        continue
+                    if (src_controller is not sac_player
+                            and 'whenever a player sacrifices' not in sl):
                         continue
                     _req = next((sym for word, sym in _color_words.items()
                                  if f'a {word} creature' in sl), None)
@@ -359,21 +381,25 @@ def _fire_sacrifice_triggers(rules, game: GameState, sac_player: Player, sacrifi
                     trigger_texts.append(sentence.strip())
                 if not trigger_texts:
                     continue
-                opp = next((p for p in game.players if p is not sac_player), sac_player)
+                # Resolve from the TRIGGER SOURCE's controller's perspective —
+                # an opponent's Mayhem Devil pings for ITS controller, not for
+                # the sacrificing player.
+                opp = next((p for p in game.players if p is not src_controller),
+                           src_controller)
                 lib = get_effect_library()
-                ctx = build_game_context(game, sac_player, opp, card=source)
+                ctx = build_game_context(game, src_controller, opp, card=source)
                 ctx['sacrificed_card_name'] = sacrificed_card.name
                 # Try the dedicated "korvold sacrifice" template by appending suffix
                 key_with_suffix = source.name.lower() + " sacrifice"
                 for trigger_text in trigger_texts:
                     if key_with_suffix in getattr(lib, '_card_templates', {}):
                         template = lib._card_templates[key_with_suffix]
-                        actions = template.action_generator(sac_player.name, opp.name, ctx)
+                        actions = template.action_generator(src_controller.name, opp.name, ctx)
                     else:
                         actions, _desc = lib.resolve_etb(
                             card_name=source.name,
                             oracle_text=trigger_text,
-                            controller=sac_player.name,
+                            controller=src_controller.name,
                             opponent=opp.name,
                             game_context=ctx,
                         )
@@ -1269,6 +1295,15 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                         and 'cast' in reason.lower()
                         and 'free' in reason.lower()):
                     msg = f"✨ **{card.name}** is cast for free ({reason})"
+                    # July 24 (slice 4b groundwork): template free-cast moves
+                    # (Rashmi-class "cast it without paying") are real casts —
+                    # queue battlefield cast triggers for the Tier-3 drain +
+                    # emit CARD_CAST (parity-paired inside the helper).
+                    _er = getattr(rules, 'engine_ref', None)
+                    if _er is not None:
+                        from mtg.triggers import queue_cast_triggers_sync
+                        queue_cast_triggers_sync(_er, game, player, card,
+                                                 via="free_cast_move")
                 else:
                     # July 20 batch-3 audit (reviewer S1): battlefield entries
                     # carry the controller's name — "📦 **Forest** →
@@ -1277,12 +1312,18 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                     # silently ate 2 of the 4 lines (the drain site also
                     # collapses same-player duplicates into ×N now).
                     _who = f" ({player.name})" if actual_to_zone == 'battlefield' else ""
+                    # July 24 batch-6 audit: face-down exile returns (Necropotence)
+                    # must not name the card in the shared Discord thread — the
+                    # opponent never learned it. Console log_event above keeps
+                    # the true name for audits.
+                    _shown = ("a face-down card" if action.get("hide_card_name")
+                              else f"**{card.name}**")
                     if source:
-                        msg = f"📦 **{card.name}** → {actual_to_zone}{_who} (from {source})"
+                        msg = f"📦 {_shown} → {actual_to_zone}{_who} (from {source})"
                     elif reason:
-                        msg = f"📦 **{card.name}** → {actual_to_zone}{_who} ({reason})"
+                        msg = f"📦 {_shown} → {actual_to_zone}{_who} ({reason})"
                     else:
-                        msg = f"📦 **{card.name}** → {actual_to_zone}{_who}"
+                        msg = f"📦 {_shown} → {actual_to_zone}{_who}"
                 if ltb_trigger_msgs:
                     msg += "\n" + "\n".join(ltb_trigger_msgs)
                 if entry_trigger_msgs:
@@ -2202,7 +2243,25 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
         if not game.stack:
             print(f"[COUNTER-FIZZLE] Stack is empty, counter has no target")
             return "🚫 Counter effect fizzles — no spell on the stack to target"
-        target = game.stack[-1]
+        # July 24 batch-6 audit (reviewer S2): honor the DECLARED target like
+        # counter_spell does. A stale Spell Pierce force-resolved via the LIFO
+        # cap acted on game.stack[-1] — an unrelated spell with no
+        # unless-clause. If the declared target left the stack, fizzle
+        # (CR 608.2b) instead of grabbing whatever is on top.
+        target = None
+        _cu_target_name = action.get("target_name")
+        if _cu_target_name:
+            for entry in reversed(game.stack):
+                entry_name = getattr(getattr(entry, 'card', None), 'name', None)
+                if (entry_name and entry_name.lower() == _cu_target_name.lower()
+                        and not getattr(entry, 'countered', False)):
+                    target = entry
+                    break
+            if target is None:
+                return (f"💨 Counter fizzles — **{_cu_target_name}** is no "
+                        f"longer on the stack")
+        if target is None:
+            target = game.stack[-1]
         if getattr(target, 'countered', False):
             return f"🚫 Counter fizzles — target spell already countered"
         pay_cost = action.get("cost", "")
@@ -2244,9 +2303,27 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                 ability_desc = source_name or trigger_text[:60] or "ability"
                 return f"🚫 **{ability_desc}**'s triggered ability is countered!"
             else:
-                # No ability on stack — maybe counter the top spell instead (Voidslime/Disallow)
+                # No ability on stack — Voidslime/Disallow ("Counter target
+                # spell, activated ability, or triggered ability") may counter
+                # the spell instead; Tale's End only a LEGENDARY spell.
+                # July 24 batch-6 audit (reviewer S2): this fallback was wired
+                # to all five COUNTER_ABILITY_CARDS, so Stifle countered a
+                # Scroll Rack SPELL (its text has no spell clause at all —
+                # CR 601.2c). Gate on the source's own oracle text; stay
+                # permissive only when the oracle is unknown (legacy/Tier-3
+                # callers that don't thread _source_oracle).
+                _ca_oracle = (action.get('_source_oracle') or '').lower()
+                if _ca_oracle and 'spell' not in _ca_oracle:
+                    return (f"🚫 Counter ability fizzles — no triggered/"
+                            f"activated abilities on the stack")
                 top = game.stack[-1]
                 if hasattr(top, 'countered'):
+                    if 'legendary spell' in _ca_oracle:
+                        _top_tl = (getattr(getattr(top, 'card', None),
+                                           'type_line', '') or '').lower()
+                        if 'legendary' not in _top_tl:
+                            return (f"🚫 Counter ability fizzles — target "
+                                    f"spell is not legendary")
                     top.countered = True
                     target_name = top.card.name if hasattr(top, 'card') and top.card else "spell"
                     return f"🚫 **{target_name}** is countered!"
@@ -2272,6 +2349,15 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                     # Put lands into exile (simplified: bottom of library)
                     p.library.append(exiled)
                 else:
+                    # July 24 (slice 4b groundwork): Etali's free casts ARE
+                    # casts (CR 601) — battlefield cast triggers never fired
+                    # for them (sync-gap class). Queue + emit (parity-paired
+                    # inside the helper).
+                    _er = getattr(rules, 'engine_ref', None)
+                    if _er is not None:
+                        from mtg.triggers import queue_cast_triggers_sync
+                        queue_cast_triggers_sync(_er, game, etali_player,
+                                                 exiled, via="etali_free_cast")
                     # Cast for free — put onto battlefield if permanent, or resolve if spell
                     if exiled.is_creature() or exiled.is_artifact() or exiled.is_enchantment() or exiled.is_planeswalker():
                         etali_player.battlefield.append(exiled)
@@ -2658,7 +2744,7 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                 if not legal:
                     print(f"[TARGETING] Destroy blocked: {card.name} — {reason}")
                     return f"🛡️ **{card.name}** can't be targeted ({reason})"
-            if card.has_keyword("Indestructible"):
+            if card.has_keyword("Indestructible", game=game):
                 return f"🛡️ **{card.name}** is indestructible!"
             # June 10 audit (V13): honor destroy-replacement saves on the
             # single-target path too (CR 614.6 / 702.154) — the May 30 save
@@ -2954,6 +3040,12 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                             c.reset_battlefield_state()
                             c.summoning_sick = True
                             c.entered_this_turn = True
+                            # July 24 batch-6 (reviewer D1): "It gains haste"
+                            # riders (Puppeteer Clique) — opt-in flag.
+                            if action.get("haste"):
+                                c.summoning_sick = False
+                                if 'Haste' not in (c.temp_keywords or []):
+                                    c.temp_keywords.append('Haste')
                             p.battlefield.append(c)
                             game.register_static_keyword_grants(c, p.name)
                             game.register_static_pt_effects(c, p.name)
@@ -3697,7 +3789,7 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                                     if c.is_creature() and not getattr(c, '_phased_out', False)]
             for creature in creatures_to_destroy:
                 # Check for indestructible
-                if creature.has_keyword('Indestructible'):
+                if creature.has_keyword('Indestructible', game=game):
                     continue
                 # Exclude-types filter (e.g. Cast Off keeps Giants alive)
                 if exclude_types:
@@ -3845,7 +3937,7 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                     continue
                 if except_name and perm.name.lower() == except_name:
                     continue
-                if perm.has_keyword('Indestructible'):
+                if perm.has_keyword('Indestructible', game=game):
                     continue
                 if perm.counters.get('shield', 0) > 0:
                     perm.counters['shield'] -= 1
@@ -3891,7 +3983,7 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                     continue
                 if max_power is not None and eff_power > max_power:
                     continue
-                if creature.has_keyword('Indestructible'):
+                if creature.has_keyword('Indestructible', game=game):
                     continue
                 game.unregister_static_effects(creature)
                 p.battlefield.remove(creature)
@@ -4025,7 +4117,7 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                 elif perm_type == "lands" and c.is_land():
                     to_destroy.append(c)
             for c in to_destroy:
-                if c.has_keyword('Indestructible'):
+                if c.has_keyword('Indestructible', game=game):
                     continue
                 game.unregister_static_effects(c)
                 p.battlefield.remove(c)
@@ -4061,7 +4153,7 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
             for c in list(p.battlefield):
                 if not c.is_creature() or getattr(c, '_phased_out', False):
                     continue
-                if c.has_keyword('Indestructible'):
+                if c.has_keyword('Indestructible', game=game):
                     continue
                 cmc = getattr(c, 'cmc', 0) or 0
                 if min_cmc is not None and cmc < min_cmc:
@@ -4504,7 +4596,12 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                 non_cmd = [c for c in base if not getattr(c, 'is_commander', False)]
                 candidates = non_cmd or base
             if not candidates:
-                return f"⚠️ {p.name} has no permanent to sacrifice"
+                # July 24 batch-6 (reviewer A1, MINOR): name the actual
+                # restriction — "no permanent" for a creature edict misled
+                # audits (Butcher of Malakir's parallel path already said
+                # "no creatures").
+                _noun = type_filter if type_filter else "permanent"
+                return f"⚠️ {p.name} has no {_noun} to sacrifice"
             # Prefer tokens → lowest CMC non-land → lowest CMC land
             def sac_priority(c):
                 is_preferred = c.name.lower() == preferred_card
@@ -4580,7 +4677,16 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                     save_msgs.extend(_finalize_death_save_return(rules, game, p, victim, _ret_label))
                     game.recalculate_granted_keywords()
                     game.recalculate_power_toughness()
-            base_msg = f"💀 {p.name} sacrifices **{victim.name}**"
+            # July 24 batch-6 anomaly (reviewer A1 #7): the Butcher of Malakir
+            # template's edict lines had no source prefix while the hardcoded
+            # Grave Pact/Dictate path wraps its own — a 3-edict cascade showed
+            # "💀 Claude sacrifices X" with no attribution for exactly one of
+            # the three. Opt-in `source` field; paths that already wrap a
+            # prefix don't set it, so no double prefix.
+            _sac_src = (action.get("source") or "").strip()
+            _who_sacrifices = f"{p.name} sacrifices **{victim.name}**"
+            base_msg = (f"💀 {_sac_src}: 💀 {_who_sacrifices}" if _sac_src
+                        else f"💀 {_who_sacrifices}")
             if moved_to_command_zone:
                 base_msg += " → command zone"
             followup_msgs = []

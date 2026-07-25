@@ -236,11 +236,19 @@ def _should_emit_resolve_hint(game, effect_key: str) -> bool:
     return True
 
 
-def _satisfies_sacrifice_cost(card, cost_text: str, game=None) -> bool:
+def _satisfies_sacrifice_cost(card, cost_text: str, game=None,
+                              source=None) -> bool:
     """Return whether *card* can pay the typed sacrifice activation cost."""
     if card is None:
         return False
-    if 'sacrifice a creature' in (cost_text or '').lower():
+    _cost = (cost_text or '').lower()
+    # July 24 batch-6 (reviewer A1): "Sacrifice ANOTHER creature" (Yawgmoth)
+    # — the source itself can't pay it.
+    if ('sacrifice another creature' in _cost and source is not None
+            and getattr(card, 'id', None) == getattr(source, 'id', None)):
+        return False
+    if ('sacrifice a creature' in _cost
+            or 'sacrifice another creature' in _cost):
         return card.is_creature(game)
     return True
 
@@ -1315,6 +1323,13 @@ class GameEngine:
         player.hand.remove(card)
         effect_messages = []
 
+        # July 24 (slice 4b groundwork): the legacy sync cast never ran cast
+        # triggers (sync-gap class). No live caller is known, but if anything
+        # ever routes here, the triggers queue for the Tier-3 drain and the
+        # CARD_CAST parity ledger counts the cast (paired inside the helper).
+        from mtg.triggers import queue_cast_triggers_sync
+        queue_cast_triggers_sync(self, game, player, card, via="cast_sync")
+
         if card.is_instant() or card.is_sorcery():
             # Goes to graveyard after resolving (or command zone for signature spells)
             if getattr(card, 'is_signature_spell', False) and game.format == "oathbreaker":
@@ -2338,14 +2353,12 @@ class GameEngine:
         return _resolve_suspend_spell(self, game, player, card, opponent)
     def end_turn(self, game: GameState) -> List[str]:
         """End the current turn and start the next. Returns end-step messages (e.g. discard prompts)."""
-        # Pub/sub slice 2: diff PERMANENT_ENTERED emissions against the
-        # legacy ETB scan records for the turn just ending; prints
-        # [EVENT-PARITY] for misses (the next batch greps these — one clean
-        # batch gates flipping the scans into subscribers).
-        from mtg.triggers import report_entered_parity, report_death_parity
-        report_entered_parity(game)
-        # Slice 3a (July 21): CREATURE_DIED shadow parity.
-        report_death_parity(game)
+        # (Slices 2c + 3c, July 24: both parity recorders retired — clean
+        # post-flip batches at [EVENT-PARITY]=0 and [EVENT-PARITY-DIES]=0.)
+        # Slice 4a (July 24): CARD_CAST shadow parity — [EVENT-PARITY-CAST]
+        # for casts the trigger scan never saw; one clean batch gates 4b.
+        from mtg.triggers import report_cast_parity
+        report_cast_parity(game)
 
         # [TRANSFORM] Save spell count for day/night and werewolf transform tracking
         game.active_player.spells_cast_prev_turn = game.active_player.spells_cast_this_turn
@@ -3254,7 +3267,17 @@ class GameEngine:
                                 maybe_reraise(e)
                     else:
                         return None  # Can't pay sacrifice cost
-                elif 'sacrifice a creature' in cost_lower or 'sacrifice a permanent' in cost_lower:
+                elif ('sacrifice a creature' in cost_lower
+                      # July 24 batch-6 (reviewer A1, CRITICAL): "Sacrifice
+                      # ANOTHER creature" (Yawgmoth) matched neither phrase,
+                      # so the whole sacrifice cost silently evaporated in
+                      # the AI path while the life cost still charged —
+                      # Bloodghast survived two Yawgmoth activations and
+                      # attacked the same turn (game_1529979552258855062).
+                      # The manual !activate path (mtg/cog.py) already had
+                      # this phrase — the documented two-paths divergence.
+                      or 'sacrifice another creature' in cost_lower
+                      or 'sacrifice a permanent' in cost_lower):
                     # "Sacrifice a creature" as cost (e.g. Altar of Dementia, Ashnod's Altar)
                     # Find a creature to sacrifice (prefer target_name if provided, else weakest)
                     sac_target = None
@@ -3264,7 +3287,7 @@ class GameEngine:
                         # Good accepted an explicitly named Pernicious Deed
                         # even though its cost requires a creature.
                         if not _satisfies_sacrifice_cost(
-                                sac_target, cost_lower, game):
+                                sac_target, cost_lower, game, source=perm):
                             print(f"[ACTIVATE-COST] {getattr(sac_target, 'name', target_name)} "
                                   f"cannot pay {perm.name}'s sacrifice cost")
                             sac_target = None
@@ -3931,6 +3954,12 @@ class GameEngine:
                             "source": perm.name,
                             "actions": [{"action": "move_card", "card": _exiled.name,
                                          "from_zone": "exile", "to_zone": "hand",
+                                         # The card was exiled face down — the
+                                         # return line must not name it either
+                                         # (July 24 batch-6: "⏰ Necropotence:
+                                         # 📦 **Toxic Deluge** → hand" leaked
+                                         # hidden info to the opponent).
+                                         "hide_card_name": True,
                                          "player": player.name}]})
                         # The exiled card is face down — never name it in Discord.
                         inline_msgs.append(
