@@ -61,23 +61,7 @@
       "quantity": 1
     },
     {
-      "name": "Mogis's Marauder",
-      "quantity": 1
-    },
-    {
-      "name": "Mikaeus, the Unhallowed",
-      "quantity": 1
-    },
-    {
       "name": "Archon of Sun's Grace",
-      "quantity": 1
-    },
-    {
-      "name": "Sun Titan",
-      "quantity": 1
-    },
-    {
-      "name": "Grave Titan",
       "quantity": 1
     },
     {
@@ -133,14 +117,6 @@
       "quantity": 1
     },
     {
-      "name": "Recruiter of the Guard",
-      "quantity": 1
-    },
-    {
-      "name": "Ranger-Captain of Eos",
-      "quantity": 1
-    },
-    {
       "name": "Selfless Spirit",
       "quantity": 1
     },
@@ -153,23 +129,7 @@
       "quantity": 1
     },
     {
-      "name": "Grind // Dust",
-      "quantity": 1
-    },
-    {
-      "name": "Massacre Wurm",
-      "quantity": 1
-    },
-    {
       "name": "Crypt Ghast",
-      "quantity": 1
-    },
-    {
-      "name": "Noxious Gearhulk",
-      "quantity": 1
-    },
-    {
-      "name": "Angel of Invention",
       "quantity": 1
     },
     {
@@ -177,15 +137,7 @@
       "quantity": 1
     },
     {
-      "name": "Dusk // Dawn",
-      "quantity": 1
-    },
-    {
       "name": "Utter End",
-      "quantity": 1
-    },
-    {
-      "name": "Merciless Eviction",
       "quantity": 1
     },
     {
@@ -237,10 +189,6 @@
       "quantity": 1
     },
     {
-      "name": "Spectral Procession",
-      "quantity": 1
-    },
-    {
       "name": "Bitterblossom",
       "quantity": 1
     },
@@ -270,10 +218,6 @@
     },
     {
       "name": "Toxic Deluge",
-      "quantity": 1
-    },
-    {
-      "name": "Austere Command",
       "quantity": 1
     },
     {
@@ -394,11 +338,11 @@
     },
     {
       "name": "Plains",
-      "quantity": 2
+      "quantity": 9
     },
     {
       "name": "Swamp",
-      "quantity": 2
+      "quantity": 9
     }
   ]
 }

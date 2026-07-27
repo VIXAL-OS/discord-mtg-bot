@@ -346,6 +346,18 @@ def resolve_combat_damage(rules, game: GameState) -> List[str]:
                         except Exception as e:
                             print(f"[COMBAT-TRIGGER] Action failed for {attacker.name}: {e}")
                     print(f"[COMBAT-TRIGGER] {attacker.name}: {explanation}")
+                elif actions is None:
+                    # Nothing matched. This path is sync, so it has no Tier-3
+                    # escalation — and until July 28 2026 it also had no tag and
+                    # no queue, so an unmatched combat-damage trigger vanished
+                    # without a trace. Ragavan's entire trigger (Treasure +
+                    # impulse exile) disappeared on every connect and no audit
+                    # grep could see it. Queue it for the async drain, the same
+                    # shape as queue_unhandled_dies and the July 24 sync cast
+                    # bridge; the `not game.ended` gate above still applies.
+                    from mtg.triggers import queue_unhandled_combat_damage
+                    queue_unhandled_combat_damage(
+                        game, attacker, attacker_owner, damage_amount)
             except Exception as e:
                 print(f"[COMBAT-TRIGGER] Error for {attacker.name}: {e}")
         game._combat_damage_to_player = []  # Clear after processing
@@ -583,6 +595,11 @@ def apply_combat_damage_to_player(rules, game: GameState, player: 'PlayerState',
             # life total to go below 0 internally; this is purely a UX clamp.
             displayed_life = max(0, player.life)
             print(f"[COMBAT-LIFE] {player.name} takes {amount} combat damage from {source_card.name} (life: {displayed_life})")
+        if is_combat:
+            # Tymna the Weaver counts opponents dealt combat damage this turn.
+            # Set even at amount 0? No — CR 119.3: 0 damage isn't dealt.
+            if amount > 0:
+                player.dealt_combat_damage_this_turn = True
 
     # CR 903.10a / 704.5b — Commander damage tracking. If the source is a
     # commander dealing combat damage to a player, accumulate per source-controller.
@@ -1039,9 +1056,23 @@ def deal_combat_damage(rules, game: GameState, attackers: List[Tuple[Card, Playe
                         # to the blocker AND "tramples for 1" — 6 damage from a
                         # 5-power creature (game_1529168842905882755). State was
                         # correct; only the display double-counted.
-                        display_dmg = (min(attacker_power, remaining_damage + damage_to_blocker)
-                                       if (len(blocker_ids) == 1 and not has_trample)
-                                       else actual_dmg)
+                        # July 26 batch-7 audit: `attacker_power` is captured
+                        # BEFORE damage replacement runs, so once a doubler or
+                        # halver was live the single-blocker branch reported
+                        # the printed power instead of what was actually dealt
+                        # — game_1530441531188711565 showed "deals 5 damage"
+                        # for a hit that Gisela had doubled to 10 (lifelink
+                        # confirmed 10). Whenever a replacement moved the
+                        # number, `actual_dmg` is authoritative; the
+                        # attacker_power clamp survives only for the unmodified
+                        # case it was added for (July 21 trample double-count).
+                        if len(blocker_ids) == 1 and not has_trample:
+                            display_dmg = (
+                                actual_dmg if actual_dmg != damage_to_blocker
+                                else min(attacker_power,
+                                         remaining_damage + damage_to_blocker))
+                        else:
+                            display_dmg = actual_dmg
                         # CR 120.8: zero damage isn't dealt — skip the noise line
                         # (June 10 audit: 36 "deals 0 damage" lines per batch).
                         if display_dmg > 0:

@@ -125,7 +125,8 @@ class FormatValidator:
         return sorted(list(colors))
     
     @staticmethod
-    def validate_deck(cards: List, format_name: str, commander=None) -> Tuple[bool, List[str]]:
+    def validate_deck(cards: List, format_name: str, commander=None,
+                      companion=None) -> Tuple[bool, List[str]]:
         """
         Validate a deck against format rules.
 
@@ -232,7 +233,59 @@ class FormatValidator:
                         f"**{card.name}** is not pauper-legal ({legal})"
                     )
 
+        # Companion restriction (CR 702.139). There was no companion check at
+        # all — the July 27 fanout found data/test_companion_lurrus.json running
+        # 4x Street Wraith (a MV-5 permanent card) under Lurrus of the
+        # Dream-Den, whose whole clause is "each permanent card in your starting
+        # deck has mana value 2 or less", and validate_deck reported the deck
+        # LEGAL. A fixture that violates the mechanic it exists to test is worse
+        # than no fixture, and nothing could have told us.
+        if companion is not None:
+            issues.extend(FormatValidator._companion_issues(cards, companion))
+
         return len(issues) == 0, issues
+
+    @staticmethod
+    def _companion_issues(cards: List, companion) -> List[str]:
+        """Check a deck against its companion's deckbuilding restriction.
+
+        Only the restrictions expressible as a simple per-card predicate are
+        modelled; anything else is reported as unmodelled rather than silently
+        passed, so a companion we can't check never looks verified.
+        """
+        text = (getattr(companion, 'oracle_text', '') or '').lower()
+        name = getattr(companion, 'name', 'companion')
+        clause = ''
+        for line in text.split('\n'):
+            if line.strip().startswith('companion'):
+                clause = line
+                break
+        if not clause:
+            return []
+
+        issues = []
+        mv_match = re.search(
+            r'each permanent card in your starting deck has mana value (\d+) or less',
+            clause)
+        if mv_match:
+            limit = int(mv_match.group(1))
+            permanent_types = ('creature', 'artifact', 'enchantment', 'land',
+                               'planeswalker', 'battle')
+            for card in cards:
+                type_line = (getattr(card, 'type_line', '') or '').lower()
+                if not any(t in type_line for t in permanent_types):
+                    continue
+                mv = getattr(card, 'cmc', 0) or 0
+                if mv > limit:
+                    issues.append(
+                        f"**{card.name}** (mana value {int(mv)}) violates "
+                        f"{name}'s companion restriction (permanents must be "
+                        f"mana value {limit} or less)")
+            return issues
+
+        print(f"[COMPANION] Restriction for {name} is not modelled — deck not "
+              f"checked against it: {clause.strip()[:120]}")
+        return issues
     
     @staticmethod
     def check_commander_legality(card) -> Tuple[bool, str]:
@@ -276,12 +329,45 @@ class FormatValidator:
 # DATA CLASSES
 # =============================================================================
 
+def _restricts_combat(oracle: str, what: str) -> bool:
+    """Does this oracle text forbid `what` ('attack' or 'block')?
+
+    July 27, 2026 — the substring trap, again. The checks here used to be a
+    bare `"can't block" in oracle`, and the STANDARD Magic phrasing is
+    "can't attack or block": that string contains "can't attack" but NOT
+    "can't block". So Pacifism, Arrest, Faith's Fetters and every other
+    "can't attack or block" aura correctly stopped attacking and silently
+    failed to stop blocking. In game_1530434723992834068 a Pacifism'd
+    Watcher in the Mist blocked and killed an attacker on seven separate
+    turns while the engine was rejecting it as an attacker every turn.
+
+    Same family as `'creature' in 'noncreature'` (Woodfall Primus, July 24)
+    and the Coldsteel Heart -> Painter's Servant name match (May 17):
+    substring tests over natural-language oracle text need the full phrasing
+    enumerated, not the convenient fragment.
+    """
+    if not oracle:
+        return False
+    other = 'block' if what == 'attack' else 'attack'
+    # "can't attack or block" / "can't block or attack" cover both verbs.
+    if f"can't {what} or {other}" in oracle or f"can't {other} or {what}" in oracle:
+        return True
+    return f"can't {what}" in oracle
+
+
 @dataclass
 class Card:
     """Represents a card in any zone."""
     name: str
     id: str = ""  # Unique instance ID
-    owner_index: int = 0
+    # -1 means "ownership unknown", NOT "player 0". Deck load stamps every card
+    # (mtg/engine.py) and the token paths stamp their tokens, but a Card built
+    # ad hoc at runtime has no owner — and defaulting those to 0 would let an
+    # unstamped permanent on player 1's battlefield be treated as player 0's,
+    # i.e. a brand-new way for cards to change hands. Consumers must treat
+    # unknown as "owned by whoever controls it" (see helpers.owner_of /
+    # helpers.owns_card), which is exactly the pre-July-28 behaviour.
+    owner_index: int = -1
     
     # Card data (loaded from Scryfall or deck)
     mana_cost: str = ""
@@ -330,6 +416,18 @@ class Card:
     # Cast/linked-effect bookkeeping used while the card is on the stack or
     # exiled by a specific source.
     _cast_origin: str = field(default="", repr=False, compare=False)
+    # Escape (CR 702.139). `_escape_cost` is the alternative cost the payment
+    # stage should charge; `_was_escaped` is what Kroxa's "sacrifice it unless
+    # it escaped" reads. Declared rather than stapled specifically because the
+    # BUG here was a read with no writer anywhere — a flag nobody can find is a
+    # flag nobody sets.
+    _escape_cost: str = field(default="", repr=False, compare=False)
+    _was_escaped: bool = field(default=False, repr=False, compare=False)
+    # Adventure (CR 715.3): set when the adventure half resolves and the card
+    # goes to exile, cleared when it leaves. Deliberately separate from
+    # Player.playable_from_exile, which end_turn wipes every turn — adventure
+    # castability persists for as long as the card stays exiled.
+    _adventure_exiled: bool = field(default=False, repr=False, compare=False)
     _declared_graveyard_target_id: Optional[str] = field(default=None, repr=False, compare=False)
     _declared_graveyard_target_owner: str = field(default="", repr=False, compare=False)
     _imprinted_card_id: Optional[str] = field(default=None, repr=False, compare=False)
@@ -1341,7 +1439,7 @@ class Card:
             try:
                 for aura in self._get_attached_auras(game):
                     oracle = (getattr(aura, 'oracle_text', '') or '').lower()
-                    if "can't attack" in oracle:
+                    if _restricts_combat(oracle, 'attack'):
                         return False
             except Exception:
                 pass
@@ -1369,7 +1467,7 @@ class Card:
             try:
                 for aura in self._get_attached_auras(game):
                     oracle = (getattr(aura, 'oracle_text', '') or '').lower()
-                    if "can't block" in oracle:
+                    if _restricts_combat(oracle, 'block'):
                         return False
             except Exception:
                 pass
@@ -1474,7 +1572,7 @@ class Card:
         card = cls(
             name=data["name"],
             id=data.get("id", ""),
-            owner_index=data.get("owner_index", 0),
+            owner_index=data.get("owner_index", -1),
             mana_cost=data.get("mana_cost", ""),
             cmc=data.get("cmc", 0),
             type_line=data.get("type_line", ""),
@@ -1529,6 +1627,11 @@ class Player:
     # Bloodchief Ascension and similar "lost N life this turn" conditions.
     # Reset for every player when a new turn begins in GameEngine.end_turn.
     life_lost_this_turn: int = 0
+    # "was dealt combat damage this turn" — Tymna the Weaver counts the
+    # opponents this is true of. Added July 27, 2026 alongside the main-phase
+    # trigger scan; nothing tracked it before because nothing could ask.
+    # Reset for every player with life_lost_this_turn in GameEngine.end_turn.
+    dealt_combat_damage_this_turn: bool = False
     
     # Zones
     library: List[Card] = field(default_factory=list)
@@ -1770,6 +1873,22 @@ class Player:
 
         return False
 
+    def _all_lands_are_all_basic_types(self) -> bool:
+        """Does this player control a "lands you control are every basic land
+        type" effect (Dryad of the Ilysian Grove, Prismatic Omen)?
+
+        Matched on the PHRASE rather than the card name so both cards — and any
+        future one with the same wording — are covered, and so a name-substring
+        misfire of the Coldsteel-Heart kind can't happen.
+        """
+        for permanent in self.battlefield:
+            if getattr(permanent, '_phased_out', False):
+                continue
+            oracle = (getattr(permanent, 'oracle_text', '') or '').lower()
+            if 'are every basic land type' in oracle:
+                return True
+        return False
+
     def _get_mana_production(self, card: Card) -> Dict[str, int]:
         """
         Get what mana a card produces when tapped.
@@ -1816,6 +1935,25 @@ class Player:
             creature_count = len(self.creatures())
             return {'G': creature_count} if creature_count > 0 else {'G': 0}
             
+        # === "Lands you control are every basic land type" ===
+        # Dryad of the Ilysian Grove, Prismatic Omen. Only the extra-land-drop
+        # half of Dryad was implemented; the type-adding half did not exist
+        # anywhere, and nothing could have consumed it if it had — mana
+        # production is derived per card with no static-effect consultation.
+        # In a four-colour deck (Dryad is in the brawl_omnath deck) that half IS
+        # the card: every land taps for every colour, and without it the
+        # castable list and can_pay_mana_cost reject casts that are legal on the
+        # real board.
+        #
+        # Placed AFTER the special/dynamic lands above so Ancient Tomb keeps
+        # {C:2}, Gaea's Cradle keeps its count, and fetchlands keep producing
+        # nothing — a land that taps for something unusual is not suddenly a
+        # one-mana rainbow. Scoped by `self.battlefield` because the effect
+        # reads "lands YOU control", so an opponent's Dryad correctly does
+        # nothing for us.
+        if card.is_land() and self._all_lands_are_all_basic_types():
+            return {'any': 1}
+
         # Lands that produce any color
         if 'command tower' in name_lower:
             return {'any': 1}
@@ -2157,9 +2295,35 @@ class Player:
                               f"for {victim.name}")
             except Exception as _dt_err:
                 print(f"[PHYREXIAN-TOWER] dies-trigger dispatch failed: {_dt_err}")
+            # July 26 batch-7 audit: sacrificing is its own event (CR 701.17),
+            # separate from dying — Korvold's "whenever you sacrifice a
+            # permanent" never fired for a Tower sacrifice because only the
+            # dies scan ran here. Both AI-activation branches in mtg/engine.py
+            # and the manual !activate path in mtg/cog.py already fire this;
+            # the Tower path was the odd one out. (Same two-divergent-paths
+            # class the debugging checklist calls out.)
+            try:
+                from mtg.actions import _fire_sacrifice_triggers
+                rules_engine = getattr(game, '_rules_engine', None)
+                if rules_engine is not None:
+                    sac_msgs = _fire_sacrifice_triggers(
+                        rules_engine, game, self, victim) or []
+                    if sac_msgs:
+                        pq = getattr(game, '_pending_messages', None)
+                        if pq is None:
+                            pq = []
+                            game._pending_messages = pq
+                        pq.extend(sac_msgs)
+                        print(f"[PHYREXIAN-TOWER] Fired {len(sac_msgs)} "
+                              f"sacrifice-trigger(s) for {victim.name}")
+            except (ValueError, KeyError, AttributeError, TypeError, ImportError) as _st_err:
+                print(f"[PHYREXIAN-TOWER] sacrifice-trigger dispatch failed: {_st_err}")
+                from mtg.util import maybe_reraise
+                maybe_reraise(_st_err)
         return victim
 
-    def tap_lands_for_mana(self, amount: int, preferred_colors: str = "") -> bool:
+    def tap_lands_for_mana(self, amount: int, preferred_colors: str = "",
+                           game=None) -> bool:
         """
         Tap mana sources to add mana to pool (amount-based, color-unaware).
         Returns True if successful, False if not enough mana.
@@ -2203,7 +2367,7 @@ class Player:
             # production reports {B: 2} but no sac target now exists, fall
             # back to the {C: 1} ability — sac couldn't be paid.
             if 'phyrexian tower' in card.name.lower() and production.get('B', 0) >= 2:
-                victim = self._apply_sac_cost_at_tap(card)
+                victim = self._apply_sac_cost_at_tap(card, game)
                 if victim is None:
                     # Couldn't sac — degrade production to {C: 1}
                     production = {'C': 1}
@@ -2217,7 +2381,8 @@ class Player:
         return True
 
     def tap_sources_for_cost(self, mana_cost_str: str, additional_generic: int = 0,
-                             x_value: int = 0, pay_phyrexian_with_life: bool = False) -> bool:
+                             x_value: int = 0, pay_phyrexian_with_life: bool = False,
+                             game=None) -> bool:
         """
         [MANA-ENGINE] Color-aware mana tapping using ManaCost parser.
 
@@ -2250,7 +2415,7 @@ class Player:
                         total += x_value
                     else:
                         total += 1
-            return self.tap_lands_for_mana(total)
+            return self.tap_lands_for_mana(total, game=game)
 
         parsed = ManaCost.parse(mana_cost_str)
 
@@ -2439,8 +2604,20 @@ class Player:
 
         # Check if colored requirements are met, use 'any' sources for shortfalls
         for color, needed in list(remaining_needs.items()):
-            have = mana_produced.get(color, 0)
-            shortfall = needed - have
+            # July 26 batch-7 audit: `remaining_needs[color]` is ALREADY the
+            # outstanding shortfall — Phase 1 decrements it by whatever it
+            # tapped (line ~2462) and deletes the key once satisfied. The old
+            # `needed - have` re-subtracted `mana_produced[color]`, i.e. the
+            # very mana that decrement had already accounted for, so a
+            # partially-filled colored requirement computed shortfall 0 and no
+            # 'any' source was ever allocated to it. Swamp + Command Tower
+            # could not pay {B}{B}; two Swamps could. That silently blocked any
+            # multi-pip cost held up by one dedicated source plus any-color
+            # sources — Command Tower, Arcane Signet, talismans, Chromatic
+            # Lantern — which in Commander is the common case, not a corner.
+            # (Found via game_1530441513702785114, where Phyrexian Arena was
+            # rejected twice on a board that could pay for it.)
+            shortfall = needed
             if shortfall > 0:
                 for card, production in any_sources:
                     if id(card) in tapped_cards:
@@ -2605,7 +2782,7 @@ class Player:
                 # but the player has no sac target right now, degrade to
                 # the {C: 1} ability so we don't fabricate mana.
                 if 'phyrexian tower' in card.name.lower() and production.get('B', 0) >= 2:
-                    victim = self._apply_sac_cost_at_tap(card)
+                    victim = self._apply_sac_cost_at_tap(card, game)
                     if victim is None:
                         production = {'C': 1}
                 # June 10 deep-dive: a Phase-1/3-committed source adds ONLY its
@@ -3214,11 +3391,6 @@ class GameState:
     # post-flip batches at [EVENT-PARITY]=0 and [EVENT-PARITY-DIES]=0.)
     # Slice 4a (July 24, 2026): CARD_CAST shadow parity — (card_id, name,
     # via) tuples recorded by the bus subscriber, and the per-cast ids the
-    # _check_cast_triggers scan saw (a LIST — the same card object can be
-    # cast twice in one turn). Diffed + cleared by report_cast_parity
-    # (end_turn). One clean batch gates slice 4b.
-    _cast_events: list = field(default_factory=list, repr=False, compare=False)
-    _cast_scanned_ids: list = field(default_factory=list, repr=False, compare=False)
     _strategy_task: Any = field(default=None, repr=False, compare=False)
     _strategy_memo: str = field(default="", repr=False, compare=False)
     # Cross-system display queue: trigger messages produced by sync helpers
@@ -3312,6 +3484,14 @@ class GameState:
     # helpers.damage_prevention_disabled at every prevention gate; self-expires
     # because it only matches an exact turn number.
     _damage_prevention_off_turn: int = field(default=-1, repr=False, compare=False)
+
+    # How many spells the player whose turn JUST ENDED cast during that turn.
+    # Daybound's printed reminder is "If a player casts no spells during their
+    # own turn, it becomes night next turn", so the day/night check at upkeep
+    # must read the turn that just ended — not the incoming active player's own
+    # previous turn, which in a two-player game is a turn older still. Written
+    # in end_turn from the ending player's count, before the per-turn reset.
+    _spells_cast_last_turn: int = field(default=0, repr=False, compare=False)
 
     # Combat flow: when Claude attacks a human, we pause for the human to declare blocks
     waiting_for_human_blocks: bool = False

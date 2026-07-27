@@ -400,12 +400,24 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
         if self._stdout_tee:
             self._stdout_tee.remove_game(thread_id)
 
+    def _mtg_channel_id(self, ctx) -> Optional[int]:
+        """The designated MTG channel for THIS guild, or None if unrestricted.
+
+        July 26, 2026: resolves per-guild. Falls back to the old scalar
+        attribute so a host bot that hasn't adopted the mapping still works.
+        """
+        resolver = getattr(self.bot, 'mtg_channel_for', None)
+        if callable(resolver):
+            guild = getattr(ctx, 'guild', None)
+            return resolver(guild.id if guild else None)
+        return getattr(self.bot, 'mtg_channel_id', None)
+
     def _is_mtg_channel(self, ctx) -> bool:
         """Check if we're in the designated MTG channel (or its threads)."""
-        mtg_channel_id = getattr(self.bot, 'mtg_channel_id', None)
+        mtg_channel_id = self._mtg_channel_id(ctx)
         if not mtg_channel_id:
-            return True  # No restriction configured
-        
+            return True  # No restriction configured in this guild
+
         channel_id = ctx.channel.id
         parent_id = getattr(ctx.channel, 'parent_id', None)
         return channel_id == mtg_channel_id or parent_id == mtg_channel_id
@@ -430,8 +442,10 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
             if len(self.bot._mtg_warnings) > 100:
                 self.bot._mtg_warnings = set(list(self.bot._mtg_warnings)[-50:])
             
-            mtg_channel = self.bot.get_channel(self.bot.mtg_channel_id)
-            channel_mention = mtg_channel.mention if mtg_channel else f"<#{self.bot.mtg_channel_id}>"
+            _cid = self._mtg_channel_id(ctx)
+            mtg_channel = self.bot.get_channel(_cid) if _cid else None
+            channel_mention = (mtg_channel.mention if mtg_channel
+                               else (f"<#{_cid}>" if _cid else "the MTG channel"))
             await ctx.send(f"*ear flick* MTG games are only available in {channel_mention}!")
         
         return False
@@ -1382,7 +1396,8 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
         # If not in hand, check if it's playable from exile (Chandra 0, etc.)
         if not card:
             exile_card = player.find_card(actual_card_name, Zone.EXILE)
-            if exile_card and exile_card.id in player.playable_from_exile:
+            if exile_card and (exile_card.id in player.playable_from_exile
+                               or getattr(exile_card, '_adventure_exiled', False)):
                 card = exile_card
                 from_exile = True
 
@@ -1397,12 +1412,15 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
                     player.playable_from_graveyard.remove(c.id)
                     # Pay escape exile cost if applicable
                     if c.oracle_text:
-                        esc_match = re.search(
-                            r'escape.{1,3}\{[^}]+\}(?:\{[^}]+\})*,?\s*exile\s+(\d+)\s+other\s+cards?\s+from\s+your\s+graveyard',
-                            c.oracle_text.lower()
-                        )
-                        if esc_match:
-                            exile_count = int(esc_match.group(1))
+                        from mtg.helpers import parse_escape_cost
+                        _esc = parse_escape_cost(c.oracle_text)
+                        if _esc:
+                            _esc_cost, exile_count = _esc
+                            # Charge the escape cost, and let the ETB see that
+                            # it WAS escaped (Kroxa's "sacrifice it unless it
+                            # escaped" had no producer for this at all).
+                            c._escape_cost = _esc_cost
+                            c._was_escaped = True
                             exiled_names = []
                             for _ in range(exile_count):
                                 if player.graveyard:
@@ -1469,7 +1487,11 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
             if from_exile:
                 player.exile.remove(card)
                 player.hand.append(card)
-                player.playable_from_exile.remove(card.id)
+                # An adventure card is castable from exile without being
+                # in playable_from_exile — don't remove what isn't there.
+                if card.id in player.playable_from_exile:
+                    player.playable_from_exile.remove(card.id)
+                card._adventure_exiled = False
             
             success, msg = self.engine.play_land(game, player, card)
             if success:
@@ -2103,7 +2125,7 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
                 await ctx.send(f"❌ **{card.name}** needs a creature you control to equip.")
                 return
             mana_cost = ability.get('mana_cost', '')
-            if mana_cost and not player.tap_sources_for_cost(mana_cost):
+            if mana_cost and not player.tap_sources_for_cost(mana_cost, game=game):
                 await ctx.send(f"❌ Cannot pay {mana_cost} to equip **{card.name}**.")
                 return
             msg = self.engine.rules._execute_action_on_state(game, {
@@ -2152,7 +2174,7 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
         # Validation only proved the cost was affordable; actually tap the
         # sources here for every non-Equip activated ability.
         mana_cost = ability.get('mana_cost', '')
-        if mana_cost and not player.tap_sources_for_cost(mana_cost):
+        if mana_cost and not player.tap_sources_for_cost(mana_cost, game=game):
             await ctx.send(f"❌ Cannot pay {mana_cost} to activate **{card.name}**.")
             return
 
@@ -2166,6 +2188,37 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
             player.life -= life_cost
             player.record_life_loss(life_cost)
             print(f"[ACTIVATE] {card.name}: {player.name} paid {life_cost} life (life now {player.life})")
+
+        # Parse "Discard a card" as a cost (Anje Falkenrath, Wild Mongrel).
+        # CR 601.2h — paid before the ability resolves. This parser already
+        # ACCEPTS "Discard" as a cost keyword (see the has_other_cost list
+        # above), so the ability was offered and then only its {T} charged.
+        # Added to both activation paths in one commit: they have a documented
+        # history of diverging, and this is the third instance of that class.
+        discard_cost_match = re.search(r'discard\s+(a|one|two|three|\d+)\s+cards?',
+                                       cost_text, re.IGNORECASE)
+        if discard_cost_match or re.search(r'discard your hand', cost_text, re.IGNORECASE):
+            if not player.hand:
+                await ctx.send(f"❌ Cannot discard for **{card.name}** — your hand is empty.")
+                return
+            if re.search(r'discard your hand', cost_text, re.IGNORECASE):
+                n_discard = len(player.hand)
+            else:
+                raw = discard_cost_match.group(1).lower()
+                n_discard = ({'a': 1, 'one': 1, 'two': 2, 'three': 3}.get(raw)
+                             or (int(raw) if raw.isdigit() else 1))
+            for _ in range(min(n_discard, len(player.hand))):
+                # Through the discard action so discard triggers fire (Anje's
+                # own madness untap could never happen without this).
+                dm = self.engine.rules._execute_action_on_state(game, {
+                    "action": "discard", "player": player.name, "card": "worst",
+                })
+                if dm:
+                    # `messages` doesn't exist yet this early in the function;
+                    # send the cost line directly, which is also the right
+                    # order — costs are paid before the ability resolves.
+                    await ctx.send(dm)
+            print(f"[ACTIVATE-COST] {player.name} discards {n_discard} card(s) for {card.name}")
 
         # Tap the card if needed
         if ability['needs_tap']:
@@ -4736,7 +4789,7 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
             game.phase = Phase.MAIN2
 
     async def _autoplay_send(self, thread, content=None, embed=None,
-                             _is_chunk=False):
+                             _is_chunk=False, final=False):
         """Send a message to the autoplay thread, with rate limiting and logging.
 
         _is_chunk: set by the 1900-char splitter below for the pieces of ONE
@@ -4748,6 +4801,27 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
         Discord). Chunks skip the suppression layers; the whole message
         already went through them once.
         """
+        # Post-game-end gate (CR 104.2a in spirit — nothing happens after a
+        # player loses). July 24 gated trigger DISPATCH on `not game.ended`, but
+        # nothing gated the message FLUSH, so a cast coroutine suspended across
+        # the end of the game could still post afterwards. Seen in
+        # game_1530441479389184000: Pact of Negation was countered by Frilled
+        # Mystic at 01:18:13 and Discord said so at the time, then the Pact's
+        # own long-suspended cast_spell_async unwound at 01:18:59 and re-posted
+        # "❌ Pact of Negation was countered!" AFTER the "🏆 Claude wins!"
+        # summary — which reads as a rules bug and is merely a stale flush.
+        # Suppressed from Discord, kept on console so the record survives for
+        # audits (same shape as [RESOLVE-PROSE-DROPPED]). Chunks are exempt:
+        # they are pieces of a message whose parent already passed this gate.
+        # Fails OPEN when the game can't be resolved, so nothing is lost by
+        # accident.
+        if content and not final and not _is_chunk:
+            _tid = getattr(thread, 'id', None)
+            _g = self.engine.games.get(_tid) if _tid is not None else None
+            if _g is not None and getattr(_g, 'ended', False):
+                print(f"[POST-GAME-SUPPRESSED] {str(content)[:200]}")
+                return
+
         # May 17 audit: final defense-in-depth strip of dangling-article
         # artifacts ("The .", trailing " The") that leak through from
         # judge.py / triggers.py / spells.py sanitizers. This catches the

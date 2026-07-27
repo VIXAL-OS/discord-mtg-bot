@@ -2,30 +2,99 @@
   "name": "Lurrus Companion (Modern)",
   "format": "modern",
   "companion": "Lurrus of the Dream-Den",
-  "description": "Companion mechanic stress test: starts outside game, pay 3 to move to hand, then cast normally. All permanents MV 2 or less. Tests companion zone, companion restriction validation, Lurrus graveyard recursion.",
-  "colors": ["B", "R"],
+  "description": "Companion mechanic stress test: starts outside game, pay 3 to move to hand, then cast normally. All permanent cards MV 2 or less (Lurrus companion restriction). Tests companion zone, companion restriction validation, Lurrus graveyard recursion.",
+  "colors": [
+    "B",
+    "R"
+  ],
   "cards": [
-    {"name": "Ragavan, Nimble Pilferer", "quantity": 4},
-    {"name": "Dragon's Rage Channeler", "quantity": 4},
-    {"name": "Death's Shadow", "quantity": 4},
-    {"name": "Scourge of the Skyclaves", "quantity": 2},
-    {"name": "Kroxa, Titan of Death's Hunger", "quantity": 2},
-    {"name": "Mishra's Bauble", "quantity": 4},
-    {"name": "Thoughtseize", "quantity": 4},
-    {"name": "Lightning Bolt", "quantity": 4},
-    {"name": "Fatal Push", "quantity": 4},
-    {"name": "Unholy Heat", "quantity": 2},
-    {"name": "Drown in the Loch", "quantity": 2},
-    {"name": "Street Wraith", "quantity": 4},
-    {"name": "Bloodstained Mire", "quantity": 4},
-    {"name": "Polluted Delta", "quantity": 4},
-    {"name": "Marsh Flats", "quantity": 2},
-    {"name": "Blood Crypt", "quantity": 2},
-    {"name": "Watery Grave", "quantity": 1},
-    {"name": "Godless Shrine", "quantity": 1},
-    {"name": "Swamp", "quantity": 3},
-    {"name": "Mountain", "quantity": 1},
-    {"name": "Takenuma, Abandoned Mire", "quantity": 1},
-    {"name": "Sokenzan, Crucible of Defiance", "quantity": 1}
+    {
+      "name": "Ragavan, Nimble Pilferer",
+      "quantity": 4
+    },
+    {
+      "name": "Dragon's Rage Channeler",
+      "quantity": 4
+    },
+    {
+      "name": "Death's Shadow",
+      "quantity": 4
+    },
+    {
+      "name": "Scourge of the Skyclaves",
+      "quantity": 2
+    },
+    {
+      "name": "Kroxa, Titan of Death's Hunger",
+      "quantity": 2
+    },
+    {
+      "name": "Mishra's Bauble",
+      "quantity": 4
+    },
+    {
+      "name": "Thoughtseize",
+      "quantity": 4
+    },
+    {
+      "name": "Lightning Bolt",
+      "quantity": 4
+    },
+    {
+      "name": "Fatal Push",
+      "quantity": 4
+    },
+    {
+      "name": "Unholy Heat",
+      "quantity": 2
+    },
+    {
+      "name": "Drown in the Loch",
+      "quantity": 2
+    },
+    {
+      "name": "Thought Scour",
+      "quantity": 4
+    },
+    {
+      "name": "Bloodstained Mire",
+      "quantity": 4
+    },
+    {
+      "name": "Polluted Delta",
+      "quantity": 4
+    },
+    {
+      "name": "Marsh Flats",
+      "quantity": 2
+    },
+    {
+      "name": "Blood Crypt",
+      "quantity": 2
+    },
+    {
+      "name": "Watery Grave",
+      "quantity": 1
+    },
+    {
+      "name": "Godless Shrine",
+      "quantity": 1
+    },
+    {
+      "name": "Swamp",
+      "quantity": 3
+    },
+    {
+      "name": "Mountain",
+      "quantity": 1
+    },
+    {
+      "name": "Takenuma, Abandoned Mire",
+      "quantity": 1
+    },
+    {
+      "name": "Sokenzan, Crucible of Defiance",
+      "quantity": 1
+    }
   ]
 }

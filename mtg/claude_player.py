@@ -4237,18 +4237,20 @@ Respond with ONLY "keep" or "mulligan"."""
 
             # 3. Escape — card has "Escape—{cost}, exile N other cards from your graveyard"
             if not source_tag and card.oracle_text:
-                esc_match = re.search(
-                    r'escape.{1,3}(\{[^}]+\}(?:\{[^}]+\})*),?\s*exile\s+(\d+)\s+other\s+cards?\s+from\s+your\s+graveyard',
-                    card.oracle_text.lower()
-                )
-                if esc_match:
-                    escape_cost_str = esc_match.group(1).upper()
-                    exile_count = int(esc_match.group(2))
+                from mtg.helpers import parse_escape_cost
+                _escape = parse_escape_cost(card.oracle_text)
+                if _escape:
+                    escape_cost_str, exile_count = _escape
                     # Check if enough other cards in graveyard to exile
                     other_gy_count = len(player.graveyard) - 1  # Exclude this card
                     if other_gy_count >= exile_count:
                         source_tag = f"ESCAPE from graveyard, exile {exile_count}"
                         cast_cost = escape_cost_str
+                        # Stash the cost so the payment stage charges the ESCAPE
+                        # cost, not the printed one — mirroring the flashback
+                        # branch above. Without this an escaped Kroxa would be
+                        # charged {B}{R} instead of {2}{B}{B}{R}{R}.
+                        card._escape_cost = escape_cost_str
                         if card.id not in player.playable_from_graveyard:
                             player.playable_from_graveyard.append(card.id)
 
@@ -4256,6 +4258,20 @@ Respond with ONLY "keep" or "mulligan"."""
                 # Check mana affordability (uses ManaCost engine when available)
                 if _check_color_castable(cast_cost, mana_by_color, any_color_mana, total_mana):
                     results.append(f"{card.name} ({cast_cost}) [{source_tag}]")
+
+        # Adventure creature halves waiting in exile (CR 715.3). The castable
+        # builder scanned hand, command zone, companion zone, free-cast effects
+        # and the graveyard — but never exile, so even once the cast gates
+        # accepted these the AI was never told they existed and would never
+        # propose one. The adventure half offered inside the hand loop above is
+        # a DIFFERENT thing: that is the instant/sorcery half of a card still in
+        # hand, never the creature half from exile.
+        for card in getattr(player, 'exile', []) or []:
+            if not getattr(card, '_adventure_exiled', False):
+                continue
+            cost = card.mana_cost or ""
+            if _check_color_castable(cost, mana_by_color, any_color_mana, total_mana):
+                results.append(f"{card.name} ({cost}) [CREATURE HALF from exile]")
 
         return results
 

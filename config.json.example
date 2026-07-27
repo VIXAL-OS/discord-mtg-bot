@@ -4,7 +4,7 @@
   "excluded_channels": [],
   "_comments": {
     "bot_persona": "Name of a file under personas/ (without .json) — picks the character layer the bot speaks as when chatting in game threads. Defaults to 'plain' (no roleplay, just Claude). Try 'ressapanda' for a whimsical-red-panda persona, or write your own following personas/README.md.",
-    "mtg_channel_id": "Discord channel ID where MTG games happen. The bot responds to every message in this channel even without being mentioned. Set to null to require @-mentions in other channels.",
+    "mtg_channel_id": "Channel where MTG games are played — the bot responds to EVERY message there (and in its threads) without needing an @-mention. Two accepted shapes: a single channel ID (e.g. 123456789), which applies in EVERY server the bot is in; or a per-server mapping {\"<guild_id>\": <channel_id>, ...} when the bot is in more than one server, optionally with a \"*\" key as the fallback for unlisted servers. Set to null to require an @-mention everywhere (games still work anywhere — they're keyed by thread, not by channel).",
     "excluded_channels": "Channel IDs where the bot should NEVER respond (even to commands). Useful if another bot owns that channel."
   }
 }

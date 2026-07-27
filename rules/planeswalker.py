@@ -606,6 +606,19 @@ class PlaneswalkerManager:
         messages.extend(effect_messages)
         effects_applied = effect_messages
 
+        # [PW-ACTIVATE] belongs HERE, at the shared choke point, not in one
+        # caller. There are three activation implementations — human (cog),
+        # Claude (engine) and Rick (autoplay) — all converging on this method,
+        # and only the Claude one printed the tag. An auditor grepping
+        # [PW-ACTIVATE] saw Rick's five successful Daretti activations in
+        # game_1529160643909914765 as ZERO, which manufactured a convincing
+        # "ability silently dropped" trail during the July 27 audit itself.
+        # The player name is included because that attribution is the whole
+        # point of the tag.
+        print(f"[PW-ACTIVATE] {getattr(player, 'name', '?')} — {card.name} "
+              f"[{cost_str}]: "
+              f"{'; '.join(effect_messages[:2]) if effect_messages else 'no effect messages'}")
+
         return ActivationResult(
             success=True,
             messages=messages,

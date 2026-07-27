@@ -1,13 +1,29 @@
-"""Pub/sub slice 4a (July 24, 2026) — CARD_CAST in shadow mode.
+"""Pub/sub slice 4 (CARD_CAST) — the emission spine.
 
-CARD_CAST is emitted at the two live cast funnels — _await_stack_window
-(every cast_spell_async cast) and the cascade free-cast — and the only
-subscriber is the parity recorder. _check_cast_triggers stays the
-directly-called consumer and records what it scanned; report_cast_parity
-(end_turn) prints [EVENT-PARITY-CAST] for emissions the scan never saw.
-One clean batch gates slice 4b (flip the scan into a subscriber + close
-the sync-cast-site gaps: suspend, Etali, free-cast moves — deliberately
-NOT emitted in 4a, see mtg/events.py's migration plan).
+Slice 4a (July 24, 2026) emitted CARD_CAST at every cast path and shadowed it
+with a parity recorder. Slice 4b (July 26, 2026) retired the recorder after
+game_15304* returned [EVENT-PARITY-CAST]=0 on post-4a code.
+
+**The consumer deliberately did NOT move onto the bus, and this file is what
+keeps that decision honest.** `_check_cast_triggers` is async and needs
+`await` for Tier-3 `resolve_effect`, the cascade free-cast, its own recursion,
+and — decisively — `engine._combat_priority_round`, which is the
+[CAST-TRIGGER-PRIORITY] window that lets a Stifle counter a cast trigger (19
+fires in that batch). The bus contract is sync handlers only, so subscribing a
+queuer would demote every inline cast trigger — Talrand tokens, prowess, the
+whole counter-a-trigger interaction — to a Tier-3 drain. That is a real
+behaviour downgrade bought with nothing but uniformity.
+
+What the migration actually wanted is still delivered: CARD_CAST fires at
+EVERY cast path (both async funnels plus the sync bridge), which is the "one
+spine, no missed call sites" property the parity gate proved. Consumption
+differs by path — the async funnels consume directly (they ARE the funnel),
+the sync sites consume via `queue_cast_triggers_sync`.
+
+Because there is now no subscriber watching it, the emission is exactly the
+kind of thing that rots silently. These tests are the net: they pin that both
+funnels still emit, that a failed cast emits nothing, and that no async
+handler has been quietly subscribed in violation of the bus contract.
 """
 import asyncio
 import inspect
@@ -17,65 +33,12 @@ import pytest
 from mtg import events
 
 
-class TestCastShadowRecorder:
-    def test_emission_is_recorded_with_via(self, make_game, make_card):
-        import mtg.triggers  # noqa: F401 — subscriber registers at import
-        game = make_game()
-        rick = game.players[0]
-        bolt = make_card("Lightning Bolt", type_line="Instant",
-                         power="0", toughness="0")
-        events.emit(events.CARD_CAST, game, card=bolt, caster=rick,
-                    via="cast", engine=None)
-        assert game._cast_events
-        assert game._cast_events[-1] == (bolt.id, "Lightning Bolt", "cast")
+class TestEmissionSpine:
+    """Every cast path must still reach the bus."""
 
-    def test_scanned_cast_produces_no_miss(self, make_game, make_card):
-        from mtg.triggers import report_cast_parity
-        game = make_game()
-        bolt = make_card("Lightning Bolt", type_line="Instant",
-                         power="0", toughness="0")
-        game._cast_events.append((bolt.id, bolt.name, "cast"))
-        game._cast_scanned_ids.append(bolt.id)
-        assert report_cast_parity(game) == []
-        assert game._cast_events == []
-        assert game._cast_scanned_ids == []
-
-    def test_unscanned_cast_is_reported(self, make_game, make_card, capsys):
-        from mtg.triggers import report_cast_parity
-        game = make_game()
-        bolt = make_card("Lightning Bolt", type_line="Instant",
-                         power="0", toughness="0")
-        game._cast_events.append((bolt.id, bolt.name, "cascade"))
-        misses = report_cast_parity(game)
-        assert len(misses) == 1
-        assert "Lightning Bolt" in misses[0] and "cascade" in misses[0]
-        assert "[EVENT-PARITY-CAST]" in capsys.readouterr().out
-        # State cleared for the next turn's window.
-        assert report_cast_parity(game) == []
-
-    def test_multiplicity_two_casts_need_two_scans(self, make_game, make_card):
-        # An adventure card is one Card OBJECT cast twice in a turn
-        # (instant half, then creature half) — a set-based diff would mask
-        # a missed scan on the second cast.
-        from mtg.triggers import report_cast_parity
-        game = make_game()
-        adv = make_card("Bonecrusher Giant",
-                        type_line="Creature — Giant",
-                        power="4", toughness="3")
-        game._cast_events.append((adv.id, adv.name, "cast"))
-        game._cast_events.append((adv.id, adv.name, "cast"))
-        game._cast_scanned_ids.append(adv.id)   # only ONE scan record
-        misses = report_cast_parity(game)
-        assert len(misses) == 1, (
-            "two casts of the same card object need two scan records")
-
-
-class TestCastShadowEndToEnd:
-    def test_cast_spell_async_emits_once_and_scan_pairs(
-            self, make_game, make_card):
+    def test_cast_spell_async_emits_exactly_once(self, make_game, make_card):
         from mtg.engine import GameEngine
         from mtg.spells import cast_spell_async
-        from mtg.triggers import report_cast_parity
         engine = GameEngine(None)
         game = make_game()
         rick = game.players[0]
@@ -86,18 +49,24 @@ class TestCastShadowEndToEnd:
                          oracle_text="Lightning Bolt deals 3 damage to any target.",
                          mana_cost="{R}", cmc=1, power="0", toughness="0")
         rick.hand.append(bolt)
-        ok, msg, _ = asyncio.run(cast_spell_async(engine, game, rick, bolt))
+
+        seen = []
+        events.subscribe(events.CARD_CAST,
+                         lambda g, **kw: seen.append(kw) or None)
+        try:
+            ok, msg, _ = asyncio.run(cast_spell_async(engine, game, rick, bolt))
+        finally:
+            events._subscribers[events.CARD_CAST] = [
+                s for s in events._subscribers.get(events.CARD_CAST, [])
+                if getattr(s, "__name__", "") != "<lambda>"]
         assert ok, msg
-        casts = [e for e in game._cast_events if e[0] == bolt.id]
-        assert len(casts) == 1, (
-            f"exactly one CARD_CAST per cast, got {len(casts)}")
-        assert casts[0][2] == "cast"
-        # The scan ran adjacent to the emit — the diff must be clean.
-        assert report_cast_parity(game) == []
+        mine = [kw for kw in seen if getattr(kw.get('card'), 'id', None) == bolt.id]
+        assert len(mine) == 1, f"exactly one CARD_CAST per cast, got {len(mine)}"
+        assert mine[0].get('via') == "cast"
+        assert mine[0].get('caster') is rick
 
     def test_failed_cast_emits_nothing(self, make_game, make_card):
-        # A cast rejected by _validate_cast / payment never happened
-        # (CR 601.2) — no emission, no scan.
+        """A cast rejected by _validate_cast / payment never happened (CR 601.2)."""
         from mtg.engine import GameEngine
         from mtg.spells import cast_spell_async
         engine = GameEngine(None)
@@ -107,27 +76,77 @@ class TestCastShadowEndToEnd:
                          oracle_text="Lightning Bolt deals 3 damage to any target.",
                          mana_cost="{R}", cmc=1, power="0", toughness="0")
         rick.hand.append(bolt)
-        ok, msg, _ = asyncio.run(cast_spell_async(engine, game, rick, bolt))
+
+        seen = []
+        events.subscribe(events.CARD_CAST,
+                         lambda g, **kw: seen.append(kw) or None)
+        try:
+            ok, msg, _ = asyncio.run(cast_spell_async(engine, game, rick, bolt))
+        finally:
+            events._subscribers[events.CARD_CAST] = [
+                s for s in events._subscribers.get(events.CARD_CAST, [])
+                if getattr(s, "__name__", "") != "<lambda>"]
         assert not ok
-        assert not game._cast_events, "a failed cast is not a cast"
+        assert not [kw for kw in seen
+                    if getattr(kw.get('card'), 'id', None) == bolt.id], (
+            "a failed cast is not a cast")
 
-
-class TestCastShadowStructure:
     def test_cascade_free_cast_site_emits(self):
-        # Structural: the cascade free-cast (the second live funnel) must
-        # emit CARD_CAST adjacent to its _check_cast_triggers call.
+        """The second async funnel — structural, it needs a real cascade to run."""
         import mtg.triggers
         src = inspect.getsource(mtg.triggers)
         anchor = src.index("_check_cast_triggers(engine, game, caster, found_card)")
         window = src[max(0, anchor - 800):anchor]
         assert "events.emit(events.CARD_CAST" in window, (
-            "the cascade free-cast lost its CARD_CAST shadow emit")
+            "the cascade free-cast lost its CARD_CAST emit")
 
-    def test_recorder_is_the_only_card_cast_subscriber(self):
-        # 4a is SHADOW mode: _check_cast_triggers must NOT be subscribed
-        # yet — the flip is slice 4b, gated on a clean batch.
+    def test_sync_bridge_emits(self):
+        """suspend / Etali / free-cast moves / legacy sync cast (7ba7ad6)."""
+        import mtg.triggers
+        src = inspect.getsource(mtg.triggers.queue_cast_triggers_sync)
+        assert "events.emit(events.CARD_CAST" in src, (
+            "the sync cast bridge lost its CARD_CAST emit — suspend/Etali/"
+            "free-cast moves would leave the spine again")
+
+
+class TestConsumerStaysOffTheBus:
+    """Slice 4b's decision, pinned so it can't be undone by accident."""
+
+    def test_no_async_handler_is_subscribed(self):
+        """The bus contract is sync handlers only (mtg/events.py CONTRACTS)."""
         import mtg.triggers  # noqa: F401 — registration happens at import
-        subs = events._subscribers.get(events.CARD_CAST, [])
-        names = [getattr(s, "__name__", "") for s in subs]
-        assert names == ["_record_cast_for_parity"], (
-            f"shadow mode: the recorder must be the sole subscriber, got {names}")
+        for ev, subs in events._subscribers.items():
+            for s in subs:
+                assert not inspect.iscoroutinefunction(s), (
+                    f"{getattr(s, '__name__', s)} is async but subscribed to "
+                    f"{ev}; emit() dispatches synchronously so the coroutine "
+                    f"would never be awaited")
+
+    def test_check_cast_triggers_is_not_subscribed(self):
+        """Subscribing it would demote inline cast triggers to Tier-3 drains
+        and destroy the [CAST-TRIGGER-PRIORITY] Stifle window."""
+        import mtg.triggers  # noqa: F401
+        names = [getattr(s, "__name__", "")
+                 for s in events._subscribers.get(events.CARD_CAST, [])]
+        assert "_check_cast_triggers" not in names, (
+            "the async cast-trigger scan must not be a subscriber — see this "
+            "module's docstring for why the 4b flip was deliberately not made")
+
+    def test_check_cast_triggers_still_needs_async(self):
+        """If this ever stops being true, revisit the 4b decision."""
+        import mtg.triggers
+        assert inspect.iscoroutinefunction(mtg.triggers._check_cast_triggers)
+        src = inspect.getsource(mtg.triggers._check_cast_triggers)
+        assert "_combat_priority_round" in src, (
+            "the [CAST-TRIGGER-PRIORITY] window was the decisive reason the "
+            "consumer stayed off the bus — if it moved, re-evaluate slice 4b")
+
+    def test_parity_recorder_is_retired(self):
+        """Slice 4b cleanup: recorder, reporter and its two fields are gone."""
+        import mtg.triggers
+        from mtg.models import GameState
+        assert not hasattr(mtg.triggers, "_record_cast_for_parity")
+        assert not hasattr(mtg.triggers, "report_cast_parity")
+        fields = {f.name for f in GameState.__dataclass_fields__.values()}
+        assert "_cast_events" not in fields
+        assert "_cast_scanned_ids" not in fields

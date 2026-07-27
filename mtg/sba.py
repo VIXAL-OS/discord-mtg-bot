@@ -37,7 +37,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from mtg.constants import Phase, Zone, COMMAND_ZONE_FORMATS
 from mtg import events
-from mtg.helpers import command_zone_owner
+from mtg.helpers import command_zone_owner, owner_of
 from mtg.models import Card, Player, GameState
 
 
@@ -640,7 +640,7 @@ def process_state_based_actions(rules, game: GameState) -> List[str]:
                             print(f"  [REPLACEMENT-APPLY] SBA death redirected to battlefield ({friendly_reason})")
                             needs_layers_recalc = True
                         else:
-                            player.graveyard.append(card)
+                            owner_of(game, card, player).graveyard.append(card)
                             messages.append(f"☠️ {card.name} dies ({friendly_reason})")
 
                     # [DIES-TRIGGER] Track dead creatures for trigger processing.
@@ -721,7 +721,7 @@ def process_state_based_actions(rules, game: GameState) -> List[str]:
                         _zone_owner.command_zone.append(card)
                         messages.append(f"👑 {_zone_owner.name}'s **{card.name}** → command zone (legend rule)")
                     else:
-                        player.graveyard.append(card)
+                        owner_of(game, card, player).graveyard.append(card)
                         messages.append(f"👑 {player.name}'s **{card.name}** → graveyard (legend rule)")
                     print(f"[SBA-LEGEND] {card.name} → "
                           f"{'command zone' if card.is_commander else 'graveyard'} "
@@ -753,7 +753,7 @@ def process_state_based_actions(rules, game: GameState) -> List[str]:
                         _zone_owner.command_zone.append(card)
                         messages.append(f"💀 {card.name} goes to command zone (0 loyalty)")
                     else:
-                        player.graveyard.append(card)
+                        owner_of(game, card, player).graveyard.append(card)
                         messages.append(f"💀 {card.name} goes to graveyard (0 loyalty)")
                     # [LTB-TRIGGER] Check for leaves-the-battlefield triggers
                     if hasattr(rules, 'engine_ref') and rules.engine_ref:
@@ -769,7 +769,7 @@ def process_state_based_actions(rules, game: GameState) -> List[str]:
                 if card:
                     game.unregister_static_effects(card)
                     player.battlefield.remove(card)
-                    player.graveyard.append(card)
+                    owner_of(game, card, player).graveyard.append(card)
                     messages.append(f"⚔️ {card.name} defeated! (no defense counters remaining)")
                     # [LTB-TRIGGER] Battles may have LTB triggers
                     if hasattr(rules, 'engine_ref') and rules.engine_ref:
@@ -798,7 +798,7 @@ def process_state_based_actions(rules, game: GameState) -> List[str]:
                 if card:
                     game.unregister_static_effects(card)
                     player.battlefield.remove(card)
-                    player.graveyard.append(card)
+                    owner_of(game, card, player).graveyard.append(card)
                     messages.append(f"💫 {card.name} goes to graveyard ({action['reason']})")
                     if hasattr(rules, 'engine_ref') and rules.engine_ref:
                         ltb_msgs = rules.engine_ref._check_ltb_triggers_sync(game, card, player, "graveyard")
@@ -814,7 +814,7 @@ def process_state_based_actions(rules, game: GameState) -> List[str]:
                 if card:
                     game.unregister_static_effects(card)
                     player.battlefield.remove(card)
-                    player.graveyard.append(card)
+                    owner_of(game, card, player).graveyard.append(card)
                     messages.append(f"🌍 {card.name} goes to graveyard (World rule — CR 704.5k)")
                     if hasattr(rules, 'engine_ref') and rules.engine_ref:
                         ltb_msgs = rules.engine_ref._check_ltb_triggers_sync(game, card, player, "graveyard")
@@ -896,7 +896,7 @@ def process_state_based_actions(rules, game: GameState) -> List[str]:
                     else:
                         game.unregister_static_effects(card)
                         player.battlefield.remove(card)
-                        player.graveyard.append(card)
+                        owner_of(game, card, player).graveyard.append(card)
                         lore = card.counters.get('lore', 0) if hasattr(card, 'counters') and card.counters else '?'
                         messages.append(f"📖 {card.name} sacrificed (final chapter reached, lore={lore})")
                         if hasattr(rules, 'engine_ref') and rules.engine_ref:

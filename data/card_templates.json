@@ -40,7 +40,7 @@
       "key": "cavalry pegasus",
       "name": "Cavalry Pegasus (attack)",
       "event": "attack",
-      "description": "Each attacking Knight and each other attacking Pegasus gain flying until end of turn",
+      "description": "Each attacking Human gains flying until end of turn",
       "actions": [
         {
           "action": "grant_keywords",
@@ -49,8 +49,9 @@
             "Flying"
           ],
           "duration": "end_of_turn",
-          "filter": "attacking_knights_and_other_pegasi",
-          "reason": "Cavalry Pegasus grants flying to attacking Knights and other attacking Pegasi"
+          "target": "attacking_subtype",
+          "subtype": "Human",
+          "reason": "Cavalry Pegasus grants flying to each attacking Human"
         }
       ]
     },

@@ -1001,6 +1001,30 @@ _NAMED_CARD_REPLACEMENTS = {
             ),
         )
     ],
+    # July 26 batch-7 audit: oracle-identical to Fiery Emancipation above
+    # except double-instead-of-triple, but it had no entry here and the
+    # generic fallback regex needs "a source WOULD deal damage" with nothing
+    # in between — this card says "a source YOU CONTROL would deal damage", so
+    # it matched nothing and registered nothing. In
+    # game_1530441531188711565 Claude's damage was doubled once (by Gisela)
+    # while Marauders sat on the battlefield contributing nothing.
+    "angrath's marauders": lambda card_id, controller: [
+        ReplacementEffect(
+            id=f"{card_id}_marauders",
+            source_name="Angrath's Marauders",
+            source_id=card_id,
+            controller=controller,
+            replaces_event=EventType.DAMAGE,
+            condition_text="damage from your sources doubled",
+            replacement_type="double_damage",
+            multiply_amount=2.0,
+            # Same controller gate as Fiery Emancipation: "a source you
+            # control" is part of the printed text here, not a house rule.
+            condition=lambda ev, _ctrl=controller: (
+                bool(ev.source_controller) and ev.source_controller == _ctrl
+            ),
+        )
+    ],
     "doubling season": lambda card_id, controller: [
         create_doubling_season_counters(card_id, controller),
         create_doubling_season_tokens(card_id, controller),

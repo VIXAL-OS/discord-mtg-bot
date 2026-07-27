@@ -566,6 +566,83 @@ def _resolve_player_or_card_target(game, activating_player, target_name):
     return None
 
 
+_SELF_TARGET_WORDS = frozenset((
+    'you', 'yourself', 'self', 'me', 'my', 'controller', 'caster'))
+_OPPONENT_TARGET_WORDS = frozenset((
+    'opponent', 'opp', 'them', 'enemy', 'target player', 'target opponent',
+    'another player', 'each opponent'))
+
+
+def resolve_cast_target(game, caster, card, target_name):
+    """Resolve a declared cast target string to a StackEntry, Card or Player.
+
+    ONE resolver for both cast paths. Two divergent copies existed — the AI one
+    in mtg/engine.py and the pretend-human one in mtg/autoplay.py — and each had
+    a gap the other didn't (the July 27 fanout found both):
+
+      * the autoplay copy never searched graveyards, so every graveyard-targeting
+        spell Rick cast silently lost its declared target and the reanimation
+        fallback grabbed the biggest creature in ANY graveyard (CR 608.2b). The
+        AI copy got that branch in the July 20 audit; this one never did.
+      * NEITHER copy understood the pronoun "opponent", which is what the AI
+        actually emits for burn (`target: "opponent"`). It resolved to None, and
+        `get_legal_targets` lists creatures before players for "any target", so
+        Lightning Bolt aimed at the face killed a creature instead.
+
+    Resolution order is CR-shaped: stack (counterspells target spells, not
+    permanents) -> battlefield -> graveyard (only for graveyard-targeting
+    spells) -> player.
+
+    Returns the resolved object, or None if nothing matches.
+    """
+    if not target_name:
+        return None
+    target_name = coerce_ai_string(target_name)
+    if not target_name:
+        return None
+    lowered = target_name.strip().lower()
+    oracle = (getattr(card, 'oracle_text', '') or '').lower()
+
+    # 1. Counterspells target objects on the stack.
+    if 'counter target' in oracle and 'spell' in oracle:
+        for entry in reversed(getattr(game, 'stack', []) or []):
+            entry_name = getattr(getattr(entry, 'card', None), 'name', None) or (
+                entry.get('card_name') if isinstance(entry, dict) else None)
+            if entry_name and entry_name.lower() == lowered:
+                return entry
+
+    # 2. Permanents.
+    for p in game.players:
+        found = p.find_card(target_name, Zone.BATTLEFIELD)
+        if found:
+            return found
+
+    # 3. Graveyards — ONLY when the spell actually reaches there, so an
+    #    ordinary removal spell can't accidentally "target" a dead card.
+    if any(phrase in oracle for phrase in
+           ('in a graveyard', 'in your graveyard',
+            'from your graveyard', 'from a graveyard')):
+        for p in game.players:
+            found = p.find_card(target_name, Zone.GRAVEYARD)
+            if found:
+                return found
+
+    # 4. Players, including the pronouns the AI actually emits. Deliberately
+    #    NOT the fuzzy card fallback that _resolve_player_or_card_target uses:
+    #    a card name that merely starts with a player's name must not silently
+    #    become that player.
+    if lowered in _SELF_TARGET_WORDS:
+        return caster
+    if lowered in _OPPONENT_TARGET_WORDS:
+        for p in game.players:
+            if p is not caster:
+                return p
+    for p in game.players:
+        if (getattr(p, 'name', '') or '').lower() == lowered:
+            return p
+    return None
+
+
 def _collapse_repeated_life_gain(messages):
     """Collapse consecutive identical life-gain messages for the same player into
     one line with an ×N multiplier. Handles the Soul Warden / Impact Tremors
@@ -626,6 +703,80 @@ def _should_emit_resolve_hint(game, effect_key: str) -> bool:
         return False
     hints.add(effect_key)
     return True
+
+
+def owner_of(game, card, fallback):
+    """Resolve a card's OWNER — the player it started the game under.
+
+    CR 400.3 / 404.3: a card that leaves the battlefield goes to its owner's
+    zone, not its controller's. Everywhere the engine says `owner` it usually
+    means whichever battlefield list held the card, which is the CONTROLLER —
+    the same conflation `command_zone_owner` below was written to fix for
+    commanders (June 10, C7). The July 27 fanout found the ordinary-permanent
+    twin: a stolen Sun Titan destroyed under the thief's control landed in the
+    THIEF's graveyard, permanently changing hands.
+
+    Behaviour-neutral whenever owner == controller, i.e. every permanent that
+    was never stolen — the blast radius is exactly control-change effects.
+    """
+    idx = getattr(card, 'owner_index', None)
+    try:
+        if idx is not None and 0 <= int(idx) < len(game.players):
+            return game.players[int(idx)]
+    except (TypeError, ValueError):
+        pass
+    return fallback
+
+
+_NUMBER_WORDS = {
+    'one': 1, 'two': 2, 'three': 3, 'four': 4, 'five': 5,
+    'six': 6, 'seven': 7, 'eight': 8, 'nine': 9, 'ten': 10,
+}
+
+
+def parse_escape_cost(oracle_text):
+    """Parse "Escape—{cost}, Exile N other cards from your graveyard".
+
+    Returns (cost_string, exile_count) or None.
+
+    THE bug this exists to fix: four separate copies of this regex all required
+    `(\\d+)` for the count, and Scryfall spells it as an English WORD on every
+    printing — "Exile five other cards", "three", "four", "eight", "two". The
+    pattern matched 0 of the 7 escape cards in the cache, so detection never
+    fired and every downstream escape branch (cost selection, the graveyard
+    castable list, the exile payment in all three cast paths) was unreachable
+    dead code. The mechanic did not work at all; the test deck built for it
+    could not exercise it. One parser now, so the four copies cannot drift.
+    """
+    if not oracle_text:
+        return None
+    match = re.search(
+        r'escape.{1,3}(\{[^}]+\}(?:\{[^}]+\})*),?\s*exile\s+'
+        r'(\d+|one|two|three|four|five|six|seven|eight|nine|ten)'
+        r'\s+other\s+cards?\s+from\s+your\s+graveyard',
+        oracle_text.lower())
+    if not match:
+        return None
+    raw = match.group(2)
+    count = int(raw) if raw.isdigit() else _NUMBER_WORDS.get(raw)
+    if not count:
+        return None
+    return match.group(1).upper(), count
+
+
+def owns_card(card, player_index):
+    """Does the player at `player_index` OWN this card?
+
+    Unknown ownership (owner_index == -1, i.e. a Card built at runtime rather
+    than stamped by deck load) counts as owned by whoever controls it — the
+    caller only ever asks about a permanent on that player's battlefield, and
+    treating unstamped cards as "someone else's" would silently break the
+    you-own-it gates on Aminatou and Yorion.
+    """
+    idx = getattr(card, 'owner_index', -1)
+    if idx is None or idx < 0:
+        return True
+    return idx == player_index
 
 
 def command_zone_owner(game, card, fallback):
@@ -715,3 +866,229 @@ def apnap_order_died(died_pairs, game):
     except (ValueError, AttributeError, TypeError, IndexError):
         # Player not in game.players / malformed pair — insertion order.
         return list(died_pairs)
+
+
+# --------------------------------------------------------------------------- #
+# Static cost reduction (CR 601.2f)                                            #
+# --------------------------------------------------------------------------- #
+# "Black spells you cast cost {1} less to cast." — implemented July 26, 2026.
+# Before that, `ManaCost.cost_reductions` was declared in rules/mana.py and
+# NEVER written by anything, so every reducer was a blank card. Nine of them
+# sit in the test decks, including Baral, Chief of Compliance — a COMMANDER
+# whose entire defining ability was a no-op in the deck named after him.
+#
+# CR 601.2f: cost reduction applies to the TOTAL cost but can only reduce the
+# GENERIC portion — colored pips are never reducible. Callers must cap the
+# returned amount at the generic actually available (see _compute_alt_costs).
+
+_COST_REDUCTION_RE = re.compile(
+    r'(?P<restrict>[^.\n]*?)\bspells?\s+you\s+cast\b'
+    r'(?P<zone>[^.\n]*?)'
+    r'\bcosts?\s*\{(?P<amt>\d+)\}\s*less\s+to\s+cast',
+    re.IGNORECASE,
+)
+
+_REDUCTION_COLORS = {
+    'white': 'W', 'blue': 'U', 'black': 'B', 'red': 'R', 'green': 'G',
+}
+# Card TYPES (CR 205.2a). Anything left over in the restriction clause is
+# treated as a subtype — that is how Danitha's "Aura and Equipment spells"
+# works, since Aura and Equipment are subtypes, not types.
+_REDUCTION_TYPES = {
+    'creature', 'instant', 'sorcery', 'artifact', 'enchantment',
+    'planeswalker', 'land', 'battle', 'kindred', 'tribal',
+}
+# Words that appear in the restriction clause but carry no restriction.
+_REDUCTION_NOISE = {
+    'and', 'or', 'the', 'a', 'an', 'your', 'you', 'this', 'these', 'other',
+    'spell', 'spells', 'cast', '',
+}
+
+
+def spell_colors_from_cost(mana_cost: str) -> set:
+    """The spell's colors, per CR 202.2 — derived from its mana cost.
+
+    Deliberately NOT `card.color_identity`: identity also picks up colors
+    from oracle text (an activated ability's {B}), which would make a
+    colorless artifact with a black activation count as a "Black spell".
+    Hybrid ({W/U}) and Phyrexian ({W/P}) symbols each contribute their
+    color, which is correct — such a spell IS both colors.
+    """
+    out = set()
+    for sym in re.findall(r'\{([^}]+)\}', mana_cost or ''):
+        for ch in sym.upper():
+            if ch in ('W', 'U', 'B', 'R', 'G'):
+                out.add(ch)
+    return out
+
+
+def _restriction_applies(restrict: str, card) -> bool:
+    """Does a parsed restriction clause ("Black creature", "Noncreature") match?
+
+    Within a category the match is OR ("Instant and sorcery" = either);
+    across categories it is AND ("Black creature" = black AND a creature).
+
+    NEGATION is handled explicitly. `non`-prefixed words are the whole point
+    of the tax family ("Noncreature spells cost {1} more"), and a naive
+    substring test gets them exactly backwards — 'creature' is a substring of
+    'noncreature'. That is the documented Woodfall Primus trap from the
+    July 24 audit, and it would make Thalia tax precisely the spells she is
+    supposed to leave alone.
+    """
+    tokens = [t for t in re.split(r'[^a-z]+', (restrict or '').lower())
+              if t and t not in _REDUCTION_NOISE]
+    if not tokens:
+        return True  # unrestricted: "Spells cost {1} more/less"
+
+    type_line = (getattr(card, 'type_line', '') or '').lower()
+    card_colors = spell_colors_from_cost(getattr(card, 'mana_cost', ''))
+
+    want_colors, want_types, want_subtypes = set(), set(), set()
+    for t in tokens:
+        negated = False
+        base = t
+        if t.startswith('non') and len(t) > 3:
+            stripped = t[3:]
+            if stripped in _REDUCTION_TYPES or stripped in _REDUCTION_COLORS:
+                negated, base = True, stripped
+        if negated:
+            # A negated clause is a hard veto, evaluated immediately: the
+            # spell must NOT be that type/color for the effect to apply.
+            if base in _REDUCTION_COLORS:
+                if _REDUCTION_COLORS[base] in card_colors:
+                    return False
+            elif base in type_line:
+                return False
+            continue
+        if base in _REDUCTION_COLORS:
+            want_colors.add(_REDUCTION_COLORS[base])
+        elif base in _REDUCTION_TYPES:
+            want_types.add(base)
+        else:
+            want_subtypes.add(base)
+
+    if want_colors and not (card_colors & want_colors):
+        return False
+    if want_types and not any(t in type_line for t in want_types):
+        return False
+    if want_subtypes and not any(s in type_line for s in want_subtypes):
+        return False
+    return True
+
+
+def _zone_ok(zone: str, from_graveyard: bool) -> bool:
+    """Zone qualifier gate. Unmodelled qualifiers REFUSE rather than over-apply."""
+    zone = (zone or '').lower()
+    if 'from your graveyard' in zone:
+        return bool(from_graveyard)
+    # "from exile", "from anywhere but your hand", ... — not modelled.
+    return 'from' not in zone
+
+
+def _reduction_applies(restrict: str, zone: str, card, from_graveyard: bool) -> bool:
+    """Does a parsed reduction clause apply to `card`?"""
+    if not _zone_ok(zone, from_graveyard):
+        return False
+    return _restriction_applies(restrict, card)
+
+
+def compute_cost_reduction(player, card, *, from_graveyard: bool = False):
+    """Total generic cost reduction for `card` from `player`'s battlefield.
+
+    Returns (amount, [source names]). The amount is UNCAPPED — the caller
+    must clamp it to the generic portion actually present (CR 601.2f), since
+    a reduction can never eat a colored pip.
+
+    Only the controller's own permanents are scanned: every printed reducer
+    of this shape says "you cast".
+    """
+    total = 0
+    sources = []
+    for perm in (player.active_battlefield()
+                 if hasattr(player, 'active_battlefield') else player.battlefield):
+        if perm is card:
+            continue
+        oracle = getattr(perm, 'oracle_text', '') or ''
+        if 'less to cast' not in oracle.lower():
+            continue
+        for m in _COST_REDUCTION_RE.finditer(oracle):
+            if _reduction_applies(m.group('restrict'), m.group('zone'),
+                                  card, from_graveyard):
+                try:
+                    amt = int(m.group('amt'))
+                except (TypeError, ValueError):
+                    continue
+                total += amt
+                sources.append(perm.name)
+    return total, sources
+
+
+# --------------------------------------------------------------------------- #
+# Static cost INCREASES — "spells cost {N} more to cast" (CR 601.2f)           #
+# --------------------------------------------------------------------------- #
+# Thalia, Sphere of Resistance, Thorn of Amethyst, Grand Arbiter, Vryn
+# Wingmare, Archon of Emeria, Lodestone Golem, Elspeth Conquers Death II...
+#
+# Scope differs from reductions in a way that matters: reducers all say "you
+# cast" (controller-only), but taxes are frequently SYMMETRIC ("Noncreature
+# spells cost {1} more to cast" — Thalia taxes her own controller too) or
+# explicitly opponent-facing ("Spells your opponents cast cost {1} more").
+# So this scans EVERY battlefield and resolves the scope per clause, relative
+# to the permanent's own controller.
+_COST_INCREASE_RE = re.compile(
+    r'(?P<restrict>[^.\n]*?)\bspells?\b(?P<scope>[^.\n]*?)'
+    r'\bcosts?\s*\{(?P<amt>\d+)\}\s*more\s+to\s+cast',
+    re.IGNORECASE,
+)
+
+
+def _increase_scope_matches(scope: str, restrict: str, source_controller,
+                            caster) -> bool:
+    """Whose spells does this clause tax?
+
+    "your opponents cast" -> only casters who are NOT the source's controller
+    "you cast"            -> only the source's controller
+    (unqualified)         -> everyone, including the source's controller
+    """
+    blob = f"{restrict or ''} {scope or ''}".lower()
+    if 'opponent' in blob:
+        return caster is not source_controller
+    if re.search(r'\byou\s+cast\b', blob):
+        return caster is source_controller
+    return True
+
+
+def compute_cost_increase(game, player, card):
+    """Total generic cost increase for `player` casting `card`.
+
+    Returns (amount, [source names]). Scans every player's battlefield, since
+    taxes are commonly symmetric or opponent-facing.
+    """
+    total = 0
+    sources = []
+    players = getattr(game, 'players', None) or [player]
+    for owner in players:
+        bf = (owner.active_battlefield()
+              if hasattr(owner, 'active_battlefield') else owner.battlefield)
+        for perm in bf:
+            if perm is card:
+                continue
+            oracle = getattr(perm, 'oracle_text', '') or ''
+            if 'more to cast' not in oracle.lower():
+                continue
+            for m in _COST_INCREASE_RE.finditer(oracle):
+                scope, restrict = m.group('scope'), m.group('restrict')
+                # A trailing "your opponents"/"you" lives in `scope`; keep it
+                # out of the type/color restriction parsing.
+                if not _increase_scope_matches(scope, restrict, owner, player):
+                    continue
+                if not _restriction_applies(
+                        re.sub(r'\b(your\s+opponents?|you)\b', '', restrict or '',
+                               flags=re.IGNORECASE), card):
+                    continue
+                try:
+                    total += int(m.group('amt'))
+                except (TypeError, ValueError):
+                    continue
+                sources.append(perm.name)
+    return total, sources

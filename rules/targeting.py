@@ -574,6 +574,15 @@ class TargetTextParser:
             restriction.target_types = {TargetType.CREATURE, TargetType.PLANESWALKER}
         elif "creature or player" in text or "player or creature" in text:
             restriction.target_types = {TargetType.CREATURE, TargetType.PLAYER}
+        elif "player or planeswalker" in text or "planeswalker or player" in text:
+            # July 27 fanout: this branch did not exist, and the `player` branch
+            # below explicitly excludes any phrase containing "planeswalker", so
+            # "target player or planeswalker" fell through to the planeswalker-
+            # only branch and dropped PLAYER entirely. With no planeswalker on
+            # the battlefield the cast gates then HARD-REJECTED completely legal
+            # burn: 31 blocked casts across the batch, and in all six games
+            # where Skullcrack was blocked it was never cast at all.
+            restriction.target_types = {TargetType.PLAYER, TargetType.PLANESWALKER}
         elif "player" in text and "planeswalker" not in text:
             restriction.target_types = {TargetType.PLAYER}
         elif "planeswalker" in text:

@@ -541,6 +541,15 @@ async def resolve_effect(rules, game: GameState, effect_description: str,
         and "destroy" not in effect_lower
         and "exile" not in effect_lower
         and "deal" not in effect_lower
+        # July 27 fanout: the exclusion list checked draw/destroy/exile/deal but
+        # not the disruption verbs, so Thought Erasure — whose SURVEIL REMINDER
+        # text contains "look at the top card of your library" — tripped this
+        # gate and its entire hand-disruption half (reveal, choose a nonland,
+        # discard it) was skipped as an unmodellable library look.
+        and "discard" not in effect_lower
+        and "reveals their hand" not in effect_lower
+        and "you choose" not in effect_lower
+        and "sacrifice" not in effect_lower
     )
     if is_library_look:
         # May 17 audit: minimal library-order modeling — actually execute

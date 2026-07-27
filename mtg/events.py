@@ -89,11 +89,36 @@ MIGRATION PLAN (one slice per audit cycle; batches are the regression net)
       triggers queue for the async Tier-3 drain ([CAST-TRIGGER-SYNC]; a
       suspended Rift Bolt finally makes Talrand a Drake), and the helper
       emits CARD_CAST with a PAIRED parity record, so the zero gate holds.
-      That closes the '4b sync gaps' item early. One clean
-      [EVENT-PARITY-CAST]=0 batch gates 4b, which is now JUST the flip
-      (_check_cast_triggers becomes a subscriber).
-  Slice 4b+: COMBAT_DAMAGE_DEALT, PHASE_CHANGED — at which point the React
-      frontend's websocket layer is just another subscriber.
+      That closes the '4b sync gaps' item early.
+  Slice 4b (July 26, 2026): game_15304* returned [EVENT-PARITY-CAST]=0 on
+      post-4a code, so the recorder (_record_cast_for_parity,
+      report_cast_parity, GameState._cast_events/_cast_scanned_ids, the
+      end_turn call, the subscribe line, the scan-side recording) is
+      RETIRED. **The consumer deliberately did NOT move onto the bus.**
+      _check_cast_triggers is async and needs `await` for Tier-3
+      resolve_effect, the cascade free-cast, its own recursion, and —
+      decisively — engine._combat_priority_round, the
+      [CAST-TRIGGER-PRIORITY] window that lets a Stifle counter a cast
+      trigger (19 fires in that batch). Per CONTRACTS below the bus is
+      sync-only, so subscribing a queuer would demote EVERY inline cast
+      trigger (Talrand tokens, prowess, the whole counter-a-trigger
+      interaction) to a Tier-3 drain — a real behaviour downgrade bought
+      with nothing but uniformity.
+      The migration's goals are met without the flip: CARD_CAST fires at
+      every cast path (both async funnels + the sync bridge) — the "one
+      spine, no missed call sites" property, which the parity gate proved
+      — while CONSUMPTION differs by path: the async funnels consume
+      directly (they ARE the funnel), the sync sites consume via
+      queue_cast_triggers_sync. Because nothing subscribes to CARD_CAST
+      now, tests/test_slice4a_cast_shadow.py is the net that stops the
+      emission rotting unnoticed, and it also pins that no async handler
+      gets subscribed in violation of the contract.
+      Revisit this decision only if _check_cast_triggers loses its need to
+      await (the test asserts that need explicitly).
+  Slice 5+: COMBAT_DAMAGE_DEALT, PHASE_CHANGED — shadow first, one slice
+      per audit cycle. The React frontend's websocket layer is the intended
+      next CARD_CAST subscriber, and it is sync-friendly (it only needs to
+      serialize state), so it can attach without reopening 4b.
 
 CONTRACTS
 ---------
@@ -137,13 +162,17 @@ CREATURE_DIED = "creature_died"
 # cast_spell_async funnel: hand/response/adventure/flashback/commander/
 # signature) | "cascade" (the cascade free-cast) | "suspend" |
 # "etali_free_cast" | "free_cast_move" | "cast_sync" (the four sync sites,
-# emitted by triggers.queue_cast_triggers_sync with a paired parity
-# record)>, engine=<GameEngine — threaded now so the 4b consumer flip
-# needs no emit-site changes>. Emitted ONCE per cast at announcement time
-# (CR 601.2i — before the counter window; cast triggers fire even if the
-# spell is countered). Slice 4a (July 24, 2026): SHADOW — the only
-# subscriber is the parity recorder; _check_cast_triggers remains the
-# directly-called consumer (sync sites consume via the Tier-3 queue).
+# emitted by triggers.queue_cast_triggers_sync)>, engine=<GameEngine>.
+# Emitted ONCE per cast at announcement time (CR 601.2i — before the
+# counter window; cast triggers fire even if the spell is countered).
+# Slice 4b (July 26, 2026): the parity recorder is retired and CARD_CAST
+# currently has NO subscriber. That is deliberate, not an oversight —
+# _check_cast_triggers is async (it awaits the [CAST-TRIGGER-PRIORITY]
+# Stifle window) and this bus is sync-only, so the async funnels consume
+# directly while the sync sites consume via the Tier-3 queue. The emission
+# is the migration's real deliverable (one spine, every cast path) and is
+# pinned by tests/test_slice4a_cast_shadow.py so it cannot rot unnoticed.
+# The React websocket layer is the intended next subscriber.
 CARD_CAST = "card_cast"
 # Planned: COMBAT_DAMAGE_DEALT, PHASE_CHANGED (see migration plan above).
 

@@ -56,6 +56,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from mtg.constants import Phase, Zone, COMMAND_ZONE_FORMATS, MELD_PAIRS
 from mtg.helpers import _collapse_repeated_life_gain, _should_emit_resolve_hint, sanitize_oracle_for_display, format_trigger_line, names_match
 from mtg.models import Card, Player, GameState, StackEntry
+from mtg.util import maybe_reraise
 from mtg import events
 
 
@@ -285,10 +286,21 @@ async def drain_pending_triggers(engine, game: GameState) -> List[str]:
                 controller=controller_name,
                 context=ctx or f"{trigger_type} trigger for {src.name}",
             )
-            messages.extend(resolve_msgs)
             if actions:
+                messages.extend(resolve_msgs)
                 print(f"[DRAIN-{trigger_type.upper()}] {src.name}: executed {len(actions)} action(s)")
             else:
+                # July 26 batch-7 audit: the "(suppressed)" label described the
+                # CONSOLE print only — `messages.extend` ran unconditionally
+                # above it, so a no-op Tier 3 resolution still posted its raw
+                # explanation to Discord. game_1530445545447886909 shipped a
+                # verbatim chain-of-thought: "He chooses to return the Elvish
+                # Mystic? No, Elvish Mystic is not an artifact; ... So there is
+                # no target, ability fizzles". Same policy as F6 Option D for
+                # trigger emits: drop the prose, keep it on the console so an
+                # audit can still recover it.
+                for _m in resolve_msgs:
+                    print(f"[RESOLVE-PROSE-DROPPED] {src.name}: {_m}")
                 print(f"[DRAIN-{trigger_type.upper()}] {src.name}: no state change (suppressed)")
             # SBA check between resolutions (CR 117.5). If this trigger
             # killed someone, surface the loss now so the next iteration
@@ -793,13 +805,49 @@ def _spell_matches_cast_trigger(engine, sentence_lower: str, card: Card,
             return False
 
     # --- Heroic: "that targets this creature" / "that targets ~" ---
-    # Heroic abilities only trigger when the cast spell targets the creature.
-    # We can't fully track targeting, so skip these triggers entirely for now
-    # (they'll need explicit targeting info to work correctly).
+    # Heroic only triggers when the cast spell targets the creature. The skip
+    # itself is a deliberate approximation, but until July 28 2026 it was
+    # SILENT — a bare `return False` at all three call sites, which are bare
+    # `continue`s, so the trigger never reached the [CAST-TRIGGER-UNHANDLED]
+    # queue either and was invisible to every audit grep. An approximation
+    # nobody can see is indistinguishable from a bug.
     if 'that targets' in sentence_lower:
+        print(f"[HEROIC-SKIP] targeting-conditional cast trigger not evaluated: "
+              f"{sentence_lower[:80]}")
         return False
 
     return True
+
+
+def queue_unhandled_combat_damage(game: GameState, attacker: Card,
+                                  attacker_owner: Player, damage_amount: int) -> None:
+    """Queue an unmatched "deals combat damage to a player" trigger for the
+    async Tier-3 drain.
+
+    resolve_combat_damage is sync, so it cannot escalate to Tier 3 itself — and
+    before July 28 2026 it also printed nothing and queued nothing when no
+    template matched, so the trigger simply vanished. Ragavan, Nimble Pilferer's
+    whole ability (Treasure token + impulse exile) disappeared on every connect,
+    invisible to every audit grep because there was no tag to grep for. The
+    sibling scans queue their unhandled tails (queue_unhandled_dies, the July 24
+    sync cast bridge); this one now does too.
+    """
+    oracle = (getattr(attacker, 'oracle_text', '') or '')
+    sentence = next(
+        (s.strip() for s in oracle.split('.')
+         if 'combat damage to a player' in s.lower()
+         or 'combat damage to an opponent' in s.lower()),
+        oracle.strip())
+    print(f"[COMBAT-TRIGGER-UNHANDLED] {attacker.name}: {sentence[:120]}")
+    engine = getattr(game, '_rules_engine', None)
+    engine = getattr(engine, 'engine_ref', None) if engine is not None else None
+    if engine is None or not hasattr(engine, '_queue_async_trigger'):
+        # No engine to drain it — the tag above is still the audit trail.
+        return
+    engine._queue_async_trigger(
+        game, attacker, sentence, "combat_damage", attacker_owner.name,
+        context=(f"{attacker.name} dealt {damage_amount} combat damage to a player"),
+    )
 
 
 async def _check_cast_triggers(engine, game: GameState, caster: Player, card: Card) -> List[str]:
@@ -809,10 +857,8 @@ async def _check_cast_triggers(engine, game: GameState, caster: Player, card: Ca
     These fire even if the spell is countered.
     """
     # Pub/sub slice 4a parity: record that the scan saw this cast so
-    # report_cast_parity can flag CARD_CAST emissions that never reached it.
     # A LIST, not a set — the same card object can be cast twice in a turn
     # (adventure half then creature half) and each cast needs its own record.
-    game._cast_scanned_ids.append(card.id)
     messages = []
     oracle = card.oracle_text or ''
     oracle_lower = oracle.lower()
@@ -1445,10 +1491,33 @@ async def _check_cast_triggers(engine, game: GameState, caster: Player, card: Ca
                 # Draw: "draw a card" (Archmage Emeritus, Beast Whisperer)
                 if not executed_trigger:
                     if 'draw a card' in sentence_lower and 'discard' not in sentence_lower:
-                        drawn = engine.draw_cards(caster, 1, game=game)
-                        if drawn:
-                            messages.append(f"⚡ {bf_card.name} — {caster.name} draws a card")
-                        executed_trigger = True
+                        # Only handle it here when the draw IS the whole trigger.
+                        # Chulane reads "draw a card, then you may put a land card
+                        # from your hand onto the battlefield" — one sentence, so
+                        # this partial match used to draw, set executed_trigger,
+                        # and thereby suppress BOTH the Tier 1.5 lookup and the
+                        # [CAST-TRIGGER-UNHANDLED] Tier-3 queue. The ramp half
+                        # never fired in any observed game and never entered the
+                        # backlog either: invisible to every audit grep. Same
+                        # shape as the July 23 Dark Prophecy / Moldervine fixes —
+                        # a partial handler must not swallow the clause it can't
+                        # resolve. Falling through entirely (rather than drawing
+                        # here and flagging it) keeps the whole trigger in one
+                        # place and cannot double-draw.
+                        _residual = (
+                            'put a land', 'you may put', 'create', 'gain ', 'lose ',
+                            'exile', 'destroy', 'return', 'search', 'scry',
+                            'surveil', 'counter target', 'sacrifice',
+                        )
+                        if any(v in sentence_lower for v in _residual):
+                            print(f"[CAST-TRIGGER-PARTIAL] {bf_card.name}: compound "
+                                  f"trigger — left to the template/Tier-3 path "
+                                  f"instead of resolving only the draw")
+                        else:
+                            drawn = engine.draw_cards(caster, 1, game=game)
+                            if drawn:
+                                messages.append(f"⚡ {bf_card.name} — {caster.name} draws a card")
+                            executed_trigger = True
 
                 # Damage: "deals N damage to each opponent/that player/any target"
                 # Covers: Kessig Flamebreather, Eidolon of the Great Revel, Guttersnipe, etc.
@@ -3052,16 +3121,22 @@ def _check_day_night_and_werewolf_transforms(engine, game: GameState) -> List[st
     messages = []
     active = game.active_player
     if game.day_night_active:
-        prev_spells = active.spells_cast_prev_turn
+        # Read the turn that JUST ENDED, per Daybound's printed reminder ("If a
+        # player casts no spells during their own turn, it becomes night next
+        # turn"). This used to read `active.spells_cast_prev_turn`, i.e. the
+        # incoming active player's OWN last turn — a turn older in a two-player
+        # game — which flipped day/night on the wrong evidence and changed
+        # combat math for every werewolf on the board.
+        prev_spells = getattr(game, '_spells_cast_last_turn', 0)
         old_is_day = game.is_day
         if game.is_day and prev_spells == 0:
             game.is_day = False
             messages.append("🌙 **It becomes night!** (no spells were cast last turn)")
-            print(f"[TRANSFORM] Day -> Night ({active.name} cast 0 spells prev turn)")
+            print(f"[TRANSFORM] Day -> Night (0 spells cast on the previous turn)")
         elif not game.is_day and prev_spells >= 2:
             game.is_day = True
             messages.append("☀️ **It becomes day!** (2+ spells were cast last turn)")
-            print(f"[TRANSFORM] Night -> Day ({active.name} cast {prev_spells} spells prev turn)")
+            print(f"[TRANSFORM] Night -> Day ({prev_spells} spells cast on the previous turn)")
         if game.is_day != old_is_day:
             for player in game.players:
                 for card in player.battlefield:
@@ -3084,7 +3159,10 @@ def _check_day_night_and_werewolf_transforms(engine, game: GameState) -> List[st
     # Classic werewolf transform triggers (non-daybound)
     opponent_idx = 1 - game.active_player_index
     opponent = game.players[opponent_idx]
-    last_turn_spells = opponent.spells_cast_prev_turn + active.spells_cast_prev_turn
+    # Classic werewolves ask whether NO spells were cast during the previous
+    # turn (by anyone), which is the same single turn the day/night check reads
+    # — not the sum of two players' own-turn counts from different turns.
+    last_turn_spells = getattr(game, '_spells_cast_last_turn', 0)
     for player in game.players:
         for card in player.battlefield:
             if not card.has_transform:
@@ -3430,6 +3508,94 @@ def _check_beginning_combat_triggers_sync(engine, game: GameState) -> Tuple[List
                     handled = True
             except Exception as e:
                 print(f"[COMBAT-BEGIN-TEMPLATE] Error for {card.name}: {e}")
+        if not handled:
+            unhandled.append((card, trigger_text))
+    return messages, unhandled
+
+
+def _check_main_phase_triggers_sync(engine, game: GameState,
+                                    precombat: bool) -> Tuple[List[str], List[Tuple]]:
+    """Check "At the beginning of your pre/postcombat main phase" triggers.
+
+    July 27, 2026: this whole trigger class was UNWIRED — exactly the shape the
+    May 30 `beginning_combat` finding had. The MAIN1/MAIN2 branches of
+    advance_phase only printed a banner and drained one-shot DELAYED triggers
+    (`_process_delayed_triggers(game, "main_phase")`, which is Necropotence-style
+    scheduling, not a battlefield scan), and `scheduled_event_types` in
+    rules/effect_templates.py excluded the event entirely. So no permanent's
+    main-phase trigger could fire, ever.
+
+    Found because Tymna the Weaver — a COMMANDER whose whole card-advantage
+    engine is "At the beginning of each of your postcombat main phases, you may
+    pay X life ... draw X cards" — did nothing across a full game. Same shape as
+    Baral's cost reduction: a commander whose defining ability was a no-op.
+
+    "your ... main phase" -> only the active player's permanents trigger.
+    Returns (messages, unhandled_triggers)."""
+    messages = []
+    unhandled = []
+    active = game.active_player
+    active_idx = game.active_player_index
+    opponent = game.players[1 - active_idx]
+    lib = get_effect_library() if HAS_EFFECT_TEMPLATES else None
+    want = 'precombat main phase' if precombat else 'postcombat main phase'
+    tag = 'MAIN1' if precombat else 'MAIN2'
+
+    for card in list(active.battlefield):
+        if getattr(card, '_phased_out', False) or not card.oracle_text:
+            continue
+        oracle_lower = card.oracle_text.lower()
+        if want not in oracle_lower or card.is_planeswalker():
+            continue
+        # Isolate the trigger paragraph (mirrors the beginning-combat extraction).
+        trigger_text = ""
+        for paragraph in card.oracle_text.split('\n'):
+            if want in paragraph.lower():
+                trigger_text = paragraph.strip()
+                break
+        if not trigger_text:
+            continue
+        handled = False
+        if lib is not None:
+            try:
+                ctx = build_game_context(game, active, opponent, card=card)
+                ctx['_trigger_source'] = card.name
+                # Tymna-style "opponents dealt combat damage this turn" —
+                # exposed here because only the trigger knows to ask.
+                ctx['_opponents_dealt_combat_damage'] = sum(
+                    1 for p in game.players
+                    if p is not active
+                    and getattr(p, 'dealt_combat_damage_this_turn', False))
+                actions, explanation = lib.resolve_etb(
+                    card_name=card.name, oracle_text=trigger_text,
+                    controller=active.name, opponent=opponent.name,
+                    game_context=ctx, event_type="main_phase",
+                )
+                if actions:
+                    for action in actions:
+                        if action.get("action") == "no_action":
+                            continue
+                        try:
+                            msg = engine.rules._execute_action_on_state(game, action)
+                            if msg:
+                                messages.append(msg)
+                        except (ValueError, KeyError, AttributeError,
+                                TypeError, IndexError) as e:
+                            print(f"[{tag}-TEMPLATE] Action failed for {card.name}: {e}")
+                            maybe_reraise(e)
+                    print(f"[{tag}-TRIGGER] Resolved {card.name}: {explanation}")
+                    handled = True
+                elif actions == []:
+                    # Library contract: [] is a deliberate handled no-op (the
+                    # condition was false), None means unhandled. Do NOT
+                    # escalate — that is the July 21 Meren regression.
+                    print(f"[{tag}-TRIGGER] {card.name}: handled no-op "
+                          f"(condition not met)")
+                    handled = True
+            except (ValueError, KeyError, AttributeError,
+                    TypeError, IndexError) as e:
+                print(f"[{tag}-TEMPLATE] Error for {card.name}: {e}")
+                maybe_reraise(e)
         if not handled:
             unhandled.append((card, trigger_text))
     return messages, unhandled
@@ -4028,9 +4194,15 @@ def _handle_land_etb(engine, game: GameState, player: Player, card: Card) -> Lis
                 messages.append(f"🌱 Avenger of Zendikar: {plant_count} Plant(s) each get {_each}!")
                 print(f"[LANDFALL] Avenger of Zendikar: +{_per_plant_total} counter on {plant_count} Plants")
         
-        # Rampaging Baloths: create a 4/4 green Beast creature token
+        # Rampaging Baloths: create a 4/4 green Beast creature token.
+        # The loose "landfall + create + beast" fallback used to live here and
+        # claimed FELIDAR RETREAT, whose token is a 2/2 white Cat BEAST — the
+        # substring matched on "Cat Beast". Because this chain is elif, that
+        # also made the Tier 1.5 lookup further down unreachable for it, so the
+        # modal +1/+1-counter half was never even offered. Eight wrong tokens
+        # across the loose logs. Require the printed token instead of guessing.
         elif "rampaging baloths" in perm.name.lower() or (
-            "landfall" in perm_oracle and "create" in perm_oracle and "beast" in perm_oracle
+            "landfall" in perm_oracle and "4/4 green beast" in perm_oracle
         ):
             beast = Card(
                 name="Beast",
@@ -4282,6 +4454,15 @@ def _handle_land_etb(engine, game: GameState, player: Player, card: Card) -> Lis
         ):
             game.unregister_static_effects(gy_card)  # No-op if not registered
             player.graveyard.remove(gy_card)
+            # CR 400.7: a card returning from the graveyard is a NEW object.
+            # Without this, damage_marked survived the trip and a 2/1 Bloodghast
+            # that died to 1 damage came back with that damage still on it and
+            # re-died to the very next SBA check — plus stale counters,
+            # attachments, attacking/blocking flags and pump modifiers. Every
+            # other re-entry path already calls this; the landfall recursion
+            # was the one that didn't. Must precede the assignments below:
+            # reset sets summoning_sick=True / entered_this_turn=False.
+            gy_card.reset_battlefield_state()
             gy_card.tapped = False
             gy_card.summoning_sick = False  # Bloodghast has haste implicitly via reanimation
             gy_card.entered_this_turn = True
@@ -4509,7 +4690,6 @@ def queue_cast_triggers_sync(engine, game, caster, card, via: str = "sync") -> i
     """
     events.emit(events.CARD_CAST, game, card=card, caster=caster,
                 via=via, engine=engine)
-    game._cast_scanned_ids.append(card.id)
     if engine is None or not hasattr(engine, '_queue_async_trigger'):
         return 0
     queued = 0
@@ -4551,43 +4731,6 @@ def queue_cast_triggers_sync(engine, game, caster, card, via: str = "sync") -> i
     return queued
 
 
-def _record_cast_for_parity(game, card=None, caster=None, via=None, **_):
-    """CARD_CAST parity recorder (slice 4a — SHADOW mode).
-
-    Records every emitted cast; report_cast_parity diffs these against the
-    casts _check_cast_triggers actually scanned. Shadow semantics (like
-    slice 3a): the direct scan calls stay authoritative — a miss means an
-    emit whose adjacent scan didn't run (or a future cast path that emits
-    without scanning). One clean batch gates slice 4b (flip the scan into
-    a subscriber + close the sync-cast-site gaps).
-    """
-    if card is None:
-        return
-    game._cast_events.append((getattr(card, 'id', None), card.name,
-                              via or 'unknown'))
-
-
-def report_cast_parity(game) -> List[str]:
-    """Diff CARD_CAST emissions against scan records and clear the per-turn
-    state (called from engine.end_turn). Multiplicity-aware: two casts of
-    the same card object need two scan records (adventure half + creature
-    half in one turn must each be scanned)."""
-    from collections import Counter
-    scanned = Counter(game._cast_scanned_ids)
-    misses = []
-    for card_id, name, via in game._cast_events:
-        if scanned.get(card_id, 0) > 0:
-            scanned[card_id] -= 1
-            continue
-        misses.append(f"cast of {name} (via={via}) never reached the "
-                      f"cast-trigger scan")
-    for miss in misses:
-        print(f"[EVENT-PARITY-CAST] {miss}")
-    game._cast_events.clear()
-    game._cast_scanned_ids.clear()
-    return misses
-
-
 events.subscribe(events.PERMANENT_ENTERED, _snow_permanent_entered_watcher)
 # Slice 2b (July 21, 2026): the creature-enters watcher scan is DRIVEN BY
 # the bus. Slice 2c (July 24, 2026): the parity recorder that shadowed the
@@ -4604,6 +4747,23 @@ events.subscribe(events.PERMANENT_ENTERED, _enchantment_entered_subscriber)
 # tests/test_slice3a_death_shadow.py (no raw _recently_died mutations
 # outside the accumulator) remains as the permanent net.
 events.subscribe(events.CREATURE_DIED, _accumulate_death_subscriber)
-# Slice 4a (July 24, 2026): CARD_CAST in SHADOW mode — the recorder is the
-# only subscriber; _check_cast_triggers stays the directly-called consumer.
-events.subscribe(events.CARD_CAST, _record_cast_for_parity)
+# Slice 4b (July 26, 2026): the CARD_CAST parity recorder is RETIRED after
+# game_15304* returned [EVENT-PARITY-CAST]=0 on post-4a code. The consumer
+# deliberately did NOT move onto the bus: _check_cast_triggers is async and
+# needs `await` for Tier-3 resolve_effect, the cascade free-cast, its own
+# recursion, and — decisively — engine._combat_priority_round, which is the
+# [CAST-TRIGGER-PRIORITY] window that lets a Stifle counter a cast trigger
+# (19 fires in that batch). The bus contract is sync handlers only, so
+# subscribing a queuer would demote every inline cast trigger (Talrand
+# tokens, prowess, that whole counter-a-trigger interaction) to a Tier-3
+# drain — a real behaviour downgrade in exchange for uniformity.
+#
+# The migration's actual goals are met without the flip: CARD_CAST is
+# emitted at EVERY cast path (both async funnels + the sync bridge), which
+# is the "one spine, no missed call sites" property, and the parity gate
+# proved it. Consumption differs by path — the async funnels consume
+# directly (they ARE the funnel), the sync sites consume via
+# queue_cast_triggers_sync. Emission is pinned by
+# tests/test_slice4a_cast_shadow.py so the spine can't silently rot with no
+# subscriber watching it; the React websocket layer is the intended next
+# subscriber.

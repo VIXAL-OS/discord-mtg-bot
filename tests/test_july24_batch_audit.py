@@ -893,26 +893,37 @@ class TestSyncCastTriggerBridge:
 
     def test_matching_cast_queues_the_trigger_and_pairs_parity(
             self, make_game, make_card):
-        from mtg.triggers import queue_cast_triggers_sync, report_cast_parity
+        from mtg.triggers import queue_cast_triggers_sync
+        from mtg import events
         engine, game, rick, claude = self._setup(make_game, make_card)
         bolt = make_card("Rift Bolt", type_line="Sorcery",
                          oracle_text="Rift Bolt deals 3 damage to any target.",
                          power="0", toughness="0")
-        queued = queue_cast_triggers_sync(engine, game, rick, bolt,
-                                          via="suspend")
+        seen = []
+        events.subscribe(events.CARD_CAST,
+                         lambda g, **kw: seen.append(kw) or None)
+        try:
+            queued = queue_cast_triggers_sync(engine, game, rick, bolt,
+                                              via="suspend")
+        finally:
+            events._subscribers[events.CARD_CAST] = [
+                x for x in events._subscribers.get(events.CARD_CAST, [])
+                if getattr(x, "__name__", "") != "<lambda>"]
         assert queued == 1
         pend = getattr(game, 'pending_async_triggers', [])
         assert any("Talrand" in str(t.get('source_card', ''))
                    or "Talrand" in str(t) for t in pend), (
             f"Talrand's trigger not queued: {pend}")
-        assert game._cast_events and game._cast_events[-1][2] == "suspend"
-        assert report_cast_parity(game) == [], (
-            "sync-bridge casts must be parity-paired (zero gate)")
+        # Slice 4b (July 26) retired the parity recorder; what still matters
+        # is that the bridge puts the cast on the bus with via="suspend", so
+        # future subscribers (React websocket) see sync casts too.
+        assert seen and seen[-1].get('via') == "suspend", (
+            f"sync-bridge cast never reached the CARD_CAST bus: {seen}")
 
     def test_nonmatching_cast_type_is_filtered(self, make_game, make_card):
         # Talrand wants instants/sorceries — a suspended CREATURE (Greater
         # Gargadon-class) must not queue his trigger.
-        from mtg.triggers import queue_cast_triggers_sync, report_cast_parity
+        from mtg.triggers import queue_cast_triggers_sync
         engine, game, rick, claude = self._setup(make_game, make_card)
         gargadon = make_card("Greater Gargadon",
                              type_line="Creature — Beast",
@@ -921,7 +932,6 @@ class TestSyncCastTriggerBridge:
         queued = queue_cast_triggers_sync(engine, game, rick, gargadon,
                                           via="suspend")
         assert queued == 0
-        assert report_cast_parity(game) == []
 
     def test_opponents_any_player_trigger_sees_the_cast(
             self, make_game, make_card):

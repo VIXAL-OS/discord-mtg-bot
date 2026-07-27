@@ -1314,9 +1314,9 @@ class GameEngine:
         # Pay mana cost — color-aware tapping when mana engine is available
         if pay_mana and (card.mana_cost or card.cmc > 0):
             if HAS_MANA_ENGINE and card.mana_cost:
-                tapped_ok = player.tap_sources_for_cost(card.mana_cost)
+                tapped_ok = player.tap_sources_for_cost(card.mana_cost, game=game)
             else:
-                tapped_ok = player.tap_lands_for_mana(card.cmc)
+                tapped_ok = player.tap_lands_for_mana(card.cmc, game=game)
             if not tapped_ok:
                 return False, f"Not enough mana to cast {card.name} (needs {card.cmc})", []
 
@@ -1648,6 +1648,11 @@ class GameEngine:
     # =========================================================================
     # END STEP TRIGGER DETECTION
     # =========================================================================
+
+    def _check_main_phase_triggers_sync(self, game: GameState, precombat: bool):
+        """Delegates to mtg.triggers._check_main_phase_triggers_sync (July 27)."""
+        from mtg.triggers import _check_main_phase_triggers_sync
+        return _check_main_phase_triggers_sync(self, game, precombat)
 
     def _check_beginning_combat_triggers_sync(self, game: GameState) -> Tuple[List[str], List[Tuple]]:
         """Delegates to mtg.triggers._check_beginning_combat_triggers_sync (May 30 audit)."""
@@ -2082,6 +2087,13 @@ class GameEngine:
             # on_phase_change has emptied old mana, so the new mana remains
             # available throughout this phase.
             messages.extend(self._process_delayed_triggers(game, "main_phase"))
+            # July 27: "At the beginning of your precombat main phase" — the
+            # battlefield scan the delayed-trigger drain above is NOT.
+            _mp_msgs, _mp_unhandled = self._check_main_phase_triggers_sync(game, True)
+            messages.extend(_mp_msgs)
+            for _c, _t in _mp_unhandled:
+                self._queue_async_trigger(game, _c, _t, "main_phase",
+                                          game.active_player.name)
         
         elif game.phase == Phase.COMBAT_BEGIN:
             messages.append(f"⚔️ **Beginning of Combat**")
@@ -2127,6 +2139,14 @@ class GameEngine:
         elif game.phase == Phase.MAIN2:
             messages.append(f"2️⃣ **Main Phase 2**")
             messages.extend(self._process_delayed_triggers(game, "main_phase"))
+            # July 27: "At the beginning of your postcombat main phase" —
+            # Tymna the Weaver et al. The delayed-trigger drain above is
+            # one-shot scheduling (Necropotence), NOT a battlefield scan.
+            _mp_msgs, _mp_unhandled = self._check_main_phase_triggers_sync(game, False)
+            messages.extend(_mp_msgs)
+            for _c, _t in _mp_unhandled:
+                self._queue_async_trigger(game, _c, _t, "main_phase",
+                                          game.active_player.name)
         
         elif game.phase == Phase.END:
             messages.append(f"📍 **End Step**")
@@ -2355,15 +2375,22 @@ class GameEngine:
         """End the current turn and start the next. Returns end-step messages (e.g. discard prompts)."""
         # (Slices 2c + 3c, July 24: both parity recorders retired — clean
         # post-flip batches at [EVENT-PARITY]=0 and [EVENT-PARITY-DIES]=0.)
-        # Slice 4a (July 24): CARD_CAST shadow parity — [EVENT-PARITY-CAST]
-        # for casts the trigger scan never saw; one clean batch gates 4b.
-        from mtg.triggers import report_cast_parity
-        report_cast_parity(game)
 
         # [TRANSFORM] Save spell count for day/night and werewolf transform tracking
         game.active_player.spells_cast_prev_turn = game.active_player.spells_cast_this_turn
-        game.active_player.spells_cast_this_turn = 0
-        game.active_player.noncreature_spells_cast_this_turn = 0  # Reset for Esper Sentinel
+        # The day/night check runs at the NEXT upkeep and must see the turn that
+        # just ended (Daybound: "If a player casts no spells during their own
+        # turn, it becomes night next turn"). Reading the incoming active
+        # player's own spells_cast_prev_turn instead looked one whole turn
+        # further back and produced provably wrong flips.
+        game._spells_cast_last_turn = game.active_player.spells_cast_this_turn
+        # Reset EVERY player's per-turn counter, not just the active one. Only
+        # the active player was reset, so instants a player cast during their
+        # OPPONENT's turn stayed on the books and were later miscounted as
+        # spells cast "during their own turn".
+        for _p in game.players:
+            _p.spells_cast_this_turn = 0
+            _p.noncreature_spells_cast_this_turn = 0  # Reset for Esper Sentinel
 
         # Reset per-turn flicker dedup tracker (see actions.py flicker handler)
         if hasattr(game, '_flicker_announce_seen'):
@@ -2433,6 +2460,7 @@ class GameEngine:
         # old turn's end-step triggers have resolved.
         for _player in game.players:
             _player.life_lost_this_turn = 0
+            _player.dealt_combat_damage_this_turn = False
 
         # Clear the per-turn resolve_effect dedupe cache (keyed on turn number
         # in the dict itself, but pruning keeps the dict from growing unbounded
@@ -2647,12 +2675,21 @@ class GameEngine:
                         break
 
             # Check if it's playable from exile (Chandra impulse draw, Light Up the Stage, etc.)
-            if not card and hasattr(player, 'playable_from_exile') and player.playable_from_exile:
+            if not card and player.exile:
                 for c in player.exile:
-                    if c.id in player.playable_from_exile and card_name and c.name.lower() == card_name.lower():
+                    _castable_from_exile = (c.id in player.playable_from_exile
+                                            or getattr(c, '_adventure_exiled', False))
+                    if _castable_from_exile and card_name and c.name.lower() == card_name.lower():
                         card = c
                         player.exile.remove(c)
-                        player.playable_from_exile.remove(c.id)
+                        # cast_spell_async gates on zone membership first (July
+                        # 20), so a card pulled out of exile with no home is
+                        # rejected as "Card not in hand" — the same hand-append
+                        # the cog and autoplay paths have always done.
+                        player.hand.append(c)
+                        if c.id in player.playable_from_exile:
+                            player.playable_from_exile.remove(c.id)
+                        c._adventure_exiled = False
                         print(f"[IMPULSE-DRAW] AI casting {c.name} from exile")
                         break
 
@@ -2667,12 +2704,12 @@ class GameEngine:
                         player.playable_from_graveyard.remove(c.id)
                         # Pay escape exile cost if applicable
                         if c.oracle_text:
-                            esc_match = re.search(
-                                r'escape.{1,3}\{[^}]+\}(?:\{[^}]+\})*,?\s*exile\s+(\d+)\s+other\s+cards?\s+from\s+your\s+graveyard',
-                                c.oracle_text.lower()
-                            )
-                            if esc_match:
-                                exile_count = int(esc_match.group(1))
+                            from mtg.helpers import parse_escape_cost
+                            _esc = parse_escape_cost(c.oracle_text)
+                            if _esc:
+                                _esc_cost, exile_count = _esc
+                                c._escape_cost = _esc_cost
+                                c._was_escaped = True
                                 exiled_names = []
                                 for _ in range(exile_count):
                                     if player.graveyard:
@@ -2713,45 +2750,12 @@ class GameEngine:
                 # Find target if specified
                 target = None
                 if target_name:
-                    # Counterspells must target stack entries, not battlefield permanents.
-                    # Check the stack first when this card is a counterspell.
-                    _is_counter = 'counter target' in (card.oracle_text or '').lower() and 'spell' in (card.oracle_text or '').lower()
-                    if _is_counter:
-                        for entry in reversed(game.stack):
-                            entry_name = getattr(getattr(entry, 'card', None), 'name', None) or (
-                                entry.get('card_name') if isinstance(entry, dict) else None)
-                            if entry_name and entry_name.lower() == target_name.lower():
-                                target = entry
-                                break
-                    if not target:
-                        # Look for target creature/permanent
-                        for p in game.players:
-                            target = p.find_card(target_name, Zone.BATTLEFIELD)
-                            if target:
-                                break
-                    # July 20 audit: graveyard-targeting spells (Animate Dead,
-                    # Dance of the Dead, "return target ... from your
-                    # graveyard") — this resolver never searched graveyards,
-                    # so the AI's declared target silently dropped to None and
-                    # the reanimation fallback picked the highest-power
-                    # creature in ANY graveyard instead
-                    # (game_1527451728084074550: declared Gonti, got the
-                    # opponent's Sun Titan — CR 608.2b violation).
-                    if not target:
-                        _oracle_l = (card.oracle_text or '').lower()
-                        if any(phrase in _oracle_l for phrase in
-                               ('in a graveyard', 'in your graveyard',
-                                'from your graveyard', 'from a graveyard')):
-                            for p in game.players:
-                                target = p.find_card(target_name, Zone.GRAVEYARD)
-                                if target:
-                                    break
-                    # Check if targeting a player
-                    if not target:
-                        for p in game.players:
-                            if p.name.lower() == target_name.lower():
-                                target = p
-                                break
+                    # Shared with the autoplay cast path (mtg/helpers.py) —
+                    # stack -> battlefield -> graveyard -> player/pronoun.
+                    # These were two divergent copies until the July 27 fanout;
+                    # see resolve_cast_target for what each one was missing.
+                    from mtg.helpers import resolve_cast_target
+                    target = resolve_cast_target(game, player, card, target_name)
 
                 # Guard: don't cast counterspells when there's nothing on the stack
                 # Exception 1: modal spells (Mystic Confluence, Cryptic Command) have other modes
@@ -3032,7 +3036,8 @@ class GameEngine:
                     if result and result.success:
                         msgs = "\n".join(result.messages) if result.messages else ""
                         cost_str = f"+{ability.loyalty_cost}" if ability.loyalty_cost > 0 else str(ability.loyalty_cost)
-                        print(f"[PW-ACTIVATE] {perm.name} [{cost_str}]: {'; '.join(result.messages[:2]) if result.messages else 'no effect messages'}")
+                        # [PW-ACTIVATE] now prints from PlaneswalkerManager.activate
+                        # so Rick's and the human's activations are tagged too.
                         # result.messages[0] is self-describing (header + oracle text);
                         # don't prepend a duplicate header.
                         return msgs or f"{player.name} activates {perm.name}'s [{cost_str}] ability"
@@ -3209,7 +3214,7 @@ class GameEngine:
                     # ignored colored requirements and multi-mana rocks. Route
                     # activation payment through the same color-aware engine as
                     # spell casting instead.
-                    if not player.tap_sources_for_cost(mana_cost):
+                    if not player.tap_sources_for_cost(mana_cost, game=game):
                         print(f"[ACTIVATE-CLAUDE] {perm.name}: can't pay {mana_cost}")
                         return None
                     print(f"[ACTIVATE-CLAUDE] Paid {mana_cost} for {perm.name} ability")
@@ -3368,6 +3373,48 @@ class GameEngine:
                     else:
                         print(f"[ACTIVATE-COST] {player.name} can't pay {life_cost} life (only has {player.life})")
                         return None  # Can't pay life cost
+
+                # Handle "Discard a card" as a cost (Anje Falkenrath, Wild
+                # Mongrel). CR 601.2h — costs are paid before the ability
+                # resolves. NEITHER activation path had a discard branch, while
+                # the cog's own parser explicitly ACCEPTS "Discard" as a cost
+                # keyword, so the ability was offered and then only its {T} was
+                # charged: Anje was a commander with a free "{T}: Draw a card",
+                # and because the discard never happened her own madness-untap
+                # trigger could never fire either.
+                _discard_match = _re.search(
+                    r'discard (a|one|two|three|\d+) cards?', cost_lower)
+                if _discard_match or 'discard your hand' in cost_lower:
+                    if not player.hand:
+                        print(f"[ACTIVATE-COST] {player.name} can't discard for "
+                              f"{perm.name} — hand is empty")
+                        if ability.get('needs_tap'):
+                            perm.tapped = False  # roll back the tap
+                        return None
+                    if 'discard your hand' in cost_lower:
+                        _n = len(player.hand)
+                    else:
+                        _raw = _discard_match.group(1)
+                        _n = ({'a': 1, 'one': 1, 'two': 2, 'three': 3}.get(_raw)
+                              or (int(_raw) if _raw.isdigit() else 1))
+                    for _ in range(min(_n, len(player.hand))):
+                        # Route through the discard action so discard triggers
+                        # (Anje's untap, madness) actually fire.
+                        _dm = self.rules._execute_action_on_state(game, {
+                            "action": "discard", "player": player.name,
+                            "card": target_name if target_name else "worst",
+                        })
+                        if _dm:
+                            # `cost_msgs` isn't in scope this early in the
+                            # branch; _pending_messages is the established way
+                            # to surface a message from deep in a cost path
+                            # (same idiom as the sacrifice triggers above).
+                            if not hasattr(game, '_pending_messages'):
+                                game._pending_messages = []
+                            game._pending_messages.append(_dm)
+                        target_name = None  # only the named card once
+                    print(f"[ACTIVATE-COST] {player.name} discards {_n} card(s) "
+                          f"for {perm.name}")
 
                 # Handle Equip: attach this equipment to target creature you control
                 if ability.get('is_equip'):
@@ -3969,6 +4016,31 @@ class GameEngine:
                               f"{_exiled.name} face down → hand at next end step")
                     else:
                         inline_msgs.append(f"📍 **{perm.name}**: library is empty")
+
+                # (f) Mishra's / Urza's Bauble: "Draw a card at the beginning of
+                # the next turn's upkeep." A correct handler for exactly this
+                # has existed on the MANUAL !activate path since June
+                # (mtg/cog.py), but autoplay and the AI both route through this
+                # executor, which had no equivalent — so the draw fell to a
+                # Tier 3 that has no vocabulary for a delayed draw and returned
+                # no actions 16 times in 20. Third instance of the documented
+                # two-activation-paths divergence.
+                # No phase_of gate: the card says "the next turn's upkeep",
+                # whoever's turn that is — unlike Necropotence's "YOUR next end
+                # step" above.
+                if not inline_msgs and re.search(
+                        r'draw a card at the beginning of the next turn', effect_lower2):
+                    self.rules._execute_action_on_state(game, {
+                        "action": "schedule_delayed_trigger",
+                        "trigger_at": "upkeep", "turn_delay": 0, "once": True,
+                        "source": perm.name,
+                        "actions": [{"action": "draw_cards",
+                                     "player": player.name, "amount": 1}],
+                    })
+                    inline_msgs.append(
+                        f"🃏 **{perm.name}** schedules a card draw for next upkeep")
+                    print(f"[ACTIVATE-CLAUDE-INLINE] {perm.name}: scheduled draw "
+                          f"for {player.name} at next upkeep")
 
                 if inline_msgs:
                     return "\n".join(cost_msgs + inline_msgs)

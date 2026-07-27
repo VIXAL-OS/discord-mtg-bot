@@ -259,6 +259,48 @@ class RulesEngine:
                           f"aware pre-gate checking {reduced} (printed "
                           f"{mana_cost_to_check}, {helpers} helper(s))")
                 mana_cost_to_check = reduced
+
+        # July 26: same treatment for static cost reduction ("Black spells you
+        # cast cost {1} less"). Without this the payment stage would happily
+        # cast the cheaper spell but the pre-gate would reject it first, so the
+        # AI would never even be offered it — the same doomed-gate asymmetry
+        # the convoke awareness above was added to fix, and the reason Baral's
+        # discount would still have been invisible in play.
+        if mana_cost_to_check:
+            from mtg.helpers import compute_cost_increase, compute_cost_reduction
+            _from_gy = card.id in (getattr(player, 'playable_from_graveyard', None) or [])
+            # CR 601.2f order: increases first, then reductions. Applying the
+            # tax here matters as much as the discount — without it the AI is
+            # offered spells a Sphere of Resistance makes unaffordable, and
+            # burns the main phase on doomed casts (the retry-storm shape the
+            # June 11 affordability filter exists to prevent).
+            _inc, _inc_src = compute_cost_increase(game, player, card)
+            if _inc > 0:
+                _taxed = re.sub(
+                    r'\{(\d+)\}',
+                    lambda m: '{' + str(int(m.group(1)) + _inc) + '}',
+                    mana_cost_to_check, count=1)
+                if _taxed == mana_cost_to_check:
+                    # No generic symbol to grow — prepend one ({U}{U} -> {2}{U}{U}).
+                    _taxed = '{' + str(_inc) + '}' + mana_cost_to_check
+                print(f"[CAST-GATE] {card.name}: cost-increase-aware pre-gate "
+                      f"checking {_taxed} (printed {mana_cost_to_check}, "
+                      f"+{_inc} from {', '.join(_inc_src)})")
+                mana_cost_to_check = _taxed
+            _red, _red_src = compute_cost_reduction(player, card,
+                                                    from_graveyard=_from_gy)
+            if _red > 0:
+                reduced = re.sub(
+                    r'\{(\d+)\}',
+                    lambda m: '{' + str(max(0, int(m.group(1)) - _red)) + '}',
+                    mana_cost_to_check, count=1)
+                if reduced != mana_cost_to_check:
+                    print(f"[CAST-GATE] {card.name}: cost-reduction-aware "
+                          f"pre-gate checking {reduced} (printed "
+                          f"{mana_cost_to_check}, -{_red} from "
+                          f"{', '.join(_red_src)})")
+                    mana_cost_to_check = reduced
+
         can_pay, reason = player.can_pay_mana_cost(mana_cost_to_check)
         if not can_pay:
             # July 20: printed alternate costs (Force of Will's life+exile,
@@ -390,7 +432,7 @@ class RulesEngine:
         if amount <= 0:
             return True, ""
         cost = f"{{{amount}}}"
-        if not player.tap_sources_for_cost(cost):
+        if not player.tap_sources_for_cost(cost, game=game):
             return False, (f"{creature.name} can't attack — unable to pay {cost} "
                            f"for {', '.join(sources) or 'attack tax'}")
         print(f"[ATTACK-TAX] {player.name} pays {cost} for {creature.name} "

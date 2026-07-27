@@ -177,6 +177,33 @@ def _find_player_by_name(game, name: Optional[str]):
     return None
 
 
+_RESIDUAL_EFFECT_VERBS = (
+    'draw', 'discard', 'lose ', 'gain ', 'deals ', 'damage', 'destroy',
+    'exile', 'sacrifice', 'return', 'create', 'counter target', 'search',
+    'mill', 'reveals their hand', 'put a +1/+1',
+)
+
+
+def has_residual_clause_beyond_library_look(oracle_text: str) -> bool:
+    """Does this text do something BESIDES look at / reorder the library?
+
+    The scry, surveil and library-reorder shortcuts exist because library order
+    isn't modeled, so those effects can't change visible state and a Tier-3 call
+    would return nothing. But they are single-clause patterns with no exclusion
+    list, and a match RESOLVES the spell — which blocked Tier 2 and Tier 3 from
+    ever seeing the rest of the card. Read the Bones ("Scry 2, then draw two
+    cards. You lose 2 life.") lost the draw AND the life; Notion Rain matched on
+    its own surveil REMINDER TEXT and lost "draw two cards" plus 2 damage.
+
+    Reminder text is stripped first: the scry and surveil reminders talk about
+    graveyards and putting cards back, which would otherwise read as residue.
+    """
+    if not oracle_text:
+        return False
+    without_reminders = re.sub(r'\([^)]*\)', ' ', oracle_text.lower())
+    return any(verb in without_reminders for verb in _RESIDUAL_EFFECT_VERBS)
+
+
 def strip_activated_ability_lines(text: str) -> str:
     """Drop activated-ability lines ("<cost>: <effect>", CR 602.1) from
     oracle text before the GENERIC pattern pass.
@@ -426,7 +453,7 @@ class EffectTemplateLibrary:
             # Allow the bypass ONLY when the template's description actually
             # starts with a scheduled prefix; otherwise skip and fall through
             # to pattern matching (which is regex-scoped to "at <step>" anyway).
-            scheduled_event_types = {"upkeep", "end_step", "beginning_combat"}
+            scheduled_event_types = {"upkeep", "end_step", "beginning_combat", "main_phase"}
             if event_type in scheduled_event_types:
                 # Template-vs-event matching: allow the bare card-name template
                 # to fire on a scheduled event ONLY if its description starts
@@ -1940,7 +1967,8 @@ class EffectTemplateLibrary:
                  "from_zone": "battlefield", "to_zone": "exile",
                  "player": ctx.get('explicit_target_owner') or opp},
                 {"action": "gain_life", "player": ctx.get('explicit_target_owner') or opp,
-                 "amount": ctx.get('best_opponent_creature_power', 0)},
+                 "amount": resolve_target_power(
+                     ctx, ctx.get('explicit_target_name') or ctx.get('best_opponent_creature'))},
             ] if (ctx.get('explicit_target_name') or ctx.get('best_opponent_creature')) else [
                 {"action": "no_action", "reason": "No creature to target with Swords to Plowshares"}
             ],
@@ -2739,11 +2767,19 @@ class EffectTemplateLibrary:
         self._add_card("animate dead", EffectTemplate(
             name="Animate Dead",
             description="Return target creature from a graveyard to battlefield under your control",
+            # CR 608.2b: honor the declared target. Without the
+            # explicit_target_name term this always grabbed the highest-CMC
+            # creature in ANY graveyard, so a declared Birds of Paradise became
+            # the opponent's Sun Titan. "Any graveyard" IS the right scope here
+            # (the card reads "Enchant creature card in a graveyard"), so only
+            # the dropped target was wrong — no own_graveyard flag.
             action_generator=lambda ctrl, opp, ctx: [
                 {"action": "reanimate", "player": ctrl,
-                 "card": ctx.get('best_graveyard_creature', ''),
+                 "card": (ctx.get('explicit_target_name')
+                          or ctx.get('best_graveyard_creature', '')),
                  "reason": "Animate Dead returns creature from graveyard"},
-            ] if ctx.get('best_graveyard_creature') else [
+            ] if (ctx.get('explicit_target_name')
+                  or ctx.get('best_graveyard_creature')) else [
                 {"action": "no_action", "reason": "No creature cards in any graveyard"}
             ],
         ))
@@ -4234,6 +4270,16 @@ class EffectTemplateLibrary:
         # May 7 audit fix #4: stash the parsed N on the context so the description
         # template can fill it in (was leaking literal "Scry N" to Discord).
         def _scry_action(ctrl, opp, ctx):
+            # Refuse the whole card when scry is only its first clause. Read the
+            # Bones is "Scry 2, then draw two cards. You lose 2 life." — this
+            # pattern matched the scry, resolved the spell, and the draw and the
+            # life loss were never seen by any tier. Returning None keeps the
+            # cascade going instead of claiming a card we only half-understand.
+            # Temple lands ("enters tapped. When ~ enters, scry 1") and Viscera
+            # Seer (the activated path passes just "Scry 1") have no residue and
+            # still resolve here.
+            if has_residual_clause_beyond_library_look(ctx.get('_oracle', '')):
+                return None
             import random
             n = word_to_num(ctx['_match'].group(1))
             ctx['_scry_n'] = n  # consumed by description override below
@@ -4329,10 +4375,29 @@ class EffectTemplateLibrary:
         )
 
         # --- Clone / Copy token patterns ---
+        # GRAVEYARD-sourced copies must be registered BEFORE the battlefield
+        # pattern below. Feldon of the Third Path copies "target creature CARD
+        # in your graveyard"; the battlefield pattern used to match that text
+        # and copy a LIVE creature instead (July 27 fanout — observed with no
+        # creature in any graveyard at all).
+        self._add_pattern(
+            r"create a token that(?:'s| is) a copy of (?:target )?creature card in (your|a|an opponent's) graveyard",
+            EffectTemplate(
+                name="Graveyard Copy Token",
+                description="Create a token copy of a creature card in a graveyard",
+                action_generator=self._gen_graveyard_copy_token,
+                needs_target=True,
+            )
+        )
+
         # "create a token that's a copy of [target]" — covers Thousand-Faced Shadow,
         # Helm of the Host, Rite of Replication, Mimic Vat, etc.
+        # The `(?!\s+card\b)` guard keeps this BATTLEFIELD pattern off cards in
+        # other zones: MTG templating says "permanent" for a battlefield object
+        # and "card" for one in a graveyard / exile / hand, so "creature card"
+        # is never something this handler can see.
         self._add_pattern(
-            r"create a token that(?:'s| is) a copy of (?:another )?(?:target )?(?:attacking )?(creature|permanent)",
+            r"create a token that(?:'s| is) a copy of (?:another )?(?:target )?(?:attacking )?(creature|permanent)(?!\s+card\b)",
             EffectTemplate(
                 name="Copy Token",
                 description="Create a token copy of a creature",
@@ -4548,11 +4613,75 @@ class EffectTemplateLibrary:
             ],
         ))
 
+        # --- Read the Bones / Notion Rain: library look + draw + cost ---
+        # Both were victims of single-clause library-look patterns claiming the
+        # whole spell. The residual guard now stops that, but without a named
+        # template they would only fall through to the NEXT partial pattern
+        # (Read the Bones was resolving to just "lose 2 life"), so pin the full
+        # effect here where every clause is visible at once.
+        self._add_card("read the bones", EffectTemplate(
+            name="Read the Bones",
+            description="Scry 2, then draw two cards. You lose 2 life.",
+            action_generator=lambda ctrl, opp, ctx: [
+                {"action": "scry", "player": ctrl, "amount": 2},
+                {"action": "draw_cards", "player": ctrl, "amount": 2},
+                {"action": "lose_life", "player": ctrl, "amount": 2},
+            ],
+        ))
+        self._add_card("notion rain", EffectTemplate(
+            name="Notion Rain",
+            description="Surveil 2, then draw two cards. Notion Rain deals 2 damage to you.",
+            action_generator=lambda ctrl, opp, ctx: [
+                {"action": "surveil", "player": ctrl, "amount": 2},
+                {"action": "draw_cards", "player": ctrl, "amount": 2},
+                {"action": "deal_damage", "amount": 2, "target_player": ctrl,
+                 "source": "Notion Rain"},
+            ],
+        ))
+
+        # --- Chulane: cast-trigger draw + free land drop ---
+        self._add_card("chulane, teller of tales", EffectTemplate(
+            name="Chulane, Teller of Tales",
+            # Deliberately NOT phrased "Whenever you cast...": the cast-trigger
+            # scan looks templates up through resolve_spell, which runs the ETB
+            # name-key gate, and that gate skips any description whose first
+            # clause starts with "whenever" without "enters" in it. A template
+            # worded like the card would be silently unreachable from the only
+            # site that wants it.
+            description=("Chulane cast trigger: draw a card, then put a land card "
+                         "from your hand onto the battlefield"),
+            action_generator=self._gen_chulane_cast_trigger,
+        ))
+
+        # --- Felidar Retreat: modal landfall (2/2 white Cat Beast OR counters) ---
+        self._add_card("felidar retreat", EffectTemplate(
+            name="Felidar Retreat",
+            description="Landfall: create a 2/2 white Cat Beast, or +1/+1 counters and vigilance",
+            action_generator=self._gen_felidar_retreat,
+        ))
+
+        # --- Leonin Vanguard: conditional self-pump at beginning of combat ---
+        self._add_card("leonin vanguard", EffectTemplate(
+            name="Leonin Vanguard",
+            description=("At the beginning of combat, if you control three or more "
+                         "creatures, Leonin Vanguard gets +1/+1 and you gain 1 life"),
+            action_generator=self._gen_leonin_vanguard,
+        ))
+
         # --- Kroxa, Titan of Death's Hunger: sacrifice unless escaped ---
         self._add_card("kroxa, titan of death's hunger", EffectTemplate(
             name="Kroxa, Titan of Death's Hunger",
-            description="Each opponent discards a card and loses 3 life if nonland; sacrifice Kroxa unless escaped",
+            description=("Each opponent discards a card, then each opponent who didn't "
+                         "discard a nonland card loses 3 life; sacrifice Kroxa unless escaped"),
             action_generator=self._gen_kroxa_etb,
+        ))
+        # "Whenever Kroxa enters OR ATTACKS" — the attack half fired nowhere
+        # before July 28 2026, so a Kroxa that stuck around was half a card.
+        self._add_attack_card("kroxa, titan of death's hunger", EffectTemplate(
+            name="Kroxa, Titan of Death's Hunger (attack)",
+            description=("Kroxa attacks: each opponent discards a card, then each opponent "
+                         "who didn't discard a nonland card loses 3 life"),
+            action_generator=self._gen_kroxa_attack,
         ))
 
         # --- Felidar Guardian: blink ANOTHER permanent you control (not self) ---
@@ -6074,10 +6203,16 @@ class EffectTemplateLibrary:
             EffectTemplate(
                 name="Library Look / Reorder",
                 description="Look at top cards and reorder",
-                action_generator=lambda ctrl, opp, ctx: [
-                    {"action": "no_action",
-                     "reason": "library order not modeled — keeping current order"}
-                ]
+                # Returning None (not []) when there's more to the card means
+                # "not mine" — resolve_etb keeps scanning and the spell reaches
+                # Tier 2/3 with its other clauses intact. Notion Rain matched
+                # here on its own surveil reminder text and lost both "draw two
+                # cards" and 2 damage to its controller.
+                action_generator=lambda ctrl, opp, ctx: (
+                    None if has_residual_clause_beyond_library_look(ctx.get('_oracle', ''))
+                    else [{"action": "no_action",
+                           "reason": "library order not modeled — keeping current order"}]
+                )
             )
         )
 
@@ -6339,7 +6474,7 @@ class EffectTemplateLibrary:
             source_name = ctx.get('_source_card_name') or ctx.get('best_own_creature', '')
             source_power = ctx.get('greatest_power', ctx.get('best_own_creature_power', 3))
             target = ctx.get('explicit_target_name') or ctx.get('best_opponent_creature')
-            target_power = ctx.get('best_opponent_creature_power', 0)
+            target_power = resolve_target_power(ctx, target)
             if not source_name or not target:
                 return [{"action": "no_action",
                          "reason": "Blizzard Brawl: need a creature you control and a target"}]
@@ -7221,8 +7356,8 @@ class EffectTemplateLibrary:
         return [{"action": "no_action", "reason": "No valid creature to bounce"}]
     
     def _exile_creature_with_life(self, ctrl, opp, ctx) -> List[Dict]:
-        target = ctx.get('best_opponent_creature')
-        target_power = ctx.get('best_opponent_creature_power', 0)
+        target = ctx.get('explicit_target_name') or ctx.get('best_opponent_creature')
+        target_power = resolve_target_power(ctx, target)
         if target:
             return [
                 {"action": "move_card", "card": target, "from_zone": "battlefield", "to_zone": "exile", "player": opp},
@@ -7292,6 +7427,164 @@ class EffectTemplateLibrary:
         for name in grave_pile:
             actions.append({"action": "move_card", "card": name, "from_zone": "library", "to_zone": "graveyard", "player": ctrl})
 
+        return actions
+
+    def _gen_chulane_cast_trigger(self, ctrl, opp, ctx) -> List[Dict]:
+        """Chulane, Teller of Tales: "Whenever you cast a creature spell, draw a
+        card, then you may put a land card from your hand onto the battlefield."
+
+        Both halves, because the inline cast-trigger draw handler used to match
+        the first clause of this ONE sentence and claim the whole trigger — the
+        ramp half never resolved and never even reached the unhandled backlog.
+        The land drop is free (it is not a land play, so it ignores the
+        once-per-turn land limit).
+        """
+        actions: List[Dict] = [
+            {"action": "draw_cards", "player": ctrl, "amount": 1},
+        ]
+        hand = ctx.get('controller_hand') or []
+        land = next((c for c in hand
+                     if 'land' in (getattr(c, 'type_line', '') or '').lower()), None)
+        if land is not None:
+            actions.append({
+                "action": "move_card", "card": getattr(land, 'name', ''),
+                "from_zone": "hand", "to_zone": "battlefield", "player": ctrl,
+            })
+        return actions
+
+    def _gen_felidar_retreat(self, ctrl, opp, ctx) -> List[Dict]:
+        """Felidar Retreat landfall — "choose one":
+            • Create a 2/2 white Cat Beast creature token.
+            • Put a +1/+1 counter on each creature you control. Those creatures
+              gain vigilance until end of turn.
+
+        Until July 28 2026 this card was resolved by the RAMPAGING BALOTHS
+        branch in mtg/triggers.py, whose loose "landfall + create + beast"
+        fallback matched on "Cat Beast" — so it made a 4/4 GREEN Beast, and
+        because that branch is an elif the modal choice was never offered at
+        any tier. Eight wrong tokens across the loose logs.
+
+        Mode choice: counters scale with board width, so take them once there
+        are enough creatures to beat a single 2/2; otherwise make the token.
+        """
+        creatures = int(ctx.get('controller_creature_count', 0) or 0)
+        if creatures >= 2:
+            # Two actions, because the counters and the keyword live in
+            # different handlers: add_counters owns bulk +1/+1 (by identity, so
+            # same-name tokens don't stack onto one card), pump_all_creatures
+            # owns until-EOT keywords. pump_all_creatures has no "counters" key
+            # — emitting one would be silently dropped.
+            return [
+                {"action": "add_counters", "target": "all_own_creatures",
+                 "player": ctrl, "counter_type": "+1/+1", "amount": 1},
+                {"action": "pump_all_creatures", "player": ctrl,
+                 "power": 0, "toughness": 0,
+                 "keywords": ["Vigilance"], "duration": "end_of_turn"},
+            ]
+        return [
+            {"action": "create_token", "player": ctrl, "name": "Cat Beast",
+             "power": 2, "toughness": 2,
+             "types": "Creature Token — Cat Beast", "colors": "W", "count": 1},
+        ]
+
+    def _gen_leonin_vanguard(self, ctrl, opp, ctx) -> List[Dict]:
+        """Leonin Vanguard: "At the beginning of combat on your turn, if you
+        control three or more creatures, THIS CREATURE gets +1/+1 until end of
+        turn and you gain 1 life."
+
+        No template existed, so this escalated to Tier 3 every combat — and
+        Tier 3's pump is player-scoped, not card-scoped, so it buffed the whole
+        team (up to five creatures), and twice emitted +0/+0, which pumps
+        nobody at all. 7 of 7 executed firings were wrong in one game.
+        """
+        creatures = int(ctx.get('controller_creature_count', 0) or 0)
+        if creatures < 3:
+            return [{"action": "no_action",
+                     "reason": f"Leonin Vanguard: only {creatures} creature(s), needs 3"}]
+        # "card" is pump_all_creatures' include_name filter — the card-scoped
+        # form. There is no separate "pump_creatures" action; emitting one
+        # would be dropped on the floor, which is how Tier 3's team-wide pump
+        # got to be the only thing that ever happened here.
+        return [
+            {"action": "pump_all_creatures", "player": ctrl,
+             "card": "Leonin Vanguard", "power": 1, "toughness": 1,
+             "duration": "end_of_turn"},
+            {"action": "gain_life", "player": ctrl, "amount": 1},
+        ]
+
+    def _gen_graveyard_copy_token(self, ctrl, opp, ctx) -> List[Dict]:
+        """Feldon-class: "create a token that's a copy of target creature CARD
+        in your graveyard".
+
+        Registered as a PATTERN, not a name-keyed template, deliberately: this
+        text lives on an activated ability, and the activation path calls
+        resolve_etb with event_type="activated", which skips the name-keyed
+        lookup entirely (mtg/engine.py, Apr 29 audit). A named template would
+        never fire — and would also wrongly fire on the source's own ETB.
+
+        The target is resolved HERE (same shape as Puppeteer Clique) so the
+        delayed sacrifice below can name the same card the copy was made from.
+        """
+        matched = (ctx['_match'].group(0) if ctx.get('_match') else '') or ''
+        own_graveyard = 'your graveyard' in matched.lower()
+
+        def _graveyard_of(key, list_key):
+            player_obj = ctx.get(key)
+            if player_obj is not None and hasattr(player_obj, 'graveyard'):
+                return list(player_obj.graveyard or [])
+            return list(ctx.get(list_key) or [])
+
+        pool = _graveyard_of('_controller_player', 'controller_graveyard')
+        if not own_graveyard:
+            pool = pool + _graveyard_of('_opponent_player', 'opponent_graveyard')
+
+        candidates = [c for c in pool
+                      if 'creature' in (getattr(c, 'type_line', '') or '').lower()]
+        if not candidates:
+            return [{"action": "no_action",
+                     "reason": "no creature card in the graveyard to copy"}]
+
+        chosen = None
+        explicit = (ctx.get('explicit_target_name') or '').strip()
+        if explicit:
+            chosen = next((c for c in candidates
+                           if (getattr(c, 'name', '') or '').lower() == explicit.lower()),
+                          None)
+        if chosen is None:
+            chosen = max(candidates, key=lambda c: int(getattr(c, 'cmc', 0) or 0))
+
+        oracle = (ctx.get('_oracle') or '').lower()
+        copy_action = {
+            "action": "create_copy_token", "player": ctrl,
+            "zone": "graveyard",
+            "zone_owner": "controller" if own_graveyard else "any",
+            "target": chosen.name, "count": 1,
+        }
+        # "except it's an artifact in addition to its other types" / "It gains haste."
+        if 'artifact in addition' in oracle:
+            copy_action["extra_types"] = ["Artifact"]
+        if 'gains haste' in oracle:
+            copy_action["keywords"] = ["Haste"]
+
+        actions = [copy_action]
+        if 'sacrifice it at the beginning of the next end step' in oracle:
+            # "the next end step", not "your next end step" — so no phase_of
+            # gate (cf. Necropotence, which IS owner-gated).
+            # Known approximation: the delayed sacrifice names the copied card,
+            # so if a second permanent with that name is on the battlefield the
+            # engine may sacrifice that one instead. The original stays in the
+            # graveyard, so this only bites with a pre-existing duplicate.
+            actions.append({
+                "action": "schedule_delayed_trigger", "trigger_at": "end_step",
+                "turn_delay": 0,
+                "source": ctx.get('_source_card_name') or "Graveyard copy",
+                "actions": [{
+                    "action": "sacrifice_permanent", "player": ctrl,
+                    "type_filter": "creature", "preferred_card": chosen.name,
+                    "only_preferred": True,
+                    "reason": "token copy is sacrificed at the next end step",
+                }],
+            })
         return actions
 
     def _puppeteer_clique_etb(self, ctrl, opp, ctx) -> List[Dict]:
@@ -7677,19 +7970,97 @@ class EffectTemplateLibrary:
              "keywords": ["Trample"]},
         ]
 
+    def _kroxa_enters_or_attacks(self, ctrl, opp, ctx) -> List[Dict]:
+        """The "enters or attacks" half of Kroxa, shared by the ETB and attack
+        dispatchers.
+
+        Printed text (Scryfall via data/card_data_cache.json, re-verified
+        July 28 2026):
+
+            "Whenever Kroxa enters or attacks, each opponent discards a card,
+             then each opponent who didn't discard a nonland card this way
+             loses 3 life."
+
+        The life loss is CONDITIONAL, and it fires on the opposite of what the
+        old docstring here claimed: an opponent who pitches a NONLAND card is
+        SPARED; one who pitches a land — or who has nothing to pitch — loses 3.
+        (The old text also said "deals 3 damage", which is a pre-errata wording;
+        the card loses life, so it dodges damage prevention and doublers.)
+        The July 27 fanout caught this firing unconditionally, corroborated by
+        two independent reviewers in two different games.
+
+        WHICH card an opponent discards is THEIR choice, so we model the
+        incentive the card creates: pitch the least-castable nonland to dodge
+        the drain, and eat the 3 only when the hand is all lands or empty.
+        """
+        hand = ctx.get('opponent_hand')
+        if hand is None:
+            # No hand visibility in this context. Under-apply rather than
+            # fabricate a life loss we can't justify — a phantom drain is worse
+            # than a missed one (cf. the "Tier 3 fabricated a mana payment"
+            # class from the June 10 deep dive).
+            print("[KROXA] opponent hand not in context — discarding at random "
+                  "and skipping the conditional life loss")
+            return [{"action": "discard", "player": opp, "card": "random"}]
+
+        # Two ctx builders populate 'opponent_hand' in DIFFERENT shapes: one
+        # stores live Card objects, the other a list of {'name','cmc','is_land'}
+        # dicts. Handle both or the fix silently no-ops on half the call sites.
+        def _name(entry):
+            return (entry.get('name', '') if isinstance(entry, dict)
+                    else getattr(entry, 'name', '')) or ''
+
+        def _cmc(entry):
+            raw = (entry.get('cmc', 0) if isinstance(entry, dict)
+                   else getattr(entry, 'cmc', 0))
+            return int(raw or 0)
+
+        def _is_land(entry):
+            if isinstance(entry, dict):
+                return bool(entry.get('is_land'))
+            fn = getattr(entry, 'is_land', None)
+            if callable(fn):
+                return bool(fn())
+            return 'land' in (getattr(entry, 'type_line', '') or '').lower()
+
+        nonlands = [c for c in hand if not _is_land(c)]
+        if nonlands:
+            # Highest CMC == least castable, matching the engine's own "worst
+            # card" convention in the discard handler (mtg/actions.py).
+            chosen = max(nonlands, key=_cmc)
+            return [{"action": "discard", "player": opp, "card": _name(chosen)}]
+
+        actions: List[Dict] = []
+        if hand:
+            # Hand is all lands — pitching one still leaves them on the hook.
+            actions.append({"action": "discard", "player": opp,
+                            "card": _name(hand[0])})
+        # Empty hand discards nothing, which is likewise "didn't discard a
+        # nonland card this way" — they lose 3 either way.
+        actions.append({"action": "lose_life", "player": opp, "amount": 3})
+        return actions
+
+    def _gen_kroxa_attack(self, ctrl, opp, ctx) -> List[Dict]:
+        """Kroxa's attack trigger — the "enters or attacks" half ONLY.
+
+        The sacrifice clause is worded "When Kroxa ENTERS, sacrifice it unless
+        it escaped", so attacking never sacrifices him.
+        """
+        return self._kroxa_enters_or_attacks(ctrl, opp, ctx)
+
     def _gen_kroxa_etb(self, ctrl, opp, ctx) -> List[Dict]:
-        """Kroxa, Titan of Death's Hunger triggers.
+        """Kroxa, Titan of Death's Hunger — BOTH printed triggers fire on entry.
 
-        Two abilities, both routed through this generator (resolve_upkeep_trigger
-        delegates to resolve_etb by name). We distinguish ETB vs upkeep via the
-        oracle text snippet in ctx['_oracle']:
+        Printed text:
+            "When Kroxa enters, sacrifice it unless it escaped."
+            "Whenever Kroxa enters or attacks, each opponent discards a card,
+             then each opponent who didn't discard a nonland card this way
+             loses 3 life."
 
-        ETB: "When Kroxa, Titan of Death's Hunger enters, each opponent discards
-        a card. If a player discarded a nonland card this way, Kroxa deals 3
-        damage to that player." Then upkeep clause sacrifices unless escaped.
-
-        Upkeep: "At the beginning of your upkeep, if Kroxa isn't escaped,
-        sacrifice it." No discard, no damage — just the sac check.
+        The upkeep branch below is DEFENSIVE ONLY — no printing of Kroxa has an
+        upkeep trigger. It exists because resolve_upkeep_trigger delegates to
+        resolve_etb by name, so a mis-dispatched upkeep event would otherwise
+        replay the discard half every turn.
         """
         oracle = (ctx.get('_oracle') or '').lower()
         is_upkeep = 'beginning of your upkeep' in oracle and 'sacrifice' in oracle
@@ -7710,11 +8081,8 @@ class EffectTemplateLibrary:
             if ctx.get('was_escaped', False):
                 return [{"action": "no_action", "reason": "Kroxa was escaped — survives upkeep"}]
             return [sac_action]
-        # ETB path
-        actions = [
-            {"action": "discard", "player": opp, "card": "random"},
-            {"action": "lose_life", "player": opp, "amount": 3},
-        ]
+        # ETB path: the "enters or attacks" half, then the sacrifice clause.
+        actions = self._kroxa_enters_or_attacks(ctrl, opp, ctx)
         if not ctx.get('was_escaped', False):
             actions.append(sac_action)
         return actions
@@ -7818,7 +8186,7 @@ class EffectTemplateLibrary:
         source deals source_power to target, target deals its power to source.
         """
         target = ctx.get('explicit_target_name') or ctx.get('best_opponent_creature')
-        target_power = ctx.get('best_opponent_creature_power', 0)
+        target_power = resolve_target_power(ctx, target)
         source_name = ctx.get('_source_card_name', 'source')
         if target:
             return [
@@ -7842,7 +8210,7 @@ class EffectTemplateLibrary:
             # Fallback: estimate from greatest_power context
             source_power = ctx.get('greatest_power', 3)
         target = ctx.get('explicit_target_name') or ctx.get('best_opponent_creature')
-        target_power = ctx.get('best_opponent_creature_power', 0)
+        target_power = resolve_target_power(ctx, target)
         if target:
             return [
                 {"action": "deal_damage", "amount": source_power,
@@ -8519,6 +8887,37 @@ class EffectTemplateLibrary:
 # Context Builder - prepares game context for template resolution
 # =============================================================================
 
+def resolve_target_power(ctx: Dict, target_name: str) -> int:
+    """Effective power of the creature ACTUALLY being targeted.
+
+    July 26 batch-7 audit. Templates pick their target as
+    `explicit_target_name or best_opponent_creature`, but historically read
+    the AMOUNT from `best_opponent_creature_power` — which build_game_context
+    derives independently as the single highest-power opponent creature. The
+    two silently decouple whenever the declared target isn't that creature:
+    in game_1530445545447886909 Swords to Plowshares exiled a 0-power Birds of
+    Paradise and granted its controller 1 life, because Elvish Mystic (power
+    1) was the "best" creature on that battlefield.
+
+    Falls back to `best_opponent_creature_power` when the name isn't found on
+    either battlefield, so callers that never had an explicit target keep
+    their previous behaviour exactly.
+    """
+    if target_name:
+        want = str(target_name).strip().lower()
+        for pool in ('_opponent_creatures', '_controller_creatures'):
+            for info in (ctx.get(pool) or []):
+                if str(info.get('name', '')).strip().lower() == want:
+                    try:
+                        return int(info.get('power', 0) or 0)
+                    except (TypeError, ValueError):
+                        return 0
+    try:
+        return int(ctx.get('best_opponent_creature_power', 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def build_game_context(game, player, opponent, card=None, entering_creature=None,
                        dying_creature=None, attacking_creature=None,
                        explicit_target=None, entering_player=None) -> Dict:
@@ -8698,7 +9097,7 @@ def build_game_context(game, player, opponent, card=None, entering_creature=None
 
     # Full creature lists for edict effects (Fleshbag Marauder etc.) and
     # color/type-restricted removal templates (Shriekmaw, Nekrataal, etc.)
-    def _creature_info(c):
+    def _creature_info(c):  # noqa: E306 (see resolve_target_power below)
         return {
             'name': c.name,
             'power': c.get_effective_power(game) if hasattr(c, 'get_effective_power') else 0,
@@ -8922,6 +9321,14 @@ def build_game_context(game, player, opponent, card=None, entering_creature=None
     if card and hasattr(card, '_mana_paid') and card._mana_paid:
         ctx['mana_paid_total'] = card._mana_paid
 
+    # Escape: "sacrifice it unless it escaped" (Kroxa). This key was READ in two
+    # places and written NOWHERE in production — the two tests that exercised it
+    # injected it by hand, so the pair stayed green over a dead path (the same
+    # trap as game._rules_engine). The cast paths now stamp _was_escaped when
+    # they pay the exile cost; surface it here so the ETB can finally see it.
+    if card is not None:
+        ctx['was_escaped'] = bool(getattr(card, '_was_escaped', False))
+
     # Permanent counts by type (for modal board wipes — Austere Command,
     # Akroma's Vengeance, Merciless Eviction). Phased-out permanents are
     # excluded since they aren't on the battlefield for this purpose.
@@ -9027,6 +9434,16 @@ def build_game_context(game, player, opponent, card=None, entering_creature=None
         elif hasattr(explicit_target, 'name'):
             # It's a Card object — find which player owns it
             ctx['explicit_target_name'] = explicit_target.name
+            # July 27 fanout: `explicit_target_is_creature` is READ by the Rift
+            # Bolt and Volcanic Geyser templates but was written NOWHERE outside
+            # tests, so both guards were permanently False and both spells always
+            # went to the face. The July 23 fix that added those guards had
+            # therefore never executed in a live game — its pin passed only
+            # because the test hand-injected the key. Game-aware is_creature so
+            # a devotion-gated god is classified correctly (F24).
+            ctx['explicit_target_is_creature'] = bool(
+                explicit_target.is_creature(game)
+                if hasattr(explicit_target, 'is_creature') else False)
             for p in game.players:
                 if explicit_target in p.battlefield:
                     ctx['explicit_target_owner'] = p.name
@@ -9037,6 +9454,7 @@ def build_game_context(game, player, opponent, card=None, entering_creature=None
                 for c in p.battlefield:
                     if c.name.lower() == explicit_target.lower():
                         ctx['explicit_target_owner'] = p.name
+                        ctx['explicit_target_is_creature'] = bool(c.is_creature(game))
                         break
                 if ctx.get('explicit_target_owner'):
                     break

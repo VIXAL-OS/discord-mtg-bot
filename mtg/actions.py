@@ -764,7 +764,7 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
             paid = False
             if cost:
                 try:
-                    paid = player.tap_sources_for_cost(cost)
+                    paid = player.tap_sources_for_cost(cost, game=game)
                 except (ValueError, KeyError, AttributeError, TypeError) as e:
                     print(f"[PAY-OR-LOSE] {source}: payment attempt errored: {e}")
             if paid:
@@ -1016,6 +1016,22 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
             if card_name == "random" and player.hand:
                 import random as rng
                 card = rng.choice(player.hand)
+            elif card_name == "best_nonland" and player.hand:
+                # Thoughtseize-class: the CASTER chooses, so this is the
+                # opposite polarity to "worst" below — take the opponent's
+                # strongest nonland. July 27 fanout: this sentinel (unique to
+                # data/card_templates.json's thoughtseize entry, added by the
+                # July 20 JSON migration) had no branch, so it fell to the
+                # name lookup, found no card called "best_nonland", and the
+                # discard was skipped while the caster still paid 2 life.
+                # Same shape as the June 11 "worst" bug one branch down.
+                nonlands = [c for c in player.hand if not c.is_land()]
+                # An all-lands hand means no legal choice — CR-correct to
+                # discard nothing (the caster still pays their life).
+                card = max(nonlands, key=lambda c: (c.cmc or 0)) if nonlands else None
+                if card is None:
+                    print(f"[DISCARD] {player.name}: hand has no nonland card — "
+                          f"nothing discarded")
             elif card_name in ("worst", "choose", "any") and player.hand:
                 # Heuristic self-discard (Daretti +2, looting). June 11 audit:
                 # "worst" previously matched no selector, find_card_in_zone
@@ -1829,17 +1845,45 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
             return base_msg
 
     elif action_type == "create_copy_token":
-        # Clone an existing creature on the battlefield as a token
-        # Used by: Thousand-Faced Shadow, Helm of the Host, Rite of Replication, etc.
+        # Clone an existing creature as a token.
+        # Used by: Thousand-Faced Shadow, Helm of the Host, Rite of Replication,
+        # and (with zone="graveyard") Feldon of the Third Path.
         player_name = action.get("player")
         target_name = action.get("target", "")
         target_filter = action.get("filter", "")  # "attacking", "own", "any"
         count = int(action.get("count", 1))
+        # July 27 fanout: "a copy of target creature CARD in your graveyard"
+        # (Feldon) was matched by the generic BATTLEFIELD copy pattern, which
+        # copied a live creature — observed with no creature in any graveyard.
+        # A card in a graveyard is not a permanent, so the battlefield scan
+        # below can never see it; it needs its own zone.
+        zone = (action.get("zone") or "battlefield").lower()
         p = find_player(player_name)
         if p:
             # Find the creature to copy
             source_card = None
-            if target_name and target_name not in ("best_creature", "best_attacking_creature"):
+            if zone == "graveyard":
+                zone_owner = (action.get("zone_owner") or "controller").lower()
+                pools = [p] if zone_owner == "controller" else list(game.players)
+                # Plain is_creature() is correct here: the devotion type-flip
+                # (CR 207.4) only applies to permanents on the battlefield, so a
+                # devotion-gated god in a graveyard IS a creature card.
+                candidates = [c for pl in pools for c in pl.graveyard
+                              if c.is_creature()]
+                if target_name and target_name not in (
+                        "best_creature", "best_attacking_creature"):
+                    from mtg.helpers import names_match as _names_match
+                    source_card = next(
+                        (c for c in candidates if _names_match(c.name, target_name)),
+                        None)
+                if source_card is None and candidates:
+                    source_card = max(candidates, key=lambda c: (c.cmc or 0))
+                if source_card is None:
+                    print(f"[COPY-TOKEN] No creature card in the "
+                          f"{'controller' if zone_owner == 'controller' else 'targeted'} "
+                          f"graveyard to copy")
+                    return None
+            elif target_name and target_name not in ("best_creature", "best_attacking_creature"):
                 result = find_card_on_battlefield(target_name)
                 if result:
                     source_card, _ = result
@@ -1877,6 +1921,15 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                     actual_count = final.amount
 
                 created_names = []
+                copy_entry_msgs: List[str] = []
+                # "except it's an artifact in addition to its other types"
+                # (Feldon) and any keywords the copy is granted ("It gains haste").
+                extra_types = action.get("extra_types") or []
+                if isinstance(extra_types, str):
+                    extra_types = [extra_types]
+                extra_keywords = action.get("keywords") or []
+                if isinstance(extra_keywords, str):
+                    extra_keywords = [k.strip() for k in extra_keywords.split(",") if k.strip()]
                 for i in range(actual_count):
                     # Create a token copy with the source creature's stats
                     copy_token = Card(
@@ -1888,9 +1941,24 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                         power=source_card.power or "0",
                         toughness=source_card.toughness or "0",
                     )
+                    # July 27 fanout: is_token was never set here, so a copy
+                    # token that died did NOT cease to exist (CR 111.7) — it sat
+                    # in a graveyard and was later reanimated by Animate Dead.
+                    # The sibling token paths (populate, create_token) both set
+                    # it; this one was the odd one out.
+                    copy_token.is_token = True
+                    import uuid as _uuid
+                    copy_token.id = f"token_{source_card.name.replace(' ', '_')}_{_uuid.uuid4().hex[:8]}"
+                    copy_token.owner_index = game.players.index(p) if p in game.players else 0
                     # Copy keywords
                     if source_card.keywords:
                         copy_token.keywords = list(source_card.keywords)
+                    for kw in extra_keywords:
+                        if kw and kw not in copy_token.keywords:
+                            copy_token.keywords.append(kw)
+                    for t in extra_types:
+                        if t and t.lower() not in (copy_token.type_line or "").lower():
+                            copy_token.type_line = f"{str(t).capitalize()} {copy_token.type_line}".strip()
                     # Copy color identity
                     if source_card.color_identity:
                         copy_token.color_identity = list(source_card.color_identity)
@@ -1902,11 +1970,32 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                             copy_token.counters[counter_type] = counter_count
                     p.battlefield.append(copy_token)
                     created_names.append(copy_token.name)
+                    # This site had NO entry plumbing at all. Two consequences,
+                    # both fixed here by mirroring the `populate` sibling:
+                    #  1. the copy's OWN ETB never resolved, so Rite of
+                    #     Replication on a Mulldrifter drew nothing;
+                    #  2. no PERMANENT_ENTERED, so Soul Warden-class watchers
+                    #     never saw it and it was invisible to the slice-2 bus.
+                    copy_entry_msgs.extend(
+                        _fire_noncast_battlefield_entry(rules, game, p, copy_token))
+                    events.emit(events.PERMANENT_ENTERED, game, card=copy_token,
+                                controller=p, via="create_copy_token", rules=rules)
 
-                print(f"[COPY-TOKEN] {p.name} creates {actual_count}x copy of {source_card.name}")
+                copy_trigger_msgs = list(copy_entry_msgs)
+                from mtg.helpers import drain_pending_messages as _drain_pm
+                for msg in _drain_pm(game):
+                    print(f"[COPY-TOKEN-TRIGGER] {msg}")
+                    copy_trigger_msgs.append(msg)
+
+                print(f"[COPY-TOKEN] {p.name} creates {actual_count}x copy of {source_card.name}"
+                      f"{' from graveyard' if zone == 'graveyard' else ''}")
                 ep = source_card.get_effective_power(game)
                 et = source_card.get_effective_toughness(game)
-                return f"📋 **{p.name}** creates {actual_count}x token copy of **{source_card.name}** ({ep}/{et})"
+                base_copy_msg = (f"📋 **{p.name}** creates {actual_count}x token copy of "
+                                 f"**{source_card.name}** ({ep}/{et})")
+                if copy_trigger_msgs:
+                    return base_copy_msg + "\n" + "\n".join(copy_trigger_msgs)
+                return base_copy_msg
             else:
                 print(f"[COPY-TOKEN] No valid creature to copy (filter={target_filter})")
                 return None
@@ -2274,7 +2363,7 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
         if t_ctrl is not None and pay_cost:
             paid = False
             try:
-                paid = t_ctrl.tap_sources_for_cost(pay_cost)
+                paid = t_ctrl.tap_sources_for_cost(pay_cost, game=game)
             except (ValueError, KeyError, AttributeError, TypeError) as e:
                 print(f"[COUNTER-UNLESS] payment attempt errored: {e}")
             if paid:
@@ -2791,7 +2880,15 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                 print(f"  [CR-903.9] Commander {card.name} redirected from "
                       f"graveyard → command zone (owner={_zone_owner.name})")
             else:
-                owner.graveyard.append(card)
+                # CR 404.3: the OWNER's graveyard, not the controller's. The
+                # local is named `owner` but find_card_on_battlefield returns
+                # whichever player's battlefield held the card — the July 27
+                # fanout repro'd a stolen Sun Titan (owner_index=Rick) dying
+                # under Claude's control and landing in CLAUDE's graveyard,
+                # permanently changing hands. The commander branch above
+                # already resolved ownership properly; this one didn't.
+                from mtg.helpers import owner_of
+                owner_of(game, card, owner).graveyard.append(card)
             game.recalculate_granted_keywords()
             game.recalculate_power_toughness()
             rules.log_event(f"{card.name} destroyed")
@@ -3341,9 +3438,10 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
             # Blink, Ghostly Flicker) are "you control" and never set it.
             if action.get("require_own") and target_card is not None:
                 _pidx = game.players.index(p) if p in game.players else 0
-                if getattr(target_card, 'owner_index', _pidx) != _pidx:
+                from mtg.helpers import owns_card as _owns
+                if not _owns(target_card, _pidx):
                     _owned = [c for c in p.battlefield
-                              if getattr(c, 'owner_index', _pidx) == _pidx
+                              if _owns(c, _pidx)
                               and c.name.lower() != (source_name or '').lower()]
                     target_card = _owned[0] if _owned else None
                     if target_card is None:
@@ -3556,16 +3654,47 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                                 card.temp_keywords.append(kw)
                         return f"🛡️ {card.name} gains {', '.join(keywords)} until end of turn"
                 return None
+            # Restrictions the handler is ALREADY being handed but used to
+            # ignore. Cavalry Pegasus's template passes
+            # filter="attacking_knights_and_other_pegasi"; nothing read it, the
+            # default target is all_own_permanents, and so every permanent the
+            # controller owned — LANDS included — gained Flying. Observed
+            # granting flying to 10, 12, 13 and 15 permanents in single turns,
+            # including a Cat Soldier that is not a Human.
+            subtype = (action.get("subtype") or "").strip().lower()
+            attacking_only = (target == "attacking_subtype"
+                              or "attacking" in (action.get("filter") or "").lower())
+            unknown_filter = action.get("filter") and not subtype and not attacking_only
+            if unknown_filter:
+                # Refuse rather than silently widen to the whole battlefield —
+                # a fabricated filter string should fail loudly, not buff the
+                # board. Same principle as the Woodfall Primus "noncreature"
+                # guard: an unrecognized restriction is not "no restriction".
+                print(f"[GRANT-KEYWORDS] Refusing '{', '.join(keywords)}' — "
+                      f"unrecognized filter {action.get('filter')!r}")
+                return None
             count = 0
+            granted = []
             for card in p.battlefield:
                 if target == "all_own_creatures" and not card.is_creature():
+                    continue
+                if attacking_only:
+                    if not card.is_creature() or not getattr(card, 'attacking', False):
+                        continue
+                if subtype and subtype not in (card.type_line or "").lower():
                     continue
                 for kw in keywords:
                     if kw not in (card.temp_keywords or []):
                         card.temp_keywords = card.temp_keywords or []
                         card.temp_keywords.append(kw)
                 count += 1
+                granted.append(card.name)
+            if not count:
+                return None
             perm_word = "permanent" if count == 1 else "permanents"
+            if subtype or attacking_only:
+                who = ", ".join(granted[:4]) + (f" (+{count - 4} more)" if count > 4 else "")
+                return f"🛡️ {who} gain {', '.join(keywords)} until end of turn"
             return f"🛡️ {p.name}'s {count} {perm_word} gain {', '.join(keywords)} until end of turn"
         return None
 
@@ -4876,7 +5005,8 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                 # Owner check (Yorion: "permanents you own"). Only flicker
                 # permanents this player actually owns; skip stolen permanents.
                 if require_ownership and p_idx is not None:
-                    if getattr(c, 'owner_index', p_idx) != p_idx:
+                    from mtg.helpers import owns_card as _owns
+                    if not _owns(c, p_idx):
                         continue
                 # Prefer permanents with ETB effects
                 has_etb = c.oracle_text and 'enters' in c.oracle_text.lower() if c.oracle_text else False

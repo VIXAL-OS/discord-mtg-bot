@@ -1747,7 +1747,7 @@ class CubeDraftCog(commands.Cog, name="Cube Draft"):
     # AUTO-DRAFT — Fully automated draft + game for testing
     # =========================================================================
 
-    async def _autodraft_send(self, thread, content=None, embed=None):
+    async def _autodraft_send(self, thread, content=None, embed=None, final=False):
         """Send a message to the autodraft thread.
 
         June 10 audit: delegate to the cog's _autoplay_send so autodraft
@@ -1762,7 +1762,8 @@ class CubeDraftCog(commands.Cog, name="Cube Draft"):
         """
         cog = getattr(self, 'game_cog', None)
         if cog is not None and hasattr(cog, '_autoplay_send'):
-            await cog._autoplay_send(thread, content=content, embed=embed)
+            await cog._autoplay_send(thread, content=content, embed=embed,
+                                     final=final)
             return
         try:
             if content and embed:
@@ -1887,6 +1888,24 @@ class CubeDraftCog(commands.Cog, name="Cube Draft"):
                 type=discord.ChannelType.public_thread,
             )
             result["thread_id"] = thread.id
+
+            # Set up logging FIRST, before anything is printed or sent.
+            # This block used to sit ~150 lines further down, just before the
+            # game started — so the entire draft phase (45 picks, the round
+            # banners, both deck summaries) reached neither log file:
+            # _thread_send only writes to a logger already in game_loggers, and
+            # StdoutTee only tees once add_game has run. Measured across all
+            # four cube games in the loose logs: zero [DRAFT-CLAUDE] lines, and
+            # every console log's first content line was the confirmation
+            # print below. Pick counts and duplicate-card safety were therefore
+            # unauditable by construction.
+            game_logger = GameLogger(thread.id)
+            if hasattr(self.game_cog, 'game_loggers'):
+                self.game_cog.game_loggers[thread.id] = game_logger
+            if hasattr(self.game_cog, '_stdout_tee') and self.game_cog._stdout_tee:
+                self.game_cog._stdout_tee.add_game(thread.id, game_logger.console_path)
+                self.game_cog._stdout_tee.active_thread = thread.id
+            print(f"[AUTO-DRAFT] Game logging to {game_logger.console_path}")
 
             # ================================================================
             # PHASE 3: Build 8-seat pod
@@ -2038,15 +2057,6 @@ class CubeDraftCog(commands.Cog, name="Cube Draft"):
                 ai_response_enabled=True,
             )
 
-            # Set up logging
-            game_logger = GameLogger(thread.id)
-            if hasattr(self.game_cog, 'game_loggers'):
-                self.game_cog.game_loggers[thread.id] = game_logger
-            if hasattr(self.game_cog, '_stdout_tee') and self.game_cog._stdout_tee:
-                self.game_cog._stdout_tee.add_game(thread.id, game_logger.console_path)
-                self.game_cog._stdout_tee.active_thread = thread.id
-            print(f"[AUTO-DRAFT] Game logging to {game_logger.console_path}")
-
             # Start game
             first_player = random.randint(0, 1)
             self.engine.start_game(game, first_player)
@@ -2059,9 +2069,15 @@ class CubeDraftCog(commands.Cog, name="Cube Draft"):
                 # June 11: strict= stamp — see the autoplay [GAME-INIT] twin.
                 # July 24: sha= stamp, same twin.
                 from mtg.util import strict_mode, git_sha
+                # Compute the real deck sizes instead of asserting 40/40:
+                # auto_build_deck's fill loops have no upper trim, so a pool
+                # heavy in text-less lands can return more than deck_size, and
+                # the hardcoded literal made the format-compliance deck-size
+                # check a no-op for cube by construction.
+                _sz = [len(p.library) + len(p.hand) for p in game.players[:2]]
                 print(
                     f"[GAME-INIT] format=cube life=20/20 "
-                    f"deck0=draft(40) deck1=draft(40) "
+                    f"deck0=draft({_sz[0]}) deck1=draft({_sz[1]}) "
                     f"first_player={fp_name} "
                     f"strict={1 if strict_mode() else 0} "
                     f"sha={git_sha()}"
@@ -2306,7 +2322,8 @@ class CubeDraftCog(commands.Cog, name="Cube Draft"):
                     # (state keeps the true value per CR 119.3).
                     f"• Final life: {winner.name} {max(0, winner.life)} / {loser.name} {max(0, loser.life)}\n"
                     f"• Turns: {game.turn_number}\n"
-                    f"• Draft rounds: {result['draft_rounds']}, picks: {result['draft_picks']}")
+                    f"• Draft rounds: {result['draft_rounds']}, picks: {result['draft_picks']}",
+                    final=True)
             elif result.get("error"):
                 result["outcome"] = "crash"
             elif result["outcome"] != "circuit_breaker":
@@ -2314,7 +2331,7 @@ class CubeDraftCog(commands.Cog, name="Cube Draft"):
                 await self._autodraft_send(thread,
                     f"⏱️ Game ended after {max_turns} turns (no winner)\n"
                     f"• Life: {game.players[0].name} {game.players[0].life} / "
-                    f"{game.players[1].name} {game.players[1].life}")
+                    f"{game.players[1].name} {game.players[1].life}", final=True)
             # (June 10 audit: the stats emits moved to the `finally` block —
             # the June 10 batch's cube game exited via a path that skipped
             # this tail, making it the only 1 of 139 games missing both

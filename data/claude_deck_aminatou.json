@@ -313,10 +313,6 @@
       "quantity": 1
     },
     {
-      "name": "Terminus",
-      "quantity": 1
-    },
-    {
       "name": "Teleportation Circle",
       "quantity": 1
     },
@@ -354,6 +350,10 @@
     },
     {
       "name": "Ashiok, Dream Render",
+      "quantity": 1
+    },
+    {
+      "name": "Grand Arbiter Augustin IV",
       "quantity": 1
     }
   ]

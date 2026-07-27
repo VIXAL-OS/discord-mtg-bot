@@ -1256,7 +1256,8 @@ async def _autoplay_execute_action(cog, thread, game: GameState, player_idx: int
         from_exile = False
         if not card:
             exile_card = player.find_card(card_name, Zone.EXILE)
-            if exile_card and exile_card.id in player.playable_from_exile:
+            if exile_card and (exile_card.id in player.playable_from_exile
+                               or getattr(exile_card, '_adventure_exiled', False)):
                 card = exile_card
                 from_exile = True
 
@@ -1274,12 +1275,12 @@ async def _autoplay_execute_action(cog, thread, game: GameState, player_idx: int
                     player.playable_from_graveyard.remove(c.id)
                     # Pay escape exile cost if applicable
                     if c.oracle_text:
-                        esc_match = re.search(
-                            r'escape.{1,3}\{[^}]+\}(?:\{[^}]+\})*,?\s*exile\s+(\d+)\s+other\s+cards?\s+from\s+your\s+graveyard',
-                            c.oracle_text.lower()
-                        )
-                        if esc_match:
-                            exile_count = int(esc_match.group(1))
+                        from mtg.helpers import parse_escape_cost
+                        _esc = parse_escape_cost(c.oracle_text)
+                        if _esc:
+                            _esc_cost, exile_count = _esc
+                            c._escape_cost = _esc_cost
+                            c._was_escaped = True
                             for _ in range(exile_count):
                                 if player.graveyard:
                                     exiled = player.graveyard.pop()
@@ -1330,7 +1331,9 @@ async def _autoplay_execute_action(cog, thread, game: GameState, player_idx: int
         if from_exile:
             player.exile.remove(card)
             player.hand.append(card)
-            player.playable_from_exile.remove(card.id)
+            if card.id in player.playable_from_exile:
+                player.playable_from_exile.remove(card.id)
+            card._adventure_exiled = False
 
         commander_tax = 0
         if from_command_zone:
@@ -1338,18 +1341,15 @@ async def _autoplay_execute_action(cog, thread, game: GameState, player_idx: int
             player.command_zone.remove(card)
             player.hand.append(card)
 
-        # Resolve target
+        # Resolve target — shared with the AI cast path (mtg/helpers.py).
+        # This copy used to search battlefield-then-player-name only: no stack,
+        # no graveyard, no pronouns. Since Rick IS the human code path, that
+        # meant every graveyard-targeting spell a human would cast lost its
+        # declared target, and "opponent" never resolved to a player at all.
         target = None
         if target_name:
-            for p in game.players:
-                target = p.find_card(target_name, Zone.BATTLEFIELD)
-                if target:
-                    break
-            if not target:
-                for p in game.players:
-                    if p.name.lower() == target_name.lower():
-                        target = p
-                        break
+            from mtg.helpers import resolve_cast_target
+            target = resolve_cast_target(game, player, card, target_name)
 
         # Pass explicit X value from batch plan (Walking Ballista, Hangarback Walker, etc.)
         if action.get("X") is not None:
@@ -1606,6 +1606,29 @@ async def _autoplay_execute_action(cog, thread, game: GameState, player_idx: int
                         print(f"[AUTOPLAY-PW] Auto-targeting {best.name} for {perm.name} ability {ability_idx}")
                     else:
                         print(f"[PW-TARGET] No artifact/enchantment target for {perm.name} — skipping")
+                        return None
+                elif 'land' in target_desc:
+                    # July 26 batch-7 audit: there was no 'land' branch at all,
+                    # and the fallback below explicitly EXCLUDES lands — so any
+                    # "target land" ability was guaranteed a non-land target.
+                    # Garruk Wildspeaker's "+1: Untap two target lands" picked
+                    # the opponent's Sword of Fire and Ice
+                    # (game_1530445545447886909). No harm landed there only
+                    # because the Tier-3 fallback discards explicit targets;
+                    # any template that honours them would have acted on it.
+                    # Untap-style land abilities help their controller, so
+                    # prefer our OWN tapped lands, then any of ours.
+                    own_lands = [c for c in player.battlefield if c.is_land()]
+                    own_tapped = [c for c in own_lands if getattr(c, 'tapped', False)]
+                    pool = own_tapped or own_lands or [c for c in opp.battlefield if c.is_land()]
+                    if pool:
+                        # "two target lands" — hand over as many as we can.
+                        want = 2 if 'two target' in target_desc else 1
+                        auto_targets = pool[:want]
+                        print(f"[PW-TARGET] Auto-targeting land(s) "
+                              f"{', '.join(c.name for c in auto_targets)} for {perm.name}")
+                    else:
+                        print(f"[PW-TARGET] No land target for {perm.name} — skipping")
                         return None
                 elif ability.needs_target:
                     # [FIX-4] Fallback: uncovered target_desc — try any battlefield permanent
@@ -2213,6 +2236,23 @@ async def _run_single_autoplay(cog, channel, game_format: str, deck1_name: str, 
             channel, f"MTG Autoplay: {label} ({game_format})")
         result["thread_id"] = thread.id
 
+        # Set up logging BEFORE create_game, not after. Deck loading is where
+        # [COMPANION] / [PARTNER] / [OATHBREAKER] / [ADVENTURE] / [TRANSFORM] /
+        # [SPLIT] and — most consequential — the "[SCRYFALL] WARNING: Failed to
+        # fetch X ... type_line will be empty!" lines are printed, and all of
+        # them landed in the window before StdoutTee had a game to tee to.
+        # Measured across ~600 loose console logs: zero hits for "placed in
+        # companion zone", "as partner", "Loaded adventure for", "Loaded DFC",
+        # or any Scryfall fetch warning, including in the 8 companion / 8
+        # partner / 16 adventure / 16 transform games. "Was the companion ever
+        # offered?" was structurally unanswerable from a batch.
+        game_logger = GameLogger(thread.id)
+        cog.game_loggers[thread.id] = game_logger
+        if cog._stdout_tee:
+            cog._stdout_tee.add_game(thread.id, game_logger.console_path)
+            cog._stdout_tee.active_thread = thread.id
+        print(f"[AUTOPLAY] Logging to {game_logger.console_path}")
+
         # Create game
         game = await cog.engine.create_game(
             thread_id=thread.id,
@@ -2243,14 +2283,6 @@ async def _run_single_autoplay(cog, channel, game_format: str, deck1_name: str, 
             game.players[1]._deck_name = deck2_name
         except Exception as e:
             print(f"[AUTOPLAY] Failed to stash deck names: {e}")
-
-        # Set up logging
-        game_logger = GameLogger(thread.id)
-        cog.game_loggers[thread.id] = game_logger
-        if cog._stdout_tee:
-            cog._stdout_tee.add_game(thread.id, game_logger.console_path)
-            cog._stdout_tee.active_thread = thread.id
-        print(f"[AUTOPLAY] Logging to {game_logger.console_path}")
 
         # Start game
         first_player = random.randint(0, 1)
@@ -2804,7 +2836,7 @@ async def _run_single_autoplay(cog, channel, game_format: str, deck1_name: str, 
                 f"\U0001f3c6 **{winner.name} wins!**\n"
                 f"\u2022 Final life: {winner.name} {max(0, winner.life)} / {loser.name} {max(0, _loser_life)}\n"
                 f"\u2022 Turns: {game.turn_number}\n"
-                f"\u2022 Format: {game_format}")
+                f"\u2022 Format: {game_format}", final=True)
         elif game.ended and game.winner is None:
             # Genuine draw (CR 104.3b \u2014 multiple players lost simultaneously).
             # Report the actual end state, not a 70-turn timeout.
@@ -2814,14 +2846,14 @@ async def _run_single_autoplay(cog, channel, game_format: str, deck1_name: str, 
                 f"\u2022 Reason: {getattr(game, 'loss_reason', 'simultaneous loss')}\n"
                 f"\u2022 Final life: {game.players[0].name} {max(0, game.players[0].life)} / {game.players[1].name} {max(0, game.players[1].life)}\n"
                 f"\u2022 Turns: {game.turn_number}\n"
-                f"\u2022 Format: {game_format}")
+                f"\u2022 Format: {game_format}", final=True)
         elif result["error"]:
             result["outcome"] = "crash"
         else:
             result["outcome"] = "timeout"
             await cog._autoplay_send(thread,
                 f"\u23f1\ufe0f Game ended after {max_turns} turns (no winner)\n"
-                f"\u2022 Life: {game.players[0].name} {max(0, game.players[0].life)} / {game.players[1].name} {max(0, game.players[1].life)}")
+                f"\u2022 Life: {game.players[0].name} {max(0, game.players[0].life)} / {game.players[1].name} {max(0, game.players[1].life)}", final=True)
 
     except Exception as e:
         import traceback

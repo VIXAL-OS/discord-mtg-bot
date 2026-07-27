@@ -190,7 +190,8 @@ class MTGBot(commands.Bot):
         self.conversations: Dict[int, List[Dict]] = {}
 
         # Config — loaded from config.json
-        self.mtg_channel_id: Optional[int] = None
+        # {guild_id: channel_id}; the None key applies to every guild.
+        self.mtg_channel_ids: Dict[Optional[int], int] = {}
         self.excluded_channels: set[int] = set()
 
         # Active persona — populated by load_config -> load_persona.
@@ -302,12 +303,53 @@ class MTGBot(commands.Bot):
     # Config + cost persistence
     # -------------------------------------------------------------------------
 
+    @staticmethod
+    def _parse_mtg_channels(raw) -> Dict[Optional[int], int]:
+        """Normalize the `mtg_channel_id` config value to {guild_id: channel_id}.
+
+        Accepts both shapes so existing config.json files keep working:
+          123456789               -> {None: 123456789}  (legacy: every guild)
+          {"<guild_id>": 123456}  -> {<guild_id>: 123456}
+        A None/absent value disables auto-respond entirely. Malformed entries
+        are skipped with a warning rather than crashing startup — a typo in
+        one guild's entry shouldn't take the bot down.
+        """
+        if raw is None:
+            return {}
+        if isinstance(raw, dict):
+            out: Dict[Optional[int], int] = {}
+            for gid, cid in raw.items():
+                try:
+                    # "default"/"*"/null all mean "applies everywhere".
+                    key = None if gid in (None, "*", "default", "") else int(gid)
+                    out[key] = int(cid)
+                except (TypeError, ValueError):
+                    print(f"⚠️  config: ignoring malformed mtg_channel_id "
+                          f"entry {gid!r}: {cid!r}")
+            return out
+        try:
+            return {None: int(raw)}
+        except (TypeError, ValueError):
+            print(f"⚠️  config: ignoring malformed mtg_channel_id: {raw!r}")
+            return {}
+
+    def mtg_channel_for(self, guild_id: Optional[int]) -> Optional[int]:
+        """The auto-respond channel for this guild, or None.
+
+        A guild-specific entry wins; the legacy `None` key is the fallback
+        that applies everywhere.
+        """
+        if guild_id is not None and guild_id in self.mtg_channel_ids:
+            return self.mtg_channel_ids[guild_id]
+        return self.mtg_channel_ids.get(None)
+
     def load_config(self):
         """Load configuration from config.json."""
         try:
             with open("config.json", encoding='utf-8') as f:
                 config = json.load(f)
-                self.mtg_channel_id = config.get("mtg_channel_id")
+                self.mtg_channel_ids = self._parse_mtg_channels(
+                    config.get("mtg_channel_id"))
                 self.excluded_channels = set(config.get("excluded_channels", []))
                 self.persona = self.load_persona(config.get("bot_persona", "plain"))
         except FileNotFoundError:
@@ -399,7 +441,13 @@ class MTGBot(commands.Bot):
 
     async def on_ready(self):
         print(f"Logged in as {self.user} (ID: {self.user.id})")
-        print(f"MTG channel: {self.mtg_channel_id or 'any'}")
+        if not self.mtg_channel_ids:
+            print("MTG channel: any (@-mention required everywhere)")
+        else:
+            for _gid, _cid in sorted(self.mtg_channel_ids.items(),
+                                     key=lambda kv: (kv[0] is not None, kv[0])):
+                _where = "all servers" if _gid is None else f"guild {_gid}"
+                print(f"MTG channel: {_cid} ({_where})")
         if self.excluded_channels:
             print(f"Excluded channels: {self.excluded_channels}")
         print(f"🎮 Discord MTG Bot ready")
@@ -422,7 +470,9 @@ class MTGBot(commands.Bot):
 
         # Respond to: (a) mentions, (b) MTG channel, (c) bot-owned threads
         is_mentioned = self.user.mentioned_in(message)
-        is_mtg_channel = (self.mtg_channel_id is not None and channel_id == self.mtg_channel_id)
+        _guild_id = message.guild.id if message.guild else None
+        _mtg_channel = self.mtg_channel_for(_guild_id)
+        is_mtg_channel = (_mtg_channel is not None and channel_id == _mtg_channel)
         is_bot_thread = (
             isinstance(message.channel, discord.Thread)
             and message.channel.owner_id == self.user.id

@@ -605,6 +605,18 @@ def _compute_alt_costs(engine, game: GameState, player: Player, card: Card,
         effective_mana_cost = card._flashback_cost
         print(f"[FLASHBACK] Using flashback cost {card._flashback_cost} instead of {card.mana_cost}")
         card._flashback_cost = None  # Clear after use
+    # Escape (CR 702.139): the alternative cost, like flashback above. There was
+    # no branch here at all, so even once detection worked an escaped Kroxa
+    # would have been charged his printed {B}{R} rather than {B}{B}{R}{R}.
+    # NOTE the marker is deliberately NOT cleared here, unlike _flashback_cost:
+    # the ETB reads `was_escaped` after resolution ("sacrifice it unless it
+    # escaped"), so clearing it at payment time would make every escaped
+    # creature sacrifice itself anyway.
+    if getattr(card, '_escape_cost', None):
+        effective_mana_cost = card._escape_cost
+        effective_cmc = helpers.cmc_of_cost_string(card._escape_cost)
+        print(f"[ESCAPE] Using escape cost {card._escape_cost} "
+              f"(CMC {effective_cmc}) instead of {card.mana_cost}")
     if getattr(card, 'cast_as_adventure', False) and card.adventure_cost:
         effective_mana_cost = card.adventure_cost
         # July 21 batch audit: was a digits + plain-single-pip count that gave
@@ -644,7 +656,25 @@ def _compute_alt_costs(engine, game: GameState, player: Player, card: Card,
             return ((False, f"{card.name} has no mana cost — it can only be suspended, not cast from hand", []),
                     None)
 
-    total_cost = effective_cmc + additional_cost
+    # [COST-ADJUST] Static cost increases and reductions (CR 601.2f), computed
+    # BEFORE X so the X budget can see them: a Medallion lets you pay 1 more
+    # into X, a Sphere of Resistance 1 less. CR 601.2f order is mana cost +
+    # additional costs + INCREASES, then reductions — increases are therefore
+    # never shrunk by a reducer that ran first.
+    cost_increase = 0
+    raw_reduction = 0
+    _red_sources: List[str] = []
+    if pay_mana:
+        from mtg.helpers import compute_cost_increase, compute_cost_reduction
+        _from_gy = card.id in (getattr(player, 'playable_from_graveyard', None) or [])
+        cost_increase, _inc_sources = compute_cost_increase(game, player, card)
+        if cost_increase:
+            print(f"[COST-INCREASE] {card.name}: +{cost_increase} generic from "
+                  f"{', '.join(_inc_sources)}")
+        raw_reduction, _red_sources = compute_cost_reduction(
+            player, card, from_graveyard=_from_gy)
+
+    total_cost = effective_cmc + additional_cost + cost_increase
     x_value_chosen = 0
 
     if effective_mana_cost and 'X' in effective_mana_cost.upper():
@@ -663,15 +693,25 @@ def _compute_alt_costs(engine, game: GameState, player: Player, card: Card,
         # Check if caller specified X value via _x_value attribute
         if hasattr(card, '_x_value') and card._x_value is not None:
             x_value_chosen = card._x_value
-            total_cost = fixed_cost + (x_value_chosen * x_count) + additional_cost
+            total_cost = (fixed_cost + (x_value_chosen * x_count)
+                          + additional_cost + cost_increase)
         else:
-            # Auto-calculate: use all available mana for X
+            # Auto-calculate: use all available mana for X.
+            # July 26: adjustments belong in this budget. An X spell's {X}
+            # becomes generic once X is chosen, so a reduction always has
+            # generic to eat here — Blue Sun's Zenith with a Sapphire
+            # Medallion should draw one MORE card, not bank the mana.
             available = player.available_mana()
-            remaining_for_x = max(0, available - fixed_cost - additional_cost)
+            remaining_for_x = max(0, available - fixed_cost - additional_cost
+                                  - cost_increase + raw_reduction)
             x_value_chosen = remaining_for_x // max(x_count, 1)
-            total_cost = fixed_cost + (x_value_chosen * x_count) + additional_cost
-        
-        print(f"[X-COST] {card.name}: X={x_value_chosen}, fixed={fixed_cost}, total={total_cost}")
+            total_cost = (fixed_cost + (x_value_chosen * x_count)
+                          + additional_cost + cost_increase)
+
+        _adj = (f", increase=+{cost_increase}" if cost_increase else "") + \
+               (f", reduction=-{raw_reduction}" if raw_reduction else "")
+        print(f"[X-COST] {card.name}: X={x_value_chosen}, fixed={fixed_cost}, "
+              f"total={total_cost}{_adj}")
         # Store X value on card so templates/context can access it
         card._x_value = x_value_chosen
 
@@ -792,6 +832,16 @@ def _compute_alt_costs(engine, game: GameState, player: Player, card: Card,
             used_alternate_cost = True
             print(f"[PACT] {card.name} cast for free (pact cost due next upkeep)")
 
+    # July 27 fanout audit: an X spell's {X} becomes generic once X is
+    # chosen, so convoke/delve/improvise can pay it -- but their
+    # generic_cost scans only for digit-brace symbols, which find nothing
+    # in "{X}{U}{U}". Logic Knot with a 3-card graveyard exiled ZERO cards
+    # and the cast then failed. The July 26 cost-reduction headroom below
+    # already accounted for X; this closes the same gap for the three
+    # alternative-cost reducers, which is an asymmetry I left behind.
+    _x_derived_generic = x_value_chosen * (
+        effective_mana_cost.upper().count('X') if effective_mana_cost else 0)
+
     # [CONVOKE] Tap untapped creatures to help pay for spells with convoke
     # Each tapped creature pays {1} or one mana of its color
     convoke_reduction = 0
@@ -802,7 +852,7 @@ def _compute_alt_costs(engine, game: GameState, player: Player, card: Card,
         if effective_mana_cost:
             for sym in re.findall(r'\{(\d+)\}', effective_mana_cost):
                 generic_cost += int(sym)
-        generic_cost += additional_cost
+        generic_cost += additional_cost + _x_derived_generic
         creatures_to_tap = min(len(untapped_creatures), generic_cost)
         for i in range(creatures_to_tap):
             untapped_creatures[i].tapped = True
@@ -821,7 +871,7 @@ def _compute_alt_costs(engine, game: GameState, player: Player, card: Card,
         if effective_mana_cost:
             for sym in re.findall(r'\{(\d+)\}', effective_mana_cost):
                 generic_cost += int(sym)
-        generic_cost += additional_cost - convoke_reduction
+        generic_cost += additional_cost + _x_derived_generic - convoke_reduction
         cards_to_exile = min(len(gy_candidates), max(0, generic_cost))
         exiled_names = []
         for i in range(cards_to_exile):
@@ -849,7 +899,8 @@ def _compute_alt_costs(engine, game: GameState, player: Player, card: Card,
         if effective_mana_cost:
             for sym in re.findall(r'\{(\d+)\}', effective_mana_cost):
                 generic_cost += int(sym)
-        generic_cost += additional_cost - convoke_reduction - delve_reduction
+        generic_cost += (additional_cost + _x_derived_generic
+                         - convoke_reduction - delve_reduction)
         artifacts_to_tap = min(len(untapped_artifacts), max(0, generic_cost))
         for i in range(artifacts_to_tap):
             untapped_artifacts[i].tapped = True
@@ -857,7 +908,40 @@ def _compute_alt_costs(engine, game: GameState, player: Player, card: Card,
         if improvise_reduction > 0:
             print(f"[IMPROVISE] {card.name}: tapped {improvise_reduction} artifact(s) to help pay")
 
-    total_alt_reduction = convoke_reduction + delve_reduction + improvise_reduction
+    # [COST-REDUCTION] Static "<X> spells you cast cost {N} less to cast"
+    # (CR 601.2f) — July 26, 2026. Before this, ManaCost.cost_reductions was
+    # declared in rules/mana.py and never written by anything, so all nine
+    # reducers in the test decks were blank cards; Baral, Chief of Compliance
+    # is a COMMANDER whose whole defining ability did nothing in the deck
+    # named after him.
+    # Cap the reduction computed above, now that X, the increase, and the
+    # convoke/delve/improvise draws on the same pool are all known.
+    cost_reduction = 0
+    if raw_reduction > 0:
+        # CR 601.2f: a reduction can only eat the GENERIC portion — it can
+        # never pay a colored pip. `generic_needed` downstream is NOT clamped
+        # at zero, so an uncapped reduction here would silently under-require
+        # colored mana. The increase is INSIDE the headroom because increases
+        # apply first and are themselves reducible.
+        printed_generic = 0
+        if effective_mana_cost:
+            for sym in re.findall(r'\{(\d+)\}', effective_mana_cost):
+                printed_generic += int(sym)
+        headroom = max(0, printed_generic + additional_cost + cost_increase
+                       + _x_derived_generic
+                       - (convoke_reduction + delve_reduction
+                          + improvise_reduction))
+        cost_reduction = min(raw_reduction, headroom)
+        if cost_reduction > 0:
+            print(f"[COST-REDUCTION] {card.name}: -{cost_reduction} generic "
+                  f"from {', '.join(_red_sources)}")
+        else:
+            print(f"[COST-REDUCTION] {card.name}: {raw_reduction} available "
+                  f"from {', '.join(_red_sources)} but no generic left to "
+                  f"reduce (CR 601.2f)")
+
+    total_alt_reduction = (convoke_reduction + delve_reduction
+                           + improvise_reduction + cost_reduction)
     return None, {
         'effective_mana_cost': effective_mana_cost,
         'effective_cmc': effective_cmc,
@@ -866,6 +950,7 @@ def _compute_alt_costs(engine, game: GameState, player: Player, card: Card,
         'pay_mana': pay_mana,
         'free_cast_source': free_cast_source,
         'total_alt_reduction': total_alt_reduction,
+        'cost_increase': cost_increase,
     }
 
 
@@ -887,6 +972,7 @@ def _pay_costs(engine, game: GameState, player: Player, card: Card,
     total_cost = costs['total_cost']
     x_value_chosen = costs['x_value_chosen']
     total_alt_reduction = costs['total_alt_reduction']
+    cost_increase = costs.get('cost_increase', 0)
     pay_mana = costs['pay_mana']
 
     # Pay mana cost — use color-aware tapping when mana engine is available
@@ -900,13 +986,14 @@ def _pay_costs(engine, game: GameState, player: Player, card: Card,
             # to reduce the parsed generic requirement from the mana cost string.
             tapped_ok = player.tap_sources_for_cost(
                 effective_mana_cost,
-                additional_generic=additional_cost - total_alt_reduction,
+                additional_generic=additional_cost + cost_increase - total_alt_reduction,
                 x_value=x_value_chosen,
                 pay_phyrexian_with_life=has_phyrexian,
+                game=game,
             )
         else:
             # Fallback: amount-based tapping (no color awareness)
-            tapped_ok = player.tap_lands_for_mana(max(0, total_cost - total_alt_reduction))
+            tapped_ok = player.tap_lands_for_mana(max(0, total_cost - total_alt_reduction), game=game)
         if not tapped_ok:
             tax_note = f" + {additional_cost} commander tax" if additional_cost > 0 else ""
             cast_name = card.adventure_name if getattr(card, 'cast_as_adventure', False) else card.name
@@ -914,6 +1001,14 @@ def _pay_costs(engine, game: GameState, player: Player, card: Card,
         # Track mana paid for X spell calculations
         card._mana_paid = total_cost
     return None
+
+
+# Absolute ceiling on LIFO-rescue cycles after the extension cap is hit. The
+# rescue loop spends the first `_rescue_min_cycles` unconditionally, then only
+# keeps going while the stack above is demonstrably moving (see the July 26
+# comment in `_await_stack_window`). This cap is what preserves the
+# anti-deadlock guarantee — it must stay finite.
+_MAX_LIFO_RESCUE_CYCLES = 12
 
 
 def _force_stack_above(engine, game: GameState, stack_entry,
@@ -1000,6 +1095,36 @@ def _force_stack_above(engine, game: GameState, stack_entry,
             acted = True
             break
     return acted
+
+
+def _entries_above(game: GameState, stack_entry) -> int:
+    """How many stack entries sit ABOVE `stack_entry` (0 == we are on top).
+
+    Returns -1 when the entry has already left the stack, which callers treat
+    as "nothing left to wait for".
+    """
+    try:
+        return len(game.stack) - game.stack.index(stack_entry) - 1
+    except ValueError:
+        return -1
+
+
+def _awake_spell_above(game: GameState, stack_entry) -> bool:
+    """True if a SPELL above us already has its resolution_event set.
+
+    An already-set event means that spell's own coroutine owns the pop and is
+    on its way to resolving — `_force_stack_above` has nothing left to do for
+    it, but we are NOT deadlocked, just slower than our rescue budget. The
+    caller uses this to keep waiting instead of resolving out of LIFO order.
+    """
+    idx = game.stack.index(stack_entry) if stack_entry in game.stack else -1
+    if idx < 0:
+        return False
+    for i in range(len(game.stack) - 1, idx, -1):
+        ev = getattr(game.stack[i], 'resolution_event', None)
+        if ev is not None and ev.is_set():
+            return True
+    return False
 
 
 async def _await_stack_window(engine, game: GameState, player: Player,
@@ -1257,12 +1382,30 @@ async def _await_stack_window(engine, game: GameState, player: Player,
                         # true-deadlock last resort.
                         print(f"[STACK] LIFO extension cap ({max_lifo_extensions}) hit for {card.name}; "
                               f"forcing the stack above to act first (CR 608)")
-                        for _rescue in range(3):
+                        # July 26 batch-7 audit: a FIXED 3-cycle budget gave up
+                        # while the stack above was still actively resolving,
+                        # and we then resolved out of LIFO order anyway — in
+                        # game_1530441479389184000 Worldly Tutor resolved
+                        # beneath the Pact of Negation that targeted it (5 of 7
+                        # cap-hits batch-wide ended "rescue exhausted"). A spell
+                        # above whose resolution_event is ALREADY SET is not a
+                        # deadlock: its own coroutine owns the pop and is merely
+                        # slower than our budget, so _force_stack_above has
+                        # nothing left to do for it and every extra cycle we
+                        # spend is cycles it needs. Keep going while we can see
+                        # PROGRESS (the stack above is shrinking) or an awake
+                        # spell above; the absolute cap preserves the original
+                        # anti-deadlock guarantee.
+                        _rescue_min_cycles = 3
+                        _rescue_used = 0
+                        _prev_above = _entries_above(game, stack_entry)
+                        while _rescue_used < _MAX_LIFO_RESCUE_CYCLES:
                             if (stack_entry.countered
                                     or not game.stack
                                     or game.stack[-1] is stack_entry
                                     or stack_entry not in game.stack):
                                 break
+                            _rescue_used += 1
                             _force_stack_above(engine, game, stack_entry,
                                                effect_messages)
                             try:
@@ -1271,11 +1414,24 @@ async def _await_stack_window(engine, game: GameState, player: Player,
                                     timeout=min(resolution_timeout, 3.0))
                                 break
                             except asyncio.TimeoutError:
-                                continue
+                                pass
+                            _above = _entries_above(game, stack_entry)
+                            _progress = 0 <= _above < _prev_above
+                            _prev_above = _above
+                            # Past the base budget, only keep spending cycles
+                            # while something above is demonstrably moving.
+                            if (_rescue_used >= _rescue_min_cycles
+                                    and not _progress
+                                    and not _awake_spell_above(game, stack_entry)):
+                                print(f"[STACK-LIFO-FORCE] no progress above "
+                                      f"{card.name} after {_rescue_used} rescue "
+                                      f"cycle(s) — stack above looks stuck")
+                                break
                         if (not stack_entry.countered and game.stack
                                 and stack_entry in game.stack
                                 and game.stack[-1] is not stack_entry):
-                            print(f"[STACK] LIFO rescue exhausted for {card.name}; "
+                            print(f"[STACK] LIFO rescue exhausted for {card.name} "
+                                  f"after {_rescue_used} cycle(s); "
                                   f"resolving anyway to prevent deadlock")
                     if stack_entry in game.stack and stack_entry is game.stack[-1]:
                         game.stack.remove(stack_entry)
@@ -1526,8 +1682,15 @@ async def _dispatch_resolution(engine, game: GameState, player: Player,
                 _at = _at[:497].rstrip() + '…'
             adv_msgs = [f"🧙 **{card.adventure_name}** resolves — {_at}"]
         effect_messages.extend(adv_msgs)
-        # Adventure cards go to exile after the adventure resolves
+        # Adventure cards go to exile after the adventure resolves, and CR 715.3
+        # lets the owner cast the CREATURE half from exile for as long as it
+        # stays there. Nothing marked it castable, and every exile-cast gate
+        # tests membership of `playable_from_exile`, so the creature half — the
+        # entire point of the mechanic and of the adventure test deck — could
+        # never be cast. Deliberately NOT reusing playable_from_exile: end_turn
+        # clears that list every turn, while adventure castability persists.
         player.exile.append(card)
+        card._adventure_exiled = True
         card.cast_as_adventure = False  # Reset flag
         engine.rules.log_event(f"{player.name} casts {card.adventure_name} (adventure of {card.name})")
         return True, f"Cast {card.adventure_name}", effect_messages
