@@ -1826,10 +1826,41 @@ class GameEngine:
             print(f"[CLEANUP] Clearing {len(game.pending_resolves)} stale pending resolves")
             game.pending_resolves = []
 
-        # Clear stale stack items — lingering items block sorcery-speed spells next turn
+        # Clear stale stack items — lingering items block sorcery-speed spells next turn.
+        # July 31 batch-10 audit: the blind clear() swept LIVE spells whose
+        # coroutines were still mid-choreography (cast-trigger window waits,
+        # response asks) — Mystic Snake / Heroic Intervention / Dissipate /
+        # Trickbind were all legally cast and paid for, got swept at the turn
+        # boundary, and the [STACK-ENTRY-VANISHED] net routed them to the
+        # graveyard as "countered" without resolving (game_1532415558488821913).
+        # A live entry's coroutine is bounded (window waits ≤20, LIFO
+        # extensions ≤5, rescue ≤12), so preserving it across ONE boundary
+        # lets the existing LIFO machinery resolve it next turn. An entry that
+        # survives a SECOND cleanup is a leak (its coroutine died) and gets
+        # swept — the case this cleanup was originally built for. Swept
+        # entries now also leave the priority mirror (the blind clear never
+        # did that, quietly recreating the May 19 phantom-desync class).
         if game.stack:
-            print(f"[CLEANUP] Clearing {len(game.stack)} stale stack items at end of turn")
-            game.stack.clear()
+            _survivors, _swept = [], []
+            for _entry in game.stack:
+                _ev = getattr(_entry, 'resolution_event', None)
+                _live = _ev is not None and not _ev.is_set()
+                if _live and getattr(_entry, 'cleanup_survivals', 0) == 0:
+                    _entry.cleanup_survivals = 1
+                    _survivors.append(_entry)
+                else:
+                    _swept.append(_entry)
+            if _swept:
+                print(f"[CLEANUP] Clearing {len(_swept)} stale stack items at end of turn")
+                _ps = getattr(game, '_priority_system', None)
+                if _ps is not None:
+                    for _entry in _swept:
+                        if getattr(_entry, 'priority_id', None):
+                            _ps.remove_stack_entry_by_priority_id(_entry.priority_id)
+            if _survivors:
+                print(f"[CLEANUP] Preserving {len(_survivors)} live stack entries across "
+                      f"the turn boundary — their coroutines are still resolving")
+            game.stack[:] = _survivors
 
         # Clear death watchers (Searing Blood, etc.) — only valid for the turn registered
         if hasattr(game, '_death_watchers'):
@@ -2421,14 +2452,10 @@ class GameEngine:
         return _resolve_suspend_spell(self, game, player, card, opponent)
     def end_turn(self, game: GameState) -> List[str]:
         """End the current turn and start the next. Returns end-step messages (e.g. discard prompts)."""
-        # (Slices 2c + 3c, July 24: both parity recorders retired — clean
-        # post-flip batches at [EVENT-PARITY]=0 and [EVENT-PARITY-DIES]=0.)
-        # Slice 5a (July 30): COMBAT_DAMAGE_DEALT shadow parity report.
-        try:
-            from mtg.triggers import report_combat_damage_parity
-            report_combat_damage_parity(game)
-        except ImportError:
-            pass
+        # (Slices 2c + 3c, July 24; slice 5b, July 31: all parity recorders
+        # retired after clean post-flip batches — [EVENT-PARITY],
+        # [EVENT-PARITY-DIES], and [EVENT-PARITY-CDD] are stale-code
+        # tripwires now.)
 
         # [TRANSFORM] Save spell count for day/night and werewolf transform tracking
         game.active_player.spells_cast_prev_turn = game.active_player.spells_cast_this_turn
@@ -2969,6 +2996,24 @@ class GameEngine:
                 print(f"[PLAN-STALE] '{card_name}' not in hand — prior plan action likely moved it. Available: {', '.join(hand_names[:10])}")
                 return None
 
+        elif action_type == "cycle":
+            # July 31 batch-10 audit: the legal-actions provider advertises
+            # {"type": "cycle", "card": X} entries (mtg/legal_actions.py:296)
+            # but neither executor dispatched the type. Same routing as the
+            # activate→cycle path below; the interpreter handler is defensive
+            # (returns None on missing player/card/cycling text).
+            _cyc_name = action.get("card") or action.get("name")
+            if not _cyc_name:
+                print(f"[ACTIVATE-CLAUDE] cycle action missing card name: {action}")
+                return None
+            print(f"[ACTIVATE-CLAUDE] Dispatching cycle for {_cyc_name}")
+            return self.rules._execute_action_on_state(game, {
+                "action": "cycle",
+                "player": player.name,
+                "card": _cyc_name,
+                "x": action.get("X") or action.get("x") or 0,
+            })
+
         elif action_type == "suspend":
             # July 30 (batch-9 reviewer R2): suspend initiation. Rather than
             # cast from hand, pay the suspend cost and exile with N time
@@ -3345,12 +3390,37 @@ class GameEngine:
                                   f"{cost_str} → {_new_cost or '{0}'} (reducers on battlefield)")
                             cost_str = _new_cost
                 mana_cost = _activation_mana_cost(cost_str)
+                # July 31 batch-10 reviewer (CR 118.9): {X} activation costs
+                # were always paid at X=0 (tap_sources_for_cost defaults
+                # x_value=0) while the Tier-3 escalation below sent the raw
+                # "X" text — the judge then INVENTED its own X. Pernicious
+                # Deed wiped 7 permanents as if X≈3 having paid X=0
+                # (game_1532415549039050783); Polukranos went monstrous for 0
+                # with 3 mana up. Auto-maximize X the same way the manual
+                # !activate path has since cog.py:2160 (available minus the
+                # non-X part, capped at 20) and remember it so the Tier-3
+                # description substitutes the REAL number — cost and effect
+                # use one X, chosen when the ability is activated.
+                _activation_x = None
+                if mana_cost and '{X}' in mana_cost:
+                    _total_avail = (sum(player.mana_pool.values())
+                                    + len(player.untapped_lands()))
+                    _non_x = sum(1 for s in re.findall(r'\{([^}]+)\}', mana_cost)
+                                 if s not in ('X', 'T', 'Q'))
+                    _x_symbol_count = mana_cost.count('{X}')
+                    _activation_x = max(
+                        0, (_total_avail - _non_x) // max(1, _x_symbol_count))
+                    _activation_x = min(_activation_x, 20)
+                    print(f"[ACTIVATE-CLAUDE] Auto-sizing X={_activation_x} "
+                          f"for {perm.name} ({mana_cost})")
                 if mana_cost:
                     # June 11 live retest: equip used an amount-only loop that
                     # ignored colored requirements and multi-mana rocks. Route
                     # activation payment through the same color-aware engine as
                     # spell casting instead.
-                    if not player.tap_sources_for_cost(mana_cost, game=game):
+                    if not player.tap_sources_for_cost(
+                            mana_cost, game=game,
+                            x_value=_activation_x or 0):
                         print(f"[ACTIVATE-CLAUDE] {perm.name}: can't pay {mana_cost}")
                         game._last_activation_failure = (
                             game.turn_number, perm.name,
@@ -4027,6 +4097,13 @@ class GameEngine:
                 # state corruption. Inline imperative parsers first (free),
                 # then Tier-3 escalation; the announce remains as last resort.
                 effect_text2 = ability['effect'] or ''
+                # July 31 batch-10 (CR 118.9, second half): substitute the X
+                # actually PAID into the effect text before the inline parsers
+                # and the Tier-3 description see it — same convention as the
+                # manual path (cog.py's re.sub at ~2346). Without this the
+                # judge invents its own X (Pernicious Deed: paid 0, wiped at 3).
+                if _activation_x is not None:
+                    effect_text2 = re.sub(r'\bX\b', str(_activation_x), effect_text2)
                 effect_lower2 = effect_text2.lower()
                 inline_msgs = []
 
@@ -4203,12 +4280,23 @@ class GameEngine:
                                      f"{sacrificed_cost_card.name}, power {sac_power_snapshot})")
                     t3_msgs, t3_actions = await self.rules.resolve_effect(
                         game, _t3_desc, source_card=perm.name, controller=player.name)
-                    if t3_msgs or t3_actions:
+                    # July 31 batch-10 reviewer: gate on ACTIONS, not messages.
+                    # With zero actions, t3_msgs is the judge's raw prose
+                    # ("Assuming X = 0 for safety, ...") and posting it is the
+                    # exact leak class autoplay.py and spells.py already
+                    # suppress ([RESOLVE-PROSE-DROPPED]); this call site was
+                    # never brought in line (game_1532415549039050783,
+                    # Polukranos monstrosity prose in Discord).
+                    if t3_actions:
                         print(f"[ACTIVATE-CLAUDE-TIER3] {perm.name}: resolved via judge "
-                              f"({len(t3_actions or [])} action(s))")
+                              f"({len(t3_actions)} action(s))")
                         _body = t3_msgs or [f"{player.name} activates {perm.name}"]
                         return "\n".join(cost_msgs + _body)
-                    print(f"[ACTIVATE-CLAUDE-TIER3] {perm.name}: judge returned no actions — falling to announce")
+                    if t3_msgs:
+                        print(f"[ACTIVATE-CLAUDE-TIER3] {perm.name}: no actions — "
+                              f"prose kept on console only: {t3_msgs[0][:160]}")
+                    else:
+                        print(f"[ACTIVATE-CLAUDE-TIER3] {perm.name}: judge returned no actions — falling to announce")
                 except Exception as e:
                     print(f"[ACTIVATE-CLAUDE-TIER3] resolve_effect failed for {perm.name}: {e}")
                     from mtg.util import maybe_reraise

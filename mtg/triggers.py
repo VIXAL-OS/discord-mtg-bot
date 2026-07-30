@@ -788,6 +788,22 @@ def _spell_matches_cast_trigger(engine, sentence_lower: str, card: Card,
             if getattr(caster, 'spells_cast_this_turn', 0) > 1:
                 return False
 
+    # --- "casts a spell from a graveyard" (Ash Zealot) ---
+    # July 31 batch-10 reviewer (oathbreaker mirror): this branch was MISSING,
+    # so Ash Zealot's "Whenever a player casts a spell from a graveyard" fell
+    # through to the unconditional return True and fired 3 damage on every
+    # ordinary hand cast — five times in game_1532409452295360512, deciding
+    # the winner (Claude died at 0 instead of surviving at 6). The signal has
+    # existed on the Card since July 29 (_cast_from_graveyard, set in
+    # _validate_cast); the matcher just never read it. Scoped to the
+    # CONDITION clause (before the first comma) so a trigger whose EFFECT
+    # half mentions a graveyard ("…, return target card from your
+    # graveyard") isn't wrongly gated.
+    _cond_clause = sentence_lower.split(',', 1)[0]
+    if re.search(r'from (?:a|your|their) graveyard', _cond_clause):
+        if not getattr(card, '_cast_from_graveyard', False):
+            return False
+
     # --- "no mana was spent" / "without paying" (Roiling Vortex) ---
     if 'no mana was spent' in sentence_lower or 'without paying' in sentence_lower:
         mana_paid = getattr(card, '_mana_paid', None)
@@ -832,7 +848,14 @@ def queue_unhandled_combat_damage(game: GameState, attacker: Card,
     sibling scans queue their unhandled tails (queue_unhandled_dies, the July 24
     sync cast bridge); this one now does too.
     """
-    oracle = (getattr(attacker, 'oracle_text', '') or '')
+    # July 31 batch-10 audit: extract from activated-ability-stripped text so
+    # a quoted grant inside an activated line (Ascendant Spirit) can never be
+    # queued as the trigger sentence — the detection in mtg/combat.py strips
+    # too, but a card with BOTH a real combat trigger and such a line should
+    # extract the real one.
+    from rules.effect_templates import strip_activated_ability_lines
+    oracle = strip_activated_ability_lines(
+        getattr(attacker, 'oracle_text', '') or '')
     # July 30 batch-9 audit: split on newlines too — a keyword line ends with
     # a newline, not a period, so the old period-only split glued "Flying,
     # trample" onto the front of every extracted trigger sentence.
@@ -1010,6 +1033,18 @@ async def _check_cast_triggers(engine, game: GameState, caster: Player, card: Ca
             for _part in _line.split(','):
                 if _part.strip().strip('.').strip() == 'cascade':
                     _cascade_count += 1
+    # July 31 batch-10: Yidris, Maelstrom Wielder's grant — "as you cast
+    # spells from your hand this turn, they gain cascade". Recorded by the
+    # grant_hand_cascade action when his combat-damage template resolves;
+    # hand casts only (graveyard/escape and cascade free-casts excluded —
+    # the grant's own printed scope plus the no-self-recursion guard).
+    if (_cascade_count == 0
+            and game._hand_cascade_grants.get(caster.name) == game.turn_number
+            and not getattr(card, '_cast_from_graveyard', False)
+            and not getattr(card, '_from_cascade', False)):
+        _cascade_count = 1
+        print(f"[CASCADE-GRANT] {card.name} gains cascade (Yidris grant, "
+              f"hand cast this turn)")
     if _cascade_count > 0 and not getattr(card, '_cascade_done', False):
         card._cascade_done = True  # Prevent re-entry if _check_cast_triggers called multiple times
         # Apex Devastator: "Cascade, cascade, cascade, cascade" = 4 cascades
@@ -1286,6 +1321,18 @@ async def _check_cast_triggers(engine, game: GameState, caster: Player, card: Ca
         # trigger (Monastery Mentor's token half) still match.
         bf_oracle_scan = re.sub(r'\([^)]*\)', '', bf_oracle)
         bf_oracle_lower = bf_oracle_scan.lower()
+        # July 31 batch-10 reviewer: Extort's ENTIRE trigger condition lives
+        # inside its reminder text ("Extort (Whenever you cast a spell, you
+        # may pay {W/B}...)") — there is no un-parenthesized printing. The
+        # July 22 strip above (a Prowess fix) therefore silently killed the
+        # whole keyword: Crypt Ghast and Blind Obedience never extorted
+        # across three qualifying casts in game_1532415549039050783, a
+        # regression from a June 10 fix that had made extort work. For
+        # extort-bearing cards, scan the RAW oracle — the reminder text IS
+        # the ability, which the Tier-1.5 \bextort\b pattern then resolves.
+        if re.search(r'(?:^|\n)\s*extort\b', bf_oracle, flags=re.IGNORECASE):
+            bf_oracle_scan = bf_oracle
+            bf_oracle_lower = bf_oracle.lower()
         if 'whenever you cast' in bf_oracle_lower or 'whenever a player casts' in bf_oracle_lower:
             # Check if this trigger matches the spell type
             for sentence in bf_oracle_scan.split('.'):
@@ -3078,7 +3125,15 @@ def _check_attack_triggers_sync(engine, game: GameState, attacker_card: Card, at
             continue  # Phased-out permanents don't trigger
         if not card.oracle_text:
             continue
-        oracle_lower = card.oracle_text.lower()
+        # July 31 batch-10 audit: strip activated-ability lines first — Jaya,
+        # Fiery Negotiator's "−2: … Whenever you attack this turn, …" is a
+        # LOYALTY ability, and this scan matched its quoted text as a
+        # battlefield attack watcher on every combat (16 queued, all Tier-3
+        # refused, batch 15324). Loyalty heads ("−2") are activated abilities
+        # per CR 606; the strip helper drops those lines. Same class as the
+        # Ascendant Spirit combat-damage-scan fix.
+        from rules.effect_templates import strip_activated_ability_lines
+        oracle_lower = strip_activated_ability_lines(card.oracle_text).lower()
         # June 10 deep-dive (Karlach): the bare "attacks" pre-filter made the
         # "whenever you attack" branch below UNREACHABLE — Karlach, Fury of
         # Avernus's oracle says "Whenever you attack, …" (contains "attack,"
@@ -3502,8 +3557,17 @@ def _check_upkeep_triggers_sync(engine, game: GameState) -> Tuple[List[str], Lis
                                         messages.append(msg)
                                 except Exception as e:
                                     print(f"[UPKEEP-TEMPLATE] Action failed for {card.name}: {e}")
-                            if actions:
+                            # July 31 batch-10 reviewer: the May 7 label fix
+                            # ("Resolved" only when a real action ran) never
+                            # reached this Phase-2 (non-active-player) scan —
+                            # an all-no_action list is truthy, so Lambholt
+                            # Pacifist's static stub printed "Resolved" on
+                            # every OPPONENT upkeep while the active-player
+                            # scan correctly said "Conditional not met".
+                            if any(a.get("action") != "no_action" for a in actions):
                                 print(f"[UPKEEP-TEMPLATE] Resolved {card.name}: {explanation}")
+                            elif actions:
+                                print(f"[UPKEEP-TEMPLATE] Conditional not met for {card.name}: {explanation}")
                             else:
                                 print(f"[UPKEEP-TEMPLATE] {card.name}: silent no-op")
                             continue  # Handled
@@ -4893,44 +4957,40 @@ events.subscribe(events.CREATURE_DIED, _accumulate_death_subscriber)
 
 
 # ---------------------------------------------------------------------------
-# Pub/sub slice 5a (July 30, 2026 — SHADOW): COMBAT_DAMAGE_DEALT recorder.
-# The two funnels in mtg/combat.py emit once per damage APPLICATION; the
-# attacker loop's game._combat_damage_to_player appends (what the
-# [COMBAT-TRIGGER] dispatch consumes) are mirrored into _cdd_consumer_seen.
-# report_combat_damage_parity diffs the two multisets from end_turn:
-#   - an EMISSION with no consumer append = a damage path whose
-#     combat-damage triggers silently never fire (first-strike-step connects
-#     are the prime suspect), and
-#   - an APPEND with no emission = a path bypassing the replacement/poison
-#     funnel entirely.
-# One clean batch gates slice 5b (flipping consumers onto the bus: the
-# Obliterator class, battlefield-wide Ohran/Tovolar watchers).
+# Pub/sub slice 5b (July 31, 2026): COMBAT_DAMAGE_DEALT is BUS-FED into the
+# combat-damage trigger queues. The subscriber below is the SOLE sanctioned
+# appender for game._combat_damage_to_player and ._combat_damage_to_creature
+# (the slice-3b pattern): it only ACCUMULATES — the drain in
+# mtg/combat.py's resolve_combat_damage keeps the batch semantics (per-step
+# waves and the `not game.ended` gate, CR 104.2a). Player-kind entries feed
+# the battlefield-watcher + attacker self-trigger dispatch; creature-kind
+# entries feed the damaged-creature scan (Phyrexian Obliterator class).
+# The 5a parity recorder was retired at this flip — its gate cleared at
+# ZERO mismatches over 134 FS-step combats and 2,496 player-damage events
+# (batch 15324). [EVENT-PARITY-CDD] is now a stale-code tripwire like its
+# 2c/3c/4b siblings.
 # ---------------------------------------------------------------------------
 
-def _cdd_shadow_recorder(game, source=None, target=None, amount=0,
-                         target_kind="", **_payload):
-    """Record player-kind COMBAT_DAMAGE_DEALT emissions for the parity diff."""
-    if target_kind != "player":
-        return  # creature-side emissions have no legacy consumer to diff yet
-    game._cdd_bus_seen.append(
-        (getattr(source, 'id', getattr(source, 'name', '?')),
-         getattr(target, 'name', '?'), amount))
+def _accumulate_combat_damage_subscriber(game, source=None, target=None,
+                                         amount=0, target_kind="", **_payload):
+    """Accumulate combat-damage events for the resolve_combat_damage drain."""
+    if amount <= 0 or source is None:
+        return
+    if target_kind == "player":
+        src_owner = next(
+            (p for p in game.players
+             if any(c.id == getattr(source, 'id', None)
+                    for c in p.battlefield)),
+            None)
+        if src_owner is None:
+            # Dealer already left the battlefield (FS trades). In 2-player
+            # combat the dealer's controller is the non-target player.
+            src_owner = next((p for p in game.players if p is not target), None)
+        if src_owner is None:
+            return
+        game._combat_damage_to_player.append((source, src_owner, amount))
+    elif target_kind == "creature":
+        game._combat_damage_to_creature.append((source, target, amount))
 
 
-def report_combat_damage_parity(game) -> None:
-    """Print [EVENT-PARITY-CDD] for every mismatch, then clear both records."""
-    from collections import Counter
-    bus = Counter(game._cdd_bus_seen)
-    consumed = Counter(game._cdd_consumer_seen)
-    for key, n in (bus - consumed).items():
-        print(f"[EVENT-PARITY-CDD] emitted but never reached the "
-              f"combat-trigger list (×{n}): source_id={key[0]} "
-              f"player={key[1]} amount={key[2]}")
-    for key, n in (consumed - bus).items():
-        print(f"[EVENT-PARITY-CDD] consumer append with NO bus emission "
-              f"(×{n}): source_id={key[0]} player={key[1]} amount={key[2]}")
-    game._cdd_bus_seen = []
-    game._cdd_consumer_seen = []
-
-
-events.subscribe(events.COMBAT_DAMAGE_DEALT, _cdd_shadow_recorder)
+events.subscribe(events.COMBAT_DAMAGE_DEALT, _accumulate_combat_damage_subscriber)

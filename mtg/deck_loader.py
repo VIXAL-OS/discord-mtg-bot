@@ -18,6 +18,32 @@ from typing import Dict, List, Optional, Tuple
 import aiohttp
 
 from mtg.constants import MDFC_PATHWAYS
+
+
+def _front_face_keywords(scryfall_data: dict) -> list:
+    """Filter Scryfall's aggregate `keywords` down to the FRONT face's own.
+
+    July 31 batch-10 reviewer (CR 712.1): Scryfall's top-level keywords field
+    is the UNION across card faces, so an un-transformed Sage of Ancient Lore
+    carried its back face's Vigilance and Trample all game
+    (game_1532409540866212023 — it attacked "(vigilance)" and got trample
+    math on its front face). Card.transform() already re-parses keywords
+    from the active face's oracle on every flip; this patches the INITIAL
+    load only. Gated to true double-faced layouts — split/adventure faces
+    share one physical face, so their aggregate genuinely belongs to the
+    object. Cache entries with no layout field pass through unchanged.
+    """
+    kws = scryfall_data.get("keywords", []) or []
+    faces = scryfall_data.get("card_faces") or []
+    if len(faces) < 2 or not kws:
+        return kws
+    if (scryfall_data.get("layout") or "").lower() not in (
+            "transform", "modal_dfc"):
+        return kws
+    front_oracle = (faces[0].get("oracle_text") or "").lower()
+    return [k for k in kws if k.lower() in front_oracle]
+
+
 from mtg.models import Card
 
 
@@ -127,7 +153,7 @@ class DeckLoader:
                     power=scryfall_data.get("power"),
                     toughness=scryfall_data.get("toughness"),
                     loyalty=scryfall_data.get("loyalty"),
-                    keywords=scryfall_data.get("keywords", []),
+                    keywords=_front_face_keywords(scryfall_data),
                     # MDFC / transform / split fix: Scryfall's `color_identity`
                     # is the union across all card faces (CR 903.4 — for
                     # commander legality, color identity is computed from
@@ -184,8 +210,10 @@ class DeckLoader:
         for card_entry in json_data.get("cards", []):
             card_name = card_entry.get("name", "Unknown")
             quantity = card_entry.get("quantity", 1)
-            
+
             scryfall_data = await self.fetch_card_data(card_name)
+            # (front-face keyword filter applied at every construction site
+            # below via _front_face_keywords — see its docstring)
             
             for _ in range(quantity):
                 card = Card(
@@ -196,7 +224,7 @@ class DeckLoader:
                     power=scryfall_data.get("power"),
                     toughness=scryfall_data.get("toughness"),
                     loyalty=scryfall_data.get("loyalty"),
-                    keywords=scryfall_data.get("keywords", []),
+                    keywords=_front_face_keywords(scryfall_data),
                     # MDFC / transform / split fix: Scryfall's `color_identity`
                     # is the union across all card faces (CR 903.4 — for
                     # commander legality, color identity is computed from
@@ -238,7 +266,7 @@ class DeckLoader:
                     power=scryfall_data.get("power"),
                     toughness=scryfall_data.get("toughness"),
                     loyalty=scryfall_data.get("loyalty"),
-                    keywords=scryfall_data.get("keywords", []),
+                    keywords=_front_face_keywords(scryfall_data),
                 )
                 self._extract_adventure_data(commander, scryfall_data)
                 self._extract_split_data(commander, scryfall_data)
@@ -261,7 +289,7 @@ class DeckLoader:
                     power=scryfall_data.get("power"),
                     toughness=scryfall_data.get("toughness"),
                     loyalty=scryfall_data.get("loyalty"),
-                    keywords=scryfall_data.get("keywords", []),
+                    keywords=_front_face_keywords(scryfall_data),
                 )
                 self._extract_adventure_data(signature_spell, scryfall_data)
                 self._extract_split_data(signature_spell, scryfall_data)
@@ -312,7 +340,7 @@ class DeckLoader:
                     power=scryfall_data.get("power"),
                     toughness=scryfall_data.get("toughness"),
                     loyalty=scryfall_data.get("loyalty"),
-                    keywords=scryfall_data.get("keywords", []),
+                    keywords=_front_face_keywords(scryfall_data),
                     # MDFC / transform / split fix: Scryfall's `color_identity`
                     # is the union across all card faces (CR 903.4 — for
                     # commander legality, color identity is computed from

@@ -1396,15 +1396,19 @@ _NAMED_CARD_REPLACEMENTS = {
             source_id=card_id,
             controller=controller,
             replaces_event=EventType.DAMAGE,
-            # Double only damage from YOUR sources dealt to opponents /
-            # opponent-controlled permanents. Requires source_controller to
-            # be set (fail-safe: if unknown, don't fire — prevents false
-            # positives on malformed events).
+            # July 31 batch-10 reviewer: the source_controller == controller
+            # gate was CR-wrong — Gisela's clause 1 reads "If a SOURCE would
+            # deal damage to an opponent...", no "you control" qualifier. The
+            # gate also silently excluded every off-battlefield source: the
+            # source-controller lookup scans battlefields, so a resolved
+            # instant (Lightning Helix, game_1532415537986928832) resolved to
+            # "" and the doubling never fired for spell damage. Same Apr-2026
+            # house-rule class the May 30 audit removed from Furnace of Rath.
+            # The halve twin below never had a source gate — this now matches.
             condition=lambda e, _ctrl=controller: (
-                bool(e.source_controller) and e.source_controller == _ctrl
-                and (e.affected_player or "") and e.affected_player != _ctrl
+                bool(e.affected_player) and e.affected_player != _ctrl
             ),
-            condition_text="damage from your sources to opponents is doubled",
+            condition_text="damage dealt to opponents is doubled",
             replacement_type="double_damage_opp",
             multiply_amount=2.0,
         ),
@@ -1517,6 +1521,18 @@ def scan_oracle_for_replacements(
 
     # Fall back to generic oracle text patterns (need oracle text for regex)
     if not oracle_text:
+        return []
+    # July 31 batch-10 reviewer: strip activated-ability lines before the
+    # generic pattern loop. Roiling Vortex's "{R}: Your opponents can't gain
+    # life this turn." is a COSTED, turn-scoped activated ability, but the
+    # raw-blob search matched its text and registered a permanent, unpaid,
+    # non-expiring can't-gain-life replacement at ETB
+    # (game_1532409452295360512). Same Glen Elendra class the July 21 audit
+    # fixed in effect_templates.py — this is the sibling subsystem that
+    # never got the guard. Named templates above are unaffected.
+    from rules.effect_templates import strip_activated_ability_lines
+    oracle_text = strip_activated_ability_lines(oracle_text)
+    if not oracle_text.strip():
         return []
     results = []
     oracle_lower = oracle_text.lower()

@@ -115,6 +115,35 @@ except ImportError:
     create_deepseek_reasoner_adapter = None
 
 
+async def _await_stack_quiescence(game: GameState, timeout: float = 12.0) -> None:
+    """Give live stack coroutines time to finish before end_turn's cleanup.
+
+    July 31 batch-10 audit: the turn loop reached end_turn while response
+    choreography (cast-trigger priority windows, response asks) was still in
+    flight, and the end-of-turn stale-stack sweep destroyed legally-cast
+    spells (Heroic Intervention was at window-wait 9/20 when the turn ended
+    under it — game_1532415558488821913). Every waiting coroutine is bounded
+    (window waits ≤20, LIFO extensions ≤5, rescue ≤12), so a short drain here
+    lets the stack empty during the end step — approximating CR 500.2's
+    "a phase ends only when the stack is empty" — instead of carrying live
+    entries across the turn boundary via the cleanup's preserve path.
+    """
+    deadline = time.monotonic() + timeout
+    waited = False
+    while time.monotonic() < deadline:
+        live = [e for e in game.stack
+                if getattr(e, 'resolution_event', None) is not None
+                and not e.resolution_event.is_set()]
+        if not live:
+            break
+        waited = True
+        await asyncio.sleep(0.25)
+    if waited:
+        leftover = len(game.stack)
+        print(f"[STACK-DRAIN] Waited for live stack entries before end of turn "
+              f"({'fully drained' if leftover == 0 else str(leftover) + ' still pending'})")
+
+
 def _format_blocker_list(names):
     """Collapse repeated blocker names: ['Warrior Token']*5 + ['Scute Swarm']
     becomes "5x Warrior Token + Scute Swarm". Apr 29 audit display fix.
@@ -209,6 +238,7 @@ async def _resolve_combat(cog, ctx, game: GameState):
                 cog.engine.delete_game(game.thread_id)
             else:
                 # End Claude's turn, pass to human
+                await _await_stack_quiescence(game)
                 cog.engine.end_turn(game)
                 _, _p1 = cog.engine.advance_phase(game)  # UNTAP → UPKEEP
                 _, _p2 = cog.engine.advance_phase(game)  # UPKEEP → DRAW (upkeep triggers here)
@@ -1483,6 +1513,25 @@ async def _autoplay_execute_action(cog, thread, game: GameState, player_idx: int
             # failures ("unknown reason — mana looks sufficient" retry storms).
             if msg:
                 game._last_cast_failure = (game.turn_number, card.name, msg)
+
+    elif action_type == "cycle":
+        # July 31 batch-10 audit: the legal-actions provider advertises
+        # {"type": "cycle", "card": X} entries (mtg/legal_actions.py:296) but
+        # neither executor dispatched the type — a plan proposing it fell
+        # through to the unknown-action path. Route to the same interpreter
+        # action the mode='cycling' cast path uses (the handler is defensive:
+        # returns None on missing player/card/cycling text).
+        cyc_name = action.get("card") or action.get("name")
+        if not cyc_name:
+            print(f"[AUTOPLAY] cycle action missing card name: {action}")
+            return None
+        print(f"[AUTOPLAY] Dispatching cycle for {cyc_name}")
+        return cog.engine.rules._execute_action_on_state(game, {
+            "action": "cycle",
+            "player": player.name,
+            "card": cyc_name,
+            "x": action.get("X") or action.get("x") or 0,
+        })
 
     elif action_type == "activate":
         perm_name = action.get("permanent")
@@ -2834,6 +2883,7 @@ async def _run_single_autoplay(cog, channel, game_format: str, deck1_name: str, 
                 if game.ended:
                     break
 
+                await _await_stack_quiescence(game)
                 end_msgs = cog.engine.end_turn(game)
                 for msg in end_msgs:
                     await cog._autoplay_send(thread, msg)

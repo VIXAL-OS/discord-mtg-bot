@@ -455,6 +455,38 @@ async def resolve_effect(rules, game: GameState, effect_description: str,
             return ([], [{"action": "pump_all_creatures", "player": controller,
                           "card": source_card, "power": _pp, "toughness": _tt}])
 
+    # July 31 batch-10: two deterministic carve-outs that must run BEFORE the
+    # combat-shape guard below, whose broad regex ("attack|combat damage")
+    # otherwise refuses them. Both were observed silently no-oping in batch
+    # 15324: Spore Frog's activation was refused AFTER its sacrifice cost was
+    # paid (creature gone, fog never applied — twice), and Aetherize's
+    # "Return all attacking creatures" resolve was refused outright. Neither
+    # is a synthetic kill description — they're the cards' real text, and
+    # both compute deterministically from game state.
+    _det_desc = (effect_description or '').lower().strip()
+    if re.match(r'^prevent all combat damage that would be dealt this turn\.?$',
+                _det_desc):
+        print(f"[RESOLVE-FOG] {source_card or 'effect'}: prevent all combat "
+              f"damage this turn — Tier 3 bypassed")
+        return ([], [{"action": "prevent_combat_damage", "scope": "all"}])
+    if re.match(r"^return all attacking creatures to their owner(?:'s|s'|s)? hands?\.?$",
+                _det_desc):
+        _bounce_actions = []
+        for _p in game.players:
+            for _c in list(_p.battlefield):
+                if getattr(_c, 'attacking', False):
+                    _owner_idx = getattr(_c, 'owner_index', -1)
+                    _owner = (game.players[_owner_idx].name
+                              if 0 <= _owner_idx < len(game.players) else _p.name)
+                    _bounce_actions.append({
+                        "action": "move_card", "card": _c.name,
+                        "from_zone": "battlefield", "to_zone": "hand",
+                        "player": _owner})
+        print(f"[RESOLVE-BOUNCE-ATTACKERS] {source_card or 'effect'}: "
+              f"returning {len(_bounce_actions)} attacking creature(s) to hand "
+              f"— Tier 3 bypassed")
+        return ([], _bounce_actions)
+
     if not rules.client:
         return [f"⚠️ Unresolved effect: {effect_description}"], []
 

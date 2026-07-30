@@ -612,6 +612,18 @@ class Card:
         """
         if not mana_cost:
             return 0
+        # July 31 batch-10 reviewer: an ADVENTURE card's Scryfall mana_cost is
+        # the combined "{creature} // {adventure}" string, and parsing both
+        # halves priced Oakhame Ranger at CMC 8 — [PLAN-VALIDATE] rejected it
+        # as unaffordable every turn of game_1532409540866212023 despite 4
+        # real mana. An adventure card's mana value is the CREATURE face's
+        # everywhere (the Adventure's characteristics exist only on the
+        # stack). SPLIT cards deliberately keep the combined parse — CR
+        # 708.4a: off the stack their halves are combined, so MV = sum.
+        # (MDFC combined strings would want the front face too; unobserved,
+        # left alone.)
+        if ' // ' in mana_cost and 'adventure' in (self.type_line or '').lower():
+            mana_cost = mana_cost.split(' // ')[0]
         # Structured parser — handles hybrid generic ({2/W} = CMC 2) correctly
         if HAS_MANA_ENGINE:
             try:
@@ -3384,6 +3396,12 @@ class StackEntry:
     resolution_event: Any = field(default=None, repr=False)
     # Links this StackEntry to the corresponding StackObject.id in PrioritySystem
     priority_id: Optional[str] = None
+    # July 31 batch-10 audit: how many end-of-turn cleanups this entry has
+    # survived. A LIVE entry (unresolved resolution_event — its coroutine is
+    # still choreographing) is preserved across ONE turn boundary so the
+    # stack machinery can finish resolving it; surviving a second cleanup
+    # means the coroutine leaked and the entry is swept as truly stale.
+    cleanup_survivals: int = 0
 
     def to_dict(self) -> Dict:
         return {
@@ -3505,17 +3523,30 @@ class GameState:
     # can say "declined" instead of the misleading "no creature you control".
     # Consumed (and cleared) at the fizzle-message emit in mtg/spells.py.
     _aura_fizzle_note: Any = field(default=None, repr=False, compare=False)
-    # Pub/sub slice 5a (July 30, 2026 — SHADOW): COMBAT_DAMAGE_DEALT parity
-    # scaffolding. _cdd_bus_seen records player-kind bus emissions (the
-    # recorder in mtg/triggers.py); _cdd_consumer_seen records the attacker
-    # loop's _combat_damage_to_player appends. report_combat_damage_parity
-    # diffs + clears both at end_turn ([EVENT-PARITY-CDD]). Removed at 5b
-    # like the 2c/3c recorders.
-    _cdd_bus_seen: list = field(default_factory=list, repr=False, compare=False)
-    _cdd_consumer_seen: list = field(default_factory=list, repr=False, compare=False)
+    # Pub/sub slice 5b (July 31, 2026): the combat-damage trigger queues are
+    # BUS-FED — _accumulate_combat_damage_subscriber (mtg/triggers.py) is the
+    # sole sanctioned appender for both (the slice-3b pattern: subscribers
+    # accumulate, the drain in resolve_combat_damage keeps its batch
+    # semantics and its `not game.ended` gate). Player-kind entries are
+    # (source_card, source_owner, amount); creature-kind entries are
+    # (source_card, damaged_creature, amount) for the damaged-creature scan
+    # (Phyrexian Obliterator class). The 5a parity recorder and its
+    # _cdd_bus_seen/_cdd_consumer_seen scaffolding were retired at the flip.
+    _combat_damage_to_player: list = field(default_factory=list, repr=False, compare=False)
+    _combat_damage_to_creature: list = field(default_factory=list, repr=False, compare=False)
     # Spell Queller bookkeeping: source card name → [(exiled_card, owner_name)]
     # (exile_from_stack records; release_queller_exile drains on LTB).
     _queller_exiles: dict = field(default_factory=dict, repr=False, compare=False)
+    # July 31 batch-10: "exiled with it" linkage for Underworld Sentinel-class
+    # cards. Key f"{source_name_lower}|{controller_name}" → list of exiled
+    # card names. The dies-side generator VERIFIES each name is still in the
+    # owner's exile before emitting a return, so a failed exile self-heals.
+    _linked_exiles: dict = field(default_factory=dict, repr=False, compare=False)
+    # July 31 batch-10: Yidris, Maelstrom Wielder's grant — player name →
+    # turn number on which their hand-cast spells gain cascade (set by the
+    # grant_hand_cascade action; consulted by the cascade block in
+    # mtg/triggers.py). Self-expires on turn mismatch.
+    _hand_cascade_grants: dict = field(default_factory=dict, repr=False, compare=False)
     # Per-turn byte-identical Discord message counts (trigger-burst dedup
     # Layer 3 in _autoplay_send). Reset at turn advance.
     _turn_burst_counts: dict = field(default_factory=dict, repr=False, compare=False)

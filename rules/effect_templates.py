@@ -1757,6 +1757,20 @@ class EffectTemplateLibrary:
                  "source": "Soulherder"},
             ],
         ))
+        # July 31 batch-10: suffix-keyed twin so end-step dispatch finds the
+        # template FIRST via the F25 suffix lookup, immune to any future
+        # bare-key overwrite (a second bare "soulherder" registration at
+        # ~line 2955 shadowed the one above for months — its non-scheduled
+        # description dodged the F25 prefix guard and every end step
+        # escalated to Tier 3, 17 drains in batch 15324).
+        self._add_card("soulherder endstep", EffectTemplate(
+            name="Soulherder",
+            description="At end step, exile target creature you control, return it to battlefield",
+            action_generator=lambda ctrl, opp, ctx: [
+                {"action": "flicker", "player": ctrl, "target": ctx.get('best_own_etb_creature', ''),
+                 "source": "Soulherder"},
+            ],
+        ))
         self._add_card("thassa, deep-dwelling", EffectTemplate(
             name="Thassa, Deep-Dwelling",
             description="At end step, exile target creature you control, return it to battlefield",
@@ -2952,11 +2966,16 @@ class EffectTemplateLibrary:
         ))
 
         # --- END STEP TRIGGERS ---
-        self._add_card("soulherder", EffectTemplate(
-            name="Soulherder",
-            description="End step: exile another creature you control, return to battlefield",
-            action_generator=lambda ctrl, opp, ctx: self._gen_felidar_guardian(ctrl, opp, ctx),
-        ))
+        # (July 31 batch-10: the SECOND bare "soulherder" registration that
+        # lived here was DELETED — _add_card is a plain dict assignment, so it
+        # silently overwrote the guard-compliant template above (line ~1752)
+        # with a description ("End step: ...") that dodges the F25
+        # scheduled-prefix guard. Result: end-step dispatch skipped the
+        # template entirely and escalated to Tier 3 on every end step (17
+        # drains in batch 15324). Same duplicate-key-overwrite class as the
+        # July 30 Ancient Bronze Dragon note below and July 28's dead
+        # _gen_reanimate. The surviving registration is the suffix-keyed
+        # "soulherder endstep" one added alongside the ~1752 site.)
 
 
         # (July 30, 2026: the March-27 "ancient bronze dragon" ETB
@@ -4768,18 +4787,15 @@ class EffectTemplateLibrary:
                          "create an X/X Dinosaur Beast with trample (X = that damage)"),
             action_generator=self._gen_quartzwood_crasher,
         ))
-        self._add_attack_card("ohran frostfang", EffectTemplate(
-            name="Ohran Frostfang",
-            description=("A creature you control dealt combat damage to a "
-                         "player: draw a card (own connect only)"),
-            action_generator=self._gen_combat_damage_draw_one,
-        ))
-        self._add_attack_card("tovolar, dire overlord", EffectTemplate(
-            name="Tovolar, Dire Overlord",
-            description=("A Wolf or Werewolf you control dealt combat damage "
-                         "to a player: draw a card (own connect only)"),
-            action_generator=self._gen_combat_damage_draw_one,
-        ))
+        # (July 31 slice 5b: the "ohran frostfang" AND "tovolar, dire
+        # overlord" own-connect registrations that lived here were DELETED.
+        # The battlefield-watcher loop in mtg/combat.py now handles the whole
+        # "whenever a [qualifier] creature you control deals combat damage to
+        # a player" family generically — Ohran's template was a strict
+        # DUPLICATE of the old name-gated loop (4 draws for 3 attackers,
+        # game_1532415549039050783), and Tovolar's own-connect-only template
+        # both under-covered (other wolves' connects drew nothing) and would
+        # now double-fire against the generalized watcher.)
         self._add_attack_card("neheb, dreadhorde champion", EffectTemplate(
             name="Neheb, Dreadhorde Champion",
             description=("Neheb deals combat damage: discard excess lands, "
@@ -4804,6 +4820,44 @@ class EffectTemplateLibrary:
             description=("Flaxen Intruder deals combat damage to a player: "
                          "may sacrifice it to destroy an artifact or enchantment"),
             action_generator=self._gen_flaxen_intruder,
+        ))
+
+        # --- July 31 batch-10 audit: the batch-15324 refused-trigger tail ---
+        # Same design as the block above: declare-time generators gate on NOT
+        # ctx['damage_dealt'], combat-damage generators on ctx['damage_dealt'],
+        # so the two dispatch paths sharing this registry can never double-fire
+        # a template.
+        self._add_attack_card("predator ooze", EffectTemplate(
+            name="Predator Ooze",
+            description=("Predator Ooze attacks: put a +1/+1 counter on it "
+                         "(its dealt-damage-dies counter trigger is separate "
+                         "and unmodeled here)"),
+            action_generator=self._gen_attack_self_counter,
+        ))
+        self._add_attack_card("bloodmad vampire", EffectTemplate(
+            name="Bloodmad Vampire",
+            description=("Bloodmad Vampire deals combat damage to a player: "
+                         "put a +1/+1 counter on it"),
+            action_generator=self._gen_combat_damage_self_counter,
+        ))
+        self._add_attack_card("underworld sentinel", EffectTemplate(
+            name="Underworld Sentinel",
+            description=("Underworld Sentinel attacks: exile a creature card "
+                         "from your graveyard (linked — returned to the "
+                         "battlefield by its dies trigger)"),
+            action_generator=self._gen_underworld_sentinel_attack,
+        ))
+        self._add_dies_card("underworld sentinel", EffectTemplate(
+            name="Underworld Sentinel",
+            description=("Underworld Sentinel dies: put all cards exiled "
+                         "with it onto the battlefield"),
+            action_generator=self._gen_underworld_sentinel_dies,
+        ))
+        self._add_attack_card("yidris, maelstrom wielder", EffectTemplate(
+            name="Yidris, Maelstrom Wielder",
+            description=("Yidris deals combat damage to a player: spells cast "
+                         "from your hand this turn gain cascade"),
+            action_generator=self._gen_yidris_cascade_grant,
         ))
 
         # --- Felidar Guardian: blink ANOTHER permanent you control (not self) ---
@@ -5407,13 +5461,15 @@ class EffectTemplateLibrary:
         )
 
         # Garruk, Primal Hunter -3: "Draw cards equal to greatest power among creatures you control."
+        # July 31 batch-10 reviewer: the old inline lambda floored the draw at
+        # max(..., 1), drawing a card off an EMPTY board (0 creatures → the
+        # card says draw 0). The correct generator _gen_garruk_minus3 had
+        # existed since March as DEAD CODE (never referenced) — the
+        # live-wrong/dead-right split the audit history keeps finding. Wired.
         self._pw_ability_templates[("garruk", "draw cards equal to the greatest power")] = EffectTemplate(
             name="Garruk -3 Draw",
             description="Draw cards equal to greatest power among creatures you control",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "draw_cards", "player": ctrl,
-                 "amount": max(ctx.get('greatest_power', 1), 1)}
-            ],
+            action_generator=self._gen_garruk_minus3,
         )
 
         # Liliana, Dreadhorde General +1: "Create a 2/2 black Zombie creature token."
@@ -7998,6 +8054,83 @@ class EffectTemplateLibrary:
                  "types": "Token Creature — Dinosaur Beast", "count": 1,
                  "keywords": ["trample"]}]
 
+    # --- July 31 batch-10 generators (the batch-15324 refused-trigger tail) ---
+
+    def _gen_attack_self_counter(self, ctrl, opp, ctx) -> List[Dict]:
+        """'Whenever this creature attacks, put a +1/+1 counter on it'
+        (Predator Ooze). Declare-time: the combat-damage dispatch sharing
+        this registry must not re-fire it."""
+        if ctx.get('damage_dealt'):
+            return []
+        name = ctx.get('attacking_name')
+        if not name:
+            return []
+        return [{"action": "add_counters", "card": name,
+                 "counter_type": "+1/+1", "amount": 1}]
+
+    def _gen_combat_damage_self_counter(self, ctrl, opp, ctx) -> List[Dict]:
+        """'Whenever this creature deals combat damage to a player, put a
+        +1/+1 counter on it' (Bloodmad Vampire; the Slith-family shape)."""
+        if not ctx.get('damage_dealt'):
+            return []
+        name = ctx.get('attacking_name')
+        if not name:
+            return []
+        return [{"action": "add_counters", "card": name,
+                 "counter_type": "+1/+1", "amount": 1}]
+
+    def _gen_underworld_sentinel_attack(self, ctrl, opp, ctx) -> List[Dict]:
+        """Underworld Sentinel attacks: exile target creature card from your
+        graveyard (mandatory), linked so the dies trigger can return it."""
+        if ctx.get('damage_dealt'):
+            return []
+        ctrl_player = ctx.get('_controller_player')
+        game = ctx.get('_game')
+        if ctrl_player is None or game is None:
+            return []
+        gy_creatures = [c for c in (getattr(ctrl_player, 'graveyard', []) or [])
+                        if 'creature' in (getattr(c, 'type_line', '') or '').lower()]
+        if not gy_creatures:
+            return []  # no legal target — the trigger fizzles (CR 603.3c)
+
+        def _pw(c):
+            try:
+                return int(getattr(c, 'power', 0) or 0)
+            except (TypeError, ValueError):
+                return 0
+        best = max(gy_creatures, key=_pw)
+        key = f"underworld sentinel|{ctrl}"
+        game._linked_exiles.setdefault(key, []).append(best.name)
+        return [{"action": "move_card", "card": best.name,
+                 "from_zone": "graveyard", "to_zone": "exile", "player": ctrl}]
+
+    def _gen_underworld_sentinel_dies(self, ctrl, opp, ctx) -> List[Dict]:
+        """Underworld Sentinel dies: put all cards exiled with it onto the
+        battlefield. Reads the linkage the attack generator recorded and
+        VERIFIES each name is still in the controller's exile, so a failed
+        or reordered exile self-heals instead of returning the wrong card."""
+        game = ctx.get('_game')
+        ctrl_player = ctx.get('_controller_player')
+        if game is None or ctrl_player is None:
+            return []
+        key = f"underworld sentinel|{ctrl}"
+        names = game._linked_exiles.pop(key, [])
+        if not names:
+            return []
+        exile_names = {c.name for c in (getattr(ctrl_player, 'exile', []) or [])}
+        return [{"action": "move_card", "card": n, "from_zone": "exile",
+                 "to_zone": "battlefield", "player": ctrl}
+                for n in names if n in exile_names]
+
+    def _gen_yidris_cascade_grant(self, ctrl, opp, ctx) -> List[Dict]:
+        """Yidris, Maelstrom Wielder connects: spells cast from your hand
+        this turn gain cascade (recorded by grant_hand_cascade; consulted by
+        the cascade block in mtg/triggers.py at cast time)."""
+        if not ctx.get('damage_dealt'):
+            return []
+        return [{"action": "grant_hand_cascade", "player": ctrl,
+                 "source": "Yidris, Maelstrom Wielder"}]
+
     def _gen_combat_damage_draw_one(self, ctrl, opp, ctx) -> List[Dict]:
         """Ohran Frostfang / Tovolar: draw 1 when the source itself connects."""
         if not ctx.get('damage_dealt'):
@@ -9266,7 +9399,10 @@ def build_game_context(game, player, opponent, card=None, entering_creature=None
     )
 
     # Controller creature stats (for spells like Rishkar's Expertise, Overwhelming Stampede)
-    controller_creatures = [c for c in player.battlefield if c.is_creature()]
+    # July 31 batch-10: is_creature(game) — the no-game call bypasses the
+    # devotion type-flip, so a sub-threshold god (Thassa at devotion 1/5)
+    # was counted as a creature candidate (the June 10 D4 class).
+    controller_creatures = [c for c in player.battlefield if c.is_creature(game)]
     ctx['controller_creature_count'] = len(controller_creatures)
     greatest_power = 0
     for c in controller_creatures:

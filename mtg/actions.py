@@ -3472,12 +3472,23 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                 # target — never override an AI-chosen target with our own
                 # heuristic, even if the AI's pick has no ETB. (Bug #5: the
                 # template was overriding AI targets with best_own_etb_creature.)
+                # July 31 batch-10 reviewer: is_creature(game) — the no-game
+                # call bypassed the devotion type-flip, and with no other
+                # creatures the SOURCE became its own fallback target: Thassa,
+                # Deep-Dwelling (devotion 1/5, not a creature, and printed
+                # "one OTHER target creature") flickered HERSELF twice in
+                # game_1532409540866212023. Excluding the source by name also
+                # covers every real flicker source's "other/another" wording.
+                _flicker_src_lower = (source_name or '').lower()
                 for c in p.battlefield:
-                    if c.is_creature() and c.oracle_text and 'enters' in c.oracle_text.lower():
+                    if (c.is_creature(game) and c.name.lower() != _flicker_src_lower
+                            and c.oracle_text and 'enters' in c.oracle_text.lower()):
                         target_card = c
                         break
                 if not target_card:
-                    creatures = [c for c in p.battlefield if c.is_creature()]
+                    creatures = [c for c in p.battlefield
+                                 if c.is_creature(game)
+                                 and c.name.lower() != _flicker_src_lower]
                     if creatures:
                         target_card = creatures[0]
             # July 23 audit (#1): Aminatou's -1 is "exile another target
@@ -3773,6 +3784,24 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                 print(f"[FOG] Combat damage to {p.name} prevented this turn")
                 return f"🌫️ Combat damage to {p.name} is prevented this turn"
         return None
+
+    elif action_type == "grant_hand_cascade":
+        # July 31 batch-10: Yidris, Maelstrom Wielder — "Whenever Yidris deals
+        # combat damage to a player, as you cast spells from your hand this
+        # turn, they gain cascade." Records the grant; the cascade block in
+        # mtg/triggers.py consults game._hand_cascade_grants at cast time
+        # (hand casts only — _cast_from_graveyard / _from_cascade excluded).
+        # Before this, the commander's defining ability was a structural no-op
+        # (unhandled combat-damage trigger → Tier-3 combat-shape refusal).
+        player_name = action.get("player", "")
+        p = find_player(player_name)
+        if not p:
+            return None
+        game._hand_cascade_grants[p.name] = game.turn_number
+        print(f"[CASCADE-GRANT] {p.name}'s hand-cast spells gain cascade this turn "
+              f"(source: {action.get('source', 'Yidris')})")
+        return (f"🌀 **{action.get('source', 'Yidris, Maelstrom Wielder')}**: "
+                f"spells {p.name} casts from their hand this turn gain cascade")
 
     elif action_type == "grant_flashback":
         # Grant flashback to best instant/sorcery in graveyard.

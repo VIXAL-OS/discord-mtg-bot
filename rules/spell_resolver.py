@@ -880,12 +880,15 @@ class SpellResolver:
             
             current = target.counters.get(effect.counter_type, 0)
             target.counters[effect.counter_type] = current + effect.amount
-            
-            # Apply +1/+1 counter effects
-            if effect.counter_type == "+1/+1":
-                target.power_modifier = getattr(target, 'power_modifier', 0) + effect.amount
-                target.toughness_modifier = getattr(target, 'toughness_modifier', 0) + effect.amount
-            
+
+            # July 31 batch-10 reviewer: the counters-dict write above IS the
+            # counter — get_effective_power/toughness read it directly. The
+            # old extra power_modifier/toughness_modifier bump here made a
+            # Tier-2-placed +1/+1 counter read as +2/+2 until the end-of-turn
+            # modifier sweep zeroed the modifier half (Snakeskin Veil on
+            # Tovolar, game_1532409540866212023). Counters are permanent
+            # state, not until-EOT pumps.
+
             messages.append(f"⭕ {effect.amount} {effect.counter_type} counter(s) put on {target.name}")
         
         return messages

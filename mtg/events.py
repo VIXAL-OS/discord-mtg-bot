@@ -115,10 +115,19 @@ MIGRATION PLAN (one slice per audit cycle; batches are the regression net)
       gets subscribed in violation of the contract.
       Revisit this decision only if _check_cast_triggers loses its need to
       await (the test asserts that need explicitly).
-  Slice 5a: COMBAT_DAMAGE_DEALT — SHADOW (July 30, 2026). Emitted at both
-      damage-application funnels in mtg/combat.py; the recorder diffs
-      player-kind emissions against game._combat_damage_to_player appends
-      ([EVENT-PARITY-CDD] from end_turn). One clean batch gates 5b.
+  Slice 5b: COMBAT_DAMAGE_DEALT — LIVE (July 31, 2026; 5a shadow gate
+      cleared at zero mismatches over batch 15324's 134 FS-step combats).
+      Emitted at both damage-application funnels in mtg/combat.py;
+      _accumulate_combat_damage_subscriber (mtg/triggers.py) is the sole
+      appender for game._combat_damage_to_player (player-kind → the
+      battlefield-watcher family + attacker self-trigger dispatch) and
+      game._combat_damage_to_creature (creature-kind → the damaged-creature
+      scan, Phyrexian Obliterator class). Both drains stay in
+      resolve_combat_damage under the `not game.ended` gate (CR 104.2a) —
+      the slice-3b accumulate-don't-resolve pattern. NONCOMBAT damage
+      paths (spells, abilities) emit nothing yet; the damaged-creature scan
+      therefore sees combat damage only — extending the event to those
+      paths is its own future slice.
   Slice 6+: PHASE_CHANGED — shadow first, one slice per audit cycle. The
       React frontend's websocket layer is the intended next CARD_CAST
       subscriber, and it is sync-friendly (it only needs to serialize

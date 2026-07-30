@@ -227,18 +227,30 @@ class TestCombatDamageTemplates:
             assert gen("Rick", "Claude", {}) == [], gen.__name__
 
     def test_registry_reaches_the_dispatcher_lookup(self):
+        # July 31: exemplar switched Ohran → Tovolar → Bloodmad Vampire as
+        # slice 5b generalized the battlefield-watcher family — Ohran and
+        # Tovolar's own-connect templates are both deleted (the combat.py
+        # watcher loop owns the class); Bloodmad's SELF-trigger template
+        # stays.
         lib = self._lib()
         actions, _desc = lib.resolve_attack_trigger(
-            trigger_card_name="Ohran Frostfang",
-            trigger_oracle=("Attacking creatures you control have deathtouch.\n"
-                            "Whenever a creature you control deals combat "
-                            "damage to a player, draw a card."),
-            attacking_creature_name="Ohran Frostfang",
-            attacking_creature_power=2,
+            trigger_card_name="Bloodmad Vampire",
+            trigger_oracle=("Whenever this creature deals combat damage to a "
+                            "player, put a +1/+1 counter on it."),
+            attacking_creature_name="Bloodmad Vampire",
+            attacking_creature_power=4,
             controller="Rick", opponent="Claude",
-            game_context={"damage_dealt": 2})
-        assert actions == [{"action": "draw_cards", "player": "Rick",
-                            "amount": 1}]
+            game_context={"damage_dealt": 4})
+        assert actions == [{"action": "add_counters", "card": "Bloodmad Vampire",
+                            "counter_type": "+1/+1", "amount": 1}]
+
+    def test_watcher_templates_stay_deleted(self):
+        # The double-dispatch pin: battlefield-watcher cards must NOT be in
+        # the attack registry — combat.py's generalized watcher loop is their
+        # single dispatch (slice 5b).
+        lib = self._lib()
+        assert "ohran frostfang" not in lib._attack_templates
+        assert "tovolar, dire overlord" not in lib._attack_templates
 
     def test_queue_sentence_no_keyword_prefix(self, make_game, make_card, capsys):
         from mtg.triggers import queue_unhandled_combat_damage

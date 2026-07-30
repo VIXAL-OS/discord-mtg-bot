@@ -50,6 +50,7 @@ Extracted from mtg/rules_engine.py during the Phase 2 OSS-readability
 refactor (Phase 2D).
 """
 
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from mtg.constants import Phase, Zone, COMMAND_ZONE_FORMATS
@@ -74,7 +75,8 @@ except ImportError:
 
 # Optional: Tier 1.5 effect templates (combat-damage triggers like Glissa)
 try:
-    from rules.effect_templates import get_effect_library, build_game_context
+    from rules.effect_templates import (get_effect_library, build_game_context,
+                                        strip_activated_ability_lines)
     HAS_EFFECT_TEMPLATES = True
 except ImportError:
     HAS_EFFECT_TEMPLATES = False
@@ -252,19 +254,50 @@ def resolve_combat_damage(rules, game: GameState) -> List[str]:
     combat_damage_dealt = getattr(game, '_combat_damage_to_player', [])
     if combat_damage_dealt and HAS_EFFECT_TEMPLATES and not game.ended:
         for attacker, attacker_owner, damage_amount in combat_damage_dealt:
-            # Ohran Frostfang is a battlefield watcher, not an ability on the
-            # attacking creature. The prior attacker-only scan missed every
-            # draw unless Frostfang itself dealt the damage.
+            # Slice 5b (July 31, 2026): the old name-gated Ohran Frostfang
+            # block generalized to the whole battlefield-watcher family —
+            # "Whenever a [qualifier] creature(s)/[subtype(s)] you control
+            # deal(s) combat damage to a player, <effect>". Tovolar's "a Wolf
+            # or Werewolf you control" now draws on EVERY wolf connect (his
+            # own-connect template was the only coverage before). Draw
+            # effects resolve inline; anything else queues to the Tier-3
+            # audit-trail with [COMBAT-WATCHER-UNHANDLED] (templates are the
+            # fix path, per the F2 design).
             for watcher in list(attacker_owner.battlefield):
-                watcher_oracle = (watcher.oracle_text or '').lower()
-                if (watcher.name.lower() == 'ohran frostfang'
-                        and 'whenever a creature you control deals combat damage to a player' in watcher_oracle):
+                w_scan = strip_activated_ability_lines(watcher.oracle_text or '')
+                # "a/an <qual>" only — "one or more ... deal" fires once per
+                # COMBAT (a batch trigger), and this loop runs per dealer, so
+                # matching it here would over-fire. Left to templates.
+                _wm = re.search(
+                    r'whenever (?:a|an) ([a-z\'\- ]+?) you control '
+                    r'deals? combat damage to a player,\s*([^\n.]+)',
+                    w_scan.lower())
+                if not _wm:
+                    continue
+                _qual, _weffect = _wm.group(1).strip(), _wm.group(2).strip()
+                # Qualifier match: "creature(s)" is unconditional; otherwise
+                # each " or "-alternative must appear in the dealer's type
+                # line (Tovolar: "wolf or werewolf" vs a Human Werewolf).
+                if _qual not in ('creature', 'creatures'):
+                    _dealer_types = (getattr(attacker, 'type_line', '') or '').lower()
+                    _alts = [a.strip().rstrip('s') for a in _qual.split(' or ')]
+                    if not any(a and a in _dealer_types for a in _alts):
+                        continue
+                if re.match(r'^draw (a|one) cards?', _weffect):
                     msg = rules._execute_action_on_state(game, {
                         "action": "draw_cards", "player": attacker_owner.name,
                         "amount": 1, "_source_card_name": watcher.name,
                     })
                     if msg:
                         messages.append(f"🐍 {watcher.name}: {msg}")
+                    print(f"[COMBAT-WATCHER] {watcher.name}: draw 1 "
+                          f"({attacker.name} connected)")
+                else:
+                    print(f"[COMBAT-WATCHER-UNHANDLED] {watcher.name}: "
+                          f"{_weffect[:100]}")
+                    from mtg.triggers import queue_unhandled_combat_damage
+                    queue_unhandled_combat_damage(
+                        game, watcher, attacker_owner, damage_amount)
             # July 20 audit (Worldslayer): "Whenever EQUIPPED creature deals
             # combat damage to a player" lives on the EQUIPMENT — the
             # attacker-oracle scan below never saw it (three hits while
@@ -315,8 +348,28 @@ def resolve_combat_damage(rules, game: GameState) -> List[str]:
 
             if not attacker.oracle_text:
                 continue
-            oracle_lower = attacker.oracle_text.lower()
+            # July 31 batch-10 audit: strip activated-ability lines before
+            # detection. Ascendant Spirit's "{S}{S}{S}{S}: ... it gains
+            # 'Whenever this creature deals combat damage to a player, draw a
+            # card.'" is an ACTIVATED ability whose quoted grant tripped this
+            # scan on every connect (8 queued, all Tier-3 refused, batch
+            # 15324). The printed-text scan can't know whether the grant is
+            # live (that's Layer-6 state), and scanning the quoted text
+            # fabricates a trigger the creature may not have. Same class as
+            # the July 21 resolve_etb strip (Glen Elendra).
+            oracle_lower = strip_activated_ability_lines(attacker.oracle_text).lower()
             if "combat damage to a player" not in oracle_lower and "combat damage to an opponent" not in oracle_lower:
+                continue
+            # Slice 5b: watcher-phrased text ("...you control deals combat
+            # damage...") belongs to the battlefield-watcher loop above, not
+            # to this SELF-trigger scan — an attacking Ohran/Tovolar would
+            # otherwise double-dispatch (their own-connect templates were
+            # removed for exactly that). Skip when no non-watcher sentence
+            # carries the phrase.
+            if not any(
+                    ('combat damage to a player' in s or 'combat damage to an opponent' in s)
+                    and 'you control deal' not in s
+                    for para in oracle_lower.split('\n') for s in para.split('.')):
                 continue
             try:
                 opp_idx = 1 - game.players.index(attacker_owner)
@@ -361,6 +414,64 @@ def resolve_combat_damage(rules, game: GameState) -> List[str]:
             except Exception as e:
                 print(f"[COMBAT-TRIGGER] Error for {attacker.name}: {e}")
         game._combat_damage_to_player = []  # Clear after processing
+
+    # Slice 5b (July 31, 2026): damaged-creature scan — "Whenever a source
+    # deals damage to this creature" (Phyrexian Obliterator; CR 603.2). No
+    # scan existed anywhere before (July 30 reviewer R14). The creature-kind
+    # COMBAT_DAMAGE_DEALT subscriber accumulates; this drain resolves under
+    # the same `not game.ended` gate as the player-kind drain above.
+    # NONCOMBAT damage does not reach this scan yet — the spell/ability
+    # damage paths emit no event (a future slice's territory, noted in
+    # mtg/events.py).
+    damaged_entries = getattr(game, '_combat_damage_to_creature', [])
+    if damaged_entries and not game.ended:
+        for source_card, damaged, dmg_amount in damaged_entries:
+            d_scan = strip_activated_ability_lines(
+                getattr(damaged, 'oracle_text', '') or '').lower()
+            _dm = re.search(
+                r'whenever a source deals damage to (?:this creature|'
+                + re.escape((damaged.name or '').lower())
+                + r'),\s*([^\n.]+)',
+                d_scan)
+            if not _dm:
+                continue
+            _deffect = _dm.group(1).strip()
+            _damaged_owner = next(
+                (p for p in game.players if damaged in p.battlefield), None)
+            _src_owner = next(
+                (p for p in game.players
+                 if any(c.id == getattr(source_card, 'id', None)
+                        for c in p.battlefield)),
+                None)
+            if _src_owner is None and _damaged_owner is not None:
+                # The source died mid-combat (FS trades) — in 2-player
+                # combat the dealer's controller is the other player.
+                _src_owner = next(p for p in game.players
+                                  if p is not _damaged_owner)
+            if (_src_owner is not None and re.match(
+                    r"that source's controller sacrifices that many permanents",
+                    _deffect)):
+                _sac_msgs = []
+                for _ in range(int(dmg_amount)):
+                    _m = rules._execute_action_on_state(game, {
+                        "action": "sacrifice_permanent",
+                        "player": _src_owner.name,
+                        "source": damaged.name,
+                        "reason": f"{damaged.name}'s damage trigger"})
+                    if _m:
+                        _sac_msgs.append(_m)
+                print(f"[DAMAGED-TRIGGER] {damaged.name}: {_src_owner.name} "
+                      f"sacrifices {dmg_amount} permanent(s)")
+                if _sac_msgs:
+                    messages.extend(_sac_msgs)
+            else:
+                print(f"[DAMAGED-TRIGGER-UNHANDLED] {damaged.name}: "
+                      f"{_deffect[:100]}")
+                from mtg.triggers import queue_unhandled_combat_damage
+                queue_unhandled_combat_damage(
+                    game, damaged,
+                    _damaged_owner or game.players[0], dmg_amount)
+        game._combat_damage_to_creature = []
 
     # Apply lifelink (single event per controller per damage step, CR 119.3d/702.15)
     for idx, heal in lifelink_healing.items():
@@ -923,14 +1034,10 @@ def deal_combat_damage(rules, game: GameState, attackers: List[Tuple[Card, Playe
                             f"👑 Commander damage: {defending_player.name} has taken "
                             f"{_cd_total}/21 from {attacker.name}"
                         )
-                # Track for combat damage triggers (Ancient Bronze Dragon, etc.)
-                if not hasattr(game, '_combat_damage_to_player'):
-                    game._combat_damage_to_player = []
-                game._combat_damage_to_player.append((attacker, attacker_owner, actual_damage))
-                # Slice 5a shadow: mirror the append for the parity recorder.
-                game._cdd_consumer_seen.append(
-                    (getattr(attacker, 'id', attacker.name),
-                     defending_player.name, actual_damage))
+                # Slice 5b: the combat-damage trigger queue is BUS-FED — the
+                # COMBAT_DAMAGE_DEALT emission inside the damage funnel
+                # accumulates via _accumulate_combat_damage_subscriber, so
+                # this producer site no longer appends directly.
             else:
                 messages.append(f"🛡️ {attacker.name}'s damage to {defending_player.name} was prevented")
 
@@ -1185,14 +1292,7 @@ def deal_combat_damage(rules, game: GameState, attackers: List[Tuple[Card, Playe
                                 f"👑 Commander damage: {defending_player.name} has taken "
                                 f"{_cd_total}/21 from {attacker.name}"
                             )
-                    # Track for combat damage triggers
-                    if not hasattr(game, '_combat_damage_to_player'):
-                        game._combat_damage_to_player = []
-                    game._combat_damage_to_player.append((attacker, attacker_owner, actual_trample))
-                    # Slice 5a shadow: mirror the append (second producer site).
-                    game._cdd_consumer_seen.append(
-                        (getattr(attacker, 'id', attacker.name),
-                         defending_player.name, actual_trample))
+                    # Slice 5b: bus-fed — see the unblocked producer site.
                 else:
                     messages.append(f"🛡️ {attacker.name}'s trample damage to {defending_player.name} was prevented")
                 if attacker.has_lifelink(game=game) and actual_trample > 0:
