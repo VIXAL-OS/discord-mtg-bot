@@ -71,21 +71,44 @@ def _request(url: str) -> urllib.request.Request:
 
 
 def ensure_bulk(refresh: bool) -> Path:
-    """Download the Scryfall oracle-cards bulk file if missing (or refresh)."""
+    """Download the Scryfall oracle-cards bulk file if missing (or refresh).
+
+    July 29, 2026: Scryfall replaced `download_uri` (a plain JSON array)
+    with `jsonl_download_uri` (gzipped JSONL) in the bulk-data index — the
+    old key now raises KeyError and CI died with exit 2 on every push.
+    Support both shapes; the cache on disk stays a plain JSON array either
+    way, so every consumer (build_name_set, --bulk users) is unchanged.
+    gzip is stdlib, preserving the no-pip-installs contract.
+    """
     if BULK_CACHE.exists() and not refresh:
         return BULK_CACHE
     print(f"[VALIDATOR] fetching bulk-data index: {BULK_INDEX_URL}")
     with urllib.request.urlopen(_request(BULK_INDEX_URL), timeout=120) as r:
         index = json.load(r)
-    uri = next(d["download_uri"] for d in index["data"]
-               if d["type"] == "oracle_cards")
-    print(f"[VALIDATOR] downloading oracle_cards bulk (~170 MB): {uri}")
+    entry = next(d for d in index["data"] if d["type"] == "oracle_cards")
+    array_uri = entry.get("download_uri")
+    jsonl_uri = entry.get("jsonl_download_uri")
+    dl = array_uri or jsonl_uri
+    if not dl:
+        raise KeyError(
+            "bulk-data index has neither download_uri nor jsonl_download_uri "
+            f"(keys: {sorted(entry.keys())})")
+    print(f"[VALIDATOR] downloading oracle_cards bulk: {dl}")
     BULK_CACHE.parent.mkdir(parents=True, exist_ok=True)
     tmp = BULK_CACHE.with_suffix(".part")
-    with urllib.request.urlopen(_request(uri), timeout=900) as r, \
+    with urllib.request.urlopen(_request(dl), timeout=900) as r, \
             open(tmp, "wb") as f:
         while chunk := r.read(1 << 20):
             f.write(chunk)
+    if not array_uri:
+        # JSONL(.gz) → normalize to the JSON array every consumer expects.
+        import gzip
+        opener = gzip.open if dl.endswith(".gz") else open
+        with opener(tmp, "rt", encoding="utf-8") as f:
+            cards = [json.loads(line) for line in f if line.strip()]
+        tmp.write_text(json.dumps(cards), encoding="utf-8")
+        print(f"[VALIDATOR] normalized JSONL bulk to a JSON array "
+              f"({len(cards):,} cards)")
     tmp.replace(BULK_CACHE)
     print(f"[VALIDATOR] saved {BULK_CACHE} ({BULK_CACHE.stat().st_size // (1 << 20)} MB)")
     return BULK_CACHE

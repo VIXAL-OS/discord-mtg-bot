@@ -2320,10 +2320,25 @@ class GameEngine:
         from mtg.spells import _process_suspend_upkeep
         return _process_suspend_upkeep(self, game)
     def _process_delayed_triggers(self, game: GameState, phase_name: str) -> List[str]:
-        """Fire delayed triggers scheduled for the given phase (upkeep, end_step, etc.)."""
+        """Fire delayed triggers scheduled for the given phase (upkeep, end_step, etc.).
+
+        July 29 hotfix (game_1532203668261044486: 9,867 cycles, a 3.3MB log,
+        and the batch died at 125/152): this loop used to iterate the LIVE
+        list. Yorion's end-step return re-entered Oath of Teferi, whose
+        template flickered Yorion back immediately; Yorion's ETB scheduled a
+        NEW end-step return, which the live-list iteration picked up IN THE
+        SAME DRAIN — an unbounded mutual flicker inside a single end step.
+        CR 603.7: an ability scheduled for "the beginning of the next end
+        step" DURING an end step waits for the next one. Detach the queue
+        before draining: mid-drain schedules land on the fresh live list and
+        fire at the NEXT drain (and can no longer be silently lost by the
+        final reassignment either).
+        """
         messages = []
         remaining_delayed = []
-        for dt in game.delayed_triggers:
+        pending = game.delayed_triggers
+        game.delayed_triggers = []
+        for dt in pending:
             if dt.get('trigger_at') == phase_name:
                 # "your next upkeep" triggers (Pact of Negation, rebound) fire
                 # only on their owner's upkeep. Without this gate they fired on
@@ -2381,7 +2396,9 @@ class GameEngine:
                     remaining_delayed.append(dt)
             else:
                 remaining_delayed.append(dt)
-        game.delayed_triggers = remaining_delayed
+        # Anything scheduled DURING the drain is now in game.delayed_triggers
+        # — keep it for the next drain alongside the survivors.
+        game.delayed_triggers = remaining_delayed + game.delayed_triggers
         return messages
 
     def _resolve_suspend_spell(self, game: GameState, player: Player, card: Card, opponent: Player) -> List[str]:
