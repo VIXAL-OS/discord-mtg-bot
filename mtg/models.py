@@ -438,6 +438,11 @@ class Card:
     _imprinted_card_id: Optional[str] = field(default=None, repr=False, compare=False)
     _imprinted_card_name: str = field(default="", repr=False, compare=False)
     _imprinted_owner_index: Optional[int] = field(default=None, repr=False, compare=False)
+    # July 30: the card sits face down in a hidden-info zone (Necropotence /
+    # Gonti exile). Set/cleared by move_card; GameState.visible_state masks
+    # face-down cards for every viewer. Display-level hiding alone
+    # (hide_card_name at emit sites) leaks through full-state serialization.
+    _face_down: bool = field(default=False, repr=False, compare=False)
     # Copy-effect bookkeeping. The snapshot restores printed characteristics
     # when the permanent changes zones (CR 707.8); the other fields describe
     # the battlefield-only copy state.
@@ -4527,7 +4532,67 @@ class GameState:
             "last_unresolved_effect": self.last_unresolved_effect,
             "pending_resolves": self.pending_resolves,
         }
-    
+
+    def visible_state(self, viewer_index: int) -> Dict:
+        """Per-player filtered snapshot for DISPLAY layers — the React
+        websocket serializer's foundation.
+
+        Built July 30, 2026, deliberately BEFORE the frontend exists:
+        to_dict() above is the omniscient save-game serializer, and
+        hidden-information discipline retrofitted after the first
+        "opponent's hand visible in the network tab" bug report is the
+        classic failure. Arena's model — the server owns hidden zones, the
+        client renders only what its player may see — is the spec here.
+
+        Visibility rules:
+          - the viewer's own hand is visible; opponents' hands are COUNTS
+          - ALL libraries are counts (contents/order hidden even from the
+            owner, CR 401.2)
+          - face-down exile (Card._face_down — Necropotence, Gonti) is
+            masked to a placeholder for EVERY viewer. Gonti's controller
+            may peek per its printed text; per-card peek rights are
+            card-specific and unmodeled — masking for all is the
+            conservative direction.
+          - battlefields, graveyards, the stack, and command zones are
+            public (CR 400.2)
+        """
+        def _card_public(c):
+            if getattr(c, '_face_down', False):
+                return {"name": "Face-down card", "face_down": True}
+            return c.to_dict()
+
+        players = []
+        for idx, p in enumerate(self.players):
+            is_viewer = (idx == viewer_index)
+            players.append({
+                "name": p.name,
+                "life": p.life,
+                "poison": getattr(p, 'poison', 0),
+                "is_viewer": is_viewer,
+                "hand": ([_card_public(c) for c in p.hand] if is_viewer
+                         else {"count": len(p.hand)}),
+                "library_count": len(p.library),
+                "battlefield": [_card_public(c) for c in p.battlefield],
+                "graveyard": [_card_public(c) for c in p.graveyard],
+                "exile": [_card_public(c) for c in p.exile],
+                "command_zone": [_card_public(c)
+                                 for c in (getattr(p, 'command_zone', []) or [])],
+                "commander_damage": {str(k): v for k, v in
+                                     (getattr(p, 'commander_damage', {}) or {}).items()},
+            })
+        return {
+            "viewer_index": viewer_index,
+            "format": self.format,
+            "turn_number": self.turn_number,
+            "phase": self.phase.value,
+            "active_player_index": self.active_player_index,
+            "stack": [s.to_dict() if hasattr(s, 'to_dict') else s
+                      for s in self.stack],
+            "ended": self.ended,
+            "winner": self.winner,
+            "players": players,
+        }
+
     @classmethod
     def from_dict(cls, data: Dict) -> 'GameState':
         """Reconstruct game state from dict."""

@@ -1353,6 +1353,14 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                     # must not name the card in the shared Discord thread — the
                     # opponent never learned it. Console log_event above keeps
                     # the true name for audits.
+                    # July 30: persist face-down-ness ON the card so the
+                    # per-player serializer (GameState.visible_state) can
+                    # mask it — display-level hiding alone leaks through any
+                    # full-state serialization (the frontend's network tab).
+                    if action.get("hide_card_name") and actual_to_zone == 'exile':
+                        card._face_down = True
+                    elif actual_to_zone in ('hand', 'battlefield', 'graveyard', 'library'):
+                        card._face_down = False
                     _shown = ("a face-down card" if action.get("hide_card_name")
                               else f"**{card.name}**")
                     if source:

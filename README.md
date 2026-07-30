@@ -14,6 +14,12 @@ Includes:
 
 For a Discord companion bot with distress support / memory / tarot / YouTube transcription, see the sibling [`discord-companion-bot`](https://github.com/VIXAL-OS/discord-companion-bot) repo. That bot can optionally import this MTG engine if you want both in one deployment.
 
+## Design philosophy: budgeting the impossible
+
+Magic: The Gathering is [Turing complete](https://arxiv.org/abs/1904.09828) — Churchill, Biderman & Herrick (2019) showed a legal two-player game can encode an arbitrary Turing machine, which means a *fully general* rules engine that always knows what happens next is mathematically impossible. Every digital Magic implementation is a choice about where to spend that impossibility: MTG Arena closes the card pool (a card doesn't exist until it's implemented), MTGO hand-implements everything and wears the bugs.
+
+This engine takes the third road: accept **any** deck, and be honest about how each card will be handled. Deterministic tiers cover the head of the distribution (templates, pattern families, a regex spell resolver, the XMage bridge), an LLM judge catches the long tail, `!coverage` tells you the split for your exact deck before you play, and `!undo`/`!fix` are the escape hatches the math says every open-pool engine must have. The tiers aren't a workaround for an unfinished engine — they're the only architecture an open card pool permits.
+
 ## Quick start
 
 ```bash

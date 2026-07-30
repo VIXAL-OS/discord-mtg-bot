@@ -19,6 +19,7 @@ on:
       - mtg/sba.py
       - data/card_data_cache.json
       - tools/validate_card_names.py
+      - data/pattern_hit_baseline.json
 
 jobs:
   validate:

@@ -91,6 +91,10 @@ EXCEPT_BASELINE = {
     # crash barrier with its own [XMAGE] log line — the deliberately
     # swallow-only class, not a maybe_reraise candidate).
     "cog.py": 31,
+    # July 30: _check_color_castable moved here from claude_player.py — its
+    # ManaCost-parse fallback catch moved with it (claude_player's count
+    # dropped by one under its unchanged ceiling).
+    "legal_actions.py": 1,
     "combat.py": 5,
     "coverage.py": 3,
     "deck_loader.py": 4,

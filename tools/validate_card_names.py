@@ -31,6 +31,7 @@ unavailable. CI runs this weekly + on template/saga-table changes
 import argparse
 import difflib
 import json
+import re
 import sys
 import urllib.request
 from pathlib import Path
@@ -44,6 +45,16 @@ if hasattr(sys.stdout, "reconfigure"):
 
 BULK_CACHE = REPO / "data" / "scryfall_oracle_cards.json"
 CARD_CACHE = REPO / "data" / "card_data_cache.json"
+PATTERN_BASELINE = REPO / "data" / "pattern_hit_baseline.json"
+
+# Templating-drift alarm thresholds (July 30, 2026): a pattern family's
+# bulk hit count DROPPING is WotC retemplating announcing itself — the
+# 2026 "this creature" rewording made Blood Artist detection dead code,
+# and Rancor's "put into a graveyard from the battlefield" never matched
+# the LTB gate; both were found post-hoc in batches. Rises are normal
+# (new cards); only drops alarm, and only when both thresholds trip.
+DRIFT_REL_THRESHOLD = 0.15  # >= 15% relative drop ...
+DRIFT_ABS_THRESHOLD = 5     # ... AND >= 5 cards absolute
 BULK_INDEX_URL = "https://api.scryfall.com/bulk-data"
 USER_AGENT = "mtg-bot-card-name-validator/1.0 (https://github.com/VIXAL-OS)"
 
@@ -223,6 +234,86 @@ def collect_hardcoded_names():
     return out
 
 
+def check_pattern_drift(bulk_cards, update_baseline: bool = False) -> int:
+    """Count bulk-oracle hits per Tier-1.5 regex pattern family; alarm on drops.
+
+    Templating drift is a named bug class in this project: Arena
+    auto-implements most cards because WotC's oracle templating is rigid,
+    and our pattern families make the same bet — so when WotC RETEMPLATES
+    (2019 "enters the battlefield" -> 2024 "enters"; 2026 "this creature"),
+    pattern families silently stop matching and the loss is only visible
+    post-hoc in an autoplay batch. This stage snapshots per-pattern hit
+    counts against the full bulk and alarms when a family shrinks.
+
+    Semantics note: counts are raw `re.search` over each card's lowercased
+    oracle text (reminder text included) — an approximation of the runtime
+    match paths, but a CONSISTENT one, which is all drift detection needs.
+
+    Returns the number of alarms (0 = clean or baseline just created).
+    """
+    from rules.effect_templates import get_effect_library
+    lib = get_effect_library()
+    patterns = [p for p, _t in getattr(lib, "_pattern_templates", [])]
+    if not patterns:
+        print("[VALIDATOR] no pattern templates loaded — skipping drift check")
+        return 0
+
+    oracles = [
+        (c.get("oracle_text") or "").lower()
+        for c in bulk_cards
+        # July 21 gotcha: token/art_series layouts shadow real cards.
+        if c.get("layout") not in ("token", "art_series")
+        and c.get("oracle_text")
+    ]
+    counts = {}
+    for pat in patterns:
+        try:
+            rx = re.compile(pat)
+        except re.error as e:
+            print(f"[VALIDATOR] unparseable pattern {pat[:70]!r}: {e}")
+            continue
+        counts[pat] = sum(1 for o in oracles if rx.search(o))
+
+    if update_baseline or not PATTERN_BASELINE.exists():
+        PATTERN_BASELINE.write_text(
+            json.dumps(counts, indent=1, sort_keys=True) + "\n",
+            encoding="utf-8")
+        print(f"[VALIDATOR] pattern-hit baseline "
+              f"{'updated' if update_baseline else 'CREATED'} "
+              f"({len(counts)} patterns) → {PATTERN_BASELINE.name}")
+        return 0
+
+    baseline = json.loads(PATTERN_BASELINE.read_text(encoding="utf-8"))
+    alarms = []
+    for pat, n in counts.items():
+        b = baseline.get(pat)
+        if b is None:
+            continue  # new pattern — flagged below, recorded on next update
+        drop = b - n
+        if b > 0 and drop >= DRIFT_ABS_THRESHOLD and drop / b >= DRIFT_REL_THRESHOLD:
+            alarms.append((pat, b, n))
+
+    new_patterns = [p for p in counts if p not in baseline]
+    stale_patterns = [p for p in baseline if p not in counts]
+    if new_patterns:
+        print(f"[VALIDATOR] note: {len(new_patterns)} pattern(s) not in the "
+              f"baseline — run with --update-baseline to record them")
+    if stale_patterns:
+        print(f"[VALIDATOR] note: {len(stale_patterns)} baseline pattern(s) "
+              f"no longer registered — --update-baseline prunes them")
+
+    if alarms:
+        print(f"[VALIDATOR] {len(alarms)} PATTERN-DRIFT alarm(s) — a family's "
+              f"bulk hit count dropped (WotC retemplating, or a deliberate "
+              f"pattern change that needs --update-baseline in this commit):")
+        for pat, b, n in sorted(alarms, key=lambda a: a[1] - a[2], reverse=True):
+            print(f"  - {b} → {n} hits: {pat[:100]!r}")
+    else:
+        print(f"[VALIDATOR] OK — {len(counts)} pattern families within drift "
+              f"thresholds (rel {DRIFT_REL_THRESHOLD:.0%}, abs {DRIFT_ABS_THRESHOLD})")
+    return len(alarms)
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--bulk", type=Path, default=None,
@@ -233,6 +324,9 @@ def main(argv=None) -> int:
                     help="only validate card_data_cache.json oracle text")
     ap.add_argument("--names-only", action="store_true",
                     help="only validate hardcoded card names")
+    ap.add_argument("--update-baseline", action="store_true",
+                    help="rewrite data/pattern_hit_baseline.json from the "
+                         "current bulk + pattern registry")
     args = ap.parse_args(argv)
     if args.cache_only and args.names_only:
         ap.error("--cache-only and --names-only are mutually exclusive")
@@ -288,6 +382,12 @@ def main(argv=None) -> int:
                 print(f"  ... and {len(mismatches) - 50} more")
         else:
             print("[VALIDATOR] OK — cached oracle text matches Scryfall")
+
+    # Templating-drift stage (July 30, 2026): full runs only — it needs the
+    # live pattern registry, which the names stage already imported.
+    if not args.cache_only and not args.names_only:
+        if check_pattern_drift(bulk_cards, update_baseline=args.update_baseline):
+            failed = True
 
     return 1 if failed else 0
 

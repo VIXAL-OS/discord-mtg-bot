@@ -1,4 +1,4 @@
-"""July 30, 2026 — the deferred pick-list wave (post-batch-9, Sarah-approved).
+"""July 30, 2026 — the deferred pick-list wave (post-batch-9, maintainer-approved).
 
 Shipped here:
 - CR 109.5: the PW forward path type-checks "any target" abilities — an
@@ -208,6 +208,85 @@ class TestSuspendInitiation:
         assert "SUSPEND available" in src, (
             "the castable section must surface suspendable cards — the "
             "strategist recommended suspending and the actor couldn't")
+
+
+class TestVisibleState:
+    """The per-player serializer foundation (built BEFORE the frontend so
+    hidden-info discipline is structural, not a retrofit after the first
+    "opponent's hand in the network tab" bug report)."""
+
+    def test_opponent_hand_is_count_only_and_never_leaks(
+            self, make_game, make_card):
+        import json
+        game = make_game()
+        rick, claude = game.players
+        rick.hand.append(make_card("Secret Plan Xyzzy"))
+
+        state = game.visible_state(1)  # Claude's view
+
+        assert state["players"][0]["hand"] == {"count": 1}
+        assert "Secret Plan Xyzzy" not in json.dumps(state), (
+            "the opponent's hand contents must be absent from the ENTIRE "
+            "serialized payload, not just displayed differently")
+
+    def test_own_hand_is_visible(self, make_game, make_card):
+        game = make_game()
+        rick = game.players[0]
+        rick.hand.append(make_card("My Own Card"))
+        state = game.visible_state(0)
+        assert any(c.get("name") == "My Own Card"
+                   for c in state["players"][0]["hand"])
+
+    def test_libraries_hidden_even_from_their_owner(self, make_game, make_card):
+        import json
+        game = make_game()
+        rick = game.players[0]
+        rick.library.append(make_card("Library Topdeck Zzz"))
+        state = game.visible_state(0)  # the OWNER's view
+        assert state["players"][0]["library_count"] == 1
+        assert "Library Topdeck Zzz" not in json.dumps(state), (
+            "CR 401.2 — library contents/order are hidden from everyone")
+
+    def test_face_down_exile_masked_for_every_viewer(
+            self, make_game, make_card):
+        import json
+        game = make_game()
+        rick = game.players[0]
+        hidden = make_card("Gonti Steal Target")
+        hidden._face_down = True
+        shown = make_card("Path to Exile", type_line="Instant")
+        rick.exile.extend([hidden, shown])
+
+        for viewer in (0, 1):
+            state = game.visible_state(viewer)
+            dump = json.dumps(state)
+            assert "Gonti Steal Target" not in dump
+            assert "Path to Exile" in dump, "regular exile is public"
+
+    def test_payload_is_json_serializable(self, make_game, make_card):
+        import json
+        game = make_game()
+        game.players[0].battlefield.append(make_card("Bear"))
+        game.players[0].commander_damage[1] = 5
+        json.dumps(game.visible_state(0))  # must not raise
+
+    def test_move_card_sets_and_clears_face_down(self, rules, game, make_card):
+        from mtg.actions import execute_action_on_state
+        rick = game.players[0]
+        card = make_card("Necro Stash", type_line="Instant")
+        rick.hand.append(card)
+
+        execute_action_on_state(rules, game, {
+            "action": "move_card", "card": "Necro Stash",
+            "from_zone": "hand", "to_zone": "exile", "player": "Rick",
+            "hide_card_name": True})
+        assert card._face_down is True
+
+        execute_action_on_state(rules, game, {
+            "action": "move_card", "card": "Necro Stash",
+            "from_zone": "exile", "to_zone": "hand", "player": "Rick"})
+        assert card._face_down is False, (
+            "returning to a visible zone must clear the mask")
 
 
 WAKE_ORACLE = ("Creatures you control get +1/+1.\n"

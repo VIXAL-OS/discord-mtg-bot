@@ -138,8 +138,9 @@ class TestAdventureCastableFromExile:
 
     def test_ai_is_offered_the_creature_half(self, make_game, make_card):
         """Castable-but-invisible is still unplayable: the AI proposes from this
-        list, and it never scanned exile."""
-        from mtg.claude_player import ClaudePlayer
+        list, and it never scanned exile. (July 30: the computation moved to
+        mtg/legal_actions.py — the single legal-actions provider.)"""
+        from mtg.legal_actions import graveyard_castable_entries
         game = make_game()
         rick = game.players[0]
         giant = _bonecrusher(make_card)
@@ -148,11 +149,9 @@ class TestAdventureCastableFromExile:
         for i in range(6):
             rick.battlefield.append(
                 make_card(f"Mountain{i}", type_line="Basic Land — Mountain"))
-        player_ai = ClaudePlayer.__new__(ClaudePlayer)
-        listed = ClaudePlayer._get_graveyard_castable(
-            player_ai, rick,
-            {"W": 0, "U": 0, "B": 0, "R": 6, "G": 0, "C": 0},
-            any_color_mana=0, total_mana=6)
+        listed = [e["label"] for e in graveyard_castable_entries(
+            rick, {"W": 0, "U": 0, "B": 0, "R": 6, "G": 0, "C": 0},
+            any_color_mana=0, total_mana=6)]
         assert any("Bonecrusher Giant" in entry and "exile" in entry.lower()
                    for entry in listed), f"not offered: {listed}"
 
