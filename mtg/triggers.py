@@ -3319,6 +3319,8 @@ def _check_upkeep_triggers_sync(engine, game: GameState) -> Tuple[List[str], Lis
     Returns:
         Tuple of (messages, unhandled_triggers).
     """
+    # Slice 6a shadow: recorded INSIDE the scan so any caller counts.
+    record_phase_hook_run(game, "upkeep")
     messages = []
     unhandled = []
     active = game.active_player
@@ -4994,3 +4996,64 @@ def _accumulate_combat_damage_subscriber(game, source=None, target=None,
 
 
 events.subscribe(events.COMBAT_DAMAGE_DEALT, _accumulate_combat_damage_subscriber)
+
+
+# ---------------------------------------------------------------------------
+# Pub/sub slice 6a (July 31, 2026 — SHADOW): PHASE_CHANGED recorder.
+# GameState.set_phase (the one sanctioned phase mutator; a structural pin
+# forbids raw assignments) emits once per transition. The recorder pairs
+# entries into HOOKED phases with hook runs recorded at the hooks
+# themselves — dispatch_main_phase_triggers ('main1'/'main2') and the
+# upkeep scan ('upkeep') — and report_phase_parity prints
+# [EVENT-PARITY-PHASE] from end_turn for any hooked-phase entry whose hook
+# never ran that turn. This is the direct-phase-set class that bit three
+# times (the Tymna family); the recorder is its permanent detector until
+# the 6b flip makes the hooks subscribers outright. Set semantics per
+# (turn, phase): Moraug-style repeat combat entries must not demand a
+# second dispatch. via='game_start' is exempt (empty battlefield), and an
+# ended game skips the check entirely (CR 104.2a — hooks legitimately
+# don't run after a mid-turn loss). One clean batch gates 6b.
+# ---------------------------------------------------------------------------
+
+# Phase-name → hook-record key. Only phases with instrumented hooks
+# participate in parity; everything else is emit-only (the 6b flip's map).
+_HOOKED_PHASES = {"MAIN1": "main1", "MAIN2": "main2", "UPKEEP": "upkeep"}
+
+
+def _phase_shadow_recorder(game, old_phase=None, new_phase=None, via="",
+                           **_payload):
+    """Record every PHASE_CHANGED emission for the parity diff."""
+    game._phase_emissions.append(
+        (game.turn_number, getattr(old_phase, 'name', str(old_phase)),
+         getattr(new_phase, 'name', str(new_phase)), via))
+
+
+def record_phase_hook_run(game, hook: str) -> None:
+    """Called by the phase hooks themselves so ANY caller counts."""
+    game._phase_hook_runs.append((game.turn_number, hook))
+
+
+def report_phase_parity(game) -> None:
+    """Print [EVENT-PARITY-PHASE] for hooked-phase entries with no hook run."""
+    if getattr(game, 'ended', False):
+        game._phase_emissions = []
+        game._phase_hook_runs = []
+        return
+    runs = set(game._phase_hook_runs)
+    seen = set()
+    for turn, old, new, via in game._phase_emissions:
+        hook = _HOOKED_PHASES.get(new)
+        if hook is None or via == "game_start":
+            continue
+        key = (turn, hook)
+        if key in seen:
+            continue  # set semantics — repeat entries need one dispatch
+        seen.add(key)
+        if key not in runs:
+            print(f"[EVENT-PARITY-PHASE] entered {new} on turn {turn} "
+                  f"(via={via or '?'}) but the {hook} hook never ran")
+    game._phase_emissions = []
+    game._phase_hook_runs = []
+
+
+events.subscribe(events.PHASE_CHANGED, _phase_shadow_recorder)

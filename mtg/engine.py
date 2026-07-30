@@ -1135,7 +1135,9 @@ class GameEngine:
         game.turn_number = 1
         game.active_player_index = first_player_index
         game.priority_player_index = first_player_index
-        game.phase = Phase.MAIN1
+        # via='game_start' is excluded from phase-hook parity: the battlefield
+        # is empty at this point, so there are no main-phase triggers to run.
+        game.set_phase(Phase.MAIN1, via="game_start")
         
         # Draw opening hands
         for player in game.players:
@@ -1682,6 +1684,9 @@ class GameEngine:
         connected, no scan; next turn no combat, scan says "condition not
         met"). Third iteration of the Tymna saga.
         """
+        # Slice 6a shadow: recorded at the choke point so any caller counts.
+        from mtg.triggers import record_phase_hook_run
+        record_phase_hook_run(game, "main1" if precombat else "main2")
         msgs, unhandled = self._check_main_phase_triggers_sync(game, precombat)
         for _c, _t in unhandled:
             self._queue_async_trigger(game, _c, _t, "main_phase",
@@ -2035,7 +2040,7 @@ class GameEngine:
             return game.phase, messages
         
         old_phase = game.phase
-        game.phase = PHASE_ORDER[current_idx + 1]
+        game.set_phase(PHASE_ORDER[current_idx + 1], via="advance_phase")
         self.rules.on_phase_change(game, game.phase)
         
         # Phase-specific actions
@@ -2452,10 +2457,20 @@ class GameEngine:
         return _resolve_suspend_spell(self, game, player, card, opponent)
     def end_turn(self, game: GameState) -> List[str]:
         """End the current turn and start the next. Returns end-step messages (e.g. discard prompts)."""
-        # (Slices 2c + 3c, July 24; slice 5b, July 31: all parity recorders
+        # (Slices 2c + 3c, July 24; slice 5b, July 31: those parity recorders
         # retired after clean post-flip batches — [EVENT-PARITY],
         # [EVENT-PARITY-DIES], and [EVENT-PARITY-CDD] are stale-code
         # tripwires now.)
+        # Slice 6a (July 31): PHASE_CHANGED shadow parity report. Runs BEFORE
+        # the turn-number increment below so the records it diffs belong to
+        # the turn that is ending; this method's own set_phase(UNTAP)
+        # emission lands after the report and carries into the next turn's
+        # records (UNTAP has no hook — parity-inert).
+        try:
+            from mtg.triggers import report_phase_parity
+            report_phase_parity(game)
+        except ImportError:
+            pass
 
         # [TRANSFORM] Save spell count for day/night and werewolf transform tracking
         game.active_player.spells_cast_prev_turn = game.active_player.spells_cast_this_turn
@@ -2535,7 +2550,7 @@ class GameEngine:
         game.active_player_index = 1 - game.active_player_index
         game.priority_player_index = game.active_player_index
         game.turn_number += 1
-        game.phase = Phase.UNTAP
+        game.set_phase(Phase.UNTAP, via="end_turn")
         # Bloodchief Ascension's each-end-step condition reads life lost
         # during the current turn. Clear every player's ledger only after the
         # old turn's end-step triggers have resolved.

@@ -168,7 +168,7 @@ def _format_blocker_list(names):
 
 async def _resolve_combat(cog, ctx, game: GameState):
     """Resolve combat damage using rules engine."""
-    game.phase = Phase.COMBAT_DAMAGE
+    game.set_phase(Phase.COMBAT_DAMAGE, via="autoplay:_resolve_combat")
     
     # Use rules engine for combat resolution (handles keywords)
     damage_msgs = cog.engine.rules.resolve_combat_damage(game)
@@ -212,7 +212,7 @@ async def _resolve_combat(cog, ctx, game: GameState):
         cog.engine.delete_game(game.thread_id)
     else:
         # Move to main 2
-        game.phase = Phase.MAIN2
+        game.set_phase(Phase.MAIN2, via="autoplay:_resolve_combat:main2")
         await ctx.send(f"➡️ Moving to {PHASE_NAMES[game.phase]}")
         # July 30 batch-9 audit: this direct phase set bypassed
         # advance_phase, so postcombat main-phase triggers (Tymna) never
@@ -942,7 +942,7 @@ async def _autoplay_human_turn(cog, thread, game: GameState, player_idx: int):
         await cog._autoplay_send(thread, f"⚔️ **Additional Combat Phase #{combat_round}!**")
 
         # Reset to declare attackers
-        game.phase = Phase.DECLARE_ATTACKERS
+        game.set_phase(Phase.DECLARE_ATTACKERS, via="autoplay:moraug_combat")
         attacker_names = await cog.engine.claude_ai.decide_attackers(game, player_idx)
         attacked = []
         if attacker_names:

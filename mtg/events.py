@@ -204,7 +204,15 @@ CARD_CAST = "card_cast"
 # battlefield-wide Ohran/Tovolar watchers, Player.dealt_combat_damage
 # tracking).
 COMBAT_DAMAGE_DEALT = "combat_damage_dealt"
-# Planned: PHASE_CHANGED (see migration plan above).
+# Slice 6a (July 31, 2026 — SHADOW): emitted by GameState.set_phase, the ONE
+# sanctioned way to change game.phase (a structural pin forbids raw
+# assignments). Payload: old_phase, new_phase, via (the site's name), so the
+# 6b flip knows every entry path. The shadow recorder pairs entries into
+# HOOKED phases (MAIN1/MAIN2 → dispatch_main_phase_triggers, UPKEEP → the
+# upkeep scan) with actual hook runs and prints [EVENT-PARITY-PHASE] from
+# end_turn for any entry whose hooks never ran — the direct-phase-set class
+# that produced the Tymna bug three times over. One clean batch gates 6b.
+PHASE_CHANGED = "phase_changed"
 
 _subscribers: Dict[str, List[Callable]] = {}
 

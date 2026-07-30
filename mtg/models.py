@@ -3430,6 +3430,25 @@ class GameState:
     priority_player_index: int = 0
     phase: Phase = Phase.MAIN1
 
+    def set_phase(self, new_phase: 'Phase', via: str = "") -> None:
+        """The ONE sanctioned way to change game.phase (pub/sub slice 6a).
+
+        July 31, 2026: emits PHASE_CHANGED so the shadow recorder can verify
+        every entry into a HOOKED phase actually ran its hooks — the
+        direct-phase-set class (game.phase = Phase.MAIN2 bypassing the
+        main-phase dispatch) produced the Tymna bug three times over
+        (July 27 scan unwired, July 29 F3-C, July 30 F3). A structural pin
+        (tests/test_slice6a_phase_shadow.py) forbids raw assignments in the
+        engine; construction / from_dict / !undo set the FIELD directly —
+        restoration is not a game transition, so no hooks and no emission.
+        `via` names the call site so the 6b flip knows every entry path.
+        """
+        old = self.phase
+        self.phase = new_phase
+        from mtg import events
+        events.emit(events.PHASE_CHANGED, self, old_phase=old,
+                    new_phase=new_phase, via=via)
+
     # Stack (list of StackEntry objects when stack_enabled, else empty list)
     stack: List = field(default_factory=list)
 
@@ -3534,6 +3553,15 @@ class GameState:
     # _cdd_bus_seen/_cdd_consumer_seen scaffolding were retired at the flip.
     _combat_damage_to_player: list = field(default_factory=list, repr=False, compare=False)
     _combat_damage_to_creature: list = field(default_factory=list, repr=False, compare=False)
+    # Pub/sub slice 6a (July 31, 2026 — SHADOW): PHASE_CHANGED parity
+    # scaffolding. _phase_emissions records (turn, old, new, via) from the
+    # set_phase choke point; _phase_hook_runs records (turn, hook) from the
+    # instrumented hooks (dispatch_main_phase_triggers → 'main1'/'main2',
+    # the upkeep scan → 'upkeep'). report_phase_parity diffs + clears both
+    # at end_turn ([EVENT-PARITY-PHASE]). Removed at 6b like the 5a/4a/3a/2a
+    # recorders before it.
+    _phase_emissions: list = field(default_factory=list, repr=False, compare=False)
+    _phase_hook_runs: list = field(default_factory=list, repr=False, compare=False)
     # Spell Queller bookkeeping: source card name → [(exiled_card, owner_name)]
     # (exile_from_stack records; release_queller_exile drains on LTB).
     _queller_exiles: dict = field(default_factory=dict, repr=False, compare=False)

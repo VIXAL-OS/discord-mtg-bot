@@ -3312,7 +3312,7 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
         
         # Declare attacks
         game.attackers = []
-        game.phase = Phase.DECLARE_ATTACKERS
+        game.set_phase(Phase.DECLARE_ATTACKERS, via="cog:attack_cmd")
         
         for card in attackers:
             card.attacking = True
@@ -3343,7 +3343,7 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
             attackers = [c for c in attackers if c in player.battlefield and c.attacking]
             if not attackers:
                 await ctx.send("⚔️ No attackers remain after priority — skipping to end of combat.")
-                game.phase = Phase.COMBAT_END
+                game.set_phase(Phase.COMBAT_END, via="cog:attack_cmd:no_attackers")
                 self.engine.save_game(game)
                 return
 
@@ -4783,7 +4783,7 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
         return await _autoplay_resolve_pending_action(self, thread, game)
     async def _autoplay_resolve_combat(self, thread, game: GameState):
         """Resolve combat damage (mirrors _resolve_combat but without ctx)."""
-        game.phase = Phase.COMBAT_DAMAGE
+        game.set_phase(Phase.COMBAT_DAMAGE, via="cog:_autoplay_resolve_combat")
 
         damage_msgs = self.engine.rules.resolve_combat_damage(game)
         if damage_msgs:
@@ -4815,7 +4815,7 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
             await self._autoplay_send(thread, msg)
 
         if not game.ended:
-            game.phase = Phase.MAIN2
+            game.set_phase(Phase.MAIN2, via="cog:_autoplay_resolve_combat:main2")
             # July 30 batch-9 audit: direct phase set bypassed advance_phase,
             # so postcombat main-phase triggers (Tymna) never fired on
             # combat turns — the only turns their condition can be true.
