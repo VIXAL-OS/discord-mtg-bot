@@ -2423,6 +2423,12 @@ class GameEngine:
         """End the current turn and start the next. Returns end-step messages (e.g. discard prompts)."""
         # (Slices 2c + 3c, July 24: both parity recorders retired — clean
         # post-flip batches at [EVENT-PARITY]=0 and [EVENT-PARITY-DIES]=0.)
+        # Slice 5a (July 30): COMBAT_DAMAGE_DEALT shadow parity report.
+        try:
+            from mtg.triggers import report_combat_damage_parity
+            report_combat_damage_parity(game)
+        except ImportError:
+            pass
 
         # [TRANSFORM] Save spell count for day/night and werewolf transform tracking
         game.active_player.spells_cast_prev_turn = game.active_player.spells_cast_this_turn
@@ -2963,6 +2969,35 @@ class GameEngine:
                 print(f"[PLAN-STALE] '{card_name}' not in hand — prior plan action likely moved it. Available: {', '.join(hand_names[:10])}")
                 return None
 
+        elif action_type == "suspend":
+            # July 30 (batch-9 reviewer R2): suspend initiation. Rather than
+            # cast from hand, pay the suspend cost and exile with N time
+            # counters (CR 702.62); the existing upkeep processor ticks them
+            # down and free-casts on the last one. Before this branch the
+            # mechanic was manual-command-only — the strategist recommended
+            # "Suspend Rift Bolt for {R}" and the actor structurally
+            # couldn't.
+            from mtg.spells import suspend_card_from_hand
+            card_name = action.get("card", "")
+            card = player.find_card(card_name, Zone.HAND)
+            if not card and card_name:
+                _cn = card_name.lower()
+                for c in player.hand:
+                    if _cn in c.name.lower() or c.name.lower().startswith(_cn):
+                        card = c
+                        break
+            if not card:
+                game._last_activation_failure = (
+                    game.turn_number, card_name or "?",
+                    f"'{card_name}' is not in hand to suspend")
+                return None
+            ok, msg = suspend_card_from_hand(game, player, card)
+            if not ok:
+                game._last_activation_failure = (
+                    game.turn_number, card.name, msg)
+                return None
+            return msg
+
         elif action_type == "attack":
             creature_names = action.get("creatures", [])
             attacking = []
@@ -3093,6 +3128,15 @@ class GameEngine:
                     auto_targets = None
                     if explicit_target_name:
                         target_obj = _resolve_player_or_card_target(game, player, explicit_target_name)
+                        if target_obj is not None:
+                            # July 30: CR 109.5 — "any target" abilities must
+                            # not forward a land (Wrenn -1 hit one live).
+                            from mtg.helpers import pw_any_target_legal
+                            _legal, _why = pw_any_target_legal(
+                                game, getattr(ability, 'text', ''), target_obj)
+                            if not _legal:
+                                print(f"[PW-TARGET] Rejecting forwarded target: {_why}")
+                                target_obj = None
                         if target_obj is not None:
                             auto_targets = [target_obj]
                             tname = target_obj.name if hasattr(target_obj, 'name') else target_obj
@@ -3590,6 +3634,10 @@ class GameEngine:
                         if added_colors:
                             mana_str = ''.join(added_colors)
                             print(f"[ACTIVATE-MANA] {perm.name}: added {mana_str} to {player.name}'s pool")
+                            # July 30: Mirari's Wake-class tap bonus (third
+                            # producer site — the explicit mana activation).
+                            player._fire_tap_for_mana_bonuses(
+                                perm, {mana_pattern[0].upper(): 1})
                             return f"{player.name} activates {perm.name}, adds {mana_str}"
 
                     # "Add one mana of any color" — default to most-needed color

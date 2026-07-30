@@ -566,6 +566,53 @@ def _resolve_player_or_card_target(game, activating_player, target_name):
     return None
 
 
+def parse_suspend(oracle_text):
+    """Parse "Suspend N—{cost}" → (n_counters, cost_str) or None.
+
+    July 30 (batch-9 reviewer R2): suspend INITIATION was structurally
+    unreachable for the AI/autoplay — only the manual !suspend command
+    existed, it parsed just the count, and it never charged the cost.
+    Scryfall prints digits and an em-dash ("Suspend 1—{R}"); tolerate a
+    plain hyphen/en-dash. The cost group is re-uppercased because callers
+    lowercase oracle text ({1}{u} would fail the mana engine).
+    """
+    m = re.search(r'suspend (\d+)\s*[—–\-]\s*((?:\{[^}]+\})+)',
+                  (oracle_text or '').lower())
+    if not m:
+        return None
+    return int(m.group(1)), m.group(2).upper()
+
+
+def pw_any_target_legal(game, ability_text, target_obj):
+    """CR 109.5: "any target" means a creature, player, planeswalker, or
+    battle — an unanimated LAND is not one.
+
+    July 30 deferred item (batch-8 origin): Wrenn and Six's -1 ("deals 1
+    damage to any target") accepted a land through the PW forward path —
+    _resolve_player_or_card_target matches any battlefield card by name and
+    no caller type-checked the result. Applies only when the ability text
+    says "any target"; other phrasings keep their own validation. Returns
+    (legal, reason).
+    """
+    text = (ability_text or '').lower()
+    if 'any target' not in text:
+        return True, ""
+    if not hasattr(target_obj, 'type_line'):
+        return True, ""  # a Player — always a legal "any target"
+    tl = (getattr(target_obj, 'type_line', '') or '').lower()
+    if 'planeswalker' in tl or 'battle' in tl:
+        return True, ""
+    try:
+        if target_obj.is_creature(game):
+            return True, ""
+    except TypeError:
+        if target_obj.is_creature():
+            return True, ""
+    return False, (f"{getattr(target_obj, 'name', target_obj)} is not a "
+                   f"legal 'any target' (CR 109.5 — creature, player, "
+                   f"or planeswalker)")
+
+
 _SELF_TARGET_WORDS = frozenset((
     'you', 'yourself', 'self', 'me', 'my', 'controller', 'caster'))
 _OPPONENT_TARGET_WORDS = frozenset((

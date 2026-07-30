@@ -2336,6 +2336,46 @@ class Player:
                 maybe_reraise(_st_err)
         return victim
 
+    def _fire_tap_for_mana_bonuses(self, land_card, production: dict) -> None:
+        """Mirari's Wake / Zendikar Resurgent: "Whenever you tap a land for
+        mana, add one mana of any type that land produced."
+
+        July 30 (batch-8 deferred item): the anthem half has worked since
+        forever; this half was unmodeled — a Wake on the battlefield
+        changed nothing about mana. The bonus mana FLOATS straight into
+        the pool (it is excess by construction — the payment engine never
+        counts it toward the cost being paid), so the July 21 Phase-0 pool
+        spend picks it up on the next cast this phase.
+
+        Deliberately conservative (the July 21/26 payment-engine lessons):
+        - availability advertisement does NOT count the bonus (a Wake
+          player under-advertises rather than reopening the OR-dual /
+          phantom-pool over-count classes);
+        - the color is the tapped land's committed/first produced color
+          ("any type that land produced" is the controller's choice —
+          matching the produced color is the near-always-right pick);
+        - Mana Reflection's "produces twice as much" is a REPLACEMENT
+          with different scope (any permanent) and stays unmodeled.
+        """
+        try:
+            if not land_card.is_land():
+                return
+        except TypeError:
+            return
+        _watchers = [c.name for c in self.battlefield
+                     if 'whenever you tap a land for mana' in
+                     (c.oracle_text or '').lower()
+                     and 'add one mana' in (c.oracle_text or '').lower()]
+        if not _watchers:
+            return
+        _color = next((pc for pc, pv in production.items() if pv > 0), 'C')
+        if _color == 'any':
+            _color = 'C'
+        _n = len(_watchers)
+        self.mana_pool[_color] = self.mana_pool.get(_color, 0) + _n
+        print(f"[MANA-BONUS] {', '.join(_watchers)}: +{_n} {{{_color}}} "
+              f"floats to {self.name}'s pool (tapped {land_card.name} for mana)")
+
     def tap_lands_for_mana(self, amount: int, preferred_colors: str = "",
                            game=None) -> bool:
         """
@@ -2389,6 +2429,8 @@ class Player:
 
             # Add mana to pool based on what the card produces
             self._add_production_to_pool(production, preferred_colors)
+            # July 30: Mirari's Wake-class tap bonus (second producer site).
+            self._fire_tap_for_mana_bonuses(card, production)
 
             mana_tapped += mana_amount
 
@@ -2810,6 +2852,10 @@ class Player:
                 for pc, pv in production.items():
                     _key = 'C' if pc == 'any' else pc
                     produced_by_color[_key] = produced_by_color.get(_key, 0) + pv
+                # July 30: Mirari's Wake-class tap bonus — direct pool add
+                # (never enters produced_by_color, so the cost settle below
+                # can't consume it; it is pure floating excess).
+                self._fire_tap_for_mana_bonuses(card, production)
 
         # Settle the pool: deduct the cost from what the taps produced;
         # whatever remains is true excess and floats. Then apply Phase-0
@@ -3454,6 +3500,14 @@ class GameState:
     # can say "declined" instead of the misleading "no creature you control".
     # Consumed (and cleared) at the fizzle-message emit in mtg/spells.py.
     _aura_fizzle_note: Any = field(default=None, repr=False, compare=False)
+    # Pub/sub slice 5a (July 30, 2026 — SHADOW): COMBAT_DAMAGE_DEALT parity
+    # scaffolding. _cdd_bus_seen records player-kind bus emissions (the
+    # recorder in mtg/triggers.py); _cdd_consumer_seen records the attacker
+    # loop's _combat_damage_to_player appends. report_combat_damage_parity
+    # diffs + clears both at end_turn ([EVENT-PARITY-CDD]). Removed at 5b
+    # like the 2c/3c recorders.
+    _cdd_bus_seen: list = field(default_factory=list, repr=False, compare=False)
+    _cdd_consumer_seen: list = field(default_factory=list, repr=False, compare=False)
     # Spell Queller bookkeeping: source card name → [(exiled_card, owner_name)]
     # (exile_from_stack records; release_queller_exile drains on LTB).
     _queller_exiles: dict = field(default_factory=dict, repr=False, compare=False)

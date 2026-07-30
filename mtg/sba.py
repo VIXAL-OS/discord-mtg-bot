@@ -597,10 +597,22 @@ def process_state_based_actions(rules, game: GameState) -> List[str]:
                                 affected_player=player.name,
                                 from_zone="battlefield",
                                 to_zone="graveyard",
+                                # July 30: "nontoken creature" scoped
+                                # redirects (Draugr Necromancer) filter on it.
+                                is_token=bool(getattr(card, 'is_token', False)),
                             )
                             final = game._replacement_engine.process_event_sync(event)
                             if final.to_zone != "graveyard":
                                 destination = final.to_zone
+                                # July 30: Draugr-class "exile ... with an
+                                # ice counter on it instead" — the effect
+                                # threads the counter through the event.
+                                _rc = getattr(final, 'redirect_counter', '')
+                                if _rc and destination == "exile":
+                                    card.counters[_rc] = card.counters.get(_rc, 0) + 1
+                                    print(f"  [REPLACEMENT-APPLY] {card.name} "
+                                          f"exiled with a{'n' if _rc[:1] in 'aeiou' else ''} "
+                                          f"{_rc} counter")
                                 # May 17 audit: only emit the redirect log AFTER
                                 # we know we're actually honoring it below — see
                                 # the destination switch. Previously the log

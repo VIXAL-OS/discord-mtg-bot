@@ -87,6 +87,14 @@ class GameEvent:
     # For zone changes
     from_zone: str = ""
     to_zone: str = ""
+    # July 30: token-ness of the dying object, so "nontoken creature"
+    # scoped redirects (Draugr Necromancer) can filter. Set by the DEATH
+    # event constructors; defaults False for older call sites.
+    is_token: bool = False
+    # July 30: counter placed on the card by an exile_instead redirect
+    # (Draugr Necromancer's ice counter). Written by ReplacementEffect.apply,
+    # read by the SBA redirect consumer.
+    redirect_counter: str = ""
 
     # For ENTER_BATTLEFIELD replacement (Thalia, Heretic Cathar etc.)
     enters_tapped: Optional[bool] = None
@@ -176,6 +184,9 @@ class ReplacementEffect:
     
     # For redirecting zone changes
     new_destination: Optional[str] = None  # "exile" instead of "graveyard"
+    # July 30: counter the redirect places on the card (Draugr Necromancer's
+    # "exile that card with an ice counter on it instead").
+    redirect_counter: Optional[str] = None
     
     # For preventing
     prevents: bool = False
@@ -245,6 +256,8 @@ class ReplacementEffect:
         # Redirect destination
         if self.new_destination:
             result.to_zone = self.new_destination
+            if self.redirect_counter:
+                result.redirect_counter = self.redirect_counter
 
         # Force enters-tapped state (Thalia, Heretic Cathar)
         if self.force_tapped is not None:
@@ -904,6 +917,31 @@ _NAMED_CARD_REPLACEMENTS = {
             condition_text="opponent's card would go to graveyard",
             replacement_type="exile_instead",
             new_destination="exile",
+        )
+    ],
+    # July 30 (batch-8 deferred item): Draugr Necromancer was a vanilla
+    # creature — neither half of his text existed anywhere. This models the
+    # DEATH-REDIRECT half only ("If a nontoken creature an opponent controls
+    # would die, exile that card with an ice counter on it instead" — the
+    # RIP/Leyline family plus the counter rider). The second half (casting
+    # opponents' ice-countered cards from exile with snow mana as any color)
+    # needs cross-player impulse-cast machinery and is UNMODELED.
+    "draugr necromancer": lambda card_id, controller: [
+        ReplacementEffect(
+            id=f"{card_id}_draugr",
+            source_name="Draugr Necromancer",
+            source_id=card_id,
+            controller=controller,
+            replaces_event=EventType.DEATH,
+            condition=lambda e, _ctrl=controller: (
+                e.to_zone == "graveyard"
+                and e.affected_player != _ctrl
+                and not e.is_token),
+            condition_text=("a nontoken creature an opponent controls "
+                            "would die"),
+            replacement_type="exile_instead",
+            new_destination="exile",
+            redirect_counter="ice",
         )
     ],
     "furnace of rath": lambda card_id, controller: [

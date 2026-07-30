@@ -919,6 +919,33 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
             return
 
         coverage = classify_deck(cards)
+        # July 30: Tier 2.5 awareness — probe the persistent XMage bridge
+        # for the residual tier3 cards (the module supports an xmage_probe
+        # but no caller ever supplied one). Deduped; each probe is a
+        # JSON-RPC round trip (~10-50ms), fine for an explicit command.
+        bridge = getattr(self.engine, 'xmage_bridge', None)
+        t3_names = coverage["by_tier"].get("tier3", [])
+        if bridge is not None and t3_names:
+            known = set()
+            for n in sorted(set(t3_names)):
+                try:
+                    res = await bridge.lookup(n)
+                    if isinstance(res, dict) and res.get('name'):
+                        known.add(n)
+                except Exception as e:
+                    # Network/subprocess crash barrier (bridge down mid-probe)
+                    # — keep the un-probed report rather than fail the command.
+                    print(f"[XMAGE] coverage probe aborted at '{n}': {e}")
+                    break
+            if known:
+                keep = [n for n in t3_names if n not in known]
+                moved = [n for n in t3_names if n in known]
+                coverage["by_tier"]["tier3"] = keep
+                coverage["by_tier"]["xmage"] = (
+                    coverage["by_tier"].get("xmage", []) + moved)
+                coverage["counts"]["tier3"] = len(keep)
+                coverage["counts"]["xmage"] = (
+                    coverage["counts"].get("xmage", 0) + len(moved))
         report = format_coverage_report(coverage, deck_name=report_name)
         await ctx.send(report)
 
@@ -1647,28 +1674,15 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
             await ctx.send(f"Can't find '{card_name}' in your hand!")
             return
         
-        # Check if card has Suspend
-        oracle_lower = card.oracle_text.lower() if card.oracle_text else ""
-        
-        if "suspend" not in oracle_lower:
-            await ctx.send(f"**{card.name}** doesn't have Suspend!")
+        # July 30 (batch-9 reviewer R2): route through the shared core —
+        # this command previously parsed only the COUNT and never charged
+        # the suspend cost, so every manual suspend was free.
+        from mtg.spells import suspend_card_from_hand
+        ok, msg = suspend_card_from_hand(game, player, card)
+        if not ok:
+            await ctx.send(f"❌ {msg}")
             return
-        
-        # Parse suspend number (e.g., "Suspend 3" or "Suspend 4—{U}")
-        suspend_match = re.search(r'suspend\s*(\d+)', oracle_lower)
-        if not suspend_match:
-            await ctx.send(f"Couldn't parse Suspend number from {card.name}'s text.")
-            return
-        
-        suspend_count = int(suspend_match.group(1))
-        
-        # Move card from hand to exile with time counters
-        player.hand.remove(card)
-        player.exile.append(card)
-        card.suspended = True
-        card.counters['time'] = suspend_count
-        
-        await ctx.send(f"⏳ Suspended **{card.name}** with {suspend_count} time counters!")
+        await ctx.send(msg)
         await ctx.send(f"*At the beginning of your upkeep, a time counter will be removed. When the last is removed, you'll cast it for free!*")
         
         # Save game state

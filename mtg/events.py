@@ -115,10 +115,14 @@ MIGRATION PLAN (one slice per audit cycle; batches are the regression net)
       gets subscribed in violation of the contract.
       Revisit this decision only if _check_cast_triggers loses its need to
       await (the test asserts that need explicitly).
-  Slice 5+: COMBAT_DAMAGE_DEALT, PHASE_CHANGED — shadow first, one slice
-      per audit cycle. The React frontend's websocket layer is the intended
-      next CARD_CAST subscriber, and it is sync-friendly (it only needs to
-      serialize state), so it can attach without reopening 4b.
+  Slice 5a: COMBAT_DAMAGE_DEALT — SHADOW (July 30, 2026). Emitted at both
+      damage-application funnels in mtg/combat.py; the recorder diffs
+      player-kind emissions against game._combat_damage_to_player appends
+      ([EVENT-PARITY-CDD] from end_turn). One clean batch gates 5b.
+  Slice 6+: PHASE_CHANGED — shadow first, one slice per audit cycle. The
+      React frontend's websocket layer is the intended next CARD_CAST
+      subscriber, and it is sync-friendly (it only needs to serialize
+      state), so it can attach without reopening 4b.
 
 CONTRACTS
 ---------
@@ -174,7 +178,24 @@ CREATURE_DIED = "creature_died"
 # pinned by tests/test_slice4a_cast_shadow.py so it cannot rot unnoticed.
 # The React websocket layer is the intended next subscriber.
 CARD_CAST = "card_cast"
-# Planned: COMBAT_DAMAGE_DEALT, PHASE_CHANGED (see migration plan above).
+# Slice 5a (July 30, 2026) — SHADOW. Emitted once per combat-damage
+# APPLICATION at the two funnels in mtg/combat.py:
+#   apply_combat_damage_to_player   (payload: source, target, amount,
+#                                    target_kind="player")
+#   apply_combat_damage_to_creature (target_kind="creature")
+# The shadow recorder (mtg/triggers.py) diffs player-kind emissions against
+# the attacker-loop's game._combat_damage_to_player appends — the list the
+# [COMBAT-TRIGGER] dispatch consumes — and prints [EVENT-PARITY-CDD] from
+# end_turn for either direction of mismatch. A bus-emission WITHOUT a
+# consumer append means a damage path whose combat-damage triggers
+# silently never fire (the first-strike step is the suspect); an append
+# without an emission means a path bypassing the replacement/poison
+# funnel. One clean batch gates 5b (flipping consumers onto the bus: the
+# Obliterator class "whenever a source deals damage to THIS creature",
+# battlefield-wide Ohran/Tovolar watchers, Player.dealt_combat_damage
+# tracking).
+COMBAT_DAMAGE_DEALT = "combat_damage_dealt"
+# Planned: PHASE_CHANGED (see migration plan above).
 
 _subscribers: Dict[str, List[Callable]] = {}
 

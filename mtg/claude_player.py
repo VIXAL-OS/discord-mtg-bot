@@ -1621,6 +1621,7 @@ Respond with a JSON action. Examples:
 {"type": "cast", "card": "Lightning Bolt", "target": "opponent"}
 {"type": "cast", "card": "Counterspell", "target": "stack_top"}
 {"type": "cast", "card": "Beanstalk Giant", "adventure": "Fertile Footsteps"}
+{"type": "suspend", "card": "Rift Bolt"}
 {"type": "activate", "permanent": "Chandra, Pyromaster", "ability": 0}
 {"type": "activate", "permanent": "Nicol Bolas, Dragon-God", "ability": 1}
 {"type": "resolve", "description": "Mystic Sanctuary ETB — put Counterspell on top of library"}
@@ -2062,6 +2063,31 @@ What is your best play? Respond with a JSON action."""
                 castable_section += (
                     f"\n⚠️ CANNOT CAST during your main phase (need spell on stack): "
                     f"{', '.join(stack_dependent)}"
+                )
+
+        # July 30 (batch-9 reviewer R2): surface Suspend. Before the suspend
+        # executor branch existed the mechanic was structurally unreachable —
+        # the strategist recommended "Suspend Rift Bolt for {R}" and the
+        # actor could only hardcast. Mox Tantalite-class cards (no mana
+        # cost) can ONLY enter play this way.
+        if game.phase in (Phase.MAIN1, Phase.MAIN2):
+            from mtg.helpers import parse_suspend
+            _suspendable = []
+            for c in player.hand:
+                _s = parse_suspend(c.oracle_text)
+                if not _s:
+                    continue
+                _sn, _scost = _s
+                if _check_color_castable(_scost, mana_by_color, any_color_mana, total_mana):
+                    _suspendable.append((c.name, _sn, _scost))
+            if _suspendable:
+                castable_section += (
+                    "\n⏳ SUSPEND available (pay a cheap cost NOW, exile with time "
+                    "counters, casts FREE when the last one is removed — the "
+                    "efficient line when you can't afford the full cost): "
+                    + ", ".join(f"{n} (Suspend {k} for {c})"
+                                for n, k, c in _suspendable)
+                    + f"\n  Use: {{\"type\": \"suspend\", \"card\": \"{_suspendable[0][0]}\"}}"
                 )
 
         # Fetchland activation hint — uncracked fetchlands produce 0 mana and should be activated.
@@ -2641,6 +2667,7 @@ CRITICAL: After each cast, subtract its mana cost from your available mana. Do N
 ACTION GRAMMAR:
 - {"type": "play_land", "card": "Forest"}
 - {"type": "cast", "card": "Arcane Signet"}
+- {"type": "suspend", "card": "Rift Bolt"} — pay the Suspend cost, exile with time counters, casts free later (the ⏳ hint lists candidates)
 - {"type": "activate", "permanent": "Chandra, Pyromaster", "ability": 0}
 - {"type": "resolve", "description": "<one short imperative clause, no reasoning>"}
 - {"type": "pass"}

@@ -1538,6 +1538,15 @@ async def _autoplay_execute_action(cog, thread, game: GameState, player_idx: int
             if target_name and ability.needs_target:
                 target_obj = _resolve_player_or_card_target(game, player, target_name)
                 if target_obj is not None:
+                    # July 30: CR 109.5 — "any target" abilities must not
+                    # forward a land (Wrenn -1 hit one live in batch 15315).
+                    from mtg.helpers import pw_any_target_legal
+                    _legal, _why = pw_any_target_legal(
+                        game, getattr(ability, 'text', ''), target_obj)
+                    if not _legal:
+                        print(f"[PW-TARGET] Rejecting forwarded target: {_why}")
+                        target_obj = None
+                if target_obj is not None:
                     auto_targets = [target_obj]
                     tname = target_obj.name if hasattr(target_obj, 'name') else str(target_obj)
                     print(f"[PW-TARGET] Forwarding explicit target '{target_name}' → {tname} for {perm.name}")
@@ -1744,6 +1753,30 @@ async def _autoplay_execute_action(cog, thread, game: GameState, player_idx: int
         if result_msg:
             await cog._autoplay_send(thread, result_msg)
         return result_msg
+
+    elif action_type == "suspend":
+        # July 30 (batch-9 reviewer R2): suspend initiation on the human code
+        # path — twin of the engine.py branch, one shared core (the
+        # two-cast-paths divergence rule).
+        from mtg.spells import suspend_card_from_hand
+        card_name = action.get("card", "")
+        card = player.find_card(card_name, Zone.HAND)
+        if not card and card_name:
+            _cn = card_name.lower()
+            for c in player.hand:
+                if _cn in c.name.lower() or c.name.lower().startswith(_cn):
+                    card = c
+                    break
+        if not card:
+            game._last_activation_failure = (
+                game.turn_number, card_name or "?",
+                f"'{card_name}' is not in hand to suspend")
+            return None
+        ok, msg = suspend_card_from_hand(game, player, card)
+        if not ok:
+            game._last_activation_failure = (game.turn_number, card.name, msg)
+            return None
+        return msg
 
     elif action_type == "tap":
         card_name = action.get("card")

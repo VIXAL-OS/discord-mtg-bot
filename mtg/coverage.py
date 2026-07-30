@@ -143,6 +143,42 @@ def _spell_resolver_handles(oracle_text: str) -> bool:
     return all(e.effect_type != EffectType.COMPLEX for e in effects)
 
 
+_BASIC_LAND_NAMES = frozenset((
+    'plains', 'island', 'swamp', 'mountain', 'forest', 'wastes',
+    'snow-covered plains', 'snow-covered island', 'snow-covered swamp',
+    'snow-covered mountain', 'snow-covered forest', 'snow-covered wastes'))
+
+_CARD_CACHE = None
+
+
+def _cache_backfill(card_name: str):
+    """(oracle_text, type_line, found) from data/card_data_cache.json.
+
+    July 30: deck JSONs carry name+quantity ONLY, so the `!coverage
+    <deckname>` path built Cards with empty oracle text — and an empty
+    oracle reads as "vanilla", so EVERY card classified as no_resolution
+    (the opposite failure from the ~57% tier3 overstatement the module was
+    built to fix). The Scryfall disk cache has real text for every card
+    the bot has ever seen; lazy-loaded once per process.
+    """
+    global _CARD_CACHE
+    if _CARD_CACHE is None:
+        try:
+            import json
+            from pathlib import Path
+            p = (Path(__file__).resolve().parent.parent
+                 / "data" / "card_data_cache.json")
+            _CARD_CACHE = (json.loads(p.read_text(encoding="utf-8"))
+                           if p.exists() else {})
+        except (OSError, ValueError):
+            # Unreadable/corrupt cache file — classify without backfill.
+            _CARD_CACHE = {}
+    v = _CARD_CACHE.get((card_name or '').lower().strip())
+    if isinstance(v, dict):
+        return v.get('oracle_text') or '', v.get('type_line') or '', True
+    return '', '', False
+
+
 def supported_at_tier(card_name: str, oracle_text: str = "",
                       type_line: str = "",
                       xmage_probe: Optional[Callable[[str], bool]] = None) -> str:
@@ -166,6 +202,23 @@ def supported_at_tier(card_name: str, oracle_text: str = "",
     if not HAS_TEMPLATES or get_effect_library is None:
         return "unknown"
     try:
+        # 0. July 30: backfill empty oracle text from the Scryfall disk
+        # cache (see _cache_backfill). A name the cache has never seen and
+        # no caller-supplied text is honestly "unknown", not vanilla —
+        # except basic lands, whose names are static.
+        if not oracle_text and not type_line:
+            _key = (card_name or '').lower().strip()
+            if _key in _BASIC_LAND_NAMES:
+                return "no_resolution"
+            oracle_text, type_line, _found = _cache_backfill(card_name)
+            if not _found:
+                # Name-keyed tiers can still claim an uncached card.
+                _t = get_effect_library().tier_for_card(card_name, "")
+                if _t == "template":
+                    return "template"
+                if _key in _TIER1_HARDCODED:
+                    return "hardcoded"
+                return "unknown"
         # 1. Nothing to resolve at all (vanilla, French vanilla, plain land).
         if _needs_no_resolution(oracle_text, type_line):
             return "no_resolution"

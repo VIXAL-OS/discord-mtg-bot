@@ -615,6 +615,14 @@ def apply_combat_damage_to_player(rules, game: GameState, player: 'PlayerState',
             if amount > 0:
                 player.dealt_combat_damage_this_turn = True
 
+    # Pub/sub slice 5a (July 30, 2026 — SHADOW): one emission per damage
+    # APPLICATION, after replacements and the infect/life split (poison IS
+    # dealt damage per CR 120.3). The recorder diffs these against the
+    # attacker-loop's _combat_damage_to_player appends.
+    if is_combat and amount > 0:
+        events.emit(events.COMBAT_DAMAGE_DEALT, game, source=source_card,
+                    target=player, amount=amount, target_kind="player")
+
     # CR 903.10a / 704.5b — Commander damage tracking. If the source is a
     # commander dealing combat damage to a player, accumulate per source-controller.
     # commander_damage maps source_controller_index -> total damage.
@@ -685,6 +693,10 @@ def apply_combat_damage_to_creature(rules, game: GameState, creature: Card,
     # Track deathtouch damage separately for SBA 704.5h
     if source_has_deathtouch and amount > 0:
         creature.deathtouch_damage += amount
+    # Pub/sub slice 5a (July 30, 2026 — SHADOW): see the player funnel.
+    if amount > 0:
+        events.emit(events.COMBAT_DAMAGE_DEALT, game, source=source_card,
+                    target=creature, amount=amount, target_kind="creature")
     return amount
 
 
@@ -915,6 +927,10 @@ def deal_combat_damage(rules, game: GameState, attackers: List[Tuple[Card, Playe
                 if not hasattr(game, '_combat_damage_to_player'):
                     game._combat_damage_to_player = []
                 game._combat_damage_to_player.append((attacker, attacker_owner, actual_damage))
+                # Slice 5a shadow: mirror the append for the parity recorder.
+                game._cdd_consumer_seen.append(
+                    (getattr(attacker, 'id', attacker.name),
+                     defending_player.name, actual_damage))
             else:
                 messages.append(f"🛡️ {attacker.name}'s damage to {defending_player.name} was prevented")
 
@@ -1173,6 +1189,10 @@ def deal_combat_damage(rules, game: GameState, attackers: List[Tuple[Card, Playe
                     if not hasattr(game, '_combat_damage_to_player'):
                         game._combat_damage_to_player = []
                     game._combat_damage_to_player.append((attacker, attacker_owner, actual_trample))
+                    # Slice 5a shadow: mirror the append (second producer site).
+                    game._cdd_consumer_seen.append(
+                        (getattr(attacker, 'id', attacker.name),
+                         defending_player.name, actual_trample))
                 else:
                     messages.append(f"🛡️ {attacker.name}'s trample damage to {defending_player.name} was prevented")
                 if attacker.has_lifelink(game=game) and actual_trample > 0:

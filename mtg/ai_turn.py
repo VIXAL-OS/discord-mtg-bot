@@ -2060,6 +2060,18 @@ def _get_action_error(engine, game: GameState, player_index: int, action: Dict) 
         if not card.is_land():
             return f"'{card_name}' is not a land"
     
+    elif action_type == "suspend":
+        # July 30: the suspend branches stash their real failure reason.
+        _lsf = getattr(game, '_last_activation_failure', None)
+        if _lsf:
+            _lsf_turn, _lsf_name, _lsf_msg = _lsf
+            _want = str(action.get("card", "")).lower()
+            if (_lsf_turn == game.turn_number and _want
+                    and _lsf_name.lower() == _want):
+                game._last_activation_failure = None
+                return _lsf_msg
+        return f"Could not suspend {action.get('card', '?')}"
+
     elif action_type == "activate":
         perm_name = action.get("permanent")
         ability_idx = action.get("ability", 0)

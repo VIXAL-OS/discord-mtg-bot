@@ -3307,6 +3307,36 @@ def _advance_sagas(engine, game: GameState, player: Player) -> List[str]:
     return messages
 
 
+def suspend_card_from_hand(game: GameState, player: Player, card: Card):
+    """Suspend a card from hand: pay the suspend cost, exile with N time
+    counters (CR 702.62). Returns (ok, message).
+
+    July 30 (batch-9 reviewer R2): the ONE shared implementation for all
+    three paths — the new AI/autoplay "suspend" action branches and the
+    manual !suspend command (which previously charged NOTHING for the
+    suspend cost). The upkeep tick-down + free cast side already existed
+    (_process_suspend_upkeep / _resolve_suspend_spell below).
+    """
+    from mtg.helpers import parse_suspend
+    parsed = parse_suspend(getattr(card, 'oracle_text', ''))
+    if not parsed:
+        return False, f"{card.name} has no parseable Suspend cost"
+    n, cost = parsed
+    if card not in player.hand:
+        return False, f"{card.name} is not in your hand"
+    if not player.tap_sources_for_cost(cost, game=game):
+        return False, f"Can't pay {cost} to suspend {card.name}"
+    player.hand.remove(card)
+    player.exile.append(card)
+    card.suspended = True
+    card.counters['time'] = n
+    print(f"[SUSPEND] {player.name} suspends {card.name} with {n} time "
+          f"counter(s) (paid {cost})")
+    return True, (f"⏳ {player.name} suspends **{card.name}** with {n} time "
+                  f"counter(s) (paid {cost}) — casts free when the last "
+                  f"counter is removed")
+
+
 def _process_suspend_upkeep(engine, game: GameState) -> List[str]:
     """Process suspended cards at upkeep - remove time counters and cast if 0."""
     messages = []

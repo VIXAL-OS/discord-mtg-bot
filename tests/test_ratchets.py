@@ -87,7 +87,10 @@ EXCEPT_BASELINE = {
     "ai_turn.py": 19,
     "autoplay.py": 18,
     "claude_player.py": 33,
-    "cog.py": 30,
+    # July 30: +1 for the !coverage XMage-probe barrier (network/subprocess
+    # crash barrier with its own [XMAGE] log line — the deliberately
+    # swallow-only class, not a maybe_reraise candidate).
+    "cog.py": 31,
     "combat.py": 5,
     "coverage.py": 3,
     "deck_loader.py": 4,

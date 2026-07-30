@@ -4890,3 +4890,47 @@ events.subscribe(events.CREATURE_DIED, _accumulate_death_subscriber)
 # tests/test_slice4a_cast_shadow.py so the spine can't silently rot with no
 # subscriber watching it; the React websocket layer is the intended next
 # subscriber.
+
+
+# ---------------------------------------------------------------------------
+# Pub/sub slice 5a (July 30, 2026 — SHADOW): COMBAT_DAMAGE_DEALT recorder.
+# The two funnels in mtg/combat.py emit once per damage APPLICATION; the
+# attacker loop's game._combat_damage_to_player appends (what the
+# [COMBAT-TRIGGER] dispatch consumes) are mirrored into _cdd_consumer_seen.
+# report_combat_damage_parity diffs the two multisets from end_turn:
+#   - an EMISSION with no consumer append = a damage path whose
+#     combat-damage triggers silently never fire (first-strike-step connects
+#     are the prime suspect), and
+#   - an APPEND with no emission = a path bypassing the replacement/poison
+#     funnel entirely.
+# One clean batch gates slice 5b (flipping consumers onto the bus: the
+# Obliterator class, battlefield-wide Ohran/Tovolar watchers).
+# ---------------------------------------------------------------------------
+
+def _cdd_shadow_recorder(game, source=None, target=None, amount=0,
+                         target_kind="", **_payload):
+    """Record player-kind COMBAT_DAMAGE_DEALT emissions for the parity diff."""
+    if target_kind != "player":
+        return  # creature-side emissions have no legacy consumer to diff yet
+    game._cdd_bus_seen.append(
+        (getattr(source, 'id', getattr(source, 'name', '?')),
+         getattr(target, 'name', '?'), amount))
+
+
+def report_combat_damage_parity(game) -> None:
+    """Print [EVENT-PARITY-CDD] for every mismatch, then clear both records."""
+    from collections import Counter
+    bus = Counter(game._cdd_bus_seen)
+    consumed = Counter(game._cdd_consumer_seen)
+    for key, n in (bus - consumed).items():
+        print(f"[EVENT-PARITY-CDD] emitted but never reached the "
+              f"combat-trigger list (×{n}): source_id={key[0]} "
+              f"player={key[1]} amount={key[2]}")
+    for key, n in (consumed - bus).items():
+        print(f"[EVENT-PARITY-CDD] consumer append with NO bus emission "
+              f"(×{n}): source_id={key[0]} player={key[1]} amount={key[2]}")
+    game._cdd_bus_seen = []
+    game._cdd_consumer_seen = []
+
+
+events.subscribe(events.COMBAT_DAMAGE_DEALT, _cdd_shadow_recorder)
