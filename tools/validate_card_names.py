@@ -33,6 +33,7 @@ import difflib
 import json
 import re
 import sys
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -81,6 +82,39 @@ def _request(url: str) -> urllib.request.Request:
         url, headers={"User-Agent": USER_AGENT, "Accept": "*/*"})
 
 
+# July 31, 2026: retry transient fetch failures instead of failing the run.
+# A single Scryfall 503 blip turned BOTH repos' card-names workflows red on
+# July 30 (runs 30551833137 / 30552143272, fired in the same three-minute
+# window; the next runs passed untouched). This workflow's value is that red
+# MEANS something — a typo, WotC retemplating, a real API break — so
+# transient availability must not cry wolf. Retryable: 5xx, 429, and network/
+# timeout errors. NOT retryable: other 4xx (a 404 here is the July 29
+# index-shape-change class — fail fast with the real message).
+_RETRY_DELAYS = (10, 30, 60)  # seconds between attempts (4 attempts total)
+
+
+def _urlopen_with_retries(url: str, timeout: int):
+    """urlopen with backoff on transient failures. Returns the response."""
+    import time as _time
+    last_err = None
+    for attempt, delay in enumerate((0,) + _RETRY_DELAYS):
+        if delay:
+            print(f"[VALIDATOR] retrying in {delay}s "
+                  f"(attempt {attempt + 1}/{len(_RETRY_DELAYS) + 1}) after: {last_err}")
+            _time.sleep(delay)
+        try:
+            return urllib.request.urlopen(_request(url), timeout=timeout)
+        except urllib.error.HTTPError as e:
+            if e.code >= 500 or e.code == 429:
+                last_err = e
+                continue
+            raise  # other 4xx = a real problem, fail fast
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            last_err = e
+            continue
+    raise last_err
+
+
 def ensure_bulk(refresh: bool) -> Path:
     """Download the Scryfall oracle-cards bulk file if missing (or refresh).
 
@@ -94,7 +128,7 @@ def ensure_bulk(refresh: bool) -> Path:
     if BULK_CACHE.exists() and not refresh:
         return BULK_CACHE
     print(f"[VALIDATOR] fetching bulk-data index: {BULK_INDEX_URL}")
-    with urllib.request.urlopen(_request(BULK_INDEX_URL), timeout=120) as r:
+    with _urlopen_with_retries(BULK_INDEX_URL, timeout=120) as r:
         index = json.load(r)
     entry = next(d for d in index["data"] if d["type"] == "oracle_cards")
     array_uri = entry.get("download_uri")
@@ -107,7 +141,7 @@ def ensure_bulk(refresh: bool) -> Path:
     print(f"[VALIDATOR] downloading oracle_cards bulk: {dl}")
     BULK_CACHE.parent.mkdir(parents=True, exist_ok=True)
     tmp = BULK_CACHE.with_suffix(".part")
-    with urllib.request.urlopen(_request(dl), timeout=900) as r, \
+    with _urlopen_with_retries(dl, timeout=900) as r, \
             open(tmp, "wb") as f:
         while chunk := r.read(1 << 20):
             f.write(chunk)
