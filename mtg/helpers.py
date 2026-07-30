@@ -764,6 +764,103 @@ def parse_escape_cost(oracle_text):
     return match.group(1).upper(), count
 
 
+def counter_restriction_allows(counter_oracle, target_card):
+    """Does this counterspell's printed restriction allow countering target_card?
+
+    July 29 batch audit: Mental Misstep ("Counter target spell with mana
+    value 1") countered a mana-value-2 Intangible Virtue — three independent
+    paths (response auto-target, cast validation, Tier-2 resolution) all
+    skipped restriction enforcement. Handles the two big families:
+      - "with mana value N" / "with mana value N or less"
+      - "counter target <qualifier> spell" (noncreature / creature / ...)
+    Unknown shapes return True (no restriction detected) — this is a gate
+    against ILLEGAL counters, not a full targeting model.
+    """
+    ot = (counter_oracle or '').lower()
+    if 'counter target' not in ot:
+        return True
+    tcmc = int(getattr(target_card, 'cmc', 0) or 0)
+    ttype = (getattr(target_card, 'type_line', '') or '').lower()
+    m = re.search(r'counter target [^.\n]*?with mana value (\d+)( or less)?', ot)
+    if m:
+        n = int(m.group(1))
+        if m.group(2):
+            if tcmc > n:
+                return False
+        elif tcmc != n:
+            return False
+    m = re.search(r'counter target (\w+) spell', ot)
+    if m and m.group(1) not in ('target',):
+        q = m.group(1)
+        if q.startswith('non'):
+            if q[3:] in ttype:
+                return False
+        elif q != 'spell' and q not in ttype:
+            return False
+    return True
+
+
+def player_skips_draw_step(player):
+    """Live scan: does a permanent this player controls print 'skip your draw
+    step'? Returns the source card's name, or None.
+
+    July 29 batch audit (CR 611.2c): Solitary Confinement's draw-skip was a
+    sticky Player flag with NO expiry and no removal cleanup — after Claude
+    exiled it (game_1531564136121503818), Rick never drew again for the rest
+    of the game. A static ability exists exactly while its source is on the
+    battlefield, so compute it from the battlefield. Bonus: this also honors
+    Necropotence's printed "Skip your draw step.", which no code modeled.
+    """
+    for c in getattr(player, 'battlefield', None) or []:
+        if getattr(c, '_phased_out', False):
+            continue
+        if 'skip your draw step' in (getattr(c, 'oracle_text', '') or '').lower():
+            return c.name
+    return None
+
+
+def player_has_prevent_all_static(player):
+    """Live scan: an unconditional "prevent all damage that would be dealt to
+    you" STATIC (Solitary Confinement, Glacial Chasm). Same CR 611.2c story
+    as player_skips_draw_step — the old sticky `_damage_prevented` flag
+    outlived the permanent (batch 15315 prevented 6 combat damage the same
+    turn Solitary Confinement was exiled). `_damage_prevented` remains the
+    channel for EVENT-scoped prevention (Teferi's Protection, Fog), which
+    genuinely persists after the spell resolves.
+    """
+    for c in getattr(player, 'battlefield', None) or []:
+        if getattr(c, '_phased_out', False):
+            continue
+        ot = (getattr(c, 'oracle_text', '') or '').lower()
+        if 'prevent all damage that would be dealt to you' in ot:
+            return True
+    return False
+
+
+def parse_escapes_with_counters(oracle_text):
+    """Parse the escape rider "escapes with N +1/+1 counter(s) on it".
+
+    CR 702.139e. Sibling of parse_escape_cost, with the same word-number
+    lesson applied up front: every printing spells the count as "a" or an
+    English word ("escapes with a +1/+1 counter", "escapes with two +1/+1
+    counters"), never a digit. Returns 0 when there is no rider.
+    """
+    if not oracle_text:
+        return 0
+    match = re.search(
+        r'escapes with (\d+|an?|one|two|three|four|five|six|seven|eight|nine|ten)'
+        r'\s+\+1/\+1 counters?',
+        oracle_text.lower())
+    if not match:
+        return 0
+    raw = match.group(1)
+    if raw.isdigit():
+        return int(raw)
+    if raw in ('a', 'an'):
+        return 1
+    return _NUMBER_WORDS.get(raw, 0)
+
+
 def owns_card(card, player_index):
     """Does the player at `player_index` OWN this card?
 

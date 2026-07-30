@@ -1901,7 +1901,18 @@ What is your best play? Respond with a JSON action."""
             if getattr(card, 'is_token', False):
                 continue
             # Check if we can cast this card (uses ManaCost engine when available)
-            if _check_color_castable(card.mana_cost, mana_by_color, any_color_mana, total_mana):
+            # July 29 batch audit: split cards store the COMBINED Scryfall
+            # string ("{3}{U} // {4}{U}{U}"), which parses as one 10-CMC cost
+            # — Commit // Memory was invisible to the castable list all game
+            # while its 4-mana half was affordable. You cast ONE half
+            # (CR 709.3): affordable when either half is.
+            _cast_cost = card.mana_cost or ""
+            if " // " in _cast_cost:
+                for _half in _cast_cost.split(" // "):
+                    if _check_color_castable(_half.strip(), mana_by_color, any_color_mana, total_mana):
+                        castable_cards.append(f"{card.name} ({card.mana_cost})")
+                        break
+            elif _check_color_castable(_cast_cost, mana_by_color, any_color_mana, total_mana):
                 castable_cards.append(f"{card.name} ({card.mana_cost})")
 
             # Also check adventure half castability

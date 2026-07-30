@@ -729,7 +729,12 @@ class SpellResolver:
 
         stack = getattr(game, 'stack', None) or []
         target = None
-        # Skip the counterspell itself — look for a non-self target, top-down
+        # Skip the counterspell itself — look for a non-self target, top-down.
+        # July 29 batch audit: also skip spells the counterspell's own printed
+        # restriction can't touch (Mental Misstep's "with mana value 1"
+        # countered a mana-value-2 Intangible Virtue through this path).
+        from mtg.helpers import counter_restriction_allows
+        _counter_oracle = getattr(ctx.source_card, 'oracle_text', '') if ctx.source_card else ''
         for entry in reversed(stack):
             entry_card = getattr(entry, 'card', None)
             entry_name = getattr(entry_card, 'name', None) if entry_card else None
@@ -737,6 +742,11 @@ class SpellResolver:
                 continue  # don't counter ourselves
             if getattr(entry, 'countered', False):
                 continue  # already countered
+            if entry_card is not None and not counter_restriction_allows(
+                    _counter_oracle, entry_card):
+                print(f"[COUNTER] {spell_name} can't counter {entry_name} — "
+                      f"printed restriction not met")
+                continue
             target = entry
             break
 
@@ -753,6 +763,13 @@ class SpellResolver:
             target.countered = True
         messages.append(f"🚫 **{target_name}** is countered by **{spell_name}**!")
         print(f"[COUNTER] {spell_name} cast by {caster} → countered {target_name}")
+        # July 29: Baral-class "counters a spell" triggers.
+        try:
+            from mtg.triggers import fire_counters_a_spell_triggers
+            messages.extend(fire_counters_a_spell_triggers(
+                game, ctx.source_controller.name if ctx.source_controller else None))
+        except (AttributeError, TypeError) as e:
+            print(f"[COUNTER-TRIGGER] scan failed: {e}")
         return messages
     
     async def _exec_pump(self, effect: Effect, ctx: ExecutionContext, game) -> List[str]:

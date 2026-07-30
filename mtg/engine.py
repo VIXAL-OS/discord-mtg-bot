@@ -861,6 +861,18 @@ class GameEngine:
                     'counter target triggered' in _resp_oracle or
                     'counter target activated' in _resp_oracle
                 )
+                # July 29 batch audit: enforce the counterspell's own printed
+                # restriction (Mental Misstep countered a mana-value-2 spell
+                # because nothing here checked "with mana value 1").
+                from mtg.helpers import counter_restriction_allows
+                if (_targets_a_spell and top_stack
+                        and not counter_restriction_allows(
+                            response_card.oracle_text, top_stack.card)):
+                    print(f"[STACK-AI] {player_name} can't target {spell_name} "
+                          f"with {response_card.name} — printed restriction "
+                          f"not met (CR 601.2c); passing instead")
+                    await ps.player_action(player_name, PriorityAction.pass_priority())
+                    return
                 response_target = top_stack.card if (top_stack and _targets_a_spell) else None
                 print(f"[STACK-AI] {player_name} casting response: {response_card.name}"
                       f"{f' targeting {spell_name}' if response_target else ' (auto-target)'}")
@@ -1989,7 +2001,13 @@ class GameEngine:
             # [DELAYED-TRIGGER] Fire delayed triggers scheduled for upkeep
             delayed_msgs = self._process_delayed_triggers(game, "upkeep")
             messages.extend(delayed_msgs)
-            # [SOLITARY-CONFINEMENT] Upkeep sacrifice unless discard a card
+            # [SOLITARY-CONFINEMENT] Upkeep sacrifice unless discard a card.
+            # July 29 (CR 611.2c): the upkeep cost only decides whether the
+            # permanent STAYS. Its statics (skip draw / prevent all damage)
+            # are now computed live from the battlefield at the draw and
+            # damage gates (helpers.player_skips_draw_step /
+            # player_has_prevent_all_static) — the old sticky Player flags
+            # outlived the permanent when it was exiled mid-game.
             for perm in list(game.active_player.battlefield):
                 if perm.name == "Solitary Confinement":
                     if game.active_player.hand:
@@ -1998,18 +2016,12 @@ class GameEngine:
                         game.active_player.hand.remove(discard)
                         game.active_player.graveyard.append(discard)
                         messages.append(f"🛡️ {game.active_player.name} discards {discard.name} to keep Solitary Confinement")
-                        # Set damage prevention + shroud flags (re-applied each upkeep)
-                        game.active_player._damage_prevented = True
-                        game.active_player._damage_prevented_expires_turn = game.turn_number + len(game.players)
-                        game.active_player._skip_draw = True
                         print(f"[SOLITARY-CONFINEMENT] {game.active_player.name} keeps Solitary Confinement (discarded {discard.name})")
                     else:
                         # No cards to discard — sacrifice
                         game.unregister_static_effects(perm)
                         game.active_player.battlefield.remove(perm)
                         game.active_player.graveyard.append(perm)
-                        game.active_player._damage_prevented = False
-                        game.active_player._skip_draw = False
                         messages.append(f"💀 {game.active_player.name} sacrifices Solitary Confinement (no cards to discard)")
                         print(f"[SOLITARY-CONFINEMENT] Sacrificed — no cards in hand")
             # Process suspend - remove time counters from suspended cards
@@ -2064,10 +2076,15 @@ class GameEngine:
                 print(f"[UPKEEP-TRIGGER] Error processing upkeep triggers: {e}")
         
         elif game.phase == Phase.DRAW:
-            skip_draw = getattr(game.active_player, '_skip_draw', False)
-            if skip_draw:
-                messages.append(f"🎴 **Draw Step** - {game.active_player.name} skips draw (Solitary Confinement)")
-                print(f"[SOLITARY-CONFINEMENT] {game.active_player.name} skips draw step")
+            # July 29 (CR 611.2c): computed live from the battlefield — the old
+            # sticky _skip_draw flag had no expiry and no removal cleanup, so
+            # an exiled Solitary Confinement kept eating draw steps forever.
+            # The live scan also honors Necropotence's printed skip.
+            from mtg.helpers import player_skips_draw_step
+            skip_source = player_skips_draw_step(game.active_player)
+            if skip_source:
+                messages.append(f"🎴 **Draw Step** - {game.active_player.name} skips draw ({skip_source})")
+                print(f"[SKIP-DRAW] {game.active_player.name} skips draw step ({skip_source})")
             elif game.turn_number > 1:  # First player skips draw on turn 1
                 drawn = self.draw_cards(game.active_player, 1, game=game)
                 if drawn:
@@ -2695,6 +2712,7 @@ class GameEngine:
 
             # Bug #28: Check if it's playable from graveyard (Snapcaster flashback, native flashback, escape)
             from_graveyard = False
+            _gy_escape_exiled = []
             if not card and player.playable_from_graveyard:
                 for c in player.graveyard:
                     if c.id in player.playable_from_graveyard and card_name and c.name.lower() == card_name.lower():
@@ -2710,13 +2728,12 @@ class GameEngine:
                                 _esc_cost, exile_count = _esc
                                 c._escape_cost = _esc_cost
                                 c._was_escaped = True
-                                exiled_names = []
                                 for _ in range(exile_count):
                                     if player.graveyard:
                                         exiled = player.graveyard.pop()
                                         player.exile.append(exiled)
-                                        exiled_names.append(exiled.name)
-                                print(f"[ESCAPE] AI casting {c.name} from graveyard, exiling {exile_count}: {', '.join(exiled_names)}")
+                                        _gy_escape_exiled.append(exiled)
+                                print(f"[ESCAPE] AI casting {c.name} from graveyard, exiling {exile_count}: {', '.join(e.name for e in _gy_escape_exiled)}")
                             else:
                                 print(f"[FLASHBACK] AI casting {c.name} from graveyard via flashback")
                         else:
@@ -2832,6 +2849,25 @@ class GameEngine:
                     player.hand.remove(card)
                     player.command_zone.append(card)
                     print(f"[COMMANDER] {card.name} cast failed — returned to command zone immediately")
+                # July 29 batch audit: a FAILED graveyard cast left the card in
+                # HAND (illegally moved zones) with the escape exile cost still
+                # paid — the same cost-paid-no-effect trap the autoplay twin
+                # exhibited live. Roll the whole graveyard cast back.
+                if not success and from_graveyard:
+                    if card in player.hand:
+                        player.hand.remove(card)
+                    if card not in player.graveyard:
+                        player.graveyard.append(card)
+                    if card.id not in player.playable_from_graveyard:
+                        player.playable_from_graveyard.append(card.id)
+                    for _ex in _gy_escape_exiled:
+                        if _ex in player.exile:
+                            player.exile.remove(_ex)
+                            player.graveyard.append(_ex)
+                    card._was_escaped = False
+                    card._escape_cost = ""
+                    card._cast_from_graveyard = False
+                    print(f"[ESCAPE] {card.name} cast failed — graveyard cast rolled back (card + exile cost restored)")
                 if success:
                     if from_command_zone:
                         card.times_cast_from_command_zone += 1

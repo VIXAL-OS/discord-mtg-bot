@@ -966,6 +966,15 @@ def process_state_based_actions(rules, game: GameState) -> List[str]:
                     dying_player.battlefield.append(best)
                     messages.append(f"🔮 Pattern of Rebirth: {dying_player.name} searches and puts **{best.name}** onto the battlefield!")
                     print(f"[AURA-DEATH-TRIGGER] Pattern of Rebirth: put {best.name} on battlefield for {dying_player.name}")
+                    # July 29 batch audit: this direct append skipped the
+                    # whole entry funnel — no self-ETB (a reanimated
+                    # Craterhoof pumped nothing), no watcher scan, no
+                    # PERMANENT_ENTERED emit. Same class as the July 28
+                    # create_copy_token fix; the undying/persist returns a
+                    # few hundred lines up have used the funnel all along.
+                    from mtg.actions import _fire_noncast_battlefield_entry
+                    messages.extend(_fire_noncast_battlefield_entry(
+                        rules, game, dying_player, best))
                 else:
                     messages.append(f"🔮 Pattern of Rebirth: {dying_player.name} has no creatures in library to find")
                 handled = True
@@ -1025,25 +1034,14 @@ def process_state_based_actions(rules, game: GameState) -> List[str]:
                 messages.append(f"📜 {aura_card.name}: triggered (enchanted creature died) — use `!resolve` to handle")
                 print(f"[AURA-DEATH-TRIGGER-UNHANDLED] {aura_card.name} trigger not handled")
 
-    # [EXPERIENCE-COUNTERS] Increment experience counters on controllers of
-    # Meren/Ezuri-style permanents. "Whenever another creature you control
-    # dies, you get an experience counter." We approximate by: for each
-    # death, if its controller has a permanent whose oracle text contains
-    # the exp-counter phrase, and the dead creature is not that permanent
-    # itself, bump the player's _experience_counters.
-    for dead_card, dead_player in recently_died:
-        if not dead_card.is_creature():
-            continue
-        for perm in dead_player.battlefield:
-            if perm is dead_card:
-                continue
-            otext = (getattr(perm, 'oracle_text', '') or '').lower()
-            if 'experience counter' in otext and 'another creature you control dies' in otext:
-                prev = int(getattr(dead_player, '_experience_counters', 0) or 0)
-                dead_player._experience_counters = prev + 1
-                print(f"[EXPERIENCE] {dead_player.name} gains an experience counter "
-                      f"({prev} → {prev + 1}) from {dead_card.name} dying ({perm.name})")
-                break  # One counter per death, not per exp-granting permanent
+    # [EXPERIENCE-COUNTERS] July 29 batch audit: the Meren/Ezuri increment
+    # MOVED to the CREATURE_DIED bus subscriber
+    # (mtg/triggers.py:_accumulate_death_subscriber). Living here it only saw
+    # SBA-detected deaths — sacrifice-as-cost deaths (Viscera Seer, Altar of
+    # Dementia, Phyrexian Tower) bypass this function entirely, so Meren
+    # never gained XP from the most common way players feed her. The
+    # queue_deaths call below emits CREATURE_DIED for every death in this
+    # batch, so the subscriber covers the SBA class too — exactly once.
 
     # Store recently died creatures on game state for trigger processing by caller.
     # EXTEND not REPLACE — destroy_all_creatures and other action handlers may have

@@ -526,14 +526,20 @@ def apply_combat_damage_to_player(rules, game: GameState, player: 'PlayerState',
     if amount <= 0:
         return 0
     # Damage prevention flag (Teferi's Protection, Fog, etc.)
-    if getattr(player, '_damage_prevented', False):
-        from mtg.helpers import damage_prevention_disabled
+    from mtg.helpers import damage_prevention_disabled, player_has_prevent_all_static
+    _prevent_flag = getattr(player, '_damage_prevented', False)
+    if _prevent_flag:
         # Check turn-based expiration (Teferi's = next untap, Fog = end of turn)
         expires = getattr(player, '_damage_prevented_expires_turn', float('inf'))
         if game.turn_number >= expires:
             player._damage_prevented = False
+            _prevent_flag = False
             print(f"  [DAMAGE-PREVENTED] Expired for {player.name} (set turn expired)")
-        elif damage_prevention_disabled(game):
+    # July 29 (CR 611.2c): Solitary Confinement / Glacial Chasm statics are
+    # computed live from the battlefield — no flag to go stale when the
+    # permanent leaves.
+    if _prevent_flag or player_has_prevent_all_static(player):
+        if damage_prevention_disabled(game):
             print(f"  [DAMAGE-PREVENTED] Overridden for {player.name} — damage "
                   f"can't be prevented this turn (Insult // Injury)")
         else:
@@ -681,13 +687,16 @@ def apply_noncombat_damage_to_player(rules, game: GameState, player: 'PlayerStat
     if amount <= 0:
         return 0
     # Fallback damage prevention flag (when replacement engine not available)
-    if getattr(player, '_damage_prevented', False):
-        from mtg.helpers import damage_prevention_disabled
+    from mtg.helpers import damage_prevention_disabled, player_has_prevent_all_static
+    _prevent_flag = getattr(player, '_damage_prevented', False)
+    if _prevent_flag:
         expires = getattr(player, '_damage_prevented_expires_turn', float('inf'))
         if game.turn_number >= expires:
             player._damage_prevented = False
+            _prevent_flag = False
             print(f"  [DAMAGE-PREVENTED] Expired for {player.name} (set turn expired)")
-        elif damage_prevention_disabled(game):
+    if _prevent_flag or player_has_prevent_all_static(player):
+        if damage_prevention_disabled(game):
             print(f"  [DAMAGE-PREVENTED] Overridden for {player.name} — damage "
                   f"can't be prevented this turn (Insult // Injury)")
         else:

@@ -583,13 +583,16 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                         print(f"[TARGETING] Damage to player blocked: {player.name} — {reason}")
                         return f"🛡️ {amount} damage to **{player.name}** blocked ({reason})"
                 # Damage prevention flag (Teferi's Protection, Fog, etc.)
-                if getattr(player, '_damage_prevented', False):
-                    from mtg.helpers import damage_prevention_disabled
+                from mtg.helpers import damage_prevention_disabled, player_has_prevent_all_static
+                _prevent_flag = getattr(player, '_damage_prevented', False)
+                if _prevent_flag:
                     expires = getattr(player, '_damage_prevented_expires_turn', float('inf'))
                     if game.turn_number >= expires:
                         player._damage_prevented = False
+                        _prevent_flag = False
                         print(f"  [DAMAGE-PREVENTED] Expired for {player.name}")
-                    elif damage_prevention_disabled(game):
+                if _prevent_flag or player_has_prevent_all_static(player):
+                    if damage_prevention_disabled(game):
                         print(f"  [DAMAGE-PREVENTED] Overridden for {player.name} — "
                               f"damage can't be prevented this turn (Insult // Injury)")
                     else:
@@ -2315,7 +2318,12 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                 if action.get("countered_to"):
                     target.countered_to = action.get("countered_to")
                 t_name = target.card.name if hasattr(target, 'card') and target.card else "spell"
-                return f"🚫 **{t_name}** on the stack is countered!"
+                # July 29: Baral-class "counters a spell" triggers.
+                from mtg.triggers import fire_counters_a_spell_triggers
+                _loot = fire_counters_a_spell_triggers(
+                    game, action.get("_source_controller"))
+                _base = f"🚫 **{t_name}** on the stack is countered!"
+                return _base + ("\n" + "\n".join(_loot) if _loot else "")
             else:
                 # Dict-style stack entry (legacy)
                 top_name = target.get('card_name', 'spell') if isinstance(target, dict) else str(target)
@@ -2372,7 +2380,11 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
         if hasattr(target, 'countered'):
             target.countered = True
             rules.log_event(f"{t_name} countered (cost {pay_cost} not paid)")
-            return f"🚫 **{t_name}** is countered! (controller couldn't pay {pay_cost})"
+            from mtg.triggers import fire_counters_a_spell_triggers
+            _loot = fire_counters_a_spell_triggers(
+                game, action.get("_source_controller"))
+            _base = f"🚫 **{t_name}** is countered! (controller couldn't pay {pay_cost})"
+            return _base + ("\n" + "\n".join(_loot) if _loot else "")
         return None
 
     # ---- COUNTER ABILITY (from Stifle/Trickbind templates) ----
@@ -2415,7 +2427,11 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                                     f"spell is not legendary")
                     top.countered = True
                     target_name = top.card.name if hasattr(top, 'card') and top.card else "spell"
-                    return f"🚫 **{target_name}** is countered!"
+                    from mtg.triggers import fire_counters_a_spell_triggers
+                    _loot = fire_counters_a_spell_triggers(
+                        game, action.get("_source_controller"))
+                    _base = f"🚫 **{target_name}** is countered!"
+                    return _base + ("\n" + "\n".join(_loot) if _loot else "")
                 return f"🚫 Counter ability fizzles — no triggered/activated abilities on the stack"
         else:
             return f"🚫 Counter ability fizzles — stack is empty"
@@ -4848,6 +4864,31 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
             print(f"[CHANDRA-EXILE] {p.name} exiles {card.name}, deals {damage} to opponent")
             return f"🔥 Exiles **{card.name}** (playable this turn). Deals {damage} damage to opponent."
         return None
+
+    elif action_type == "exile_top_of_library":
+        # July 29 batch audit: Ragavan's combat-damage trigger ("create a
+        # Treasure token and exile the top card of that player's library")
+        # had no vocabulary for the exile half — the whole trigger queued to
+        # Tier 3, whose combat-shaped-resolve guard refused it every time.
+        # Exiles face up. The "you may cast that card this turn" rider is
+        # NOT modeled (cross-player impulse casting isn't a thing the
+        # castable list understands yet) — the denial half still lands.
+        player_name = action.get("player")
+        count = int(action.get("count", 1) or 1)
+        p = find_player(player_name)
+        if p is None:
+            return None
+        exiled_names = []
+        for _ in range(count):
+            if not p.library:
+                break
+            top = p.library.pop(0)
+            p.exile.append(top)
+            exiled_names.append(top.name)
+        if not exiled_names:
+            return f"📚 {p.name}'s library is empty — nothing to exile"
+        print(f"[EXILE-TOP] {p.name} exiles from top of library: {', '.join(exiled_names)}")
+        return f"📤 Exiled **{', '.join(exiled_names)}** from the top of {p.name}'s library"
 
     elif action_type == "exile_from_stack":
         # Exile target spell from the stack (Spell Queller).

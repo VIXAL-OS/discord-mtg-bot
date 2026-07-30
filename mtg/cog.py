@@ -4815,12 +4815,27 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
         # they are pieces of a message whose parent already passed this gate.
         # Fails OPEN when the game can't be resolved, so nothing is lost by
         # accident.
+        #
+        # July 29 batch audit: gating on `ended` alone over-suppressed — the
+        # SBA sets `ended` mid-combat, BEFORE the winner banner posts, so the
+        # lethal combat's own damage summary (buffered during resolution,
+        # flushed right after) was eaten in ~150/152 games and players never
+        # saw how the game ended. Suppress only AFTER the final summary has
+        # actually posted: content in the ended→summary window is the
+        # ending's own record arriving in order; content after the summary
+        # is the stale-flush class the gate was built for.
         if content and not final and not _is_chunk:
             _tid = getattr(thread, 'id', None)
             _g = self.engine.games.get(_tid) if _tid is not None else None
-            if _g is not None and getattr(_g, 'ended', False):
+            if (_g is not None and getattr(_g, 'ended', False)
+                    and getattr(_g, '_final_summary_posted', False)):
                 print(f"[POST-GAME-SUPPRESSED] {str(content)[:200]}")
                 return
+        if final:
+            _tid = getattr(thread, 'id', None)
+            _g = self.engine.games.get(_tid) if _tid is not None else None
+            if _g is not None:
+                _g._final_summary_posted = True
 
         # May 17 audit: final defense-in-depth strip of dangling-article
         # artifacts ("The .", trailing " The") that leak through from

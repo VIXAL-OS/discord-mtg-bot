@@ -373,6 +373,11 @@ class EffectTemplateLibrary:
             "upkeep",
             "end_step",
             "beginning_combat",
+            # July 29 batch audit: the July 27 main-phase scan added
+            # "main_phase" to scheduled_event_types below but NOT here — the
+            # exact May 16 Bug-B shape (inner relaxation dead behind the outer
+            # gate). A name-keyed main-phase template could never fire.
+            "main_phase",
         }
         # Dies/LTB triggers prefer the dies-templates registry, which holds the
         # dies-trigger half of cards that also have an ETB template
@@ -3603,14 +3608,32 @@ class EffectTemplateLibrary:
         )
         
         # "Whenever another creature [you control] enters, draw a card"
+        # July 29 batch audit: the `.*?` between "creature" and "enters"
+        # silently swallowed Mentor of the Meek's "with power 2 or less"
+        # restriction — a 5-power Heliod drew a card. The generator now
+        # honors power bounds embedded in the trigger condition. The
+        # optional "you may pay {1}" is still not charged (no payment
+        # vocabulary at this tier) — noted, the power gate is the
+        # material fix.
+        def _gen_creature_enters_draw(ctrl, opp, ctx):
+            oracle = ctx.get('_oracle') or ''
+            m = re.search(r'with power (\d+) or (less|greater)', oracle)
+            if m:
+                bound = int(m.group(1))
+                ep = ctx.get('entering_power')
+                if ep is None:
+                    return []  # power unknown — decline rather than misfire
+                if m.group(2) == 'less' and int(ep) > bound:
+                    return []  # handled no-op: condition not met
+                if m.group(2) == 'greater' and int(ep) < bound:
+                    return []
+            return [{"action": "draw_cards", "player": ctrl, "amount": 1}]
         self._add_pattern(
             r"whenever (?:a|another) .*?creature.*?enters.*?draw a card",
             EffectTemplate(
                 name="Creature-enters Draw",
                 description="Draw a card when a creature enters",
-                action_generator=lambda ctrl, opp, ctx: [
-                    {"action": "draw_cards", "player": ctrl, "amount": 1}
-                ]
+                action_generator=_gen_creature_enters_draw,
             )
         )
         
@@ -4675,6 +4698,44 @@ class EffectTemplateLibrary:
                          "discard a nonland card loses 3 life; sacrifice Kroxa unless escaped"),
             action_generator=self._gen_kroxa_etb,
         ))
+        # --- Ragavan, Nimble Pilferer: combat damage to a player ---
+        # July 29 batch audit: the combat-damage dispatcher queued Ragavan to
+        # Tier 3 on every connect, and mtg/judge.py's combat-shaped-resolve
+        # guard (CR 510.1) refused the drain every time — one of Modern's
+        # most impactful 1-drops produced zero value across a 55-turn game.
+        # The Treasure + the opponent's exiled top card are modeled; the
+        # "you may cast that card this turn" rider is not (noted in the
+        # exile_top_of_library handler).
+        self._add_attack_card("ragavan, nimble pilferer", EffectTemplate(
+            name="Ragavan, Nimble Pilferer",
+            description=("Ragavan deals combat damage to a player: create a "
+                         "Treasure token and exile the top card of that "
+                         "player's library"),
+            action_generator=lambda ctrl, opp, ctx: [
+                {"action": "create_token", "player": ctrl, "name": "Treasure",
+                 "power": 0, "toughness": 0, "types": "Artifact — Treasure",
+                 "count": 1},
+                {"action": "exile_top_of_library", "player": opp, "count": 1},
+            ],
+        ))
+
+        # --- Tymna the Weaver: postcombat main phase draw engine ---
+        # July 29 batch audit: the July 27 main-phase trigger scan was wired
+        # and threaded ctx['_opponents_dealt_combat_damage'], but no template
+        # consumed it — every trigger queued to Tier 3, which refused with a
+        # hallucinated reason ("combat actions can't resolve at sorcery
+        # speed"), so Tymna's card-advantage engine STILL never happened.
+        # The description must start with a scheduled prefix so the
+        # scheduled-event gate lets the bare-name key fire on main_phase
+        # (and blocks it on ETB, Bitterblossom-style).
+        self._add_card("tymna the weaver", EffectTemplate(
+            name="Tymna the Weaver",
+            description=("At the beginning of each of your postcombat main phases, "
+                         "pay X life to draw X cards (X = opponents dealt combat "
+                         "damage this turn)"),
+            action_generator=self._gen_tymna_main_phase,
+        ))
+
         # "Whenever Kroxa enters OR ATTACKS" — the attack half fired nowhere
         # before July 28 2026, so a Kroxa that stuck around was half a card.
         self._add_attack_card("kroxa, titan of death's hunger", EffectTemplate(
@@ -7789,11 +7850,42 @@ class EffectTemplateLibrary:
         if target:
             actions = [{"action": "move_card", "card": target,
                         "from_zone": "battlefield", "to_zone": "hand", "player": opp}]
-            # Draw a card for kicked bounce spells (Into the Roil, Blink of an Eye)
-            # In autoplay, always assume kicked if we can afford it
-            actions.append({"action": "draw_cards", "player": ctrl, "amount": 1})
+            # "If this spell was kicked, draw a card" (Into the Roil / Blink of
+            # an Eye). July 29 batch audit: the draw was UNCONDITIONAL — the
+            # old comment said "assume kicked if we can afford it" but no
+            # check existed, so every unkicked {1}{U} cast drew a free card,
+            # and Chain of Vapor (same generator, no draw clause on any
+            # printing) drew too. Gate on the kicker-draw clause actually
+            # being in the oracle + the Gatekeeper mana-paid heuristic:
+            # both kicker printings are base 2 + kicker 2, so total paid >= 4
+            # reads as kicked.
+            _oracle = ctx.get('_oracle') or ''
+            if ('kicked' in _oracle and 'draw' in _oracle
+                    and (ctx.get('kicked', False)
+                         or (ctx.get('mana_paid_total', 0) or 0) >= 4)):
+                actions.append({"action": "draw_cards", "player": ctrl, "amount": 1})
             return actions
         return [{"action": "no_action", "reason": "No nonland permanent to bounce"}]
+
+    def _gen_tymna_main_phase(self, ctrl, opp, ctx) -> List[Dict]:
+        """Tymna the Weaver: you may pay X life, draw X cards.
+
+        X = the number of opponents that were dealt combat damage this turn —
+        the main-phase scan computes it into ctx['_opponents_dealt_combat_damage']
+        (mtg/triggers.py, from Player.dealt_combat_damage_this_turn, which
+        mtg/combat.py sets on the player who TOOK the damage). "You may pay"
+        is modeled as: decline when the life price would cut below a cushion.
+        """
+        x = ctx.get('_opponents_dealt_combat_damage', 0) or 0
+        if x <= 0:
+            return []  # handled no-op — no opponent took combat damage this turn
+        life = ctx.get('controller_life', 40)
+        if life - x < 5:
+            return []  # handled no-op — declines the optional payment
+        return [
+            {"action": "lose_life", "player": ctrl, "amount": x},
+            {"action": "draw_cards", "player": ctrl, "amount": x},
+        ]
 
     def _gen_spell_exile_target(self, ctrl, opp, ctx) -> List[Dict]:
         """Exile target permanent — for instant/sorcery spells like Utter End, Swords to Plowshares."""
@@ -7806,19 +7898,38 @@ class EffectTemplateLibrary:
         return [{"action": "no_action", "reason": f"No valid {target_type} to exile"}]
 
     def _gen_fatal_push(self, ctrl, opp, ctx) -> List[Dict]:
-        """Fatal Push: destroy creature with MV ≤ 2 (≤ 4 with revolt)."""
-        target = ctx.get('explicit_target_name') or ctx.get('best_opponent_creature')
-        if not target:
-            return [{"action": "no_action", "reason": "No valid creature target for Fatal Push"}]
-        # Check mana value — get from game context
-        target_mv = ctx.get('explicit_target_mv', 0)
+        """Fatal Push: destroy creature with MV ≤ 2 (≤ 4 with revolt).
+
+        July 29 batch audit: `explicit_target_mv` had NO producer anywhere
+        (build_game_context now writes it), so target_mv was always 0, the
+        gate below was dead code, and a cascade Fatal Push destroyed a
+        mana-value-5 Solitude. Revolt is not tracked by the engine, so the
+        non-revolt limit (2) applies — under-destroying is the safe error
+        direction (a wrong no_action beats an illegal destroy).
+        """
         has_revolt = ctx.get('revolt', False)
         mv_limit = 4 if has_revolt else 2
-        if target_mv > mv_limit:
-            revolt_note = " (revolt active)" if has_revolt else ""
-            return [{"action": "no_action",
-                     "reason": f"Fatal Push can't destroy {target} (MV {target_mv} > {mv_limit}{revolt_note})"}]
-        return [{"action": "destroy", "card": target}]
+        explicit = ctx.get('explicit_target_name')
+        if explicit:
+            # Honor the declared target; apply the printed condition to IT
+            # (CR 608.2b — an illegal-condition target means the spell does
+            # nothing, it does not retarget).
+            target_mv = int(ctx.get('explicit_target_mv', 0) or 0)
+            if target_mv > mv_limit:
+                revolt_note = " (revolt active)" if has_revolt else ""
+                return [{"action": "no_action",
+                         "reason": f"Fatal Push can't destroy {explicit} "
+                                   f"(MV {target_mv} > {mv_limit}{revolt_note})"}]
+            return [{"action": "destroy", "card": explicit}]
+        # No declared target: auto-pick the best LEGAL one (biggest power
+        # among opponent creatures with MV inside the limit).
+        legal = [c for c in (ctx.get('_opponent_creatures') or [])
+                 if int(c.get('cmc', 0) or 0) <= mv_limit]
+        if legal:
+            best = max(legal, key=lambda c: c.get('power', 0) or 0)
+            return [{"action": "destroy", "card": best['name']}]
+        return [{"action": "no_action",
+                 "reason": f"No opponent creature with MV {mv_limit} or less for Fatal Push"}]
 
     def _gen_archmages_charm(self, ctrl, opp, ctx) -> List[Dict]:
         """Archmage's Charm: choose counter, draw 2, or steal MV≤1.
@@ -8771,6 +8882,21 @@ class EffectTemplateLibrary:
         Handles both Card objects and dict representations safely.
         """
         graveyard = ctx.get('controller_graveyard', [])
+        # July 29 batch audit: honor a declared land target when it's actually
+        # a land in the controller's graveyard (the plan said Wooded
+        # Foothills, the heuristic returned Bloodstained Mire — same
+        # declared-target-discarded family as Teferi's -3).
+        explicit = (ctx.get('explicit_target_name') or '').strip()
+        if explicit:
+            for c in graveyard:
+                _name = c.name if hasattr(c, 'name') else (
+                    c.get('name', '') if isinstance(c, dict) else str(c))
+                _tl = (getattr(c, 'type_line', None)
+                       or (c.get('type_line') if isinstance(c, dict) else '') or '')
+                if _name.lower() == explicit.lower() and 'land' in _tl.lower():
+                    return [{"action": "move_card", "card": _name,
+                             "from_zone": "graveyard", "to_zone": "hand",
+                             "player": ctrl}]
         best_land = None
         best_score = -1
         for c in graveyard:
@@ -9103,6 +9229,9 @@ def build_game_context(game, player, opponent, card=None, entering_creature=None
             'power': c.get_effective_power(game) if hasattr(c, 'get_effective_power') else 0,
             'colors': list(getattr(c, 'color_identity', []) or []),
             'type_line': (c.type_line or "").lower() if hasattr(c, 'type_line') else "",
+            # July 29: MV-conditioned removal (Fatal Push) needs to pick a
+            # LEGAL fallback target, not gate an illegal one into no_action.
+            'cmc': int(getattr(c, 'cmc', 0) or 0),
         }
     ctx['_opponent_creatures'] = [
         _creature_info(c) for c in opponent.battlefield if c.is_creature()
@@ -9444,6 +9573,12 @@ def build_game_context(game, player, opponent, card=None, entering_creature=None
             ctx['explicit_target_is_creature'] = bool(
                 explicit_target.is_creature(game)
                 if hasattr(explicit_target, 'is_creature') else False)
+            # July 29 batch audit: `explicit_target_mv` was READ by Fatal
+            # Push's MV gate but written NOWHERE (the exact sibling of the
+            # explicit_target_is_creature story above) — target_mv was always
+            # 0, the gate could never fail, and a cascade Fatal Push
+            # destroyed a mana-value-5 Solitude.
+            ctx['explicit_target_mv'] = int(getattr(explicit_target, 'cmc', 0) or 0)
             for p in game.players:
                 if explicit_target in p.battlefield:
                     ctx['explicit_target_owner'] = p.name
@@ -9455,6 +9590,7 @@ def build_game_context(game, player, opponent, card=None, entering_creature=None
                     if c.name.lower() == explicit_target.lower():
                         ctx['explicit_target_owner'] = p.name
                         ctx['explicit_target_is_creature'] = bool(c.is_creature(game))
+                        ctx['explicit_target_mv'] = int(getattr(c, 'cmc', 0) or 0)
                         break
                 if ctx.get('explicit_target_owner'):
                     break

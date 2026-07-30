@@ -223,17 +223,39 @@ class TestNothingPostsAfterTheGameEnds:
         return await cog._autoplay_send(thread, content, **kw)
 
     def test_a_stale_cast_message_is_suppressed(self, game, capsys):
+        """July 29 refinement: suppression starts once the FINAL SUMMARY has
+        posted, not at the instant `ended` flips. The original Pact flush
+        arrived 46s AFTER the win banner — that is the class the gate exists
+        for, and this test now models it faithfully."""
         import asyncio
         thread = self._Thread()
         cog = self._cog(game)
         game.ended = True
+        asyncio.run(self._send(cog, thread, "🏆 **Claude wins!**", final=True))
         capsys.readouterr()
         asyncio.run(self._send(cog, thread,
                                "❌ **Pact of Negation** was countered!"))
         out = capsys.readouterr().out
-        assert thread.sent == [], "nothing may reach Discord after the game ends"
+        assert thread.sent == ["🏆 **Claude wins!**"], \
+            "nothing may reach Discord after the final summary"
         assert "[POST-GAME-SUPPRESSED]" in out, "but the record must survive"
         assert "Pact of Negation" in out
+
+    def test_the_ended_to_summary_window_still_posts(self, game):
+        """July 29 batch audit (batch 15315): the SBA sets `ended` mid-combat,
+        BEFORE the winner banner posts. The lethal combat's own buffered
+        damage summary flushes in that window, and gating on bare `ended`
+        ate it in ~150/152 games — players never saw how the game ended.
+        Content in the ended→summary window is the ending's own record and
+        must go through."""
+        import asyncio
+        thread = self._Thread()
+        cog = self._cog(game)
+        game.ended = True          # SBA fired mid-combat…
+        asyncio.run(self._send(cog, thread,
+                               "**💥 Combat Damage:**\n• ⚔️ lethal swing"))
+        assert thread.sent and "Combat Damage" in thread.sent[0], \
+            "the lethal combat summary must reach Discord before the banner"
 
     def test_the_win_summary_itself_still_posts(self, game):
         """The summary is sent AFTER game.ended is set, so it must opt out."""

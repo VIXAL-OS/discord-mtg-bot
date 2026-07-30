@@ -1266,6 +1266,7 @@ async def _autoplay_execute_action(cog, thread, game: GameState, player_idx: int
         # but the autoplay (Rick) path was missing it, so the AI's "FLASHBACK from
         # graveyard" castable list pointed at cards the cast resolver would never find.
         from_graveyard = False
+        _gy_escape_exiled = []
         if not card and player.playable_from_graveyard:
             for c in player.graveyard:
                 if c.id in player.playable_from_graveyard and c.name.lower() == card_name.lower():
@@ -1285,6 +1286,7 @@ async def _autoplay_execute_action(cog, thread, game: GameState, player_idx: int
                                 if player.graveyard:
                                     exiled = player.graveyard.pop()
                                     player.exile.append(exiled)
+                                    _gy_escape_exiled.append(exiled)
                             print(f"[AUTOPLAY-ESCAPE] {c.name} cast from graveyard, exiled {exile_count} cards")
                         else:
                             print(f"[AUTOPLAY-FLASHBACK] {c.name} cast from graveyard")
@@ -1334,6 +1336,17 @@ async def _autoplay_execute_action(cog, thread, game: GameState, player_idx: int
             if card.id in player.playable_from_exile:
                 player.playable_from_exile.remove(card.id)
             card._adventure_exiled = False
+
+        # Graveyard cast (flashback/escape): mirror engine.py — cast_spell_async
+        # gates on zone membership FIRST (July 20), so a card pulled out of the
+        # graveyard with no home is rejected as "Card not in hand". This branch
+        # was missing exactly that hand-append: game_1531564194842017916 paid
+        # Sentinel's Eyes' escape exile cost (two cards gone), then the cast
+        # failed and the card was stranded in NO zone at all.
+        if from_graveyard:
+            if card not in player.hand:
+                player.hand.append(card)
+            card._cast_from_graveyard = True
 
         commander_tax = 0
         if from_command_zone:
@@ -1397,6 +1410,13 @@ async def _autoplay_execute_action(cog, thread, game: GameState, player_idx: int
             if from_command_zone:
                 card.times_cast_from_command_zone += 1
 
+            # Flashback/escape: exile the card after resolution instead of
+            # graveyard (mirror of engine.py's _execute_action cast branch).
+            if from_graveyard and card in player.graveyard:
+                player.graveyard.remove(card)
+                player.exile.append(card)
+                print(f"[AUTOPLAY-FLASHBACK] {card.name} exiled after casting from graveyard")
+
             for em in (effect_msgs or []):
                 await cog._autoplay_send(thread, em)
 
@@ -1420,6 +1440,24 @@ async def _autoplay_execute_action(cog, thread, game: GameState, player_idx: int
             if from_command_zone and card in player.hand:
                 player.hand.remove(card)
                 player.command_zone.append(card)
+            if from_graveyard:
+                # Roll the whole graveyard cast back: the card returns to the
+                # graveyard (it was never legally cast) and the escape exile
+                # cost is refunded — paying a cost for a cast that never
+                # happened is the cost-paid-no-effect class.
+                if card in player.hand:
+                    player.hand.remove(card)
+                if card not in player.graveyard:
+                    player.graveyard.append(card)
+                if card.id not in player.playable_from_graveyard:
+                    player.playable_from_graveyard.append(card.id)
+                for _ex in _gy_escape_exiled:
+                    if _ex in player.exile:
+                        player.exile.remove(_ex)
+                        player.graveyard.append(_ex)
+                card._was_escaped = False
+                card._escape_cost = ""
+                card._cast_from_graveyard = False
             print(f"[AUTOPLAY] cast failed: {msg}")
             # July 20 batch-3 audit: same stash as engine.py's _execute_action
             # cast branch — the None return discards the real reason and

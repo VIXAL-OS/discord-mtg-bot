@@ -1348,6 +1348,13 @@ async def _check_cast_triggers(engine, game: GameState, caster: Player, card: Ca
                             print(f"[CAST-TRIGGER-PRIORITY] {caster.name} has Stifle-shaped "
                                   f"card in hand — opening priority window for "
                                   f"{bf_card.name}'s trigger from cast of {card.name}")
+                            # July 29 batch audit: expose the open window to
+                            # the buried spell's LIFO wait loop (mtg/spells.py)
+                            # — while this LLM evaluation runs, the spell at
+                            # the bottom of the stack must keep waiting rather
+                            # than burn its extension/rescue budget and
+                            # resolve out of order beneath a live counter.
+                            game._trigger_window_depth = getattr(game, '_trigger_window_depth', 0) + 1
                             try:
                                 await engine._combat_priority_round(
                                     game, send_fn,
@@ -1355,6 +1362,9 @@ async def _check_cast_triggers(engine, game: GameState, caster: Player, card: Ca
                                 )
                             except Exception as _pe:
                                 print(f"[CAST-TRIGGER-PRIORITY] window error: {_pe}")
+                            finally:
+                                game._trigger_window_depth = max(
+                                    0, getattr(game, '_trigger_window_depth', 1) - 1)
                             # July 21 batch audit: "not on the stack anymore"
                             # is NOT proof of a counter — in
                             # game_1529172174773157998 the window's async
@@ -4667,6 +4677,68 @@ def _accumulate_death_subscriber(game, card=None, player=None, **_):
     if card is None:
         return
     game._recently_died.append((card, player))
+    # July 29 batch audit: the Meren/Ezuri experience-counter bump lived only
+    # in process_state_based_actions' LOCAL death list, so the whole
+    # sacrifice-as-cost death class (Viscera Seer, Altar of Dementia,
+    # Phyrexian Tower) never granted XP — every Meren end-step return went to
+    # hand all game (game_1531564156203827213). The bus is the one choke-point
+    # EVERY death path reaches (slice 3b), and at emit time the granter is
+    # still on the battlefield, which is closer to the CR 603.6e pre-event
+    # state the post-batch SBA sweep got wrong for simultaneous deaths.
+    try:
+        if player is not None and card.is_creature():
+            for perm in getattr(player, 'battlefield', None) or []:
+                if perm is card:
+                    continue
+                otext = (getattr(perm, 'oracle_text', '') or '').lower()
+                if ('experience counter' in otext
+                        and 'another creature you control dies' in otext):
+                    prev = int(getattr(player, '_experience_counters', 0) or 0)
+                    player._experience_counters = prev + 1
+                    print(f"[EXPERIENCE] {player.name} gains an experience counter "
+                          f"({prev} → {prev + 1}) from {card.name} dying ({perm.name})")
+                    break
+    except (AttributeError, TypeError, ValueError) as e:
+        print(f"[EXPERIENCE] increment failed: {e}")
+        maybe_reraise(e)
+
+
+def fire_counters_a_spell_triggers(game, controller_name):
+    """July 29 batch audit: "Whenever a spell or ability you control counters
+    a spell" had NO event scan anywhere — Baral, Chief of Compliance's loot
+    half was a structural no-op across three real counter events in
+    game_1531555430847873116 (the Tymna/Kroxa/Baral commander-half-card
+    family). Called from the sites that mark a stack entry countered
+    (mtg/actions.py counter handlers + rules/spell_resolver.py).
+
+    Models the Baral-class loot: draw a card, then discard the highest-CMC
+    card ("you may draw" taken whenever the library isn't empty).
+    Returns display messages.
+    """
+    msgs = []
+    if not controller_name:
+        return msgs
+    player = next((p for p in game.players
+                   if p.name == controller_name), None)
+    if player is None:
+        return msgs
+    for perm in list(player.battlefield):
+        ot = (getattr(perm, 'oracle_text', '') or '').lower()
+        if 'counters a spell' in ot and 'draw a card' in ot:
+            if not player.library:
+                continue
+            drawn = player.library.pop(0)
+            player.hand.append(drawn)
+            line = f"🃏 **{perm.name}**: {player.name} draws a card"
+            if player.hand:
+                discard = max(player.hand, key=lambda c: (c.cmc or 0))
+                player.hand.remove(discard)
+                player.graveyard.append(discard)
+                line += f", then discards **{discard.name}**"
+            msgs.append(line)
+            print(f"[COUNTER-TRIGGER] {perm.name} loots for {player.name} "
+                  f"(a spell they control countered a spell)")
+    return msgs
 
 
 def queue_cast_triggers_sync(engine, game, caster, card, via: str = "sync") -> int:

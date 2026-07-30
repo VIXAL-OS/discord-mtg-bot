@@ -495,10 +495,19 @@ async def claude_make_pick(
     )
 
     try:
+        # July 29 batch audit: claude-sonnet-5 runs ADAPTIVE THINKING when the
+        # `thinking` param is omitted, and max_tokens caps thinking + text
+        # together — so max_tokens=50 was consumed entirely by the thinking
+        # block and the response truncated before any text arrived.
+        # response_text() then returned '' and EVERY pick fell back to the
+        # heuristic ("Unparseable response: ''" ~70% of picks in the 15315
+        # cube game) while still paying for the call. Disable thinking for
+        # this single-number pick and give the answer a little headroom.
         response = await asyncio.to_thread(
             client.messages.create,
             model="claude-sonnet-5",
-            max_tokens=50,
+            max_tokens=100,
+            thinking={"type": "disabled"},
             messages=[{"role": "user", "content": prompt}],
         )
 

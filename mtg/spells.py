@@ -1027,6 +1027,17 @@ def _force_stack_above(engine, game: GameState, stack_entry,
     resolving will mark us countered). Returns True if anything was acted on.
     """
     from mtg.util import maybe_reraise
+    # July 29 batch audit: while a [CAST-TRIGGER-PRIORITY] window is open, the
+    # trigger it guards is NOT stalled — its owner is mid-evaluation, and
+    # resolving it inline here double-resolves it when the window closes
+    # (batch 15315: the Murmuring Mystic trigger resolved at the cap-hit AND
+    # again via [CAST-TRIGGER-VANISHED], with the Bird token materializing
+    # silently). The wait loop upstream now waits windows out, so reaching
+    # here with one open means the window hung — still don't touch it.
+    if getattr(game, '_trigger_window_depth', 0) > 0:
+        print("[STACK-LIFO-FORCE] cast-trigger priority window open — "
+              "not force-resolving anything above the cap-hit entry")
+        return False
     try:
         idx = game.stack.index(stack_entry)
     except ValueError:
@@ -1353,6 +1364,19 @@ async def _await_stack_window(engine, game: GameState, player: Player,
                     # timeout fired before FoW resolved).
                     max_lifo_extensions = 5
                     extensions_used = 0
+                    # July 29 batch audit: an OPEN cast-trigger priority window
+                    # ([CAST-TRIGGER-PRIORITY] — an LLM evaluation in flight)
+                    # blocks the response spell's whole coroutine for longer
+                    # than this budget. Batch 15315: Beast Whisperer burned all
+                    # 5 extensions + the rescue while Claude's Stifle
+                    # evaluation over the Murmuring Mystic trigger was still
+                    # running, then "resolved anyway" BENEATH the Arcane
+                    # Denial targeting it (CR 608 — the counter fizzled).
+                    # While a window is open, extensions don't count against
+                    # the cap; a separate generous bound keeps the
+                    # anti-deadlock guarantee if the window itself hangs.
+                    max_window_waits = 20
+                    window_waits_used = 0
                     while extensions_used < max_lifo_extensions:
                         try:
                             await asyncio.wait_for(stack_entry.resolution_event.wait(),
@@ -1360,6 +1384,14 @@ async def _await_stack_window(engine, game: GameState, player: Player,
                             # Event fired — spell resolved (or was countered) in proper order.
                             break
                         except asyncio.TimeoutError:
+                            if (getattr(game, '_trigger_window_depth', 0) > 0
+                                    and window_waits_used < max_window_waits):
+                                window_waits_used += 1
+                                print(f"[STACK] {card.name} buried but a cast-trigger "
+                                      f"priority window is open — waiting it out "
+                                      f"({window_waits_used}/{max_window_waits}, "
+                                      f"extensions not consumed)")
+                                continue
                             extensions_used += 1
                             # If we've now reached the top, fall through to
                             # the normal resolve-now path on the next loop
@@ -2034,6 +2066,19 @@ async def _dispatch_resolution(engine, game: GameState, player: Player,
         if card.name.lower() == 'wishclaw talisman':
             card.counters['wish'] = 3
             effect_messages.append("🔮 Wishclaw Talisman enters with three wish counters")
+
+        # Escape rider (CR 702.139e): "This creature escapes with N +1/+1
+        # counters on it." Applied AFTER reset_battlefield_state (which
+        # clears counters) and only when this cast actually escaped —
+        # batch 15315's first live escape (Woe Strider) entered as a bare
+        # 3/2 with the printed two-counter rider silently dropped.
+        if getattr(card, '_was_escaped', False):
+            _esc_counters = helpers.parse_escapes_with_counters(card.oracle_text)
+            if _esc_counters:
+                card.counters['+1/+1'] = card.counters.get('+1/+1', 0) + _esc_counters
+                effect_messages.append(
+                    f"⭕ **{card.name}** escapes with {_esc_counters} +1/+1 counter(s)")
+                print(f"[ESCAPE] {card.name} escapes with {_esc_counters} +1/+1 counter(s) (CR 702.139e)")
 
         # [SAGA] Sagas get their first lore counter on ETB (CR 714.3a)
         if 'saga' in (card.type_line or '').lower():

@@ -423,6 +423,11 @@ class Card:
     # flag nobody sets.
     _escape_cost: str = field(default="", repr=False, compare=False)
     _was_escaped: bool = field(default=False, repr=False, compare=False)
+    # Graveyard-origin cast marker (flashback/escape). Both AI cast paths
+    # stamp it so templates (Increasing Devotion, Snapcaster tracking) can
+    # detect graveyard-origin casting; declared July 29 when the autoplay
+    # path gained the same stamp.
+    _cast_from_graveyard: bool = field(default=False, repr=False, compare=False)
     # Adventure (CR 715.3): set when the adventure half resolves and the card
     # goes to exile, cleared when it leaves. Deliberately separate from
     # Player.playable_from_exile, which end_turn wipes every turn — adventure
@@ -3004,6 +3009,21 @@ class Player:
         if not mana_cost:
             return True, "No mana cost"
 
+        # July 29 batch audit: split cards carry the COMBINED cost string
+        # ("{3}{U} // {4}{U}{U}") — parsed as ONE cost it demands both
+        # halves' pips at once (CMC 10 for Commit // Memory), so the
+        # response-priority filter auto-passed with 7 untapped Islands at
+        # the lethal moment. You cast one half (CR 709.3): payable when
+        # either half is.
+        if " // " in mana_cost:
+            _reasons = []
+            for _half in mana_cost.split(" // "):
+                ok, reason = self.can_pay_mana_cost(_half.strip())
+                if ok:
+                    return True, f"Can pay split half {_half.strip()}"
+                _reasons.append(reason)
+            return False, "; ".join(_reasons) or "Cannot pay either split half"
+
         # Structured mana engine — proper color validation
         if HAS_MANA_ENGINE:
             try:
@@ -3484,6 +3504,19 @@ class GameState:
     # helpers.damage_prevention_disabled at every prevention gate; self-expires
     # because it only matches an exact turn number.
     _damage_prevention_off_turn: int = field(default=-1, repr=False, compare=False)
+
+    # July 29 batch audit: >0 while a [CAST-TRIGGER-PRIORITY] window (the
+    # Stifle-response LLM evaluation over a cast trigger) is open. The buried
+    # spell's LIFO wait loop in mtg/spells.py reads it so an in-flight window
+    # never burns the extension/rescue budget — batch 15315 resolved Beast
+    # Whisperer beneath the Arcane Denial targeting it because the window's
+    # evaluation outlived the whole budget (CR 608 violation, counter robbed).
+    _trigger_window_depth: int = field(default=0, repr=False, compare=False)
+    # July 29 batch audit: True once a final=True game-summary send has gone
+    # out. The post-game flush gate in cog._autoplay_send suppresses only
+    # AFTER this — the ended→summary window carries the lethal combat's own
+    # buffered messages, which were being eaten in ~150/152 games.
+    _final_summary_posted: bool = field(default=False, repr=False, compare=False)
 
     # How many spells the player whose turn JUST ENDED cast during that turn.
     # Daybound's printed reminder is "If a player casts no spells during their

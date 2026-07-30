@@ -147,6 +147,14 @@ class PlaneswalkerManager:
             (r'target (creature)', 'creature'),
             (r'target (player)', 'player'),
             (r'target (planeswalker)', 'planeswalker'),
+            # July 29 batch audit: no pattern matched "target [qualifier]
+            # permanent" — Teferi, Hero of Dominaria's -3 ("target nonland
+            # permanent") parsed as needs_target=False, so the declared
+            # target was silently dropped and Tier 3 hallucinated its own
+            # (loyalty burned 7→4 for zero effect in
+            # game_1531560953928355911). Qualified form must precede the
+            # bare one.
+            (r'target (non\w+ permanent)', r'\1'),
             (r'target (permanent)', 'permanent'),
             (r'target (artifact)', 'artifact'),
             (r'target (enchantment)', 'enchantment'),
@@ -484,21 +492,34 @@ class PlaneswalkerManager:
             # exist in-game, the player can't activate it. Check here BEFORE
             # paying loyalty, so no-target activations don't spend loyalty
             # counters just to fizzle on resolution.
+            _optional_targeting = 'up to' in (ability.text or '').lower()
             try:
                 legal = get_legal_planeswalker_targets(game, player, ability)
             except Exception:
                 legal = None  # fall back to existing prompt path if detection errors
-            if legal is not None and len(legal) == 0:
+            if legal is not None and len(legal) == 0 and _optional_targeting:
+                # July 29 batch audit: "up to one target" abilities are
+                # legally activatable choosing ZERO targets (CR 601.2c gates
+                # mandatory targets only) — Wrenn and Six's [+1] was refused
+                # outright 4× in game_1531560953928355911, and the refusal
+                # didn't even consume the once-per-turn activation, granting
+                # free retries. Fall through: pay loyalty, record the
+                # activation, resolve with none chosen.
+                print(f"[PW-TARGET] {card.name} [{ability.loyalty_cost:+d}]: "
+                      f"'up to' ability with no legal targets — activating "
+                      f"with none chosen (CR 601.2c)")
+            elif legal is not None and len(legal) == 0:
                 return ActivationResult(
                     success=False,
                     messages=[f"❌ No legal targets for {card.name}'s [{ability.loyalty_cost:+d}] ability — cannot activate"],
                 )
-            return ActivationResult(
-                success=False,
-                needs_targets=True,
-                target_prompt=f"Choose {ability.target_description} for {card.name}'s ability",
-                messages=[f"🎯 {card.name}'s [{ability.loyalty_cost:+d}] ability needs a target: {ability.target_description}"]
-            )
+            else:
+                return ActivationResult(
+                    success=False,
+                    needs_targets=True,
+                    target_prompt=f"Choose {ability.target_description} for {card.name}'s ability",
+                    messages=[f"🎯 {card.name}'s [{ability.loyalty_cost:+d}] ability needs a target: {ability.target_description}"]
+                )
 
         # Pay the loyalty cost
         old_loyalty = card.loyalty_counters
@@ -1423,10 +1444,21 @@ def get_legal_planeswalker_targets(game, player, ability: PlaneswalkerAbility) -
             if c.is_planeswalker() and (c.oracle_text or '').lower().find(oracle[:60]) >= 0:
                 source_id = c.id
                 break
+        # July 29 batch audit: qualified forms ("nonland permanent" — Teferi,
+        # Hero of Dominaria's -3) now parse into desc; honor the negation so
+        # the legality check doesn't offer the excluded type.
+        _neg_match = re.match(r'non(\w+)\s+permanent', desc)
+        _neg = _neg_match.group(1) if _neg_match else None
         for perm, owner in all_permanents:
             if wants_own and owner is not player:
                 continue
             if is_another and source_id and getattr(perm, 'id', None) == source_id:
+                continue
+            if _neg == 'land' and perm.is_land():
+                continue
+            if _neg == 'creature' and perm.is_creature(game):
+                continue
+            if _neg == 'token' and getattr(perm, 'is_token', False):
                 continue
             targets.append((perm, f"{perm.name} ({owner.name}'s)"))
 
