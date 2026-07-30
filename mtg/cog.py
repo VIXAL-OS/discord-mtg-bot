@@ -2162,13 +2162,26 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
                 # Cap at reasonable value
                 x_value = min(x_value, 20)
 
+        # July 30 batch-9 reviewer audit: plural counter costs ("Remove three
+        # quest counters ... and sacrifice it" — Khalni Heart Expedition) never
+        # matched the singular-only regex, so the whole cost went unenforced.
+        # Manual-path twin of the mtg/engine.py fix (the two-activation-paths
+        # divergence class, again).
+        from mtg.helpers import _NUMBER_WORDS as _num_words
         counter_cost_match = re.search(
-            r'remove (?:a|one|1) ([\w +/\-]+) counter from (?:this|'
+            r'remove (a|an|one|two|three|four|five|six|seven|eight|nine|ten|\d+)'
+            r' ([\w +/\-]+?) counters? from (?:this|'
             + re.escape(card.name.lower()) + r')', cost_text.lower())
+        counter_cost_n = 0
         if counter_cost_match:
-            counter_type = counter_cost_match.group(1).strip()
-            if card.counters.get(counter_type, 0) < 1:
-                await ctx.send(f"❌ **{card.name}** has no {counter_type} counter to remove.")
+            _nw = counter_cost_match.group(1)
+            counter_cost_n = (_num_words.get(_nw)
+                              or (int(_nw) if _nw.isdigit() else 1))
+            counter_type = counter_cost_match.group(2).strip()
+            if card.counters.get(counter_type, 0) < counter_cost_n:
+                await ctx.send(f"❌ **{card.name}** has only "
+                               f"{card.counters.get(counter_type, 0)} {counter_type} "
+                               f"counter(s) — the cost needs {counter_cost_n}.")
                 return
 
         # Validation only proved the cost was affordable; actually tap the
@@ -2224,8 +2237,10 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
         if ability['needs_tap']:
             card.tapped = True
         if counter_cost_match:
-            counter_type = counter_cost_match.group(1).strip()
-            card.counters[counter_type] -= 1
+            counter_type = counter_cost_match.group(2).strip()
+            card.counters[counter_type] -= counter_cost_n
+            print(f"[ACTIVATE-COST] {card.name} removes {counter_cost_n} "
+                  f"{counter_type} counter(s)")
 
         # Process exile/sacrifice costs BEFORE effect execution
         cost_lower = cost_text.lower()
@@ -2245,7 +2260,7 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
                 player.battlefield.remove(card)
                 player.exile.append(card)
                 exiled_self = True
-        elif 'sacrifice' in cost_lower and (card_name_lower in cost_lower or 'sacrifice this' in cost_lower or f'sacrifice {card_name_lower}' in cost_lower):
+        elif 'sacrifice' in cost_lower and (card_name_lower in cost_lower or 'sacrifice this' in cost_lower or 'sacrifice it' in cost_lower or f'sacrifice {card_name_lower}' in cost_lower):
             # Sacrifice this permanent as part of the cost
             if card in player.battlefield:
                 # [LAYERS] Unregister static effects before removal
@@ -4787,6 +4802,11 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
 
         if not game.ended:
             game.phase = Phase.MAIN2
+            # July 30 batch-9 audit: direct phase set bypassed advance_phase,
+            # so postcombat main-phase triggers (Tymna) never fired on
+            # combat turns — the only turns their condition can be true.
+            for _m in self.engine.dispatch_main_phase_triggers(game, False):
+                await self._autoplay_send(thread, _m)
 
     async def _autoplay_send(self, thread, content=None, embed=None,
                              _is_chunk=False, final=False):

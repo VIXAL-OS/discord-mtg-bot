@@ -1666,6 +1666,28 @@ class GameEngine:
         from mtg.triggers import _check_main_phase_triggers_sync
         return _check_main_phase_triggers_sync(self, game, precombat)
 
+    def dispatch_main_phase_triggers(self, game: GameState,
+                                     precombat: bool) -> List[str]:
+        """Scan + queue for "at the beginning of your pre/postcombat main
+        phase" triggers — the one choke-point for every MAIN1/MAIN2 entry.
+
+        July 30 batch-9 audit: advance_phase's MAIN1/MAIN2 branches ran the
+        scan inline, but BOTH post-combat transitions set game.phase =
+        Phase.MAIN2 directly (mtg/autoplay.py _resolve_combat, mtg/cog.py
+        _autoplay_resolve_combat) — so on any turn with real combat, Tymna's
+        postcombat trigger never ran at all. The only [MAIN2-TRIGGER] lines
+        in batch 15322 came from NO-combat turns that reached MAIN2 through
+        advance_phase — i.e. the trigger could fire exactly when its
+        condition was guaranteed false (game_1532229678751027252: Tymna
+        connected, no scan; next turn no combat, scan says "condition not
+        met"). Third iteration of the Tymna saga.
+        """
+        msgs, unhandled = self._check_main_phase_triggers_sync(game, precombat)
+        for _c, _t in unhandled:
+            self._queue_async_trigger(game, _c, _t, "main_phase",
+                                      game.active_player.name)
+        return msgs
+
     def _check_beginning_combat_triggers_sync(self, game: GameState) -> Tuple[List[str], List[Tuple]]:
         """Delegates to mtg.triggers._check_beginning_combat_triggers_sync (May 30 audit)."""
         from mtg.triggers import _check_beginning_combat_triggers_sync
@@ -2106,11 +2128,7 @@ class GameEngine:
             messages.extend(self._process_delayed_triggers(game, "main_phase"))
             # July 27: "At the beginning of your precombat main phase" — the
             # battlefield scan the delayed-trigger drain above is NOT.
-            _mp_msgs, _mp_unhandled = self._check_main_phase_triggers_sync(game, True)
-            messages.extend(_mp_msgs)
-            for _c, _t in _mp_unhandled:
-                self._queue_async_trigger(game, _c, _t, "main_phase",
-                                          game.active_player.name)
+            messages.extend(self.dispatch_main_phase_triggers(game, True))
         
         elif game.phase == Phase.COMBAT_BEGIN:
             messages.append(f"⚔️ **Beginning of Combat**")
@@ -2159,11 +2177,7 @@ class GameEngine:
             # July 27: "At the beginning of your postcombat main phase" —
             # Tymna the Weaver et al. The delayed-trigger drain above is
             # one-shot scheduling (Necropotence), NOT a battlefield scan.
-            _mp_msgs, _mp_unhandled = self._check_main_phase_triggers_sync(game, False)
-            messages.extend(_mp_msgs)
-            for _c, _t in _mp_unhandled:
-                self._queue_async_trigger(game, _c, _t, "main_phase",
-                                          game.active_player.name)
+            messages.extend(self.dispatch_main_phase_triggers(game, False))
         
         elif game.phase == Phase.END:
             messages.append(f"📍 **End Step**")
@@ -3224,18 +3238,43 @@ class GameEngine:
 
                 # Check if can activate
                 if ability['needs_tap'] and perm.tapped:
+                    game._last_activation_failure = (
+                        game.turn_number, perm.name,
+                        f"{perm.name} is already tapped")
                     return None
                 if ability['needs_tap'] and perm.is_creature():
                     if perm.entered_this_turn and not perm.has_haste():
+                        game._last_activation_failure = (
+                            game.turn_number, perm.name,
+                            f"{perm.name} has summoning sickness — its tap "
+                            f"ability can't be activated this turn")
                         return None  # Summoning sickness
 
+                # July 30 batch-9 reviewer audit: the old singular-only regex
+                # ("remove (a|one|1) X counter") never matched plural costs, so
+                # Khalni Heart Expedition's "Remove three quest counters ...
+                # and sacrifice it" was activated at 1 counter, for free,
+                # twice, and never sacrificed (game_1532232990367682571).
+                from mtg.helpers import _NUMBER_WORDS
                 counter_cost_match = re.search(
-                    r'remove (?:a|one|1) ([\w +/\-]+) counter from (?:this|'
+                    r'remove (a|an|one|two|three|four|five|six|seven|eight|'
+                    r'nine|ten|\d+) ([\w +/\-]+?) counters? from (?:this|'
                     + re.escape(perm.name.lower()) + r')', ability['cost'].lower())
+                counter_cost_n = 0
                 if counter_cost_match:
-                    counter_type = counter_cost_match.group(1).strip()
-                    if perm.counters.get(counter_type, 0) < 1:
-                        print(f"[ACTIVATE-CLAUDE] {perm.name}: no {counter_type} counter to remove")
+                    _nw = counter_cost_match.group(1)
+                    counter_cost_n = (_NUMBER_WORDS.get(_nw)
+                                      or (int(_nw) if _nw.isdigit() else 1))
+                    counter_type = counter_cost_match.group(2).strip()
+                    if perm.counters.get(counter_type, 0) < counter_cost_n:
+                        print(f"[ACTIVATE-CLAUDE] {perm.name}: only "
+                              f"{perm.counters.get(counter_type, 0)} {counter_type} "
+                              f"counter(s) — cost needs {counter_cost_n}")
+                        game._last_activation_failure = (
+                            game.turn_number, perm.name,
+                            f"{perm.name} has only "
+                            f"{perm.counters.get(counter_type, 0)} {counter_type} "
+                            f"counter(s); the cost needs {counter_cost_n}")
                         return None
 
                 # Deduct mana costs from the ability cost string
@@ -3269,6 +3308,9 @@ class GameEngine:
                     # spell casting instead.
                     if not player.tap_sources_for_cost(mana_cost, game=game):
                         print(f"[ACTIVATE-CLAUDE] {perm.name}: can't pay {mana_cost}")
+                        game._last_activation_failure = (
+                            game.turn_number, perm.name,
+                            f"Can't pay {mana_cost} to activate {perm.name}")
                         return None
                     print(f"[ACTIVATE-CLAUDE] Paid {mana_cost} for {perm.name} ability")
 
@@ -3282,9 +3324,10 @@ class GameEngine:
                 if ability['needs_tap']:
                     perm.tapped = True
                 if counter_cost_match:
-                    counter_type = counter_cost_match.group(1).strip()
-                    perm.counters[counter_type] -= 1
-                    print(f"[ACTIVATE-COST] {perm.name} removes a {counter_type} counter")
+                    counter_type = counter_cost_match.group(2).strip()
+                    perm.counters[counter_type] -= counter_cost_n
+                    print(f"[ACTIVATE-COST] {perm.name} removes "
+                          f"{counter_cost_n} {counter_type} counter(s)")
 
                 # Process sacrifice/exile costs BEFORE effect execution
                 cost_lower = ability['cost'].lower()
@@ -3297,7 +3340,11 @@ class GameEngine:
                 sacrificed_cost_card = None
                 sac_power_snapshot = 0
 
-                if 'sacrifice' in cost_lower and (perm_name_lower in cost_lower or 'sacrifice this' in cost_lower or f'sacrifice {perm_name_lower}' in cost_lower):
+                # July 30: "... and sacrifice it" (Khalni Heart Expedition) is
+                # a pronoun back-reference to the permanent itself — the old
+                # name/this-only detection never sacrificed it. Cost text only
+                # (pre-colon), so effect-side "sacrifice it" can't match here.
+                if 'sacrifice' in cost_lower and (perm_name_lower in cost_lower or 'sacrifice this' in cost_lower or 'sacrifice it' in cost_lower or f'sacrifice {perm_name_lower}' in cost_lower):
                     if perm in player.battlefield:
                         game.unregister_static_effects(perm)
                         player.battlefield.remove(perm)

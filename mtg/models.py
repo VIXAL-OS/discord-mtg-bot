@@ -737,6 +737,15 @@ class Card:
             if not result:
                 continue
             equip_card = result[0]
+            # July 30 batch-9 reviewer audit: find_card_global searches EVERY
+            # zone, and the exile/bounce paths don't clear the creature's
+            # attachments list — an exiled Batterskull kept granting its Germ
+            # +4/+4/vigilance/lifelink for two more combats (8 phantom damage
+            # + 8 phantom lifelink, game_1532224002137784391). Equipment only
+            # grants while ON the battlefield (CR 301.5); a 0/0-base token
+            # then correctly dies to SBA the moment its bonus vanishes.
+            if len(result) > 2 and result[2] != Zone.BATTLEFIELD:
+                continue
             if not equip_card.oracle_text:
                 continue
             # May 16 audit: skip non-equipment attachments. The attachments list
@@ -3433,6 +3442,13 @@ class GameState:
     # (283 of 588 [MANA-DIVERGENCE] lines in the 15289 batch were non-mana
     # failures). Consumed (and cleared) by _get_action_error.
     _last_cast_failure: Any = field(default=None, repr=False, compare=False)
+    # July 30 batch-9 (deferred July 29 item): same stash for ACTIVATIONS —
+    # Rhys the Redeemed failed 8 activations across 24 turns with feedback of
+    # None/'' because the activate failure sites just returned None and
+    # _get_action_error's activate branch re-derived nothing (no summoning-
+    # sickness or affordability checks). (turn, permanent_name, message);
+    # consumed (and cleared) by _get_action_error.
+    _last_activation_failure: Any = field(default=None, repr=False, compare=False)
     # July 24 batch-6: aura auto-target fizzle context — set when a beneficial
     # aura declines an opponent-only legal-target board so the fizzle message
     # can say "declined" instead of the misleading "no creature you control".

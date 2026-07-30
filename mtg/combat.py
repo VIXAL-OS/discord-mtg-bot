@@ -379,6 +379,14 @@ def resolve_combat_damage(rules, game: GameState) -> List[str]:
             # broke the audit's math three times).
             print(f"[LIFELINK] {game.players[idx].name}: +{actual_heal} life → {game.players[idx].life}")
 
+    # July 30 batch-9 audit (deferred July 29 item): gain-life triggers fired
+    # during combat (Heliod counters, Vito drains) buffer their display lines
+    # in game._pending_messages, whose only drains were the draw step and the
+    # cast path — so combat-fired gains showed under the NEXT turn's banner.
+    # State was always correct; drain here so the lines ride the combat block.
+    from mtg.helpers import drain_pending_messages
+    messages.extend(drain_pending_messages(game))
+
     return messages
 
 

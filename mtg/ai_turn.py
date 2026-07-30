@@ -2063,6 +2063,19 @@ def _get_action_error(engine, game: GameState, player_index: int, action: Dict) 
     elif action_type == "activate":
         perm_name = action.get("permanent")
         ability_idx = action.get("ability", 0)
+        # July 30 batch-9 (deferred July 29 item): surface the REAL failure
+        # reason the activate branch just stashed — the re-derivation below
+        # has no summoning-sickness or affordability checks, so Rhys the
+        # Redeemed's 8 failed activations fed the AI None/'' for 24 turns
+        # and the rejection-feedback loop never engaged. Twin of the
+        # _last_cast_failure stash (July 20).
+        _laf = getattr(game, '_last_activation_failure', None)
+        if _laf:
+            _laf_turn, _laf_name, _laf_msg = _laf
+            if (_laf_turn == game.turn_number and perm_name
+                    and _laf_name.lower() == str(perm_name).lower()):
+                game._last_activation_failure = None
+                return _laf_msg
         # Find the permanent
         perm = player.find_card(perm_name, Zone.BATTLEFIELD)
         if not perm:

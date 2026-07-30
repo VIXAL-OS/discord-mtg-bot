@@ -577,8 +577,22 @@ class PlaneswalkerManager:
         # Study), and those were being refunded as "no effect" — a FREE
         # activation (effect applied + loyalty back) that also lied to the
         # player about a legal target existing.
-        if (self._activation_had_no_effect(effect_messages)
-                and not getattr(self, '_last_ability_executed_state_change', False)):
+        _no_effect = (self._activation_had_no_effect(effect_messages)
+                      and not getattr(self, '_last_ability_executed_state_change', False))
+        if _no_effect and 'up to' in (getattr(ability, 'text', '') or '').lower():
+            # July 30 batch-9 audit: an "up to N target(s)" ability that
+            # resolves choosing nothing is a LEGAL activation that simply
+            # does nothing (CR 601.2c / 608.2b) — the loyalty change stands
+            # and the once-per-turn slot is consumed. The refund heuristic
+            # was undoing the +1 tick every time Wrenn and Six activated on
+            # an empty graveyard ([PW-REFUND] loyalty refunded (3 → 3)),
+            # denying the loyalty the activation legally earns — the July 29
+            # none-chosen gate let the activation START, but the refund
+            # then pre-empted its CR-correct outcome.
+            print(f"[PW-NONE-CHOSEN] {card.name} [{cost_str}]: resolved with "
+                  f"none chosen — loyalty change stands (CR 601.2c)")
+            _no_effect = False  # fall through to the success path
+        if _no_effect:
             card.loyalty_counters = old_loyalty
             # Roll back the per-turn activation counter too — refunded
             # activations don't count toward Oath of Teferi's "twice per turn".

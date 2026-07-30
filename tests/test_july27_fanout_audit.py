@@ -109,14 +109,20 @@ class TestMainPhaseTriggerClassIsWired:
 
     def test_both_main_phases_dispatch_the_scan(self):
         """MAIN1 and MAIN2 must each call it — precombat and postcombat are
-        distinct trigger events."""
+        distinct trigger events. (July 30: the inline scan+queue pair moved
+        into GameEngine.dispatch_main_phase_triggers so the direct-set
+        post-combat MAIN2 transitions share it — the Tymna gap.)"""
         import inspect
         from mtg.engine import GameEngine
         src = inspect.getsource(GameEngine.advance_phase)
-        assert src.count("_check_main_phase_triggers_sync") == 2, (
+        assert src.count("dispatch_main_phase_triggers") == 2, (
             "expected one dispatch in MAIN1 and one in MAIN2")
-        assert "_check_main_phase_triggers_sync(game, True)" in src, "MAIN1 (precombat)"
-        assert "_check_main_phase_triggers_sync(game, False)" in src, "MAIN2 (postcombat)"
+        assert "dispatch_main_phase_triggers(game, True)" in src, "MAIN1 (precombat)"
+        assert "dispatch_main_phase_triggers(game, False)" in src, "MAIN2 (postcombat)"
+        # The dispatcher itself must still run the real scan + queue.
+        dsrc = inspect.getsource(GameEngine.dispatch_main_phase_triggers)
+        assert "_check_main_phase_triggers_sync" in dsrc
+        assert "_queue_async_trigger" in dsrc
 
     def test_template_gate_accepts_main_phase(self):
         """Without this the library refuses to resolve the event type at all."""

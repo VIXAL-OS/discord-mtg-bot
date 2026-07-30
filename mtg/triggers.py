@@ -833,8 +833,11 @@ def queue_unhandled_combat_damage(game: GameState, attacker: Card,
     sync cast bridge); this one now does too.
     """
     oracle = (getattr(attacker, 'oracle_text', '') or '')
+    # July 30 batch-9 audit: split on newlines too — a keyword line ends with
+    # a newline, not a period, so the old period-only split glued "Flying,
+    # trample" onto the front of every extracted trigger sentence.
     sentence = next(
-        (s.strip() for s in oracle.split('.')
+        (s.strip() for para in oracle.split('\n') for s in para.split('.')
          if 'combat damage to a player' in s.lower()
          or 'combat damage to an opponent' in s.lower()),
         oracle.strip())
@@ -1131,44 +1134,66 @@ async def _check_cast_triggers(engine, game: GameState, caster: Player, card: Ca
                     # Non-creature spell — try to resolve its effects
                     # First try Tier 1.5 spell templates
                     cascade_resolved = False
-                    try:
-                        # Use module-level get_effect_library (don't re-import locally — shadows the
-                        # module-level import and causes UnboundLocalError later in this function)
-                        lib = get_effect_library()
-                        opp_idx = 1 - game.players.index(caster) if caster in game.players else 1
-                        opponent = game.players[opp_idx] if 0 <= opp_idx < len(game.players) else None
-                        opponent_name = opponent.name if opponent else "Opponent"
-                        # Apr 30 audit: build the FULL game context (not a stub) so
-                        # discard-target / damage-target / opponent_hand templates can
-                        # actually pick a target. The previous {'stack_top_is_creature': ...}
-                        # context made Inquisition of Kozilek resolve to no_action even
-                        # though it has a working _gen_inquisition template.
-                        if opponent:
-                            cascade_ctx = build_game_context(game, caster, opponent, card=found_card)
-                        else:
-                            cascade_ctx = {}
-                        cascade_ctx['stack_top_is_creature'] = card.is_creature()
-                        cascade_ctx['stack_top_type_known'] = True
-                        cascade_ctx['_from_cascade'] = True
-                        spell_actions, spell_desc = lib.resolve_spell(found_card.name, found_card.oracle_text or '', caster.name, opponent_name, game_context=cascade_ctx)
-                        if spell_actions and not any(a.get('action') == 'no_action' for a in spell_actions):
-                            print(f"[CASCADE-SPELL] Tier 1.5 resolved {found_card.name}: {spell_desc}")
-                            for action in spell_actions:
-                                # Bug fix: cascade spells can't counter their own source.
-                                # During cascade, the only thing "on the stack" is the cascade
-                                # source itself. A counterspell cascaded into has no legal target.
-                                if action.get('action') == 'counter_spell':
-                                    print(f"[CASCADE-SPELL] Blocked counter_spell from {found_card.name} — "
-                                          f"can't counter cascade source (no legal target)")
-                                    messages.append(f"  {found_card.name} fizzles — no legal target to counter during cascade")
-                                    continue
-                                msg = engine.rules._execute_action_on_state(game, action)
-                                if msg:
-                                    messages.append(f"  {msg}")
-                            caster.graveyard.append(found_card)
-                            cascade_resolved = True
-                    except Exception as e:
-                        print(f"[CASCADE-SPELL] Template resolution failed: {e}")
+                    # July 30 batch-9 reviewer audit: counter-target spells
+                    # cascaded into were half-resolved — the action loop below
+                    # blocked only the counter_spell action, so Mana Drain's
+                    # sibling schedule_delayed_trigger still granted the
+                    # counter-contingent {C} bonus with nothing countered
+                    # (game_1532232990367682571). Casting the hit is OPTIONAL
+                    # (CR 702.85a "may cast"); a rational caster declines a
+                    # counterspell whose only would-be target is their own
+                    # cascading spell — technically legal, strategically
+                    # suicidal. Decline BEFORE any tier resolves any part of
+                    # it, and put the card on the library bottom like every
+                    # other uncast cascade exile (the old paths wrongly sent
+                    # it to the graveyard as if it had been cast).
+                    if 'counter target' in (found_card.oracle_text or '').lower():
+                        print(f"[CASCADE-SPELL] Declining to cast {found_card.name} — "
+                              f"its only would-be target is the cascade source")
+                        messages.append(f"  {found_card.name} — declined (nothing "
+                                        f"worth countering); put on the bottom of the library")
+                        caster.library.append(found_card)
+                        cascade_resolved = True
+                    if not cascade_resolved:
+                        try:
+                            # Use module-level get_effect_library (don't re-import locally — shadows the
+                            # module-level import and causes UnboundLocalError later in this function)
+                            lib = get_effect_library()
+                            opp_idx = 1 - game.players.index(caster) if caster in game.players else 1
+                            opponent = game.players[opp_idx] if 0 <= opp_idx < len(game.players) else None
+                            opponent_name = opponent.name if opponent else "Opponent"
+                            # Apr 30 audit: build the FULL game context (not a stub) so
+                            # discard-target / damage-target / opponent_hand templates can
+                            # actually pick a target. The previous {'stack_top_is_creature': ...}
+                            # context made Inquisition of Kozilek resolve to no_action even
+                            # though it has a working _gen_inquisition template.
+                            if opponent:
+                                cascade_ctx = build_game_context(game, caster, opponent, card=found_card)
+                            else:
+                                cascade_ctx = {}
+                            cascade_ctx['stack_top_is_creature'] = card.is_creature()
+                            cascade_ctx['stack_top_type_known'] = True
+                            cascade_ctx['_from_cascade'] = True
+                            spell_actions, spell_desc = lib.resolve_spell(found_card.name, found_card.oracle_text or '', caster.name, opponent_name, game_context=cascade_ctx)
+                            if spell_actions and not any(a.get('action') == 'no_action' for a in spell_actions):
+                                print(f"[CASCADE-SPELL] Tier 1.5 resolved {found_card.name}: {spell_desc}")
+                                for action in spell_actions:
+                                    # Belt-and-braces: the decline check above
+                                    # preempts counter-target spells entirely,
+                                    # but a template action list can still
+                                    # carry a counter_spell (odd phrasings).
+                                    if action.get('action') == 'counter_spell':
+                                        print(f"[CASCADE-SPELL] Blocked counter_spell from {found_card.name} — "
+                                              f"can't counter cascade source (no legal target)")
+                                        messages.append(f"  {found_card.name} fizzles — no legal target to counter during cascade")
+                                        continue
+                                    msg = engine.rules._execute_action_on_state(game, action)
+                                    if msg:
+                                        messages.append(f"  {msg}")
+                                caster.graveyard.append(found_card)
+                                cascade_resolved = True
+                        except Exception as e:
+                            print(f"[CASCADE-SPELL] Template resolution failed: {e}")
 
                     if not cascade_resolved:
                         # Fall back to Tier 1 resolve_special_effects
@@ -2142,29 +2167,42 @@ def _check_enchantment_etb_watchers(engine, game: GameState, controller: Player,
 
 def _check_equipment_etb_watchers(engine, game: GameState, controller: Player,
                                   entered_card: Card) -> List[str]:
-    """Resolve Hammer of Nazahn for Equipment entering after the Hammer.
+    """Resolve attach-on-Equipment-ETB watchers (Hammer of Nazahn,
+    Sigarda's Aid) for Equipment entering after the watcher.
 
-    Hammer entering itself is handled by its name-keyed Tier 1.5 template.
-    This watcher covers every later Equipment entering under the same
-    controller, without charging an equip cost (the triggered ability says
-    "attach", not "equip").
+    A watcher entering itself is handled by its own Tier 1.5 template. This
+    covers every later Equipment entering under the same controller, without
+    charging an equip cost (the triggered ability says "attach", not "equip").
+
+    July 30 batch-9 reviewer audit: this was hardcoded to Hammer of Nazahn
+    BY NAME, so Sigarda's Aid ("Whenever an Equipment you control enters,
+    you may attach it to target creature you control") did nothing for all
+    8 Equipment casts in game_1532224002137784391 — 5 of them sat unattached
+    the entire game while the AI's own memo relied on the free attach.
+    Generalized to the printed attach shape.
     """
     if 'equipment' not in (entered_card.type_line or '').lower():
         return []
 
-    hammer = next((c for c in controller.battlefield
-                   if c.name.lower() == 'hammer of nazahn'
-                   and c.id != entered_card.id
-                   and not getattr(c, '_phased_out', False)), None)
-    if hammer is None:
+    watcher = None
+    for c in controller.battlefield:
+        if c.id == entered_card.id or getattr(c, '_phased_out', False):
+            continue
+        _o = (c.oracle_text or '').lower()
+        if (re.search(r"whenever (?:[\w\s,']+ or )?an(?:other)? equipment "
+                      r"you control enters", _o)
+                and 'attach' in _o):
+            watcher = c
+            break
+    if watcher is None:
         return []
 
     target = next((c for c in controller.battlefield
-                   if c.id not in (hammer.id, entered_card.id)
+                   if c.id not in (watcher.id, entered_card.id)
                    and not getattr(c, '_phased_out', False)
                    and c.is_creature(game)), None)
     if target is None:
-        print(f"[EQUIPMENT-ETB] Hammer of Nazahn: no creature for {entered_card.name}")
+        print(f"[EQUIPMENT-ETB] {watcher.name}: no creature for {entered_card.name}")
         return []
 
     msg = engine.rules._execute_action_on_state(game, {
@@ -2172,9 +2210,9 @@ def _check_equipment_etb_watchers(engine, game: GameState, controller: Player,
         "creature": target.name, "player": controller.name,
     })
     if msg:
-        print(f"[EQUIPMENT-ETB] Hammer of Nazahn attaches {entered_card.name} "
+        print(f"[EQUIPMENT-ETB] {watcher.name} attaches {entered_card.name} "
               f"to {target.name}")
-        return [f"🔨 **Hammer of Nazahn**: {msg}"]
+        return [f"🔨 **{watcher.name}**: {msg}"]
     return []
 
 
@@ -2313,6 +2351,19 @@ def _check_dies_triggers_sync(engine, game: GameState, dying_card: Card, dying_p
         # the dying creature's token-ness — a Bitterblossom Faerie token death
         # fired "Whenever a NONTOKEN creature you control dies".
         if "nontoken" in oracle_lower and getattr(dying_card, 'is_token', False):
+            continue
+
+        # July 30 batch-9 reviewer audit (CR 603.4): "if it had a +1/+1
+        # counter on it" (Basri's Lieutenant) was checked NOWHERE, and the
+        # Tier-3 dies context carries no counter info — so the LLM FABRICATED
+        # the condition as true on all 5 firings in game_1532236167368544388,
+        # minting a replacement Knight for every counterless Knight that died
+        # in a self-sustaining loop. The dying card object is right here;
+        # gate deterministically before any tier sees the trigger.
+        if ("if it had a +1/+1 counter on it" in oracle_lower
+                and not (getattr(dying_card, 'counters', None) or {}).get('+1/+1', 0)):
+            print(f"[DIES-TRIGGER] {card.name}: intervening-if not met — "
+                  f"{dying_card.name} had no +1/+1 counter (CR 603.4)")
             continue
 
         # Species Specialist only watches the type chosen as it entered. The

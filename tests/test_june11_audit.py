@@ -1154,6 +1154,9 @@ class TestSonnet5AndCombatTriggerBoundary:
             rules=SimpleNamespace(resolve_combat_damage=lambda _game: []),
             check_state_based_actions=lambda _game: [],
             drain_pending_triggers=drain,
+            # July 30: the direct MAIN2 set now dispatches the main-phase
+            # trigger scan (the Tymna gap) — stub it out here.
+            dispatch_main_phase_triggers=lambda _game, _precombat: [],
         )
         cog = SimpleNamespace(
             engine=engine,
@@ -1360,8 +1363,16 @@ class TestHammerOfNazahnAttach:
         from mtg.triggers import _check_equipment_etb_watchers
 
         game = make_game()
+        # July 30: the watcher scan matches the printed attach shape (so
+        # Sigarda's Aid works too), not the name — the card needs its
+        # real trigger line like every deck-loaded card has.
         hammer = make_card(
-            "Hammer of Nazahn", type_line="Legendary Artifact — Equipment")
+            "Hammer of Nazahn", type_line="Legendary Artifact — Equipment",
+            oracle_text=("Whenever Hammer of Nazahn or another Equipment you "
+                         "control enters, you may attach that Equipment to "
+                         "target creature you control.\n"
+                         "Equipped creature gets +2/+0 and has indestructible.\n"
+                         "Equip {4}"))
         boots = make_card(
             "Trailblazer's Boots", type_line="Artifact — Equipment")
         bear = make_card("Bear")

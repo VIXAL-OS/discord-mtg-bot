@@ -165,7 +165,8 @@ PART 2 - ACTIONS: A JSON array of game state changes to apply. Use these action 
 - {{"action": "move_card", "card": "X", "from_zone": "graveyard", "to_zone": "library", "position": "top", "player": "name"}}
 - {{"action": "create_token", "player": "name", "name": "N", "power": P, "toughness": T, "types": "...", "count": N, "keywords": ["defender", "flying"]}} — ALWAYS include the token's keywords (defender, flying, etc.); omitting them creates a token WITHOUT those abilities
 - {{"action": "add_counters", "card": "X", "counter_type": "+1/+1", "amount": N}}
-- {{"action": "pump_all_creatures", "player": "name", "power": N, "toughness": N}} — TEMPORARY +N/+N until end of turn (NOT counters)
+- {{"action": "pump_all_creatures", "player": "name", "power": N, "toughness": N}} — TEMPORARY +N/+N until end of turn (NOT counters). Add "card": "Name" to pump ONLY that one creature — "this creature gets +N/+N" MUST be scoped with "card", never applied to the whole team
+- {{"action": "scry", "player": "name", "amount": N}}
 - {{"action": "tap", "card": "X"}}
 - {{"action": "untap", "card": "X"}}
 - {{"action": "add_mana", "player": "name", "color": "C", "amount": N}}
@@ -389,16 +390,70 @@ async def resolve_effect(rules, game: GameState, effect_description: str,
                     _best = _c
             _r_desc = ' or '.join(_restrict) if _restrict else 'creature'
             if _best is not None:
+                _ret = {"action": "reanimate", "player": controller,
+                        "card": _best.name, "own_graveyard": True,
+                        "allow_types": _restrict or ["creature"],
+                        "_source_card_name": source_card}
+                _ret_actions = [_ret]
+                # July 30 batch-9 audit: Whip of Erebos went through this
+                # guard with 1 action — the "It gains haste. Exile it at the
+                # beginning of the next end step." riders were DROPPED,
+                # turning a temporary reanimation permanent
+                # (game_1532236167368544388, Phyrexian Obliterator). Parse
+                # the two rider shapes from the effect text; the delayed
+                # exile rides schedule_delayed_trigger like Puppeteer
+                # Clique ("your next end step" = phase_of-gated; "the next
+                # end step" = ungated, per the July 23 Necropotence rule).
+                # Whip's "if it would leave the battlefield, exile it
+                # instead" replacement stays unmodeled.
+                _desc_l = (effect_description or "").lower()
+                if re.search(r'\bgains? haste\b', _desc_l):
+                    _ret["haste"] = True
+                _dx = re.search(r'exile (?:it|that (?:card|creature)) at the '
+                                r'beginning of (the|your) next end step',
+                                _desc_l)
+                if _dx:
+                    _sched = {"action": "schedule_delayed_trigger",
+                              "trigger_at": "end_step", "turn_delay": 0,
+                              "source": source_card or "Delayed exile",
+                              "actions": [{"action": "move_card",
+                                           "card": _best.name,
+                                           "from_zone": "battlefield",
+                                           "to_zone": "exile",
+                                           "player": controller}]}
+                    if _dx.group(1) == "your":
+                        _sched["phase_of"] = controller
+                    _ret_actions.append(_sched)
                 print(f"[RESOLVE-GY-RETURN] {source_card}: returning {_best.name} "
-                      f"(restriction: {_r_desc}) deterministically — Tier 3 bypassed")
-                return ([], [{"action": "reanimate", "player": controller,
-                              "card": _best.name, "own_graveyard": True,
-                              "allow_types": _restrict or ["creature"],
-                              "_source_card_name": source_card}])
+                      f"(restriction: {_r_desc}) deterministically — Tier 3 bypassed"
+                      + (" +haste" if _ret.get('haste') else "")
+                      + (" +delayed exile at end step" if _dx else ""))
+                return ([], _ret_actions)
             print(f"[RESOLVE-GY-RETURN] {source_card}: no legal {_r_desc} "
                   f"creature card in {controller}'s graveyard — declining")
             return ([f"📜 {source_card or 'Effect'}: no {_r_desc} creature "
                      f"card in graveyard to return"], [])
+
+    # July 30 batch-9 reviewer audit: self-only pump activations ("{R}: This
+    # creature gets +1/+0 until end of turn") resolved via Tier 3 spread to
+    # EVERY creature the controller owned — the documented action vocabulary's
+    # only pump was player-scoped, so the LLM had no way to say "just this
+    # one" (Inferno Titan's pump buffed Shardless Agent too,
+    # game_1532232990367682571 — recurrence of the class behind the July 21
+    # display-only fix). Deterministic, like the Hidetsugu/GY-return guards:
+    # compute it ourselves, scoped to the source, no LLM call.
+    if source_card and controller:
+        _self_pump = re.match(
+            r'^\s*(?:this (?:creature|permanent)|'
+            + re.escape(source_card.lower())
+            + r')\s+gets\s+([+-]\d+)/([+-]\d+) until end of turn\.?\s*$',
+            (effect_description or '').lower())
+        if _self_pump:
+            _pp, _tt = int(_self_pump.group(1)), int(_self_pump.group(2))
+            print(f"[RESOLVE-SELF-PUMP] {source_card}: {_pp:+d}/{_tt:+d} "
+                  f"scoped to itself — Tier 3 bypassed")
+            return ([], [{"action": "pump_all_creatures", "player": controller,
+                          "card": source_card, "power": _pp, "toughness": _tt}])
 
     if not rules.client:
         return [f"⚠️ Unresolved effect: {effect_description}"], []
@@ -677,7 +732,8 @@ AVAILABLE ACTIONS (use ONLY these exact types):
 zones: hand, battlefield, graveyard, exile, library
 - {{"action": "add_counters", "card": "Card Name", "counter_type": "+1/+1", "amount": N}} — PERMANENT counters only
 - {{"action": "remove_counters", "card": "Card Name", "counter_type": "+1/+1", "amount": N}}
-- {{"action": "pump_all_creatures", "player": "name", "power": N, "toughness": N}} — TEMPORARY +N/+N until end of turn
+- {{"action": "pump_all_creatures", "player": "name", "power": N, "toughness": N}} — TEMPORARY +N/+N until end of turn. Add "card": "Name" to pump ONLY that one creature — "this creature gets +N/+N" MUST be scoped with "card", never applied to the whole team
+- {{"action": "scry", "player": "name", "amount": N}} — scry N (look at top N, reorder/bottom)
 - {{"action": "create_token", "player": "name", "name": "Token Name", "power": N, "toughness": N, "types": "Creature — Type", "count": N, "keywords": ["defender", "flying"]}} — ALWAYS include the token's printed keywords; a "0/4 Wall with defender" created without "keywords" can illegally attack
 - {{"action": "tap", "card": "Card Name"}}
 - {{"action": "untap", "card": "Card Name"}}

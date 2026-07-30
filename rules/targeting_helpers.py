@@ -291,54 +291,86 @@ def _find_any_valid_target(game, card, caster_name):
         src.controller = caster_name
 
         stripped = re.sub(r'\([^)]*\)', '', (card.oracle_text or '').lower())
-        # July 21 batch audit (R2-1): the old non-greedy capture stopped at
-        # the FIRST comma or "or", so Swan Song's "target enchantment,
-        # instant, or sorcery spell" truncated to "target enchantment" and
-        # legal counter-counters were cast-blocked all game
-        # (game_1529172161636597770). Capture the whole phrase to sentence
-        # end so the parser sees the trailing "spell".
-        tm = re.search(r'target\s+([^.\n;]+)', stripped)
-        if not tm:
-            return True  # Can't parse target phrase -> allow
-        restriction = TargetTextParser.parse(tm.group(0).strip().rstrip('.,'))
 
         validator = TargetValidator()
 
-        # Check all permanents on the battlefield
-        for pl in game.players:
-            for perm in pl.battlefield:
-                if getattr(perm, '_phased_out', False):
-                    continue
-                t = _card_to_targetable(perm, pl.name, game=game)
-                if validator.can_target(src, t, restriction, caster_name)[0]:
-                    return True
-
-        # Check players (for "any target" or "target player" spells)
-        if (TargetType.PLAYER in restriction.target_types or
-                TargetType.ANY in restriction.target_types):
+        def _restriction_satisfiable(restriction):
+            # Check all permanents on the battlefield
             for pl in game.players:
-                t = _player_to_targetable(pl)
-                if validator.can_target(src, t, restriction, caster_name)[0]:
-                    return True
-
-        # Check stack for counterspells ("target spell")
-        if TargetType.SPELL in restriction.target_types:
-            for entry in getattr(game, 'stack', []):
-                if hasattr(entry, 'card') and entry.card:
-                    t = _card_to_targetable(entry.card, "", zone="stack")
-                    t.types.add("spell")
+                for perm in pl.battlefield:
+                    if getattr(perm, '_phased_out', False):
+                        continue
+                    t = _card_to_targetable(perm, pl.name, game=game)
                     if validator.can_target(src, t, restriction, caster_name)[0]:
                         return True
-
-        # Check graveyard for spells targeting cards there
-        if restriction.zone == "graveyard":
-            for pl in game.players:
-                for gc in pl.graveyard:
-                    t = _card_to_targetable(gc, pl.name, zone="graveyard")
+            # Check players (for "any target" or "target player" spells)
+            if (TargetType.PLAYER in restriction.target_types or
+                    TargetType.ANY in restriction.target_types):
+                for pl in game.players:
+                    t = _player_to_targetable(pl)
                     if validator.can_target(src, t, restriction, caster_name)[0]:
                         return True
+            # Check stack for counterspells ("target spell")
+            if TargetType.SPELL in restriction.target_types:
+                for entry in getattr(game, 'stack', []):
+                    if hasattr(entry, 'card') and entry.card:
+                        t = _card_to_targetable(entry.card, "", zone="stack")
+                        t.types.add("spell")
+                        if validator.can_target(src, t, restriction, caster_name)[0]:
+                            return True
+            # Check graveyard for spells targeting cards there
+            if restriction.zone == "graveyard":
+                for pl in game.players:
+                    for gc in pl.graveyard:
+                        t = _card_to_targetable(gc, pl.name, zone="graveyard")
+                        if validator.can_target(src, t, restriction, caster_name)[0]:
+                            return True
+            return False
 
-        return False
+        # July 30 batch-9 reviewer audit: compound-target spells need EVERY
+        # mandatory clause satisfiable. The old single re.search captured
+        # from the FIRST "target" to sentence end, so Searing Blaze's
+        # "target player or planeswalker and 1 damage to target creature
+        # that player ... controls" collapsed to {PLAYER, PLANESWALKER} and
+        # the mandatory creature clause was silently dropped — advertised
+        # castable (and the CR 601.2c gate would have allowed the cast)
+        # against a creature-less opponent all game. Split per sentence and
+        # per " and " fragment; each fragment containing "target" is its
+        # own clause. Also from the same wave: "any target" is always
+        # satisfiable (players exist — Comet Storm's "choose any target,"
+        # defeated the old `target\s+` capture via the comma and read as
+        # unplayable all game), and "up to N target" clauses don't gate the
+        # cast (CR 601.2c — mandatory targets only, the July 29 PW rule).
+        # July 21's Swan Song whole-phrase capture is preserved: a sentence
+        # without " and " is a single fragment captured to sentence end.
+        clauses = []
+        for sentence in re.split(r'[.\n;]', stripped):
+            if 'target' not in sentence:
+                continue
+            for frag in re.split(r'\s+and\s+', sentence):
+                if 'target' in frag:
+                    clauses.append(frag.strip())
+        if not clauses:
+            return True  # Can't parse target phrase -> allow
+        for clause in clauses:
+            if re.search(r'\bany target\b', clause):
+                continue  # a player always exists -> satisfiable
+            if re.search(r'up to \w+ target', clause):
+                continue  # optional targets don't gate the cast
+            tm = re.search(r'target\s+([^.\n;]+)', clause)
+            if not tm:
+                continue  # unparseable fragment -> permissive
+            phrase = tm.group(0).strip().rstrip('.,')
+            # Qualifier tails confuse the type parser: "target creature THAT
+            # player or that planeswalker's controller controls" reads as a
+            # PLANESWALKER restriction via the tail. The target TYPE is what
+            # precedes the qualifier; dropping it errs permissive (an
+            # existence check, not full validation).
+            phrase = re.split(r'\s+that\s+', phrase)[0]
+            restriction = TargetTextParser.parse(phrase)
+            if not _restriction_satisfiable(restriction):
+                return False
+        return True
     except Exception as e:
         print(f"[TARGETING] Error checking targets for {card.name}: {e}")
         return True

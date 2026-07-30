@@ -1235,14 +1235,32 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                         attached = False
                         enchant_type = 'creature'  # Default
                         oracle_lower = (card.oracle_text or '').lower()
-                        if 'enchant land' in oracle_lower or 'enchant forest' in oracle_lower or 'enchant plains' in oracle_lower:
+                        # July 30 batch-9 reviewer audit: "Enchant creature
+                        # card in a graveyard" (Animate Dead / Dance of the
+                        # Dead) must NOT auto-attach to a battlefield
+                        # creature — this fallback ran BEFORE the name-keyed
+                        # reanimate template and stuck Animate Dead's -1/-0
+                        # on Thassa permanently while the template
+                        # reanimated Restoration Angel
+                        # (game_1532224002137784391). The reanimate action
+                        # attaches the aura to the creature it returns;
+                        # everything below (static registration, the
+                        # PERMANENT_ENTERED emit, entry triggers) still runs.
+                        if 'card in a graveyard' in oracle_lower:
+                            attached = True  # suppress the search + SBA note
+                            print(f"[AURA-ETB] {card.name} enchants a card in "
+                                  f"a graveyard — skipping battlefield "
+                                  f"auto-attach (reanimate handler attaches)")
+                        elif 'enchant land' in oracle_lower or 'enchant forest' in oracle_lower or 'enchant plains' in oracle_lower:
                             enchant_type = 'land'
                         elif 'enchant permanent' in oracle_lower:
                             enchant_type = 'permanent'
                         elif 'enchant artifact' in oracle_lower:
                             enchant_type = 'artifact'
                         # Find best target on controller's battlefield
-                        for target_card in player.battlefield:
+                        # (skipped when the graveyard-enchant branch above
+                        # already claimed the attach).
+                        for target_card in (player.battlefield if not attached else []):
                             if target_card.id == card.id:
                                 continue
                             type_match = False
@@ -1967,10 +1985,10 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                         copy_token.color_identity = list(source_card.color_identity)
                     copy_token.summoning_sick = True
                     copy_token.entered_this_turn = True
-                    # Copy counters from source
-                    for counter_type, counter_count in source_card.counters.items():
-                        if counter_count > 0:
-                            copy_token.counters[counter_type] = counter_count
+                    # July 30 (deferred July 28 item, CR 706.2): a copy
+                    # effect copies the printed/copiable values only — NOT
+                    # counters. The old loop cloned the source's +1/+1
+                    # counters onto the token.
                     p.battlefield.append(copy_token)
                     created_names.append(copy_token.name)
                     # This site had NO entry plumbing at all. Two consequences,
@@ -3175,6 +3193,18 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                                     if aura.name.lower() == src_name and not getattr(aura, '_bound_creature_id', None):
                                         aura._bound_creature_id = c.id
                                         c._reanimated_by_aura_id = aura.id
+                                        # July 30 batch-9 reviewer audit: the
+                                        # bind never set attached_to, so the
+                                        # aura's P/T mod (Animate Dead -1/-0)
+                                        # stayed wherever the generic ETB
+                                        # fallback had pointed it (Thassa).
+                                        # Attach to the reanimated creature —
+                                        # _get_attached_auras keys on it.
+                                        aura.attached_to = c.id
+                                        if not hasattr(c, 'attachments') or c.attachments is None:
+                                            c.attachments = []
+                                        if aura.id not in c.attachments:
+                                            c.attachments.append(aura.id)
                                         print(f"[REANIMATE-BIND] {aura.name} bound to {c.name}")
                                         break
                             # Pub/sub slice 2: one PERMANENT_ENTERED per entry.
@@ -4961,6 +4991,20 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                 game._queller_exiles.setdefault(source_name, []).append(
                     (stack_card, exile_owner.name)
                 )
+                # July 30 batch-9 audit (CRITICAL, latent): without a counter
+                # mark, the exiled spell's waiting cast_spell_async coroutine
+                # reads its vanished entry as "now at top" and RESOLVES the
+                # exiled spell (the Summary Dismissal class, caught live with
+                # Song of the Worldsoul before Queller's first real exile).
+                # countered_to="already_handled" — the zone move happened here.
+                try:
+                    stack_item.countered = True
+                    stack_item.countered_to = "already_handled"
+                except AttributeError:
+                    pass  # legacy dict entries carry no coroutine to unwind
+                _wake = getattr(stack_item, 'resolution_event', None)
+                if _wake is not None:
+                    _wake.set()
                 print(f"[QUELLER-EXILE] {source_name} exiled {stack_card.name} "
                       f"(owner={exile_owner.name}, cmc={stack_card.cmc})")
                 return f"✨ {source_name} exiles **{stack_card.name}** from the stack!"

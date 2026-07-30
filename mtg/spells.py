@@ -1353,7 +1353,20 @@ async def _await_stack_window(engine, game: GameState, player: Player,
                 # then the counter "fizzles — no longer on the battlefield".
                 # When not at top, extend the wait by one more cycle so the
                 # later cast gets to resolve first.
-                if game.stack and game.stack[-1] is not stack_entry:
+                # July 30 batch-9 audit (CRITICAL): an entry REMOVED from the
+                # stack is not "at top" — Summary Dismissal exiled Song of the
+                # Worldsoul, the old `not game.stack` read the empty stack as
+                # at-top, and the exiled spell resolved onto the battlefield.
+                # An entry that vanished without a counter mark must never
+                # resolve; treat it as countered so the branch below unwinds it.
+                if (not stack_entry.countered
+                        and game.stack is not None
+                        and stack_entry not in game.stack):
+                    print(f"[STACK-ENTRY-VANISHED] {card.name} left the stack "
+                          f"without a counter mark — treating as countered, "
+                          f"not resolving (CR 608)")
+                    stack_entry.countered = True
+                elif game.stack and game.stack[-1] is not stack_entry:
                     print(f"[STACK] Resolution timeout ({resolution_timeout}s) for {card.name}, "
                           f"but later cast on top — extending wait for LIFO order")
                     # May 7 audit: keep extending while a later cast remains on
@@ -1396,7 +1409,25 @@ async def _await_stack_window(engine, game: GameState, player: Player,
                             # If we've now reached the top, fall through to
                             # the normal resolve-now path on the next loop
                             # iteration. If still buried, keep waiting.
-                            if not game.stack or game.stack[-1] is stack_entry:
+                            if stack_entry.countered:
+                                # Marked while we waited — the countered
+                                # branch below owns the unwind.
+                                break
+                            if stack_entry not in game.stack:
+                                # July 30 batch-9 audit (CRITICAL): the old
+                                # `not game.stack` misread "entry removed,
+                                # stack now empty" as "now at top" and
+                                # resolved a Summary-Dismissal-exiled spell
+                                # onto the battlefield. Vanished without a
+                                # counter mark = external removal; never
+                                # resolve.
+                                print(f"[STACK-ENTRY-VANISHED] {card.name} left "
+                                      f"the stack without a counter mark — "
+                                      f"treating as countered, not resolving "
+                                      f"(CR 608)")
+                                stack_entry.countered = True
+                                break
+                            if game.stack[-1] is stack_entry:
                                 print(f"[STACK] {card.name} now at top after {extensions_used} extension(s), resolving")
                                 break
                             print(f"[STACK] {card.name} still buried under {game.stack[-1].card.name if game.stack[-1].card else '?'} — extending again ({extensions_used}/{max_lifo_extensions})")
@@ -1489,6 +1520,16 @@ async def _await_stack_window(engine, game: GameState, player: Player,
             _drop_from_priority_stack()
             # Signature spells return to command zone even when countered
             _countered_to = getattr(stack_entry, 'countered_to', None)
+            if _countered_to == "already_handled":
+                # July 30 batch-9 audit: the removing effect (Summary
+                # Dismissal, Spell Queller) already moved the card to its
+                # destination zone and posted its own message — just unwind.
+                # Re-routing here would clone the card into a second zone.
+                print(f"[STACK] {card.name} was removed from the stack by "
+                      f"another effect — unwinding without resolving")
+                engine.rules.log_event(f"{player.name}'s {card.name} was removed from the stack")
+                return ((True, f"Cast {card.name} (removed from stack)", effect_messages),
+                        cast_trigger_msgs, player_idx)
             if getattr(card, 'is_signature_spell', False) and game.format == "oathbreaker":
                 player.command_zone.append(card)
                 print(f"[OATHBREAKER] {card.name} was countered → returns to command zone")
@@ -3600,6 +3641,7 @@ def resolve_special_effects(engine, game: GameState, player: Player, card: Card,
     # full (game_1529172161636597770). Needs direct stack access → Tier 1.
     if card_name_lower == "summary dismissal":
         exiled_names = []
+        countered_triggers = 0
         for entry in list(getattr(game, 'stack', [])):
             e_card = getattr(entry, 'card', None)
             if e_card is None or e_card is card:
@@ -3619,6 +3661,18 @@ def resolve_special_effects(engine, game: GameState, player: Player, card: Card,
                     print(f"[SUMMARY-DISMISSAL] priority-stack sync failed: {_ps_err}")
                     from mtg.util import maybe_reraise
                     maybe_reraise(_ps_err)
+            # July 30 batch-9 audit: a trigger entry's .card is its SOURCE
+            # permanent (usually still on the battlefield) — exiling it
+            # would clone the object into two zones. "Counter all
+            # abilities" just removes the entry.
+            if getattr(entry, 'is_spell', True) is False:
+                entry.countered = True
+                _wake = getattr(entry, 'resolution_event', None)
+                if _wake is not None:
+                    _wake.set()
+                countered_triggers += 1
+                print(f"[SUMMARY-DISMISSAL] Countered {e_card.name}'s triggered ability on the stack")
+                continue
             e_owner_idx = getattr(e_card, 'owner_index', None)
             e_owner = (game.players[e_owner_idx]
                        if isinstance(e_owner_idx, int) and 0 <= e_owner_idx < len(game.players)
@@ -3626,16 +3680,27 @@ def resolve_special_effects(engine, game: GameState, player: Player, card: Card,
             if not hasattr(e_owner, 'exile'):
                 e_owner.exile = []
             e_owner.exile.append(e_card)
+            # July 30 batch-9 audit (CRITICAL): without a counter mark, the
+            # exiled spell's cast_spell_async coroutine timed out, read the
+            # now-empty stack as "now at top", and RESOLVED the exiled spell
+            # — Song of the Worldsoul entered the battlefield and triggered
+            # all game (game_1532236251619528895). countered_to =
+            # "already_handled" tells the countered branch the zone move is
+            # done here; waking the event unwinds the caster promptly.
+            entry.countered = True
+            entry.countered_to = "already_handled"
+            _wake = getattr(entry, 'resolution_event', None)
+            if _wake is not None:
+                _wake.set()
             exiled_names.append(e_card.name)
             print(f"[SUMMARY-DISMISSAL] Exiled {e_card.name} from the stack")
         # "Counter all abilities" — wipe the pending trigger queues (the
         # engine's stack-adjacent representation of triggered abilities).
-        countered_triggers = 0
         pat = getattr(game, 'pending_async_triggers', None)
         if pat:
-            countered_triggers = len(pat)
+            countered_triggers += len(pat)
             game.pending_async_triggers = []
-            print(f"[SUMMARY-DISMISSAL] Countered {countered_triggers} pending triggered abilit(ies)")
+            print(f"[SUMMARY-DISMISSAL] Countered {len(pat)} pending triggered abilit(ies)")
         if exiled_names:
             messages.append("🌀 **Summary Dismissal** exiles "
                             + ", ".join(f"**{n}**" for n in exiled_names)

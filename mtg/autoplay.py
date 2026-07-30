@@ -185,6 +185,11 @@ async def _resolve_combat(cog, ctx, game: GameState):
         # Move to main 2
         game.phase = Phase.MAIN2
         await ctx.send(f"➡️ Moving to {PHASE_NAMES[game.phase]}")
+        # July 30 batch-9 audit: this direct phase set bypassed
+        # advance_phase, so postcombat main-phase triggers (Tymna) never
+        # fired on the one kind of turn their condition can be true.
+        for _m in cog.engine.dispatch_main_phase_triggers(game, False):
+            await ctx.send(_m)
 
         # If it's Claude's turn (human was blocking Claude's attack),
         # continue with Claude's MAIN2 actions, then end Claude's turn
@@ -1311,11 +1316,40 @@ async def _autoplay_execute_action(cog, thread, game: GameState, player_idx: int
                 print(f"[AUTOPLAY] Skipping signature spell {card.name} — oathbreaker not on battlefield")
                 return None
 
+        def _rollback_graveyard_cast():
+            # Roll the whole graveyard cast back: the card returns to the
+            # graveyard (it was never legally cast) and the escape exile
+            # cost is refunded — paying a cost for a cast that never
+            # happened is the cost-paid-no-effect class.
+            if card in player.hand:
+                player.hand.remove(card)
+            if card not in player.graveyard:
+                player.graveyard.append(card)
+            if card.id not in player.playable_from_graveyard:
+                player.playable_from_graveyard.append(card.id)
+            for _ex in _gy_escape_exiled:
+                if _ex in player.exile:
+                    player.exile.remove(_ex)
+                    player.graveyard.append(_ex)
+            card._was_escaped = False
+            card._escape_cost = ""
+            card._cast_from_graveyard = False
+
         # [TARGETING] Pre-cast target validation — block autoplay from casting
         # targeted spells when no legal target exists (CR 601.2c)
         if HAS_TARGETING and _spell_requires_targets(card):
             if not _find_any_valid_target(game, card, player.name):
                 print(f"[TARGETING] Autoplay tried to cast {card.name} with no valid targets")
+                if from_graveyard:
+                    # July 30 batch-9 audit: this exit sits BETWEEN the
+                    # graveyard extraction (escape exile cost already paid)
+                    # and the hand-append, so returning bare left Cling to
+                    # Dust in NO zone with 5 graveyard cards destroyed
+                    # (game_1532229658215583864) — the exact stranding the
+                    # July 29 rollback fixed on the post-cast path.
+                    _rollback_graveyard_cast()
+                    print(f"[ESCAPE] {card.name} targeting failed pre-cast — "
+                          f"graveyard cast rolled back (card + exile cost restored)")
                 return None
 
         # Set adventure flag
@@ -1441,23 +1475,7 @@ async def _autoplay_execute_action(cog, thread, game: GameState, player_idx: int
                 player.hand.remove(card)
                 player.command_zone.append(card)
             if from_graveyard:
-                # Roll the whole graveyard cast back: the card returns to the
-                # graveyard (it was never legally cast) and the escape exile
-                # cost is refunded — paying a cost for a cast that never
-                # happened is the cost-paid-no-effect class.
-                if card in player.hand:
-                    player.hand.remove(card)
-                if card not in player.graveyard:
-                    player.graveyard.append(card)
-                if card.id not in player.playable_from_graveyard:
-                    player.playable_from_graveyard.append(card.id)
-                for _ex in _gy_escape_exiled:
-                    if _ex in player.exile:
-                        player.exile.remove(_ex)
-                        player.graveyard.append(_ex)
-                card._was_escaped = False
-                card._escape_cost = ""
-                card._cast_from_graveyard = False
+                _rollback_graveyard_cast()
             print(f"[AUTOPLAY] cast failed: {msg}")
             # July 20 batch-3 audit: same stash as engine.py's _execute_action
             # cast branch — the None return discards the real reason and

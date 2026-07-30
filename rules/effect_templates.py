@@ -2959,12 +2959,11 @@ class EffectTemplateLibrary:
         ))
 
 
-        self._add_card("ancient bronze dragon", EffectTemplate(
-            name="Ancient Bronze Dragon",
-            description="Roll d20, put that many +1/+1 counters on each creature you control",
-            action_generator=self._gen_ancient_bronze_dragon,
-        ))
-
+        # (July 30, 2026: the March-27 "ancient bronze dragon" ETB
+        # registration was DELETED — the card's only trigger is COMBAT
+        # DAMAGE, and the old generator pumped the whole team ±d20 until end
+        # of turn via random.randint. The real trigger lives in the attack
+        # registry now; same hallucinated-template class as Twinflame Tyrant.)
 
         # ===========================================================
         # NEW TEMPLATES — March 27 Tier 3 gap closure
@@ -4743,6 +4742,68 @@ class EffectTemplateLibrary:
             description=("Kroxa attacks: each opponent discards a card, then each opponent "
                          "who didn't discard a nonland card loses 3 life"),
             action_generator=self._gen_kroxa_attack,
+        ))
+
+        # --- July 30 batch-9 audit: combat-damage trigger templates ---
+        # All 60 [DRAIN-COMBAT_DAMAGE] drains in batch 15322 were refused by
+        # judge.py's combat-shaped-resolve guard (CR 510.1, by design) — the
+        # July 28 queue is an audit trail, but NO queued combat-damage
+        # trigger can ever resolve via Tier 3. The Ragavan fix (July 29)
+        # already proved the template path; these cover the batch's ranked
+        # refusal list. Every generator gates on ctx['damage_dealt'] so a
+        # declare-time attack scan can never misfire them, and returns []
+        # (handled no-op) when its condition/choice declines. Watcher-shaped
+        # variants ("whenever a creature you control deals...") still only
+        # fire on the SOURCE's own connect — battlefield-wide watchers are
+        # pub/sub slice 5 (COMBAT_DAMAGE_DEALT) territory.
+        self._add_attack_card("hellkite tyrant", EffectTemplate(
+            name="Hellkite Tyrant",
+            description=("Hellkite Tyrant deals combat damage to a player: "
+                         "gain control of all artifacts that player controls"),
+            action_generator=self._gen_hellkite_tyrant,
+        ))
+        self._add_attack_card("quartzwood crasher", EffectTemplate(
+            name="Quartzwood Crasher",
+            description=("Trample creatures dealt combat damage to a player: "
+                         "create an X/X Dinosaur Beast with trample (X = that damage)"),
+            action_generator=self._gen_quartzwood_crasher,
+        ))
+        self._add_attack_card("ohran frostfang", EffectTemplate(
+            name="Ohran Frostfang",
+            description=("A creature you control dealt combat damage to a "
+                         "player: draw a card (own connect only)"),
+            action_generator=self._gen_combat_damage_draw_one,
+        ))
+        self._add_attack_card("tovolar, dire overlord", EffectTemplate(
+            name="Tovolar, Dire Overlord",
+            description=("A Wolf or Werewolf you control dealt combat damage "
+                         "to a player: draw a card (own connect only)"),
+            action_generator=self._gen_combat_damage_draw_one,
+        ))
+        self._add_attack_card("neheb, dreadhorde champion", EffectTemplate(
+            name="Neheb, Dreadhorde Champion",
+            description=("Neheb deals combat damage: discard excess lands, "
+                         "draw that many, add that much {R}"),
+            action_generator=self._gen_neheb_dreadhorde,
+        ))
+        self._add_attack_card("glissa sunslayer", EffectTemplate(
+            name="Glissa Sunslayer",
+            description=("Glissa Sunslayer deals combat damage to a player: "
+                         "destroy an enchantment, or draw a card and lose 1 life"),
+            action_generator=self._gen_glissa_sunslayer,
+        ))
+        self._add_attack_card("ancient bronze dragon", EffectTemplate(
+            name="Ancient Bronze Dragon",
+            description=("Ancient Bronze Dragon deals combat damage to a "
+                         "player: roll a d20, put that many +1/+1 counters on "
+                         "up to two target creatures"),
+            action_generator=self._gen_ancient_bronze_dragon,
+        ))
+        self._add_attack_card("flaxen intruder", EffectTemplate(
+            name="Flaxen Intruder",
+            description=("Flaxen Intruder deals combat damage to a player: "
+                         "may sacrifice it to destroy an artifact or enchantment"),
+            action_generator=self._gen_flaxen_intruder,
         ))
 
         # --- Felidar Guardian: blink ANOTHER permanent you control (not self) ---
@@ -7887,6 +7948,143 @@ class EffectTemplateLibrary:
             {"action": "draw_cards", "player": ctrl, "amount": x},
         ]
 
+    # ---- July 30 batch-9: combat-damage trigger generators ----
+    # Shape helpers: the two ctx builders populate battlefield/hand lists in
+    # DIFFERENT shapes (Card objects vs dicts) — the July 28 Kroxa lesson.
+
+    @staticmethod
+    def _cd_type_line(c) -> str:
+        tl = getattr(c, 'type_line', None)
+        if tl is None and isinstance(c, dict):
+            tl = c.get('type_line')
+        return (tl or '').lower()
+
+    @staticmethod
+    def _cd_name(c) -> str:
+        n = getattr(c, 'name', None)
+        if n is None and isinstance(c, dict):
+            n = c.get('name')
+        return n or str(c)
+
+    @staticmethod
+    def _cd_cmc(c) -> int:
+        v = getattr(c, 'cmc', None)
+        if v is None and isinstance(c, dict):
+            v = c.get('cmc')
+        try:
+            return int(v or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _gen_hellkite_tyrant(self, ctrl, opp, ctx) -> List[Dict]:
+        """Hellkite Tyrant connects: gain control of ALL that player's artifacts."""
+        if not ctx.get('damage_dealt'):
+            return []
+        opp_player = ctx.get('_opponent_player')
+        arts = [c for c in (getattr(opp_player, 'battlefield', []) or [])
+                if 'artifact' in self._cd_type_line(c)]
+        if not arts:
+            return []  # handled no-op — nothing to steal
+        return [{"action": "steal_permanent", "player": ctrl,
+                 "from_player": opp, "card": self._cd_name(c)} for c in arts]
+
+    def _gen_quartzwood_crasher(self, ctrl, opp, ctx) -> List[Dict]:
+        """Quartzwood Crasher: X/X trample Dino, X = the combat damage dealt."""
+        dmg = int(ctx.get('damage_dealt') or 0)
+        if dmg <= 0:
+            return []
+        return [{"action": "create_token", "player": ctrl,
+                 "name": "Dinosaur Beast", "power": dmg, "toughness": dmg,
+                 "types": "Token Creature — Dinosaur Beast", "count": 1,
+                 "keywords": ["trample"]}]
+
+    def _gen_combat_damage_draw_one(self, ctrl, opp, ctx) -> List[Dict]:
+        """Ohran Frostfang / Tovolar: draw 1 when the source itself connects."""
+        if not ctx.get('damage_dealt'):
+            return []
+        return [{"action": "draw_cards", "player": ctrl, "amount": 1}]
+
+    def _gen_neheb_dreadhorde(self, ctrl, opp, ctx) -> List[Dict]:
+        """Neheb, Dreadhorde Champion: "may discard any number of cards. If
+        you do, draw that many cards and add that much {R}."
+
+        The choice is modeled as: pitch lands beyond the second in hand
+        (dead weight late-game) and rummage them into fresh cards + {R}.
+        No excess lands = decline the optional discard. The "you don't lose
+        this mana as steps and phases end" rider is unmodeled — the engine's
+        pool empties on phase change."""
+        if not ctx.get('damage_dealt'):
+            return []
+        hand = ctx.get('controller_hand', []) or []
+        lands = [c for c in hand if 'land' in self._cd_type_line(c)]
+        excess = lands[2:]
+        if not excess:
+            return []  # declines the optional discard
+        actions = [{"action": "discard", "player": ctrl,
+                    "card": self._cd_name(c)} for c in excess]
+        actions.append({"action": "draw_cards", "player": ctrl,
+                        "amount": len(excess)})
+        actions.append({"action": "add_mana", "player": ctrl, "color": "R",
+                        "amount": len(excess)})
+        return actions
+
+    def _gen_glissa_sunslayer(self, ctrl, opp, ctx) -> List[Dict]:
+        """Glissa Sunslayer modal: destroy the opponent's best enchantment if
+        one exists, else draw a card and lose 1 (declined below 6 life).
+        Mode three (remove counters) is not modeled."""
+        if not ctx.get('damage_dealt'):
+            return []
+        opp_player = ctx.get('_opponent_player')
+        ench = [c for c in (getattr(opp_player, 'battlefield', []) or [])
+                if 'enchantment' in self._cd_type_line(c)]
+        if ench:
+            best = max(ench, key=self._cd_cmc)
+            return [{"action": "destroy", "card": self._cd_name(best)}]
+        life = ctx.get('controller_life', 40)
+        if life < 6:
+            return []  # handled no-op — declines the life payment mode
+        return [{"action": "draw_cards", "player": ctrl, "amount": 1},
+                {"action": "lose_life", "player": ctrl, "amount": 1}]
+
+    def _gen_ancient_bronze_dragon(self, ctrl, opp, ctx) -> List[Dict]:
+        """Ancient Bronze Dragon: roll a d20, put that many +1/+1 counters on
+        up to two target creatures. The roll uses a deterministic hash of the
+        turn number (the Mana Crypt coin-flip convention) for reproducible
+        autoplay; targets are the controller's two strongest creatures."""
+        if not ctx.get('damage_dealt'):
+            return []
+        turn = ctx.get('turn_number') or ctx.get('turn') or 0
+        roll = (sum(ord(ch) for ch in f"abd-roll-{turn}") % 20) + 1
+        ctrl_player = ctx.get('_controller_player')
+        own = [c for c in (getattr(ctrl_player, 'battlefield', []) or [])
+               if 'creature' in self._cd_type_line(c)]
+        if not own:
+            return []
+        own.sort(key=self._cd_cmc, reverse=True)
+        return [{"action": "add_counters", "card": self._cd_name(c),
+                 "counter_type": "+1/+1", "amount": roll}
+                for c in own[:2]]
+
+    def _gen_flaxen_intruder(self, ctrl, opp, ctx) -> List[Dict]:
+        """Flaxen Intruder: "you may sacrifice it. When you do, destroy
+        target artifact or enchantment." Sacrifice only when the opponent has
+        one worth destroying; otherwise decline and keep the creature."""
+        if not ctx.get('damage_dealt'):
+            return []
+        opp_player = ctx.get('_opponent_player')
+        targets = [c for c in (getattr(opp_player, 'battlefield', []) or [])
+                   if ('artifact' in self._cd_type_line(c)
+                       or 'enchantment' in self._cd_type_line(c))
+                   and 'land' not in self._cd_type_line(c)]
+        if not targets:
+            return []  # declines the optional sacrifice
+        best = max(targets, key=self._cd_cmc)
+        return [{"action": "sacrifice_permanent", "player": ctrl,
+                 "preferred_card": "Flaxen Intruder", "only_preferred": True,
+                 "source": "Flaxen Intruder",
+                 "reason": "Flaxen Intruder: sacrificed after combat damage"},
+                {"action": "destroy", "card": self._cd_name(best)}]
+
     def _gen_spell_exile_target(self, ctrl, opp, ctx) -> List[Dict]:
         """Exile target permanent — for instant/sorcery spells like Utter End, Swords to Plowshares."""
         target = ctx.get('explicit_target_name') or ctx.get('best_opponent_nonland')
@@ -8276,6 +8474,13 @@ class EffectTemplateLibrary:
         graveyard = ctx.get('controller_graveyard', [])
         best_target = None
         for c in graveyard:
+            # July 30 batch-9 reviewer audit: no permanent-type filter — an
+            # Instant (Anguished Unmaking) was returned to the battlefield
+            # and sat there for 20+ turns (CR 110.1; the card says
+            # "permanent card"). game_1532224002137784391.
+            _tl = (getattr(c, 'type_line', '') or '').lower()
+            if 'instant' in _tl or 'sorcery' in _tl:
+                continue
             try:
                 cmc = int(getattr(c, 'cmc', 0) or 0)
             except (ValueError, TypeError):
@@ -8634,16 +8839,6 @@ class EffectTemplateLibrary:
         if greatest_power > 0:
             return [{"action": "draw_cards", "player": ctrl, "amount": greatest_power}]
         return [{"action": "no_action", "reason": "No creatures on battlefield for Garruk -3"}]
-
-    def _gen_ancient_bronze_dragon(self, ctrl, opp, ctx) -> List[Dict]:
-        """Ancient Bronze Dragon: roll d20, put that many +1/+1 counters on each creature."""
-        import random
-        roll = random.randint(1, 20)
-        return [
-            {"action": "pump_all_creatures", "player": ctrl,
-             "power": roll, "toughness": roll,
-             "keywords": []},
-        ]
 
     def _gen_victimize(self, ctrl, opp, ctx) -> List[Dict]:
         """Victimize: sacrifice a creature you control, return two creatures from your graveyard."""
