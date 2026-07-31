@@ -617,6 +617,17 @@ def _compute_alt_costs(engine, game: GameState, player: Player, card: Card,
         effective_cmc = helpers.cmc_of_cost_string(card._escape_cost)
         print(f"[ESCAPE] Using escape cost {card._escape_cost} "
               f"(CMC {effective_cmc}) instead of {card.mana_cost}")
+    # Madness (CR 702.35): the alternative cost, same seam as flashback/
+    # escape above. The drain (resolve_pending_madness) stamps
+    # _cast_via_madness after pre-moving the card exile→hand; X-madness
+    # costs (Avacyn's Judgment {X}{R}) flow into the X machinery below like
+    # any other X cost.
+    if (getattr(card, '_cast_via_madness', False)
+            and getattr(card, '_madness_cost', None)):
+        effective_mana_cost = card._madness_cost
+        effective_cmc = helpers.cmc_of_cost_string(card._madness_cost)
+        print(f"[MADNESS] Using madness cost {card._madness_cost} "
+              f"(CMC {effective_cmc}) instead of {card.mana_cost}")
     if getattr(card, 'cast_as_adventure', False) and card.adventure_cost:
         effective_mana_cost = card.adventure_cost
         # July 21 batch audit: was a digits + plain-single-pip count that gave
@@ -3310,6 +3321,86 @@ def _advance_sagas(engine, game: GameState, player: Player) -> List[str]:
         saga_chapters = engine._get_saga_total_chapters(card)
         if new_lore >= saga_chapters:
             print(f"[SAGA] {card.name}: final chapter reached ({new_lore}/{saga_chapters}), will sacrifice via SBA")
+    return messages
+
+
+async def resolve_pending_madness(engine, game: GameState) -> List[str]:
+    """Resolve the madness cast-or-graveyard choice (CR 702.35d).
+
+    Discard sites are sync and casting is not, so
+    helpers.madness_discard_to_exile parks (card, owner_index) on
+    game._madness_pending and this drain — invoked at the front of
+    drain_pending_triggers, the same async choke point the Tier-3 trigger
+    queue uses — makes the call: cast for the madness cost when the owner
+    can pay it (v1 strategic gate: affordable = cast; the card was worth a
+    deck slot), else the card goes to the graveyard. A failed cast also
+    ends in the graveyard (not exile) with the pre-move rolled back.
+
+    Snapshot + clear first so a madness card discarded DURING one of these
+    casts (looting into looting) pends for the NEXT drain, not this loop.
+    """
+    messages: List[str] = []
+    pending = list(getattr(game, '_madness_pending', None) or [])
+    if not pending:
+        return messages
+    game._madness_pending = []
+    for card, owner_idx in pending:
+        if not (0 <= owner_idx < len(game.players)):
+            continue
+        player = game.players[owner_idx]
+        if card not in player.exile:
+            # Zone changed since the discard (flicker, graveyard hate) —
+            # stale entry, nothing to decide.
+            continue
+        cost = getattr(card, '_madness_cost', '') or ''
+        can_pay = False
+        if cost:
+            try:
+                can_pay, _reason = player.can_pay_mana_cost(cost)
+            except Exception as e:
+                print(f"[MADNESS] can_pay check failed for {card.name}: {e}")
+                from mtg.util import maybe_reraise
+                maybe_reraise(e)
+        if can_pay and not getattr(game, 'ended', False):
+            # Pre-move exile→hand (the flashback/escape convention — the
+            # cast machinery is hand-oriented) and mark the madness cast so
+            # can_cast_spell checks the madness cost + waives timing and
+            # _compute_alt_costs charges it.
+            player.exile.remove(card)
+            player.hand.append(card)
+            card._cast_via_madness = True
+            try:
+                success, msg, effect_msgs = await engine.cast_spell_async(
+                    game, player, card)
+            except Exception as e:
+                print(f"[MADNESS] cast_spell_async raised for {card.name}: {e}")
+                from mtg.util import maybe_reraise
+                maybe_reraise(e)
+                success, msg, effect_msgs = False, str(e), []
+            card._cast_via_madness = False
+            if success:
+                print(f"[MADNESS] {player.name} casts {card.name} for its "
+                      f"madness cost {cost}")
+                messages.append(f"🌀 **{player.name}** casts **{card.name}** "
+                                f"for its madness cost {cost}")
+                messages.extend(effect_msgs or [])
+                continue
+            # CR 702.35d: not cast → graveyard. Roll the pre-move back.
+            print(f"[MADNESS] {card.name} madness cast failed ({msg}) — "
+                  f"to graveyard")
+            if card in player.hand:
+                player.hand.remove(card)
+            if card not in player.graveyard:
+                player.graveyard.append(card)
+            messages.append(f"🗑️ **{card.name}** goes to the graveyard "
+                            f"(madness cast failed)")
+        else:
+            player.exile.remove(card)
+            player.graveyard.append(card)
+            print(f"[MADNESS] {player.name} declines {card.name} "
+                  f"(madness {cost} not paid)")
+            messages.append(f"🗑️ **{card.name}** goes to the graveyard "
+                            f"(madness cost {cost} not paid)")
     return messages
 
 

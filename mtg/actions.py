@@ -1004,8 +1004,21 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                     return None
                 hand_size = len(player.hand)
                 discarded_names = [c.name for c in player.hand]
-                player.graveyard.extend(player.hand)
+                # Madness (CR 702.35, Aug 1 2026): each discarded card with
+                # madness goes to EXILE with a pending cast-or-graveyard
+                # choice — Wheel of Fortune / Reforge the Soul discarded
+                # Bloodmad Vampire / Violent Eruption silently to graveyard
+                # in batch 15325 (the whole mechanic was missing).
+                from mtg.helpers import madness_discard_to_exile
+                _wheel_hand = player.hand
                 player.hand = []
+                _mad_lines = []
+                for _c in _wheel_hand:
+                    _mm = madness_discard_to_exile(game, player, _c)
+                    if _mm:
+                        _mad_lines.append(_mm)
+                    else:
+                        player.graveyard.append(_c)
                 rules.log_event(f"{player.name} discards their hand ({hand_size} cards)")
                 # June 10 audit: don't hide exactly ONE name behind "+1 more" —
                 # collapse only when 2+ names are hidden.
@@ -1015,7 +1028,10 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                 else:
                     preview = ', '.join(discarded_names[:6])
                     more = f" (+{hand_size - 6} more)"
-                return f"🗑️ **{player.name}** discards their hand ({hand_size}): {preview}{more}"
+                _wheel_msg = f"🗑️ **{player.name}** discards their hand ({hand_size}): {preview}{more}"
+                if _mad_lines:
+                    _wheel_msg += "\n" + "\n".join(_mad_lines)
+                return _wheel_msg
             if card_name == "random" and player.hand:
                 import random as rng
                 card = rng.choice(player.hand)
@@ -1042,8 +1058,17 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                 # returned None silently — so Daretti's +2 drew 2 with ZERO
                 # discards, every activation, all batch. Excess lands first,
                 # then the highest-CMC (least castable) card.
+                # Aug 1 (madness): a SELF-chosen discard prefers a madness
+                # card — it's discarded into exile and castable for its
+                # madness cost, which is Anje's whole engine. Only for the
+                # chooser's own picks; "random"/"best_nonland" stay put.
+                from mtg.helpers import parse_madness_cost
+                _mad_choices = [c for c in player.hand
+                                if parse_madness_cost(c.oracle_text or '')]
                 lands = [c for c in player.hand if c.is_land()]
-                if len(lands) > 2:
+                if _mad_choices:
+                    card = _mad_choices[0]
+                elif len(lands) > 2:
                     card = lands[-1]
                 else:
                     card = max(player.hand, key=lambda c: (c.cmc or 0))
@@ -1054,6 +1079,14 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
 
             if card:
                 player.hand.remove(card)
+                # Madness (CR 702.35) checks FIRST — its own replacement
+                # sends the card to exile AND sets up the cast choice, which
+                # a plain RiP-style exile redirect below can't offer.
+                from mtg.helpers import madness_discard_to_exile
+                _mad_msg = madness_discard_to_exile(game, player, card)
+                if _mad_msg:
+                    rules.log_event(f"{player.name} discards {card.name} into exile (madness)")
+                    return _mad_msg
                 # [REPLACEMENT] Check for graveyard replacement (Rest in Peace → exile instead)
                 destination = "graveyard"
                 if HAS_REPLACEMENT_ENGINE and game._replacement_engine and game._replacement_engine.effects:
@@ -5353,9 +5386,13 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                         break
                     land.tapped = True
                     tapped += 1
-        # Discard the card
+        # Discard the card. Madness applies to cost discards too (CR
+        # 702.35b — cycling a madness card is the classic interaction:
+        # draw AND cast it for the madness cost).
         p.hand.remove(cycle_card)
-        p.graveyard.append(cycle_card)
+        from mtg.helpers import madness_discard_to_exile
+        if madness_discard_to_exile(game, p, cycle_card) is None:
+            p.graveyard.append(cycle_card)
         # Draw a card
         if p.library:
             drawn = p.library.pop(0)

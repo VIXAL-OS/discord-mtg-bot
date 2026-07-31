@@ -423,6 +423,14 @@ class Card:
     # flag nobody sets.
     _escape_cost: str = field(default="", repr=False, compare=False)
     _was_escaped: bool = field(default=False, repr=False, compare=False)
+    # Madness (CR 702.35, Aug 1 2026). `_madness_cost` is stamped by the
+    # discard redirect (helpers.madness_discard_to_exile) so the drain and
+    # the cast pipeline share one parse; `_cast_via_madness` marks the cast
+    # in flight so can_cast_spell checks the madness cost + waives timing
+    # (CR 702.35a — the cast happens as the trigger resolves) and
+    # _compute_alt_costs charges it. Cleared by the drain either way.
+    _madness_cost: str = field(default="", repr=False, compare=False)
+    _cast_via_madness: bool = field(default=False, repr=False, compare=False)
     # Graveyard-origin cast marker (flashback/escape). Both AI cast paths
     # stamp it so templates (Increasing Devotion, Snapcaster tracking) can
     # detect graveyard-origin casting; declared July 29 when the autoplay
@@ -3575,6 +3583,13 @@ class GameState:
     # (Slice 6a's _phase_emissions/_phase_hook_runs parity scaffolding was
     # retired at the 6b flip, July 31 — the MAIN-phase dispatch is a
     # PHASE_CHANGED subscriber now, so hook pairing is structural.)
+    # Madness (CR 702.35): (card, owner_index) pairs discarded into exile by
+    # helpers.madness_discard_to_exile, awaiting the cast-or-graveyard choice
+    # at the next async drain (spells.resolve_pending_madness, invoked from
+    # drain_pending_triggers). Sync discard sites can't cast, so the pending
+    # list bridges — the same sync-gap convention as the Tier-3 trigger
+    # queue ([QUEUE-*] → [DRAIN-*]).
+    _madness_pending: list = field(default_factory=list, repr=False, compare=False)
     # Spell Queller bookkeeping: source card name → [(exiled_card, owner_name)]
     # (exile_from_stack records; release_queller_exile drains on LTB).
     _queller_exiles: dict = field(default_factory=dict, repr=False, compare=False)

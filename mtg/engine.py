@@ -2070,10 +2070,21 @@ class GameEngine:
             for perm in list(game.active_player.battlefield):
                 if perm.name == "Solitary Confinement":
                     if game.active_player.hand:
-                        # Auto-discard highest CMC card to keep it
-                        discard = max(game.active_player.hand, key=lambda c: c.cmc or 0)
+                        # Auto-discard highest CMC card to keep it — but
+                        # prefer a madness card (Aug 1: it exiles + casts
+                        # for its madness cost, strict upside).
+                        from mtg.helpers import (madness_discard_to_exile,
+                                                 parse_madness_cost)
+                        _mad_opts = [c for c in game.active_player.hand
+                                     if parse_madness_cost(c.oracle_text or '')]
+                        discard = (_mad_opts[0] if _mad_opts else
+                                   max(game.active_player.hand, key=lambda c: c.cmc or 0))
                         game.active_player.hand.remove(discard)
-                        game.active_player.graveyard.append(discard)
+                        _mm = madness_discard_to_exile(game, game.active_player, discard)
+                        if _mm:
+                            messages.append(_mm)
+                        else:
+                            game.active_player.graveyard.append(discard)
                         messages.append(f"🛡️ {game.active_player.name} discards {discard.name} to keep Solitary Confinement")
                         print(f"[SOLITARY-CONFINEMENT] {game.active_player.name} keeps Solitary Confinement (discarded {discard.name})")
                     else:

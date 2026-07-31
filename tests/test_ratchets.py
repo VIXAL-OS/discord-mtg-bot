@@ -108,7 +108,11 @@ EXCEPT_BASELINE = {
     # sba.py 3→4 (June 10 fix sprint): _finalize_death_save_return's self-ETB
     # re-fire crash barrier — logged + maybe_reraise, per convention.
     "sba.py": 5,
-    "spells.py": 30,
+    # Aug 1 (+2): resolve_pending_madness's two crash barriers (the can_pay
+    # probe and the cast_spell_async call) — a madness resolution crash must
+    # route the card to the graveyard in production, not corrupt the drain;
+    # both carry maybe_reraise so strict batches/pytest still see failures.
+    "spells.py": 32,
     "triggers.py": 51,
     "util.py": 6,
 }

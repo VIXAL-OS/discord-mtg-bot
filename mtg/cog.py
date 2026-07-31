@@ -4376,8 +4376,19 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
             return
 
         player.hand.remove(card)
-        player.graveyard.append(card)
-        await ctx.send(f"🗑️ Discarded **{card.name}**")
+        # Madness (CR 702.35, Aug 1 2026): a real game discard routes
+        # through the exile redirect. (The !fix instruction parser below
+        # deliberately does NOT — manual state surgery goes where the
+        # human says.)
+        from mtg.helpers import madness_discard_to_exile
+        _mad_msg = madness_discard_to_exile(game, player, card)
+        if _mad_msg:
+            await ctx.send(_mad_msg)
+            for _dm in await self.engine.drain_pending_triggers(game):
+                await ctx.send(_dm)
+        else:
+            player.graveyard.append(card)
+            await ctx.send(f"🗑️ Discarded **{card.name}**")
 
         # Handle pending "may discard → draw" from planeswalker abilities (Sarkhan, etc.)
         if (game.pending_action

@@ -163,6 +163,13 @@ class RulesEngine:
 
         # Check timing — but Flash creatures/artifacts/etc. bypass sorcery-speed restrictions
         has_flash = card.has_keyword('Flash') or (card.oracle_text and 'flash' in card.oracle_text.lower().split('\n')[0])
+        # Madness (CR 702.35a): the cast happens as the madness trigger
+        # resolves and ignores timing — a Bloodmad Vampire discarded to the
+        # opponent's Wheel is castable mid-resolution, off-turn. Without
+        # this, the sorcery-speed gate below blocked every madness cast of
+        # a creature/sorcery that wasn't on the owner's own main phase.
+        if getattr(card, '_cast_via_madness', False):
+            has_flash = True
 
         # Split card: check if the half being cast is an instant (instant-speed)
         if getattr(card, 'cast_as_split_half', -1) >= 0 and card.split_types:
@@ -228,6 +235,13 @@ class RulesEngine:
             # the same cast machinery, so don't gate on zone — the
             # `_flashback_cost` marker is the authoritative signal.
             mana_cost_to_check = card._flashback_cost
+        elif getattr(card, '_cast_via_madness', False) and getattr(card, '_madness_cost', None):
+            # Madness (CR 702.35): the drain pre-moves the card exile→hand
+            # and charges the madness cost — usually CHEAPER than printed
+            # (Violent Eruption {1}{R}{R}{R} → {1}{R}{R}), so gating on the
+            # printed cost would wrongly reject casts the payment stage can
+            # cover (the FoW-waiver class, cost-selection flavor).
+            mana_cost_to_check = card._madness_cost
         # July 20 (queued from the cast-gate characterization pins): the mana
         # pre-gate is convoke/delve/improvise-aware. The payment stage covers
         # part of the GENERIC portion by tapping creatures (convoke), exiling

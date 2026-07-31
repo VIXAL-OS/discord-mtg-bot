@@ -255,6 +255,13 @@ async def drain_pending_triggers(engine, game: GameState) -> List[str]:
     queue as it processes.
     """
     messages: List[str] = []
+    # Madness first (Aug 1, 2026): discards redirected to exile by the sync
+    # choke point (helpers.madness_discard_to_exile) resolve their
+    # cast-or-graveyard choice at the first async opportunity — this drain
+    # is the established one (15 call sites across cog/autoplay/engine).
+    if getattr(game, '_madness_pending', None):
+        from mtg.spells import resolve_pending_madness
+        messages.extend(await resolve_pending_madness(engine, game))
     if not hasattr(game, 'pending_async_triggers') or not game.pending_async_triggers:
         return messages
     # Snapshot + clear so reentrant triggers enqueued during resolution
@@ -1485,11 +1492,23 @@ async def _check_cast_triggers(engine, game: GameState, caster: Player, card: Ca
                         # Auto-resolve for AI: discard worst card, draw
                         import random as _rng
                         if caster.hand:
-                            # Discard a land if available, else random
+                            # Discard a madness card first (Aug 1, CR 702.35
+                            # — exiles + casts for its madness cost), else a
+                            # land, else random.
+                            from mtg.helpers import (madness_discard_to_exile,
+                                                     parse_madness_cost)
+                            _mad_in_hand = [c for c in caster.hand
+                                            if parse_madness_cost(c.oracle_text or '')]
                             lands_in_hand = [c for c in caster.hand if c.is_land()]
-                            discard_card = lands_in_hand[0] if lands_in_hand else _rng.choice(caster.hand)
+                            discard_card = (_mad_in_hand[0] if _mad_in_hand
+                                            else lands_in_hand[0] if lands_in_hand
+                                            else _rng.choice(caster.hand))
                             caster.hand.remove(discard_card)
-                            caster.graveyard.append(discard_card)
+                            _mm = madness_discard_to_exile(game, caster, discard_card)
+                            if _mm:
+                                messages.append(_mm)
+                            else:
+                                caster.graveyard.append(discard_card)
                             drawn_cards = engine.draw_cards(caster, 1, game=game)
                             messages.append(f"⚡ {bf_card.name} — {caster.name} discards {discard_card.name}, draws a card")
                         executed_trigger = True
@@ -4886,9 +4905,19 @@ def fire_counters_a_spell_triggers(game, controller_name):
             player.hand.append(drawn)
             line = f"🃏 **{perm.name}**: {player.name} draws a card"
             if player.hand:
-                discard = max(player.hand, key=lambda c: (c.cmc or 0))
+                # Aug 1 (madness, CR 702.35): prefer + redirect.
+                from mtg.helpers import (madness_discard_to_exile,
+                                         parse_madness_cost)
+                _mad_opts = [c for c in player.hand
+                             if parse_madness_cost(c.oracle_text or '')]
+                discard = (_mad_opts[0] if _mad_opts
+                           else max(player.hand, key=lambda c: (c.cmc or 0)))
                 player.hand.remove(discard)
-                player.graveyard.append(discard)
+                _mm = madness_discard_to_exile(game, player, discard)
+                if _mm:
+                    msgs.append(_mm)
+                else:
+                    player.graveyard.append(discard)
                 line += f", then discards **{discard.name}**"
             msgs.append(line)
             print(f"[COUNTER-TRIGGER] {perm.name} loots for {player.name} "

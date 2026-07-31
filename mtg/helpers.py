@@ -811,6 +811,75 @@ def parse_escape_cost(oracle_text):
     return match.group(1).upper(), count
 
 
+def parse_madness_cost(oracle_text):
+    """Parse "Madness {cost}" (CR 702.35). Returns the cost string
+    ("{1}{R}", "{X}{R}", "{0}") or None.
+
+    Cache-verified shapes (Aug 1, 2026): every printing is the keyword
+    followed directly by consecutive brace groups — "Madness {1}{R} (If you
+    discard this card, discard it into exile. ...)". The reminder text's own
+    "madness cost" phrases never put a brace after the word, so anchoring on
+    `madness` + an immediate brace group can't false-positive on them.
+    """
+    if not oracle_text:
+        return None
+    match = re.search(
+        r'\bmadness\s*(?:—\s*)?((?:\{[^}]+\})+)',
+        oracle_text.lower())
+    if not match:
+        return None
+    return match.group(1).upper()
+
+
+def madness_discard_to_exile(game, player, card):
+    """CR 702.35: a discarded card with madness is discarded into EXILE
+    instead of the graveyard; its owner then casts it for the madness cost
+    or it goes to the graveyard.
+
+    THE shared choke-point half of the mechanic (Aug 1, 2026 — madness was
+    entirely unimplemented until then; batch-15325's Wheel of Fortune and
+    Reforge the Soul both discarded madness cards silently to graveyard).
+    Caller contract: the card is already REMOVED from hand; call this
+    INSTEAD of graveyard.append. Returns the display message when the card
+    was redirected (exile + pending recorded + the Anje-family untap scan
+    run), or None when the card has no madness — the caller then proceeds
+    with its normal graveyard discard.
+
+    The cast-or-graveyard choice resolves at the next async drain
+    (mtg/spells.py:resolve_pending_madness) because discard sites are sync
+    and casting is not — the established sync-gap bridge.
+    """
+    cost = parse_madness_cost(getattr(card, 'oracle_text', '') or '')
+    if cost is None:
+        return None
+    card._madness_cost = cost
+    player.exile.append(card)
+    try:
+        owner_idx = game.players.index(player)
+    except ValueError:
+        owner_idx = 0
+    game._madness_pending.append((card, owner_idx))
+    print(f"[MADNESS] {player.name} discards {card.name} into exile "
+          f"(madness {cost})")
+    extra = ""
+    # Anje Falkenrath's own trigger ("Whenever you discard a card, if it
+    # has madness, untap Anje Falkenrath") — the engine.py comment marked
+    # this as known-missing since the discard cost itself didn't exist.
+    # Narrow to the untap-on-madness-discard family; generic "whenever you
+    # discard" watchers (Bone Miser class) need a real DISCARD event on the
+    # bus and stay evidence-gated.
+    for perm in player.battlefield:
+        _o = (getattr(perm, 'oracle_text', '') or '').lower()
+        if ('whenever you discard a card' in _o and 'madness' in _o
+                and 'untap' in _o):
+            if getattr(perm, 'tapped', False):
+                perm.tapped = False
+                extra += f" — {perm.name} untaps"
+                print(f"[MADNESS] {perm.name} untaps (madness-discard trigger)")
+    return (f"🗑️ **{player.name}** discards **{card.name}** into exile "
+            f"(madness {cost}){extra}")
+
+
 def counter_restriction_allows(counter_oracle, target_card):
     """Does this counterspell's printed restriction allow countering target_card?
 

@@ -2080,16 +2080,28 @@ async def _autoplay_resolve_pending_action(cog, thread, game: GameState):
         # doesn't post 31 separate Discord messages.
         discard_count = pa.get('cards_to_discard', 1)
         discarded_names = []
+        from mtg.helpers import madness_discard_to_exile, parse_madness_cost
         for _ in range(discard_count):
             if not player.hand:
                 break
-            non_lands = [c for c in player.hand if not c.is_land()]
-            if non_lands:
-                worst = max(non_lands, key=lambda c: c.cmc if c.cmc else 0)
+            # Aug 1 (madness): self-chosen discard prefers a madness card —
+            # it exiles + casts for its madness cost (CR 702.35).
+            _mad_opts = [c for c in player.hand
+                         if parse_madness_cost(c.oracle_text or '')]
+            if _mad_opts:
+                worst = _mad_opts[0]
             else:
-                worst = player.hand[-1]
+                non_lands = [c for c in player.hand if not c.is_land()]
+                if non_lands:
+                    worst = max(non_lands, key=lambda c: c.cmc if c.cmc else 0)
+                else:
+                    worst = player.hand[-1]
             player.hand.remove(worst)
-            player.graveyard.append(worst)
+            _mm = madness_discard_to_exile(game, player, worst)
+            if _mm:
+                await cog._autoplay_send(thread, _mm)
+            else:
+                player.graveyard.append(worst)
             discarded_names.append(worst.name)
         if discarded_names:
             n = len(discarded_names)
@@ -2104,15 +2116,26 @@ async def _autoplay_resolve_pending_action(cog, thread, game: GameState):
         game.pending_action = None
 
     elif pa_type == 'loot_discard_draw':
-        # Discard worst card, then draw
+        # Discard worst card, then draw. Aug 1 (madness): prefer a madness
+        # card + route through the CR 702.35 exile redirect.
         if player.hand:
-            non_lands = [c for c in player.hand if not c.is_land()]
-            if non_lands:
-                worst = max(non_lands, key=lambda c: c.cmc if c.cmc else 0)
+            from mtg.helpers import madness_discard_to_exile, parse_madness_cost
+            _mad_opts = [c for c in player.hand
+                         if parse_madness_cost(c.oracle_text or '')]
+            if _mad_opts:
+                worst = _mad_opts[0]
             else:
-                worst = player.hand[-1]
+                non_lands = [c for c in player.hand if not c.is_land()]
+                if non_lands:
+                    worst = max(non_lands, key=lambda c: c.cmc if c.cmc else 0)
+                else:
+                    worst = player.hand[-1]
             player.hand.remove(worst)
-            player.graveyard.append(worst)
+            _mm = madness_discard_to_exile(game, player, worst)
+            if _mm:
+                await cog._autoplay_send(thread, _mm)
+            else:
+                player.graveyard.append(worst)
             drawn_cards = cog.engine.draw_cards(player, 1, game=game)
             source = pa.get('source', 'effect')
             draw_msg = ", draws a card" if drawn_cards else ""
@@ -2926,16 +2949,28 @@ async def _run_single_autoplay(cog, channel, game_format: str, deck1_name: str, 
                     discard_count = pa['cards_to_discard']
                     discard_player = game.players[pi]
                     discarded_names = []
+                    from mtg.helpers import (madness_discard_to_exile,
+                                             parse_madness_cost)
                     for _ in range(discard_count):
                         if not discard_player.hand:
                             break
-                        non_lands = [c for c in discard_player.hand if not c.is_land()]
-                        if non_lands:
-                            worst = max(non_lands, key=lambda c: c.cmc if c.cmc else 0)
+                        # Aug 1 (madness): prefer + redirect (CR 702.35).
+                        _mad_opts = [c for c in discard_player.hand
+                                     if parse_madness_cost(c.oracle_text or '')]
+                        if _mad_opts:
+                            worst = _mad_opts[0]
                         else:
-                            worst = discard_player.hand[-1]
+                            non_lands = [c for c in discard_player.hand if not c.is_land()]
+                            if non_lands:
+                                worst = max(non_lands, key=lambda c: c.cmc if c.cmc else 0)
+                            else:
+                                worst = discard_player.hand[-1]
                         discard_player.hand.remove(worst)
-                        discard_player.graveyard.append(worst)
+                        _mm = madness_discard_to_exile(game, discard_player, worst)
+                        if _mm:
+                            await cog._autoplay_send(thread, _mm)
+                        else:
+                            discard_player.graveyard.append(worst)
                         discarded_names.append(worst.name)
                     if discarded_names:
                         n = len(discarded_names)
