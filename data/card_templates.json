@@ -1198,13 +1198,13 @@
       "key": "light up the stage",
       "name": "Light Up the Stage",
       "event": "etb",
-      "description": "Exile top 2 of library, play until end of next turn (approx as draw 2)",
+      "description": "Exile top 2 of library face up, playable from exile (impulse; window approximated to the playable_from_exile wipe)",
       "actions": [
         {
-          "action": "draw_cards",
+          "action": "exile_top_of_library",
           "player": "$controller",
-          "amount": 2,
-          "reason": "[TEMPLATE-APPROX] Light Up the Stage: approximated exile-to-play as draw 2"
+          "count": 2,
+          "playable": true
         }
       ]
     },
@@ -2015,7 +2015,7 @@
       "key": "sylvan awakening",
       "name": "Sylvan Awakening",
       "event": "etb",
-      "description": "All lands you control become 2/2 creatures with reach, indestructible, haste until EOT",
+      "description": "All lands you control become 2/2 creatures with reach, indestructible, haste until your next turn",
       "actions": [
         {
           "action": "animate_land",
@@ -2023,7 +2023,8 @@
           "scope": "all",
           "power": 2,
           "toughness": 2,
-          "keywords": "reach,indestructible,haste"
+          "keywords": "reach,indestructible,haste",
+          "duration": "until_your_next_turn"
         }
       ]
     },

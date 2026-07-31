@@ -646,7 +646,24 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                     return f"💥 {amount} damage to **{card.name}** (loyalty: {card.loyalty_counters})"
                 else:
                     card.damage_marked = getattr(card, 'damage_marked', 0) + amount
-                    return f"💥 {amount} damage to **{card.name}**"
+                    # Aug 1: "whenever a source deals damage to this
+                    # creature" fires on NONCOMBAT damage too (CR 603.2 —
+                    # any source; Obliterator vs burn was the batch-10 R14
+                    # evidence, combat-only until now). Source controller:
+                    # the explicit threading when present, else the damaged
+                    # owner's opponent (2-player heuristic — burning your
+                    # own creature is the rare case, and getting the edict's
+                    # target wrong matters more than modeling it).
+                    from mtg.triggers import scan_damaged_creature
+                    _dt_ctrl = (find_player(action.get("_source_controller", ""))
+                                or next((p for p in game.players
+                                         if p is not owner), None))
+                    _dt_msgs = scan_damaged_creature(
+                        rules, game, card, amount, _dt_ctrl)
+                    _dmg_line = f"💥 {amount} damage to **{card.name}**"
+                    if _dt_msgs:
+                        _dmg_line += "\n" + "\n".join(_dt_msgs)
+                    return _dmg_line
 
         # Damage target was specified but couldn't be resolved on battlefield.
         # This is usually a fizzle (target died/exiled between cast and resolve)
@@ -2205,12 +2222,22 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
         # template signal that with action.get("permanent") = True so we
         # don't flag the EOT cleanup. Default stays EOT for safety.
         is_permanent_animation = bool(action.get("permanent_until_leaves", False))
+        # Aug 1: "until your next turn" (Sylvan Awakening's printed
+        # duration — the animated lands survive into the opponent's turn as
+        # blockers and revert when their controller's next turn begins).
+        # _animated_until_eot stays set alongside the expiry marker so
+        # every effective-P/T and SBA-promotion read keeps working.
+        until_your_next_turn = (action.get("duration") == "until_your_next_turn")
+        _controller_idx = next(
+            (i for i, p in enumerate(game.players) if p is target_player), 0)
         # Subtype to append depends on the source type. Lands → Elemental
         # (vanilla autoplay convention). Artifacts → Construct.
         appended_subtype = "Elemental" if required_type == "land" else "Construct"
         for land in affected:
             if not is_permanent_animation:
                 land._animated_until_eot = True
+                if until_your_next_turn:
+                    land._animated_expires_at_turn_of = _controller_idx
             else:
                 # Mark as permanently animated so EOT cleanup leaves it alone.
                 land._animated_permanent = True
@@ -2227,7 +2254,9 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                 for kw in extra_keywords:
                     if kw not in [k.lower() for k in (land.keywords or [])]:
                         land.keywords = list(land.keywords or []) + [kw]
-        return f"🌳 {len(affected)} land(s) become {power}/{toughness} creatures until end of turn"
+        _dur_text = ("until your next turn" if until_your_next_turn
+                     else "until end of turn")
+        return f"🌳 {len(affected)} land(s) become {power}/{toughness} creatures {_dur_text}"
 
     # ---- TRANSFORM ----
     elif action_type == "transform":
@@ -4978,16 +5007,29 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
         p = find_player(player_name)
         if p is None:
             return None
+        # Aug 1 (spectacle package): opt-in "playable": true marks the
+        # exiled cards on p.playable_from_exile — SAME-PLAYER impulse
+        # (Light Up the Stage exiles your own library and YOU may play
+        # them; both executors accept that list as a cast source). The
+        # end_turn wipe makes the window approximate "until the end of
+        # your next turn" — accepted, documented here. Ragavan's
+        # CROSS-player impulse rider stays unmodeled (the denial half
+        # still lands).
+        _mark_playable = bool(action.get("playable", False))
         exiled_names = []
         for _ in range(count):
             if not p.library:
                 break
             top = p.library.pop(0)
             p.exile.append(top)
+            if _mark_playable:
+                p.playable_from_exile.append(top.id)
             exiled_names.append(top.name)
         if not exiled_names:
             return f"📚 {p.name}'s library is empty — nothing to exile"
-        print(f"[EXILE-TOP] {p.name} exiles from top of library: {', '.join(exiled_names)}")
+        _play_note = " (playable this turn)" if _mark_playable else ""
+        print(f"[EXILE-TOP] {p.name} exiles from top of library: "
+              f"{', '.join(exiled_names)}{_play_note}")
         return f"📤 Exiled **{', '.join(exiled_names)}** from the top of {p.name}'s library"
 
     elif action_type == "exile_from_stack":

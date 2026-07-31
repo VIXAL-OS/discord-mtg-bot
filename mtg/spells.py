@@ -309,6 +309,9 @@ def _validate_cast(engine, game: GameState, player: Player, card: Card,
     # cast so each cast gets a fresh template/SpellResolver run.
     if hasattr(card, '_spell_resolved'):
         card._spell_resolved = False
+    # Spectacle stamp is per-cast state — a recast (flashback, returned to
+    # hand) must re-evaluate the condition, not inherit last cast's answer.
+    card._was_spectacled = False
 
     # June 11 audit: flashback/escape casts arrive here with the card in the
     # GRAVEYARD (marked playable by the castable-list generator), but this
@@ -628,6 +631,22 @@ def _compute_alt_costs(engine, game: GameState, player: Player, card: Card,
         effective_cmc = helpers.cmc_of_cost_string(card._madness_cost)
         print(f"[MADNESS] Using madness cost {card._madness_cost} "
               f"(CMC {effective_cmc}) instead of {card.mana_cost}")
+    # Spectacle (CR 702.137, Aug 1): take the spectacle cost whenever the
+    # condition is met ("an opponent lost life this turn") and the cost is
+    # payable — when its condition is on, spectacle is the designed-better
+    # mode (cheaper for the Light Up the Stage class; the upgraded-effect
+    # class reads _was_spectacled at resolution).
+    if pay_mana:
+        _spec_cost = helpers.spectacle_available(game, player, card)
+        if _spec_cost:
+            _spec_ok, _ = player.can_pay_mana_cost(_spec_cost)
+            if _spec_ok:
+                effective_mana_cost = _spec_cost
+                effective_cmc = helpers.cmc_of_cost_string(_spec_cost)
+                card._was_spectacled = True
+                print(f"[SPECTACLE] Using spectacle cost {_spec_cost} "
+                      f"(CMC {effective_cmc}) instead of {card.mana_cost} "
+                      f"(an opponent lost life this turn)")
     if getattr(card, 'cast_as_adventure', False) and card.adventure_cost:
         effective_mana_cost = card.adventure_cost
         # July 21 batch audit: was a digits + plain-single-pip count that gave

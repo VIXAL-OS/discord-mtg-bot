@@ -893,6 +893,58 @@ def queue_unhandled_combat_damage(game: GameState, attacker: Card,
     )
 
 
+def scan_damaged_creature(rules, game: GameState, damaged: Card,
+                          dmg_amount: int, source_controller) -> List[str]:
+    """"Whenever a source deals damage to this creature" (CR 603.2) — the
+    slice-5b scan, extracted Aug 1 2026 so the NONCOMBAT damage paths can
+    invoke it too. CR 603.2 says A SOURCE, any source: Phyrexian
+    Obliterator's edict fires on a Lightning Bolt exactly as on a blocker
+    (the batch-10 R14 evidence was combat-only coverage). Callers:
+    - mtg/combat.py's creature-kind drain (combat; resolves the source's
+      controller first, incl. the died-mid-combat fallback),
+    - mtg/actions.py deal_damage's creature branch (Tier-3/template damage),
+    - rules/spell_resolver.py's damage exec (Tier-2 burn).
+    source_controller may be None (unresolvable) — the deterministic edict
+    branch needs it, so None queues for Tier 3 instead.
+    Returns display messages; empty when the creature has no such trigger.
+    """
+    msgs: List[str] = []
+    if getattr(game, 'ended', False) or int(dmg_amount or 0) <= 0:
+        return msgs
+    from rules.effect_templates import strip_activated_ability_lines
+    d_scan = strip_activated_ability_lines(
+        getattr(damaged, 'oracle_text', '') or '').lower()
+    _dm = re.search(
+        r'whenever a source deals damage to (?:this creature|'
+        + re.escape((damaged.name or '').lower())
+        + r'),\s*([^\n.]+)',
+        d_scan)
+    if not _dm:
+        return msgs
+    _deffect = _dm.group(1).strip()
+    _damaged_owner = next(
+        (p for p in game.players if damaged in p.battlefield), None)
+    if (source_controller is not None and re.match(
+            r"that source's controller sacrifices that many permanents",
+            _deffect)):
+        for _ in range(int(dmg_amount)):
+            _m = rules._execute_action_on_state(game, {
+                "action": "sacrifice_permanent",
+                "player": source_controller.name,
+                "source": damaged.name,
+                "reason": f"{damaged.name}'s damage trigger"})
+            if _m:
+                msgs.append(_m)
+        print(f"[DAMAGED-TRIGGER] {damaged.name}: {source_controller.name} "
+              f"sacrifices {dmg_amount} permanent(s)")
+    else:
+        print(f"[DAMAGED-TRIGGER-UNHANDLED] {damaged.name}: "
+              f"{_deffect[:100]}")
+        queue_unhandled_combat_damage(
+            game, damaged, _damaged_owner or game.players[0], dmg_amount)
+    return msgs
+
+
 async def _check_cast_triggers(engine, game: GameState, caster: Player, card: Card) -> List[str]:
     """
     Check for on-cast triggers — abilities that fire when a spell is cast,

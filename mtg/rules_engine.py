@@ -328,6 +328,18 @@ class RulesEngine:
                 print(f"[CAST-GATE] {card.name}: printed alternate cost "
                       f"available — mana pre-gate waived")
                 return True, "OK (printed alternate cost available)"
+            # Spectacle (CR 702.137, Aug 1): usually CHEAPER than printed
+            # (Light Up the Stage {2}{R} → {R}) — when the condition is met
+            # and the spectacle cost is payable, _compute_alt_costs will
+            # take it, so the pre-gate must not reject the cast first.
+            from mtg.helpers import spectacle_available
+            _spec = spectacle_available(game, player, card)
+            if _spec:
+                _spec_ok, _spec_reason = player.can_pay_mana_cost(_spec)
+                if _spec_ok:
+                    print(f"[CAST-GATE] {card.name}: spectacle cost {_spec} "
+                          f"available — mana pre-gate passes")
+                    return True, "OK (spectacle cost available)"
             return False, reason
 
         return True, "OK"
@@ -758,22 +770,35 @@ class RulesEngine:
                 # Clear "can't block this turn" (Chandra Pyromaster +1, etc.)
                 if getattr(card, 'cant_block_this_turn', False):
                     card.cant_block_this_turn = False
-                # Revert animated lands (Sylvan Awakening, Living Lands, Awaken)
-                if getattr(card, '_animated_until_eot', False):
-                    if hasattr(card, '_original_type_line'):
-                        card.type_line = card._original_type_line
-                        del card._original_type_line
-                    for kw in (getattr(card, '_animated_keywords', []) or []):
-                        if card.keywords and kw in [k.lower() for k in card.keywords]:
-                            card.keywords = [k for k in card.keywords if k.lower() != kw]
-                    for attr in ('_animated_until_eot', '_animated_power',
-                                 '_animated_toughness', '_animated_keywords'):
-                        if hasattr(card, attr):
-                            delattr(card, attr)
+                # Revert animated lands (Living Lands, Awaken — the plain
+                # until-end-of-turn class). Aug 1: "until your next turn"
+                # animations (Sylvan Awakening) carry
+                # _animated_expires_at_turn_of and are SKIPPED here — they
+                # survive the opponent's turn as blockers and revert at
+                # end_turn's turn-advance point instead.
+                if (getattr(card, '_animated_until_eot', False)
+                        and getattr(card, '_animated_expires_at_turn_of', None) is None):
+                    self.revert_animation(card)
             player.empty_mana_pool()
         
         return messages
     
+    def revert_animation(self, card) -> None:
+        """Un-animate a temporarily animated land/artifact (extracted Aug 1
+        so the end-step revert and the until-your-next-turn expiry share
+        one implementation)."""
+        if hasattr(card, '_original_type_line'):
+            card.type_line = card._original_type_line
+            del card._original_type_line
+        for kw in (getattr(card, '_animated_keywords', []) or []):
+            if card.keywords and kw in [k.lower() for k in card.keywords]:
+                card.keywords = [k for k in card.keywords if k.lower() != kw]
+        for attr in ('_animated_until_eot', '_animated_power',
+                     '_animated_toughness', '_animated_keywords'):
+            if hasattr(card, attr):
+                delattr(card, attr)
+        card._animated_expires_at_turn_of = None
+
     def on_phase_change(self, game: GameState, new_phase: Phase):
         """Handle phase transitions."""
         # Empty mana pools on phase change (technically should be each step but simplified)

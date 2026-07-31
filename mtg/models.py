@@ -431,6 +431,19 @@ class Card:
     # _compute_alt_costs charges it. Cleared by the drain either way.
     _madness_cost: str = field(default="", repr=False, compare=False)
     _cast_via_madness: bool = field(default=False, repr=False, compare=False)
+    # Spectacle (CR 702.137, Aug 1 2026): set by _compute_alt_costs when the
+    # spectacle cost is taken (condition met + payable), read by effect
+    # resolution ("If this spell's spectacle cost was paid..."). Reset at
+    # the start of every cast alongside _spell_resolved.
+    _was_spectacled: bool = field(default=False, repr=False, compare=False)
+    # Animate-land duration (Aug 1 2026): player index whose NEXT turn ends
+    # the animation ("Until your next turn, all lands you control become
+    # 2/2..." — Sylvan Awakening). _animated_until_eot stays SET alongside
+    # it so every effective-P/T / SBA-promotion read keeps working; the
+    # end-step revert skips cards carrying this, and end_turn's
+    # turn-advance point reverts them when their controller's turn arrives.
+    _animated_expires_at_turn_of: Optional[int] = field(
+        default=None, repr=False, compare=False)
     # Graveyard-origin cast marker (flashback/escape). Both AI cast paths
     # stamp it so templates (Increasing Devotion, Snapcaster tracking) can
     # detect graveyard-origin casting; declared July 29 when the autoplay

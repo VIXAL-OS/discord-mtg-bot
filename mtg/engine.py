@@ -2560,6 +2560,17 @@ class GameEngine:
         game.active_player_index = 1 - game.active_player_index
         game.priority_player_index = game.active_player_index
         game.turn_number += 1
+        # "Until your next turn" animations (Sylvan Awakening) expire as
+        # their controller's turn BEGINS — the new active player is now
+        # known, so revert any animation waiting on this turn. (Aug 1; the
+        # end-step revert deliberately skipped these so the lands could
+        # block on the opponent's turn.)
+        for _p in game.players:
+            for _c in _p.battlefield:
+                if getattr(_c, '_animated_expires_at_turn_of', None) == game.active_player_index:
+                    self.rules.revert_animation(_c)
+                    print(f"[ANIMATE-EXPIRE] {_c.name} reverts (its "
+                          f"controller's next turn began)")
         game.set_phase(Phase.UNTAP, via="end_turn")
         # Bloodchief Ascension's each-end-step condition reads life lost
         # during the current turn. Clear every player's ledger only after the

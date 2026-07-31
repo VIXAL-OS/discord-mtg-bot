@@ -524,6 +524,23 @@ class SpellResolver:
                 # +1 was ignored too).
                 target.damage_marked += amount
                 messages.append(f"🔥 {ctx.source_card.name} deals {amount} damage to {target.name}")
+                # Aug 1: "whenever a source deals damage to this creature"
+                # fires on noncombat damage too (CR 603.2 — Obliterator vs
+                # burn; the scan was combat-only until now). The Tier-2
+                # exec KNOWS the source's controller — no heuristic needed.
+                # Runs BEFORE the SBA below so a dead Obliterator still got
+                # its trigger (the damage was dealt while it lived).
+                try:
+                    from mtg.triggers import scan_damaged_creature
+                    if rules_engine is not None:
+                        messages.extend(scan_damaged_creature(
+                            rules_engine, game, target, amount,
+                            ctx.source_controller))
+                except Exception as _dt_err:
+                    print(f"[SPELL-DAMAGE] damaged-creature scan failed for "
+                          f"{target.name}: {_dt_err}")
+                    from mtg.util import maybe_reraise
+                    maybe_reraise(_dt_err)
                 if rules_engine is not None and hasattr(rules_engine, 'process_state_based_actions'):
                     try:
                         messages.extend(rules_engine.process_state_based_actions(game) or [])
@@ -850,6 +867,20 @@ class SpellResolver:
             # Source deals damage to target (Ram Through style - source deals, target doesn't fight back)
             target_creature.damage_marked += source_power
             messages.append(f"⚔️ {source_creature.name} deals {source_power} damage to {target_creature.name}!")
+            # Aug 1: the damaged-creature scan (CR 603.2 — any source)
+            # covers fight damage too; the fighting creature's controller
+            # is the source's controller.
+            try:
+                from mtg.triggers import scan_damaged_creature
+                _re_engine = getattr(game, '_rules_engine', None)
+                if _re_engine is not None:
+                    messages.extend(scan_damaged_creature(
+                        _re_engine, game, target_creature, source_power,
+                        ctx.source_controller))
+            except Exception as _dt_err:
+                print(f"[SPELL-DAMAGE] damaged-creature scan failed in fight: {_dt_err}")
+                from mtg.util import maybe_reraise
+                maybe_reraise(_dt_err)
             
             # Check for trample - excess goes to controller
             if hasattr(source_creature, 'has_keyword') and source_creature.has_keyword('Trample'):

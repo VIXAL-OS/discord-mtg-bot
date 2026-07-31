@@ -420,22 +420,15 @@ def resolve_combat_damage(rules, game: GameState) -> List[str]:
     # scan existed anywhere before (July 30 reviewer R14). The creature-kind
     # COMBAT_DAMAGE_DEALT subscriber accumulates; this drain resolves under
     # the same `not game.ended` gate as the player-kind drain above.
-    # NONCOMBAT damage does not reach this scan yet — the spell/ability
-    # damage paths emit no event (a future slice's territory, noted in
-    # mtg/events.py).
+    # Aug 1: the scan body moved to triggers.scan_damaged_creature so the
+    # NONCOMBAT damage paths (deal_damage action, spell_resolver's damage
+    # exec) invoke the same logic — CR 603.2 says A SOURCE, any source.
+    # This drain keeps the combat-specific part: resolving the source's
+    # controller from the battlefield, with the died-mid-combat fallback.
     damaged_entries = getattr(game, '_combat_damage_to_creature', [])
     if damaged_entries and not game.ended:
+        from mtg.triggers import scan_damaged_creature
         for source_card, damaged, dmg_amount in damaged_entries:
-            d_scan = strip_activated_ability_lines(
-                getattr(damaged, 'oracle_text', '') or '').lower()
-            _dm = re.search(
-                r'whenever a source deals damage to (?:this creature|'
-                + re.escape((damaged.name or '').lower())
-                + r'),\s*([^\n.]+)',
-                d_scan)
-            if not _dm:
-                continue
-            _deffect = _dm.group(1).strip()
             _damaged_owner = next(
                 (p for p in game.players if damaged in p.battlefield), None)
             _src_owner = next(
@@ -448,29 +441,8 @@ def resolve_combat_damage(rules, game: GameState) -> List[str]:
                 # combat the dealer's controller is the other player.
                 _src_owner = next(p for p in game.players
                                   if p is not _damaged_owner)
-            if (_src_owner is not None and re.match(
-                    r"that source's controller sacrifices that many permanents",
-                    _deffect)):
-                _sac_msgs = []
-                for _ in range(int(dmg_amount)):
-                    _m = rules._execute_action_on_state(game, {
-                        "action": "sacrifice_permanent",
-                        "player": _src_owner.name,
-                        "source": damaged.name,
-                        "reason": f"{damaged.name}'s damage trigger"})
-                    if _m:
-                        _sac_msgs.append(_m)
-                print(f"[DAMAGED-TRIGGER] {damaged.name}: {_src_owner.name} "
-                      f"sacrifices {dmg_amount} permanent(s)")
-                if _sac_msgs:
-                    messages.extend(_sac_msgs)
-            else:
-                print(f"[DAMAGED-TRIGGER-UNHANDLED] {damaged.name}: "
-                      f"{_deffect[:100]}")
-                from mtg.triggers import queue_unhandled_combat_damage
-                queue_unhandled_combat_damage(
-                    game, damaged,
-                    _damaged_owner or game.players[0], dmg_amount)
+            messages.extend(scan_damaged_creature(
+                rules, game, damaged, dmg_amount, _src_owner))
         game._combat_damage_to_creature = []
 
     # Apply lifelink (single event per controller per damage step, CR 119.3d/702.15)

@@ -880,6 +880,39 @@ def madness_discard_to_exile(game, player, card):
             f"(madness {cost}){extra}")
 
 
+def parse_spectacle_cost(oracle_text):
+    """Parse "Spectacle {cost}" (CR 702.137). Returns the cost string or
+    None. Same anchor discipline as parse_madness_cost: the keyword is
+    followed directly by brace groups; the reminder text's "spectacle cost"
+    phrases carry no brace after the word."""
+    if not oracle_text:
+        return None
+    match = re.search(
+        r'\bspectacle\s*(?:—\s*)?((?:\{[^}]+\})+)',
+        oracle_text.lower())
+    if not match:
+        return None
+    return match.group(1).upper()
+
+
+def spectacle_available(game, player, card):
+    """Return the spectacle cost when the card has one AND its condition is
+    met — "if an opponent lost life this turn" (CR 702.137a; the tracking
+    is Player.life_lost_this_turn, reset in end_turn). None otherwise.
+
+    Aug 1, 2026: spectacle was a documented gap with three live sightings
+    (Light Up the Stage cast at full price in batch 15324). One predicate
+    so the pre-gate, the cost stage, and the castable list can't drift.
+    """
+    cost = parse_spectacle_cost(getattr(card, 'oracle_text', '') or '')
+    if cost is None:
+        return None
+    if any(getattr(p, 'life_lost_this_turn', 0) > 0
+           for p in game.players if p is not player):
+        return cost
+    return None
+
+
 def counter_restriction_allows(counter_oracle, target_card):
     """Does this counterspell's printed restriction allow countering target_card?
 

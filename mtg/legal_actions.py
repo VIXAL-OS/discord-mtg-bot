@@ -199,6 +199,30 @@ def graveyard_castable_entries(player, mana_by_color: Dict,
                 {"type": "cast", "card": card.name},
                 ["CREATURE HALF"]))
 
+    # Impulse-exiled cards (Aug 1 — Light Up the Stage's real effect:
+    # exile_top_of_library with playable=true marks them on
+    # player.playable_from_exile, which BOTH executors already accept as a
+    # cast source). end_turn wipes the list, so the live window
+    # approximates the printed "until the end of your next turn" — the
+    # documented trade at the action handler. Lands are skipped: impulse
+    # says "play", but the from-exile path is a CAST path and land-play
+    # from exile isn't modeled.
+    for card in getattr(player, 'exile', []) or []:
+        if card.id not in (getattr(player, 'playable_from_exile', None) or []):
+            continue
+        if getattr(card, '_adventure_exiled', False):
+            continue  # already offered above under its adventure label
+        if card.is_land():
+            continue
+        cost = card.mana_cost or ""
+        if cost and _check_color_castable(cost, mana_by_color,
+                                          any_color_mana, total_mana):
+            results.append(_entry(
+                f"{card.name} ({cost}) [IMPULSE from exile]",
+                card.name, "exile",
+                {"type": "cast", "card": card.name},
+                ["IMPULSE"]))
+
     return results
 
 
@@ -259,6 +283,22 @@ def castable_entries(game, player, mana_by_color: Dict, any_color_mana: int,
                                    any_color_mana, total_mana):
             add(_entry(f"{card.name} ({card.mana_cost})", card.name,
                        "hand", {"type": "cast", "card": card.name}))
+        else:
+            # Spectacle (CR 702.137, Aug 1): unaffordable at the printed
+            # cost but castable for the spectacle cost when an opponent
+            # lost life this turn — the pre-gate and cost stage both honor
+            # it, so the list must OFFER it or the AI never proposes the
+            # cast (the FoW filter lesson).
+            from mtg.helpers import spectacle_available
+            _spec = spectacle_available(game, player, card)
+            if _spec and _check_color_castable(_spec, mana_by_color,
+                                               any_color_mana, total_mana):
+                add(_entry(
+                    f"{card.name} ({_spec}) [SPECTACLE — an opponent lost "
+                    f"life this turn]",
+                    card.name, "hand",
+                    {"type": "cast", "card": card.name},
+                    ["spectacle"]))
 
         # Also check adventure half castability
         if card.adventure_name and card.adventure_cost:
