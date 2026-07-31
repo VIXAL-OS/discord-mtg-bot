@@ -2300,9 +2300,14 @@ Based on this game state, what is your best play?
                     continue  # Skip mana abilities — they're auto-used
                 # Skip Cycling parenthetical reminder text mentioning ability
                 # (cycling already surfaced via the castable list path above).
-                # If the cost references "discard" and effect is "draw", it's
-                # cycling — already shown elsewhere.
-                if 'discard' in cost_part and 'draw a card' in effect_lower:
+                # July 31 batch-11 (madness reviewer): the old check was
+                # 'discard' in cost_part — which ALSO matched Anje
+                # Falkenrath's real battlefield ability ("{T}, Discard a
+                # card: Draw a card."), so the madness deck's commander was
+                # never offered a single activation in 25 turns
+                # (game_1532532252825616466). Cycling's reminder cost is
+                # "discard THIS card" — match that exact shape only.
+                if 'discard this card' in cost_part and 'draw a card' in effect_lower:
                     continue
                 # Manland-style "becomes a N/N creature" — special-case the
                 # display label to make the AI's win-path obvious.

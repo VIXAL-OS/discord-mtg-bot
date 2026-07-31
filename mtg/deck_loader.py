@@ -390,6 +390,16 @@ class DeckLoader:
         card.adventure_cost = adventure_face.get("mana_cost", "")
         card.adventure_text = adventure_face.get("oracle_text", "")
         card.adventure_type = adventure_face.get("type_line", "")
+        # July 31 batch-11: the disk cache stores the CREATURE face's
+        # type_line (no " // Sorcery — Adventure" half), so Card._parse_cmc's
+        # adventure gate (the batch-10 fix) never fires on cache-loaded
+        # cards — both halves get summed and Flaxen Intruder priced at CMC 8
+        # ({G} + {5}{G}{G}) in plan-validate. Fix it HERE, where layout ==
+        # "adventure" is known: an adventure card's mana value is the
+        # creature face's (CR 715.2b — the Adventure's characteristics exist
+        # only on the stack).
+        if ' // ' in (card.mana_cost or ''):
+            card.cmc = card._parse_cmc(card.mana_cost.split(' // ')[0])
         print(f"[ADVENTURE] Loaded adventure for {card.name}: {card.adventure_name}")
 
     def _extract_split_data(self, card: Card, scryfall_data: Dict):

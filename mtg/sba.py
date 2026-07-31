@@ -473,7 +473,14 @@ def process_state_based_actions(rules, game: GameState) -> List[str]:
             game.loss_reason = f"simultaneous loss: {reasons}"
             break
 
-        for action in actions:
+        # July 31 batch-11 (cube reviewer): CR 704.3 — all SBAs found in ONE
+        # check are performed simultaneously. The old order let list position
+        # decide: a player_loses early in the batch broke out and discarded
+        # the same batch's creature_dies zone changes (Blood Artist stayed on
+        # the battlefield in the final snapshot, game_1532532179492536430).
+        # Process the loss LAST so same-batch mutations land; the post-end
+        # trigger gate (CR 104.2a) still suppresses their triggers.
+        for action in sorted(actions, key=lambda a: a.get('type') == 'player_loses'):
             if action['type'] == 'player_loses':
                 idx = action['player_index']
                 player = game.players[idx]

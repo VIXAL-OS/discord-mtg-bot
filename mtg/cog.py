@@ -4819,7 +4819,10 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
             # July 30 batch-9 audit: direct phase set bypassed advance_phase,
             # so postcombat main-phase triggers (Tymna) never fired on
             # combat turns — the only turns their condition can be true.
-            for _m in self.engine.dispatch_main_phase_triggers(game, False):
+            # Slice 6b: the PHASE_CHANGED subscriber dispatched at set_phase
+            # above and buffered; drain at the old position.
+            from mtg.helpers import drain_pending_messages
+            for _m in drain_pending_messages(game):
                 await self._autoplay_send(thread, _m)
 
     async def _autoplay_send(self, thread, content=None, embed=None,

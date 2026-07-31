@@ -197,13 +197,23 @@ def _is_self_etb_trigger_paragraph(card: Card, paragraph: str) -> bool:
 def _is_self_attack_trigger_paragraph(card: Card, paragraph: str) -> bool:
     """Return whether *paragraph* triggers when this card attacks."""
     text = (paragraph or "").lower().strip()
+    # July 31 batch-11 (limited reviewer): ability-word prefixes ("Battalion
+    # — Whenever this creature and at least two other creatures attack...")
+    # defeated the startswith gate AND the subject regex, so the whole
+    # Battalion class was silently dropped — never queued, never logged
+    # (Boros Elite attacked three qualifying combats at printed power,
+    # game_1532532194684436573). Ability words are flavor per CR 207.2c:
+    # strip "<Word> — " before shape-checking, and allow the "and at least
+    # N other creatures" subject extension.
+    text = re.sub(r"^[a-z][\w'-]*(?: [\w'-]+)? — ", "", text)
     if not text.startswith("whenever ") or "attack" not in text:
         return False
     full_name = re.escape((card.name or "").lower())
     short_name = re.escape((card.name or "").split(",", 1)[0].lower())
     subject = rf"(?:this (?:creature|permanent)|{full_name}|{short_name})"
     return bool(re.match(
-        rf"whenever\s+{subject}\s+(?:enters(?: the battlefield)?\s+or\s+)?attacks\b",
+        rf"whenever\s+{subject}\s+(?:and at least \w+ other creatures?\s+)?"
+        rf"(?:enters(?: the battlefield)?\s+or\s+)?attacks?\b",
         text,
     ))
 
@@ -3319,8 +3329,9 @@ def _check_upkeep_triggers_sync(engine, game: GameState) -> Tuple[List[str], Lis
     Returns:
         Tuple of (messages, unhandled_triggers).
     """
-    # Slice 6a shadow: recorded INSIDE the scan so any caller counts.
-    record_phase_hook_run(game, "upkeep")
+    # (Slice 6b retired the 6a hook recording that lived here. The upkeep
+    # scan deliberately stays advance_phase-invoked — see the scoping
+    # decision at the _main_phase_bus_subscriber block.)
     messages = []
     unhandled = []
     active = game.active_player
@@ -3797,8 +3808,25 @@ def _check_end_step_triggers_sync(engine, game: GameState) -> Tuple[List[str], L
 
         handled = False
 
-        # Check for sacrifice at end step (Through the Breach, Sneak Attack tokens, etc.)
-        if "sacrifice" in oracle_lower and "end step" in oracle_lower:
+        # Check for sacrifice at end step (Ball Lightning-class printed
+        # self-sacrifice; Sneak Attack / Through the Breach ride the delayed
+        # -trigger scheduler instead).
+        # July 31 batch-11 (madness reviewer, REPRODUCED): the old
+        # whole-oracle `"sacrifice" in oracle and "end step" in oracle`
+        # conjunction matched UNRELATED clauses — Herald of Anguish
+        # ("{1}{B}, Sacrifice an artifact: ..." + "At the beginning of your
+        # end step, each opponent discards a card") was auto-sacrificed on
+        # every end step, twice in game_1532532252825616466, AND handled=True
+        # suppressed his real discard trigger. Sixth instance of the
+        # substring family. Require ONE sentence containing both the
+        # end-step schedule and a SELF-sacrifice.
+        _self_sac_re = re.compile(
+            r'sacrifice (?:it|this creature|this permanent|'
+            + re.escape(card.name.lower()) + r')\b')
+        _self_sac_at_end_step = any(
+            'end step' in _sent and _self_sac_re.search(_sent)
+            for _sent in re.split(r'[.\n]', oracle_lower))
+        if _self_sac_at_end_step:
             # Mark for sacrifice after processing all triggers
             cards_to_sacrifice.append(card)
             messages.append(f"📍 End step: {card.name} is sacrificed")
@@ -3834,6 +3862,7 @@ def _check_end_step_triggers_sync(engine, game: GameState) -> Tuple[List[str], L
                         event_type="end_step",
                     )
                     if actions is not None:  # [] = deliberate template no-op (handled); only None means unhandled → Tier 3
+                        _executed_real = False
                         for action in actions:
                             if action.get("action") == "no_action":
                                 reason = action.get("reason", "")
@@ -3841,13 +3870,22 @@ def _check_end_step_triggers_sync(engine, game: GameState) -> Tuple[List[str], L
                                 if reason:
                                     print(f"[ENDSTEP-TRIGGER] {card.name}: {reason} (suppressed)")
                                 continue
+                            _executed_real = True
                             try:
                                 msg = engine.rules._execute_action_on_state(game, action)
                                 if msg:
                                     messages.append(msg)
                             except Exception as e:
                                 print(f"[ENDSTEP-TEMPLATE] Action failed for {card.name}: {e}")
-                        print(f"[ENDSTEP-TRIGGER] Resolved {card.name}: {explanation}")
+                        # July 31 batch-11 (cube reviewer): the truthy
+                        # "Resolved" label printed even when every action was
+                        # a no_action (Agent of Treachery below threshold) —
+                        # the upkeep scan's July-31 sibling, in the end-step
+                        # scan. Console-only, but audits read these labels.
+                        if _executed_real:
+                            print(f"[ENDSTEP-TRIGGER] Resolved {card.name}: {explanation}")
+                        else:
+                            print(f"[ENDSTEP-TRIGGER] {card.name}: handled no-op (condition not met)")
                         handled = True
                 except Exception as e:
                     print(f"[ENDSTEP-TEMPLATE] Error for {card.name}: {e}")
@@ -4999,61 +5037,52 @@ events.subscribe(events.COMBAT_DAMAGE_DEALT, _accumulate_combat_damage_subscribe
 
 
 # ---------------------------------------------------------------------------
-# Pub/sub slice 6a (July 31, 2026 — SHADOW): PHASE_CHANGED recorder.
-# GameState.set_phase (the one sanctioned phase mutator; a structural pin
-# forbids raw assignments) emits once per transition. The recorder pairs
-# entries into HOOKED phases with hook runs recorded at the hooks
-# themselves — dispatch_main_phase_triggers ('main1'/'main2') and the
-# upkeep scan ('upkeep') — and report_phase_parity prints
-# [EVENT-PARITY-PHASE] from end_turn for any hooked-phase entry whose hook
-# never ran that turn. This is the direct-phase-set class that bit three
-# times (the Tymna family); the recorder is its permanent detector until
-# the 6b flip makes the hooks subscribers outright. Set semantics per
-# (turn, phase): Moraug-style repeat combat entries must not demand a
-# second dispatch. via='game_start' is exempt (empty battlefield), and an
-# ended game skips the check entirely (CR 104.2a — hooks legitimately
-# don't run after a mid-turn loss). One clean batch gates 6b.
+# Pub/sub slice 6b (July 31, 2026 — the FLIP; gate cleared on batch 15325 at
+# [EVENT-PARITY-PHASE]=0): the MAIN-phase trigger dispatch is now a
+# PHASE_CHANGED subscriber. EVERY entry into MAIN1/MAIN2 — advance_phase's
+# walk AND all seven combat-path direct sets — runs the dispatch with no
+# caller cooperation needed, which permanently retires the class that bit
+# three times (the Tymna family: a set_phase caller forgetting the
+# dispatch). Messages buffer into game._pending_messages; the old call
+# sites drain at their exact old positions so Discord ordering is
+# unchanged (the slice-2b convention).
+#
+# Scoping decision (the 4b proportionality precedent): the UPKEEP scan
+# deliberately does NOT flip. UPKEEP has exactly ONE entry path —
+# advance_phase's PHASE_ORDER walk, where the scan is unconditional inside
+# a strictly ordered sequence (day/night transforms → delayed triggers →
+# Solitary Confinement → suspend → the scan → stack/queue routing) — so
+# its hook structurally cannot be orphaned, and flipping it would reorder
+# that sequence for uniformity's sake. Revisit only if a second UPKEEP
+# entry path ever appears (the structural no-raw-phase-assignment pin
+# would catch the attempt first).
+#
+# Per-entry semantics are CR-correct: "at the beginning of each of your
+# postcombat main phases" (Tymna) fires at EACH entry, so Moraug-style
+# extra main phases legitimately re-dispatch. via='game_start' is exempt
+# (empty battlefield); ended games skip per CR 104.2a.
 # ---------------------------------------------------------------------------
 
-# Phase-name → hook-record key. Only phases with instrumented hooks
-# participate in parity; everything else is emit-only (the 6b flip's map).
-_HOOKED_PHASES = {"MAIN1": "main1", "MAIN2": "main2", "UPKEEP": "upkeep"}
 
-
-def _phase_shadow_recorder(game, old_phase=None, new_phase=None, via="",
-                           **_payload):
-    """Record every PHASE_CHANGED emission for the parity diff."""
-    game._phase_emissions.append(
-        (game.turn_number, getattr(old_phase, 'name', str(old_phase)),
-         getattr(new_phase, 'name', str(new_phase)), via))
-
-
-def record_phase_hook_run(game, hook: str) -> None:
-    """Called by the phase hooks themselves so ANY caller counts."""
-    game._phase_hook_runs.append((game.turn_number, hook))
-
-
-def report_phase_parity(game) -> None:
-    """Print [EVENT-PARITY-PHASE] for hooked-phase entries with no hook run."""
-    if getattr(game, 'ended', False):
-        game._phase_emissions = []
-        game._phase_hook_runs = []
+def _main_phase_bus_subscriber(game, old_phase=None, new_phase=None, via="",
+                               **_payload):
+    """Run the MAIN-phase trigger dispatch on every MAIN1/MAIN2 entry."""
+    name = getattr(new_phase, 'name', str(new_phase))
+    if name not in ("MAIN1", "MAIN2"):
         return
-    runs = set(game._phase_hook_runs)
-    seen = set()
-    for turn, old, new, via in game._phase_emissions:
-        hook = _HOOKED_PHASES.get(new)
-        if hook is None or via == "game_start":
-            continue
-        key = (turn, hook)
-        if key in seen:
-            continue  # set semantics — repeat entries need one dispatch
-        seen.add(key)
-        if key not in runs:
-            print(f"[EVENT-PARITY-PHASE] entered {new} on turn {turn} "
-                  f"(via={via or '?'}) but the {hook} hook never ran")
-    game._phase_emissions = []
-    game._phase_hook_runs = []
+    if via == "game_start" or getattr(game, 'ended', False):
+        return
+    rules = getattr(game, '_rules_engine', None)
+    engine = getattr(rules, 'engine_ref', None) if rules is not None else None
+    if engine is None or not hasattr(engine, 'dispatch_main_phase_triggers'):
+        # The [ETB-BUS] convention: a MAIN entry the bus can't dispatch is a
+        # wiring gap, not a silent skip.
+        print(f"[PHASE-BUS] {name} entry (via={via or '?'}) with no usable "
+              f"engine ref — main-phase dispatch skipped")
+        return
+    msgs = engine.dispatch_main_phase_triggers(game, name == "MAIN1")
+    if msgs:
+        game._pending_messages.extend(msgs)
 
 
-events.subscribe(events.PHASE_CHANGED, _phase_shadow_recorder)
+events.subscribe(events.PHASE_CHANGED, _main_phase_bus_subscriber)

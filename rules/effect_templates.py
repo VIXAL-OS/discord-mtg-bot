@@ -917,7 +917,6 @@ class EffectTemplateLibrary:
             "blood artist":             (1, 1),
             "zulaport cutthroat":       (1, 1),
             "bastion of remembrance":   (1, 1),
-            "kokusho, the evening star": (5, 5),
         }
         for name, (drain, gain) in DIES_DRAIN.items():
             self._add_card(name, EffectTemplate(
@@ -927,6 +926,22 @@ class EffectTemplateLibrary:
                     {"action": "lose_life", "player": opp, "amount": d},
                     {"action": "gain_life", "player": ctrl, "amount": g},
                 ]))
+        # July 31 batch-11 (cube reviewer): Kokusho was in the DIES_DRAIN
+        # _add_card block above, but his drain is his OWN death trigger —
+        # the self-death dispatch checks _dies_templates, and the
+        # _card_templates fallback is (correctly) blocked by the May-23
+        # dies-words positive-scoping guard, so every Kokusho death was a
+        # real Tier 3 call (game_1532532179492536430). The watchers above
+        # (Blood Artist family) resolve through the watcher path and stay
+        # put; a SELF-dies trigger belongs in the dies registry.
+        self._add_dies_card("kokusho, the evening star", EffectTemplate(
+            name="Kokusho, the Evening Star",
+            description="Kokusho dies: each opponent loses 5 life, you gain "
+                        "5 life",
+            action_generator=lambda ctrl, opp, ctx: [
+                {"action": "lose_life", "player": opp, "amount": 5},
+                {"action": "gain_life", "player": ctrl, "amount": 5},
+            ]))
 
         # --- DIES FORCE SACRIFICE: each opponent sacrifices their weakest creature ---
         DIES_FORCE_SACRIFICE = {
@@ -4821,6 +4836,26 @@ class EffectTemplateLibrary:
                          "may sacrifice it to destroy an artifact or enchantment"),
             action_generator=self._gen_flaxen_intruder,
         ))
+        # --- July 31 batch-11: the batch-15325 refused-trigger tail ---
+        self._add_attack_card("port razer", EffectTemplate(
+            name="Port Razer",
+            description=("Port Razer deals combat damage to a player: untap "
+                         "each creature you control (the additional combat "
+                         "phase is unmodeled — console breadcrumb)"),
+            action_generator=self._gen_port_razer,
+        ))
+        self._add_attack_card("frenzied trapbreaker", EffectTemplate(
+            name="Frenzied Trapbreaker",
+            description=("Frenzied Trapbreaker attacks: destroy target "
+                         "artifact or enchantment defending player controls"),
+            action_generator=self._gen_frenzied_trapbreaker,
+        ))
+        self._add_attack_card("boros elite", EffectTemplate(
+            name="Boros Elite",
+            description=("Battalion: attacks with two other creatures — "
+                         "Boros Elite gets +2/+2 until end of turn"),
+            action_generator=self._gen_boros_elite_battalion,
+        ))
 
         # --- July 31 batch-10 audit: the batch-15324 refused-trigger tail ---
         # Same design as the block above: declare-time generators gate on NOT
@@ -6532,14 +6567,29 @@ class EffectTemplateLibrary:
         ))
 
         # Bug 27: Wrenn and Seven [+1] — reveal top 4, lands to hand, rest to graveyard
-        self._add_card("wrenn and seven", EffectTemplate(
-            name="Wrenn and Seven",
-            description="Reveal top 4 cards, put all land cards into hand, rest into graveyard",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "draw_cards", "player": ctrl,
-                 "amount": min(2, ctx.get('controller_library_size', 4))},
-            ],
-        ))
+        # July 31 batch-11 (brawl reviewer): Wrenn and Seven was a bare
+        # name-keyed _add_card whose flat draw-2 was BOTH wrong for the +1
+        # (real text: reveal 4, lands to hand, rest to graveyard) AND — the
+        # game-visible bug — matched by resolve_pw_ability's resolve_etb
+        # fallthrough for EVERY ability, so the [0] "put lands from hand"
+        # activation drew 2 cards instead (game_1532532200061403350). PW
+        # abilities must live in _pw_ability_templates, keyed by ability
+        # snippet (the Wrenn and Six pattern); the bare key is deleted.
+        self._pw_ability_templates[("wrenn and seven", "reveal the top four")] = EffectTemplate(
+            name="Wrenn and Seven +1",
+            description="Reveal top 4: land cards to hand, the rest to graveyard",
+            action_generator=lambda ctrl, opp, ctx: self._gen_w7_plus1(ctrl, opp, ctx),
+        )
+        self._pw_ability_templates[("wrenn and seven", "land cards from your hand onto the battlefield")] = EffectTemplate(
+            name="Wrenn and Seven 0",
+            description="Put any number of land cards from your hand onto the battlefield tapped",
+            action_generator=lambda ctrl, opp, ctx: self._gen_w7_zero(ctrl, opp, ctx),
+        )
+        self._pw_ability_templates[("wrenn and seven", "green treefolk creature token")] = EffectTemplate(
+            name="Wrenn and Seven -3",
+            description="Create a green Treefolk with reach, P/T = lands you control",
+            action_generator=lambda ctrl, opp, ctx: self._gen_w7_minus3(ctrl, opp, ctx),
+        )
 
 
         # Bug 29: Embercleave — attach to attacking creature
@@ -8079,6 +8129,78 @@ class EffectTemplateLibrary:
         return [{"action": "add_counters", "card": name,
                  "counter_type": "+1/+1", "amount": 1}]
 
+    def _gen_port_razer(self, ctrl, opp, ctx) -> List[Dict]:
+        """Port Razer connects: 'untap each creature you control. After this
+        phase, there is an additional combat phase.' (bulk-verified July 31).
+        The untap is deterministic; the additional combat phase is NOT
+        modeled (the Karlach precedent — the phase system has no extra-combat
+        insertion), and the 'can't attack a player it has already attacked
+        this turn' rider only matters with that extra combat. Breadcrumb on
+        console so audits see the known gap, not a silent drop."""
+        if not ctx.get('damage_dealt'):
+            return []
+        ctrl_player = ctx.get('_controller_player')
+        if ctrl_player is None:
+            return []
+        actions = [{"action": "untap", "card": self._cd_name(c)}
+                   for c in (getattr(ctrl_player, 'battlefield', []) or [])
+                   if 'creature' in self._cd_type_line(c)
+                   and getattr(c, 'tapped', False)]
+        print("[ATTACK-TEMPLATE] Port Razer: untapping "
+              f"{len(actions)} creature(s); additional combat phase "
+              "NOT modeled (phase system has no extra-combat insertion)")
+        return actions  # [] when nothing tapped = handled no-op
+
+    def _gen_frenzied_trapbreaker(self, ctrl, opp, ctx) -> List[Dict]:
+        """Frenzied Trapbreaker (Outland Liberator's night face) attacks:
+        'destroy target artifact or enchantment defending player controls.'
+        Declare-time trigger — the combat-damage dispatch sharing this
+        registry must not re-fire it. Mandatory target: pick the defending
+        player's best (highest-MV) artifact/enchantment; none = the trigger
+        fizzles per CR 603.3c (handled no-op)."""
+        if ctx.get('damage_dealt'):
+            return []
+        opp_player = ctx.get('_opponent_player')
+        if opp_player is None:
+            return []
+        targets = [c for c in (getattr(opp_player, 'battlefield', []) or [])
+                   if ('artifact' in self._cd_type_line(c)
+                       or 'enchantment' in self._cd_type_line(c))]
+        if not targets:
+            return []  # no legal target — fizzles (CR 603.3c)
+
+        def _mv(c):
+            try:
+                return int(getattr(c, 'cmc', 0) or 0)
+            except (TypeError, ValueError):
+                return 0
+        best = max(targets, key=_mv)
+        return [{"action": "destroy", "card": self._cd_name(best)}]
+
+    def _gen_boros_elite_battalion(self, ctrl, opp, ctx) -> List[Dict]:
+        """Battalion — Whenever this creature and at least two other
+        creatures attack, this creature gets +2/+2 until end of turn.
+        Declare-time, condition-gated on the REAL attacker count (CR 603.4
+        intervening-if class: below three attackers = handled no-op, never a
+        Tier-3 escalation the combat-shape guard would refuse anyway).
+        The scan-side fix (ability-word prefix strip in
+        _is_self_attack_trigger_paragraph) is what makes this reachable —
+        the whole Battalion family was silently dropped before July 31."""
+        if ctx.get('damage_dealt'):
+            return []
+        ctrl_player = ctx.get('_controller_player')
+        if ctrl_player is None:
+            return []
+        attackers = sum(
+            1 for c in (getattr(ctrl_player, 'battlefield', []) or [])
+            if getattr(c, 'attacking', False))
+        if attackers < 3:
+            return [{"action": "no_action",
+                     "reason": "Battalion: fewer than three attackers"}]
+        name = ctx.get('attacking_name') or "Boros Elite"
+        return [{"action": "pump_all_creatures", "player": ctrl,
+                 "card": name, "power": 2, "toughness": 2}]
+
     def _gen_underworld_sentinel_attack(self, ctrl, opp, ctx) -> List[Dict]:
         """Underworld Sentinel attacks: exile target creature card from your
         graveyard (mandatory), linked so the dies trigger can return it."""
@@ -9256,6 +9378,66 @@ class EffectTemplateLibrary:
             return [{"action": "move_card", "card": best_land,
                      "from_zone": "graveyard", "to_zone": "hand", "player": ctrl}]
         return [{"action": "no_action", "reason": "Wrenn and Six: no land cards in graveyard"}]
+
+    # --- Wrenn and Seven (July 31 batch-11; see the registration comment) ---
+
+    @staticmethod
+    def _w7_name_and_type(c):
+        name = c.name if hasattr(c, 'name') else (
+            c.get('name', '') if isinstance(c, dict) else str(c))
+        tl = (getattr(c, 'type_line', None)
+              or (c.get('type_line') if isinstance(c, dict) else '') or '')
+        return name, tl.lower()
+
+    def _gen_w7_plus1(self, ctrl, opp, ctx) -> List[Dict]:
+        """+1: Reveal the top four cards of your library. Put all land cards
+        revealed this way into your hand and the rest into your graveyard.
+        Deterministic from the actual library top; same-name physical-copy
+        ambiguity in move_card is game-equivalent (basics)."""
+        library = ctx.get('controller_library')
+        if library is None:
+            return None  # no library visibility → Tier 3
+        actions = []
+        for c in list(library)[:4]:
+            name, tl = self._w7_name_and_type(c)
+            actions.append({"action": "move_card", "card": name,
+                            "from_zone": "library",
+                            "to_zone": "hand" if 'land' in tl else "graveyard",
+                            "player": ctrl})
+        if not actions:
+            return [{"action": "no_action",
+                     "reason": "Wrenn and Seven +1: library is empty"}]
+        return actions
+
+    def _gen_w7_zero(self, ctrl, opp, ctx) -> List[Dict]:
+        """0: Put any number of land cards from your hand onto the
+        battlefield tapped. 'Any number' resolves to ALL — the ability is
+        pure upside for the activator."""
+        hand = ctx.get('controller_hand')
+        if hand is None:
+            return None  # no hand visibility → Tier 3
+        actions = []
+        for c in list(hand):
+            name, tl = self._w7_name_and_type(c)
+            if 'land' in tl:
+                actions.append({"action": "move_card", "card": name,
+                                "from_zone": "hand", "to_zone": "battlefield",
+                                "player": ctrl})
+                actions.append({"action": "tap", "card": name})
+        if not actions:
+            return [{"action": "no_action",
+                     "reason": "Wrenn and Seven 0: no land cards in hand"}]
+        return actions
+
+    def _gen_w7_minus3(self, ctrl, opp, ctx) -> List[Dict]:
+        """-3: a green Treefolk with reach whose P/T equal lands you control.
+        Snapshot approximation of the token's printed CDA (the established
+        create_token convention — dynamic P/T text isn't modeled)."""
+        lands = int(ctx.get('controller_land_count', 0) or 0)
+        return [{"action": "create_token", "player": ctrl, "name": "Treefolk",
+                 "power": lands, "toughness": lands,
+                 "types": "Token Creature — Treefolk", "count": 1,
+                 "keywords": ["reach"]}]
 
     def _gen_thoughtseize(self, ctrl, opp, ctx) -> List[Dict]:
         """Thoughtseize: opponent discards a nonland card (any MV). Caster loses 2 life."""

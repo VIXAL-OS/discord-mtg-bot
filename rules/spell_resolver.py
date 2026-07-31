@@ -791,7 +791,25 @@ class SpellResolver:
             pump_str = f"{effect.power_mod:+}/{effect.toughness_mod:+}"
             kw_str = f" and gains {', '.join(effect.keywords_granted)}" if effect.keywords_granted else ""
             messages.append(f"💪 {target.name} gets {pump_str}{kw_str} until end of turn")
-        
+
+        # July 31 batch-11 (limited reviewer): a NEGATIVE pump had no SBA
+        # chokepoint before the until-EOT modifier expired — Disfigure's
+        # -2/-2 left a 1/1 Healer's Hawk alive at effective -1 toughness for
+        # three more combats (game_1532532194684436573; CR 704.5f). Same
+        # missing-SBA sibling as the May 30 D2 damage fix two functions up
+        # and the June 10 Toxic Deluge fix on the actions path.
+        if effect.toughness_mod < 0:
+            rules_engine = getattr(game, '_rules_engine', None)
+            if rules_engine is not None and hasattr(rules_engine, 'process_state_based_actions'):
+                try:
+                    if hasattr(game, 'recalculate_power_toughness'):
+                        game.recalculate_power_toughness()
+                    messages.extend(rules_engine.process_state_based_actions(game) or [])
+                except Exception as e:
+                    print(f"[SPELL_RESOLVER] SBA after negative pump failed: {e}")
+                    from mtg.util import maybe_reraise
+                    maybe_reraise(e)
+
         return messages
     
     async def _exec_fight(self, effect: Effect, ctx: ExecutionContext, game) -> List[str]:

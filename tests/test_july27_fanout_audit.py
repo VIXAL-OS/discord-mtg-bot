@@ -108,17 +108,22 @@ class TestMainPhaseTriggerClassIsWired:
         assert hasattr(GameEngine, '_check_main_phase_triggers_sync')
 
     def test_both_main_phases_dispatch_the_scan(self):
-        """MAIN1 and MAIN2 must each call it — precombat and postcombat are
+        """MAIN1 and MAIN2 must each run it — precombat and postcombat are
         distinct trigger events. (July 30: the inline scan+queue pair moved
         into GameEngine.dispatch_main_phase_triggers so the direct-set
-        post-combat MAIN2 transitions share it — the Tymna gap.)"""
+        post-combat MAIN2 transitions share it — the Tymna gap. July 31
+        slice 6b: the dispatch is now a PHASE_CHANGED subscriber — EVERY
+        set_phase into MAIN1/MAIN2 runs it, and advance_phase's branches
+        DRAIN the buffered output at the old positions instead of calling
+        directly. The per-entry dispatch invariant lives in
+        tests/test_slice6b_phase_bus.py; this pin keeps the drain + the
+        dispatcher's real work.)"""
         import inspect
         from mtg.engine import GameEngine
         src = inspect.getsource(GameEngine.advance_phase)
-        assert src.count("dispatch_main_phase_triggers") == 2, (
-            "expected one dispatch in MAIN1 and one in MAIN2")
-        assert "dispatch_main_phase_triggers(game, True)" in src, "MAIN1 (precombat)"
-        assert "dispatch_main_phase_triggers(game, False)" in src, "MAIN2 (postcombat)"
+        assert src.count("drain_pending_messages(game)") >= 2, (
+            "MAIN1 and MAIN2 must each drain the subscriber's buffered "
+            "dispatch output at the old call position")
         # The dispatcher itself must still run the real scan + queue.
         dsrc = inspect.getsource(GameEngine.dispatch_main_phase_triggers)
         assert "_check_main_phase_triggers_sync" in dsrc

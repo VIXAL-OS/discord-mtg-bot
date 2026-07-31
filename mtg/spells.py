@@ -701,7 +701,13 @@ def _compute_alt_costs(engine, game: GameState, player: Player, card: Card,
             # becomes generic once X is chosen, so a reduction always has
             # generic to eat here — Blue Sun's Zenith with a Sapphire
             # Medallion should draw one MORE card, not bank the mana.
-            available = player.available_mana()
+            # July 31 batch-11: budget from the ONE-TAP physical ceiling,
+            # not available_mana() — the latter double-counts OR-duals
+            # (Sacred Foundry = 2), so X over-sized and the tap engine
+            # refused a cast the sizing had approved (Volcanic Geyser
+            # X=6/total-8 on 7 physical sources; the batch's only Geyser
+            # cast, lost).
+            available = player.one_tap_mana_total()
             remaining_for_x = max(0, available - fixed_cost - additional_cost
                                   - cost_increase + raw_reduction)
             x_value_chosen = remaining_for_x // max(x_count, 1)

@@ -1684,9 +1684,10 @@ class GameEngine:
         connected, no scan; next turn no combat, scan says "condition not
         met"). Third iteration of the Tymna saga.
         """
-        # Slice 6a shadow: recorded at the choke point so any caller counts.
-        from mtg.triggers import record_phase_hook_run
-        record_phase_hook_run(game, "main1" if precombat else "main2")
+        # Slice 6b (July 31): invoked by the PHASE_CHANGED subscriber
+        # (mtg/triggers.py:_main_phase_bus_subscriber) on EVERY MAIN1/MAIN2
+        # entry — no direct call sites remain, so a new set_phase caller
+        # can't orphan the dispatch (the Tymna class, retired).
         msgs, unhandled = self._check_main_phase_triggers_sync(game, precombat)
         for _c, _t in unhandled:
             self._queue_async_trigger(game, _c, _t, "main_phase",
@@ -2164,7 +2165,11 @@ class GameEngine:
             messages.extend(self._process_delayed_triggers(game, "main_phase"))
             # July 27: "At the beginning of your precombat main phase" — the
             # battlefield scan the delayed-trigger drain above is NOT.
-            messages.extend(self.dispatch_main_phase_triggers(game, True))
+            # Slice 6b: the PHASE_CHANGED subscriber ran the dispatch at
+            # set_phase and buffered its output; drain at the old position
+            # so Discord ordering is unchanged.
+            from mtg.helpers import drain_pending_messages
+            messages.extend(drain_pending_messages(game))
         
         elif game.phase == Phase.COMBAT_BEGIN:
             messages.append(f"⚔️ **Beginning of Combat**")
@@ -2213,7 +2218,9 @@ class GameEngine:
             # July 27: "At the beginning of your postcombat main phase" —
             # Tymna the Weaver et al. The delayed-trigger drain above is
             # one-shot scheduling (Necropotence), NOT a battlefield scan.
-            messages.extend(self.dispatch_main_phase_triggers(game, False))
+            # Slice 6b: subscriber-dispatched at set_phase; drain here.
+            from mtg.helpers import drain_pending_messages
+            messages.extend(drain_pending_messages(game))
         
         elif game.phase == Phase.END:
             messages.append(f"📍 **End Step**")
@@ -2461,16 +2468,8 @@ class GameEngine:
         # retired after clean post-flip batches — [EVENT-PARITY],
         # [EVENT-PARITY-DIES], and [EVENT-PARITY-CDD] are stale-code
         # tripwires now.)
-        # Slice 6a (July 31): PHASE_CHANGED shadow parity report. Runs BEFORE
-        # the turn-number increment below so the records it diffs belong to
-        # the turn that is ending; this method's own set_phase(UNTAP)
-        # emission lands after the report and carries into the next turn's
-        # records (UNTAP has no hook — parity-inert).
-        try:
-            from mtg.triggers import report_phase_parity
-            report_phase_parity(game)
-        except ImportError:
-            pass
+        # (Slice 6a's PHASE_CHANGED parity report retired at the 6b flip,
+        # July 31 — [EVENT-PARITY-PHASE] is a stale-code tripwire now.)
 
         # [TRANSFORM] Save spell count for day/night and werewolf transform tracking
         game.active_player.spells_cast_prev_turn = game.active_player.spells_cast_this_turn
@@ -2913,7 +2912,14 @@ class GameEngine:
                 # the re-derived reason misclassifies aura/graveyard-target
                 # failures as "unknown reason — mana looks sufficient".
                 if not success and msg:
-                    game._last_cast_failure = (game.turn_number, card.name, msg)
+                    # July 31 batch-11: record the CAST-AS name (adventure
+                    # halves are proposed/retried under the half's name —
+                    # see the autoplay.py twin for the batch evidence).
+                    _stash_name = (card.adventure_name
+                                   if getattr(card, 'cast_as_adventure', False)
+                                   and getattr(card, 'adventure_name', None)
+                                   else card.name)
+                    game._last_cast_failure = (game.turn_number, _stash_name, msg)
                 if effect_msgs:
                     for em in effect_msgs:
                         print(f"[EXECUTE] effect: {em}")

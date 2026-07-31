@@ -442,12 +442,25 @@ async def resolve_effect(rules, game: GameState, effect_description: str,
     # game_1532232990367682571 — recurrence of the class behind the July 21
     # display-only fix). Deterministic, like the Hidetsugu/GY-return guards:
     # compute it ourselves, scoped to the source, no LLM call.
+    # July 31 batch-11: the AI activation path (mtg/engine.py ~4292) passes
+    # "<player> activated <source>'s ability: <text>" — every ^-anchored
+    # deterministic guard below (self-pump, fog, bounce-attackers) silently
+    # never matched on that path. Spore Frog's fog was refused AFTER its
+    # sacrifice cost was paid (batch 15325 ×2 — the exact batch-10 bug the
+    # fog guard was built for; its pin tested the bare text, which the live
+    # path never sends), and [RESOLVE-SELF-PUMP] has never fired live.
+    # Strip the prefix ONCE for guard matching; the LLM path keeps the full
+    # description (the prefix is useful judge context).
+    _guard_desc = re.sub(
+        r"^\s*[^:]{1,80}? activated [^:]{1,80}?'s ability:\s*", '',
+        effect_description or '', count=1)
+
     if source_card and controller:
         _self_pump = re.match(
             r'^\s*(?:this (?:creature|permanent)|'
             + re.escape(source_card.lower())
             + r')\s+gets\s+([+-]\d+)/([+-]\d+) until end of turn\.?\s*$',
-            (effect_description or '').lower())
+            _guard_desc.lower())
         if _self_pump:
             _pp, _tt = int(_self_pump.group(1)), int(_self_pump.group(2))
             print(f"[RESOLVE-SELF-PUMP] {source_card}: {_pp:+d}/{_tt:+d} "
@@ -463,7 +476,7 @@ async def resolve_effect(rules, game: GameState, effect_description: str,
     # "Return all attacking creatures" resolve was refused outright. Neither
     # is a synthetic kill description — they're the cards' real text, and
     # both compute deterministically from game state.
-    _det_desc = (effect_description or '').lower().strip()
+    _det_desc = _guard_desc.lower().strip()
     if re.match(r'^prevent all combat damage that would be dealt this turn\.?$',
                 _det_desc):
         print(f"[RESOLVE-FOG] {source_card or 'effect'}: prevent all combat "

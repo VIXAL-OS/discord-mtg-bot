@@ -503,10 +503,15 @@ async def claude_make_pick(
         # heuristic ("Unparseable response: ''" ~70% of picks in the 15315
         # cube game) while still paying for the call. Disable thinking for
         # this single-number pick and give the answer a little headroom.
+        # July 31 batch-11 (cube reviewer): 2/45 picks still fell back — the
+        # model sometimes leads with prose despite the instruction, and
+        # max_tokens=100 truncated BEFORE the number appeared. 300 gives the
+        # number room to arrive even after a prose preamble; the regex takes
+        # the first integer either way.
         response = await asyncio.to_thread(
             client.messages.create,
             model="claude-sonnet-5",
-            max_tokens=100,
+            max_tokens=300,
             thinking={"type": "disabled"},
             messages=[{"role": "user", "content": prompt}],
         )
@@ -573,10 +578,22 @@ def auto_build_deck(pool: List[Card], deck_size: int = 40) -> Tuple[List[Card], 
         # On-color bonus
         if card_colors:
             matching = sum(1 for c in card_colors if c in main_colors)
-            if matching == len(card_colors):
+            # July 31 batch-11 (cube reviewer): the flat "splash" bonus
+            # admitted cards with a HARD off-color pip into a manabase that
+            # only mints main-color basics — Bloodbraid Elf ({2}{R}{G}) made
+            # a BG deck with zero red sources and was a dead card for all 30
+            # turns (game_1532532179492536430). A strict single-color pip
+            # outside main_colors is uncastable here (the builder drafts no
+            # fixing); treat it as off-color. Hybrid pips stay splashable —
+            # either half can pay.
+            strict_off_pip = any(
+                sym in ('W', 'U', 'B', 'R', 'G') and sym not in main_colors
+                for sym in re.findall(r'\{([^}]+)\}', card.mana_cost or '')
+            )
+            if matching == len(card_colors) and not strict_off_pip:
                 score += 5.0
-            elif matching > 0:
-                score += 2.0  # Splash
+            elif matching > 0 and not strict_off_pip:
+                score += 2.0  # True splash (hybrid / off-color ability only)
             else:
                 score -= 10.0  # Off-color, skip unless amazing
 

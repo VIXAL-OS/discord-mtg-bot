@@ -285,6 +285,17 @@ def _compute_pt_for_sba(card, game):
     raw_t = str(card.toughness or '').strip()
     is_cda = '*' in raw_p or '*' in raw_t
 
+    # July 31 batch-11 (brawl reviewer): animate_land stamps
+    # _animated_power/_animated_toughness that only get_effective_* read —
+    # printed P/T on a land is blank, so this adapter parsed 0/0 and the
+    # delegated CR 704.5f check destroyed all six Sylvan Awakening lands the
+    # moment they animated (game_1532532200061403350). The May 17 fix
+    # patched the inline path; this adapter is the second sibling (the
+    # June 10 Death's Shadow shape, again).
+    if not is_cda and (getattr(card, '_animated_until_eot', False)
+                       or getattr(card, '_animated_permanent', False)):
+        is_cda = True
+
     # Death's Shadow-style dynamic debuff ("gets -X/-X, where X is your life
     # total") prints integer P/T, so the '*' check misses it — but the debuff
     # lives only in get_effective_* (the layers engine skips dynamic

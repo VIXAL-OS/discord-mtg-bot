@@ -2173,6 +2173,27 @@ class Player:
         
         return pool_total + source_total
     
+    def one_tap_mana_total(self) -> int:
+        """Physical mana ceiling: floating pool + ONE tap of each untapped
+        source (a source's single-tap output is max over its options — an
+        OR-dual is 1, Sol Ring is 2).
+
+        `available_mana()` sums EVERY color an OR-dual can produce (Sacred
+        Foundry counts 2), a fine per-color capacity but an overstated
+        TOTAL — a source taps once. July 31 batch-11: X auto-sizing read
+        available_mana() and sized Volcanic Geyser to X=6 (total 8) on a
+        7-physical-source board; the tap engine correctly refused and the
+        batch's only Geyser cast was lost (game_1532536791742025739).
+        Anything budgeting a TOTAL (X-sizing, the can_pay one-tap gate)
+        must use this instead.
+        """
+        total = sum(self.mana_pool.values())
+        for src in self.untapped_mana_sources():
+            prod = self._get_mana_production(src)
+            if prod:
+                total += max(prod.values())
+        return total
+
     def available_mana_detailed(self) -> Dict[str, int]:
         """Get detailed available mana by color including 'any' for flexible sources."""
         available = dict(self.mana_pool)  # Start with pool
@@ -3109,11 +3130,7 @@ class Player:
                 # refusal). A source taps ONCE: gate on the physical one-tap
                 # total (floating pool + max-one-mana per untapped source)
                 # before the color-wise check.
-                _one_tap_total = sum(self.mana_pool.values())
-                for _src in self.untapped_mana_sources():
-                    _prod = self._get_mana_production(_src)
-                    if _prod:
-                        _one_tap_total += max(_prod.values())
+                _one_tap_total = self.one_tap_mana_total()
                 _parsed_for_total = ManaCost.parse(mana_cost)
                 _required_total = _parsed_for_total.generic_requirement
                 for _sym in _parsed_for_total.symbols:
@@ -3431,17 +3448,19 @@ class GameState:
     phase: Phase = Phase.MAIN1
 
     def set_phase(self, new_phase: 'Phase', via: str = "") -> None:
-        """The ONE sanctioned way to change game.phase (pub/sub slice 6a).
+        """The ONE sanctioned way to change game.phase (pub/sub slice 6).
 
-        July 31, 2026: emits PHASE_CHANGED so the shadow recorder can verify
-        every entry into a HOOKED phase actually ran its hooks — the
-        direct-phase-set class (game.phase = Phase.MAIN2 bypassing the
-        main-phase dispatch) produced the Tymna bug three times over
-        (July 27 scan unwired, July 29 F3-C, July 30 F3). A structural pin
-        (tests/test_slice6a_phase_shadow.py) forbids raw assignments in the
-        engine; construction / from_dict / !undo set the FIELD directly —
-        restoration is not a game transition, so no hooks and no emission.
-        `via` names the call site so the 6b flip knows every entry path.
+        Emits PHASE_CHANGED; since the 6b flip (July 31, 2026) the
+        MAIN-phase trigger dispatch IS a subscriber
+        (mtg/triggers.py:_main_phase_bus_subscriber), so every MAIN1/MAIN2
+        entry runs it with no caller cooperation — the direct-phase-set
+        class (game.phase = Phase.MAIN2 bypassing the dispatch) produced
+        the Tymna bug three times over (July 27 scan unwired, July 29 F3-C,
+        July 30 F3) and is now structurally dead. A permanent structural
+        pin (tests/test_slice6b_phase_bus.py) forbids raw assignments in
+        the engine; construction / from_dict / !undo set the FIELD directly
+        — restoration is not a game transition, so no hooks and no
+        emission. `via` names the call site for log forensics.
         """
         old = self.phase
         self.phase = new_phase
@@ -3553,15 +3572,9 @@ class GameState:
     # _cdd_bus_seen/_cdd_consumer_seen scaffolding were retired at the flip.
     _combat_damage_to_player: list = field(default_factory=list, repr=False, compare=False)
     _combat_damage_to_creature: list = field(default_factory=list, repr=False, compare=False)
-    # Pub/sub slice 6a (July 31, 2026 — SHADOW): PHASE_CHANGED parity
-    # scaffolding. _phase_emissions records (turn, old, new, via) from the
-    # set_phase choke point; _phase_hook_runs records (turn, hook) from the
-    # instrumented hooks (dispatch_main_phase_triggers → 'main1'/'main2',
-    # the upkeep scan → 'upkeep'). report_phase_parity diffs + clears both
-    # at end_turn ([EVENT-PARITY-PHASE]). Removed at 6b like the 5a/4a/3a/2a
-    # recorders before it.
-    _phase_emissions: list = field(default_factory=list, repr=False, compare=False)
-    _phase_hook_runs: list = field(default_factory=list, repr=False, compare=False)
+    # (Slice 6a's _phase_emissions/_phase_hook_runs parity scaffolding was
+    # retired at the 6b flip, July 31 — the MAIN-phase dispatch is a
+    # PHASE_CHANGED subscriber now, so hook pairing is structural.)
     # Spell Queller bookkeeping: source card name → [(exiled_card, owner_name)]
     # (exile_from_stack records; release_queller_exile drains on LTB).
     _queller_exiles: dict = field(default_factory=dict, repr=False, compare=False)

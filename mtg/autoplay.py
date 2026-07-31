@@ -217,7 +217,10 @@ async def _resolve_combat(cog, ctx, game: GameState):
         # July 30 batch-9 audit: this direct phase set bypassed
         # advance_phase, so postcombat main-phase triggers (Tymna) never
         # fired on the one kind of turn their condition can be true.
-        for _m in cog.engine.dispatch_main_phase_triggers(game, False):
+        # Slice 6b: the PHASE_CHANGED subscriber dispatched at set_phase
+        # above and buffered; drain at the old position.
+        from mtg.helpers import drain_pending_messages
+        for _m in drain_pending_messages(game):
             await ctx.send(_m)
 
         # If it's Claude's turn (human was blocking Claude's attack),
@@ -510,6 +513,23 @@ AUTOPLAY_PHASES = {
 }
 
 
+async def _advance_phase_with_display(cog, thread, game: GameState):
+    """advance_phase + send the phase-entry messages.
+
+    July 31 batch-11 (limited reviewer): the MAIN1-pass and skip-to-MAIN2
+    sites in the human-turn sim discarded advance_phase's return, so
+    phase-ENTRY output — the COMBAT_BEGIN banner + Leonin Vanguard-class
+    beginning-of-combat triggers, and the MAIN2-entry Tymna dispatch on
+    no-attacker turns — mutated state correctly but never reached Discord
+    (game_1532532194684436573: four Leonin fires, zero player-visible
+    lines). The July 20 fix covered the COMBAT_BEGIN→DECLARE_ATTACKERS leg
+    only; this helper is the same treatment for every other leg.
+    """
+    _, _msgs = cog.engine.advance_phase(game)
+    for _m in (_msgs or []):
+        await cog._autoplay_send(thread, _m)
+
+
 async def _autoplay_human_turn(cog, thread, game: GameState, player_idx: int):
     """Simulate a human player's turn using AI decisions but human code paths.
 
@@ -557,7 +577,7 @@ async def _autoplay_human_turn(cog, thread, game: GameState, player_idx: int):
             )
             if not has_activatable and not has_fetchlands:
                 print(f"[AUTOPLAY] Auto-pass MAIN1: empty hand, no activatable, no pending")
-                cog.engine.advance_phase(game)
+                await _advance_phase_with_display(cog, thread, game)
                 plan_used = True
         elif not has_pending:
             plan = await cog.engine.claude_ai.plan_turn(game, player_idx,
@@ -567,7 +587,7 @@ async def _autoplay_human_turn(cog, thread, game: GameState, player_idx: int):
                 if game.ended:
                     break
                 if action.get("type") == "pass":
-                    cog.engine.advance_phase(game)
+                    await _advance_phase_with_display(cog, thread, game)
                     break
                 result = await cog._autoplay_execute_action(thread, game, player_idx, action)
                 if result:
@@ -633,12 +653,12 @@ async def _autoplay_human_turn(cog, thread, game: GameState, player_idx: int):
                 last_error = "Invalid action format — please return a JSON object with 'type' field, not a list."
                 retry_count += 1
                 if retry_count > max_retries:
-                    cog.engine.advance_phase(game)
+                    await _advance_phase_with_display(cog, thread, game)
                     break
                 continue
 
             if action.get("type", "pass") == "pass":
-                cog.engine.advance_phase(game)
+                await _advance_phase_with_display(cog, thread, game)
                 break
 
             action_key = f"{action.get('type')}:{action.get('card', action.get('permanent', ''))}:{action.get('ability', '')}"
@@ -658,7 +678,7 @@ async def _autoplay_human_turn(cog, thread, game: GameState, player_idx: int):
                     last_action_result = None
                     if repeat_count >= 5:
                         print(f"[AUTOPLAY] Repeated action limit, auto-passing MAIN1")
-                        cog.engine.advance_phase(game)
+                        await _advance_phase_with_display(cog, thread, game)
                         break
                     continue
             else:
@@ -706,7 +726,7 @@ async def _autoplay_human_turn(cog, thread, game: GameState, player_idx: int):
                 last_action_result = None
                 if retry_count > max_retries:
                     print(f"[AUTOPLAY] Action FAILED (retry {max_retries}/{max_retries}): {last_error or 'no error message; action handler returned None'}")
-                    cog.engine.advance_phase(game)
+                    await _advance_phase_with_display(cog, thread, game)
                     break
                 print(f"[AUTOPLAY] Action FAILED (retry {retry_count}/{max_retries}): {last_error or 'no error message; action handler returned None'}")
 
@@ -779,7 +799,7 @@ async def _autoplay_human_turn(cog, thread, game: GameState, player_idx: int):
                 if not game.attackers and not game.ended:
                     await cog._autoplay_send(thread, "⚔️ No attackers remain after priority — skipping combat.")
                     while game.phase not in [Phase.MAIN2, Phase.END, Phase.CLEANUP]:
-                        cog.engine.advance_phase(game)
+                        await _advance_phase_with_display(cog, thread, game)
                     # Fall through to MAIN2
 
             # Opponent blocks (Claude is the opponent since pretend human is attacking)
@@ -930,7 +950,7 @@ async def _autoplay_human_turn(cog, thread, game: GameState, player_idx: int):
         elif not game.attackers and game.phase == Phase.DECLARE_ATTACKERS and not game.ended:
             # No attackers — skip to MAIN2
             while game.phase not in [Phase.MAIN2, Phase.END, Phase.CLEANUP]:
-                cog.engine.advance_phase(game)
+                await _advance_phase_with_display(cog, thread, game)
 
     # --- ADDITIONAL COMBAT PHASES (Moraug, Aurelia, etc.) ---
     additional_combats = getattr(game, '_additional_combats', 0)
@@ -1020,7 +1040,7 @@ async def _autoplay_human_turn(cog, thread, game: GameState, player_idx: int):
     # Advance to MAIN2 if we're stuck in combat phases
     if game.phase not in [Phase.MAIN2, Phase.END, Phase.CLEANUP] and not game.ended:
         while game.phase not in [Phase.MAIN2, Phase.END, Phase.CLEANUP]:
-            cog.engine.advance_phase(game)
+            await _advance_phase_with_display(cog, thread, game)
 
     # --- MAIN PHASE 2 ---
     if game.phase == Phase.MAIN2 and not game.ended:
@@ -1512,7 +1532,16 @@ async def _autoplay_execute_action(cog, thread, game: GameState, player_idx: int
             # _get_action_error's re-derivation misses aura/graveyard-target
             # failures ("unknown reason — mana looks sufficient" retry storms).
             if msg:
-                game._last_cast_failure = (game.turn_number, card.name, msg)
+                # July 31 batch-11: record the CAST-AS name — an adventure
+                # half is proposed and retried as "Fertile Footsteps", but
+                # card.name is "Beanstalk Giant", so the consumer's name
+                # gate missed and the real reason was dropped ("unknown
+                # reason — mana looks sufficient" resurfaced ×2 in 15325).
+                _stash_name = (card.adventure_name
+                               if getattr(card, 'cast_as_adventure', False)
+                               and getattr(card, 'adventure_name', None)
+                               else card.name)
+                game._last_cast_failure = (game.turn_number, _stash_name, msg)
 
     elif action_type == "cycle":
         # July 31 batch-10 audit: the legal-actions provider advertises
