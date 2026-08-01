@@ -3613,6 +3613,17 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                 # re-ETB scan below re-applies any "enters with N counters".
                 if hasattr(target_card, 'counters'):
                     target_card.counters = {}
+                # Aug 1 batch-12 (reviewer, partner game): a flickered
+                # PLANESWALKER re-enters with its PRINTED loyalty (CR 306.6 /
+                # 400.7 — new object). move_card's battlefield-entry branch
+                # has had this since June 10 (V8); this sibling entry path
+                # never did, so Aminatou kept loyalty 7 through a flicker and
+                # climbed to 10 (game_1532756760174268546).
+                if target_card.is_planeswalker():
+                    try:
+                        target_card.loyalty_counters = int(target_card.loyalty)
+                    except (TypeError, ValueError):
+                        target_card.loyalty_counters = 0
                 p.battlefield.append(target_card)
                 # [LAYERS] Re-register static effects and recalculate after flicker
                 game.register_static_keyword_grants(target_card, p.name)
@@ -3884,19 +3895,34 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
             # oracle dump while the console said silent no-op
             # (game_1527448352298500096). Snapcaster's ETB keeps the silent
             # default (it fires often and a no-op line every time is spam).
+            # Aug 1 batch-12 (reviewer, escape game): Yawgmoth's Will grants
+            # "cast spells from your graveyard" with NO type restriction, but
+            # this handler filtered to instants/sorceries only (correct for
+            # its other users: Snapcaster, Gearhulk, Past in Flames). Opt-in
+            # card_types="any" widens to every castable nonland; playing
+            # LANDS from the graveyard stays unmodeled (play_land has no
+            # graveyard branch — breadcrumb, not a silent drop).
+            _any_type = action.get("card_types") == "any"
+            def _gf_eligible(c):
+                if _any_type:
+                    return not c.is_land()
+                return c.is_instant() or c.is_sorcery()
             if action.get("grant_all"):
-                granted = [c for c in p.graveyard
-                           if c.is_instant() or c.is_sorcery()]
+                granted = [c for c in p.graveyard if _gf_eligible(c)]
                 if granted:
                     for c in granted:
                         p.playable_from_graveyard.append(c.id)
                     names = ', '.join(c.name for c in granted[:6])
                     more = f" +{len(granted) - 6} more" if len(granted) > 6 else ""
-                    return (f"⚡ {source_name}: {len(granted)} instant(s)/"
-                            f"sorcery(s) gain flashback until end of turn "
-                            f"({names}{more})")
+                    _what = ("card(s) castable from the graveyard"
+                             if _any_type else
+                             "instant(s)/sorcery(s) gain flashback")
+                    return (f"⚡ {source_name}: {len(granted)} {_what} "
+                            f"until end of turn ({names}{more})")
                 if action.get("announce_empty"):
-                    return (f"📜 {source_name}: no instants or sorceries in "
+                    _empty_what = ("castable cards" if _any_type
+                                   else "instants or sorceries")
+                    return (f"📜 {source_name}: no {_empty_what} in "
                             f"graveyard — no effect")
                 print(f"[GRANT-FLASHBACK] {p.name} ({source_name}): no instant or sorcery in graveyard — silent no-op")
                 return None

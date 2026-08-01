@@ -1390,6 +1390,19 @@ async def _autoplay_execute_action(cog, thread, game: GameState, player_idx: int
         if HAS_TARGETING and _spell_requires_targets(card):
             if not _find_any_valid_target(game, card, player.name):
                 print(f"[TARGETING] Autoplay tried to cast {card.name} with no valid targets")
+                # Aug 1 batch-12 (reviewer, pauper mirror): this gate blocks
+                # BEFORE cast_spell_async, so no _last_cast_failure was
+                # stashed and _get_action_error re-derived a reason — its
+                # mana check runs first, so Searing Blaze's block surfaced
+                # as "Need 2 mana" instead of the targeting gate that
+                # actually fired. Stash the real reason like the other
+                # producers.
+                _tgt_stash_name = (adventure_name
+                                   if (adventure_name and card.adventure_name)
+                                   else card.name)  # cast-as name (S3 lesson)
+                game._last_cast_failure = (
+                    game.turn_number, _tgt_stash_name,
+                    f"no valid targets for {_tgt_stash_name} (CR 601.2c)")
                 if from_graveyard:
                     # July 30 batch-9 audit: this exit sits BETWEEN the
                     # graveyard extraction (escape exile cost already paid)

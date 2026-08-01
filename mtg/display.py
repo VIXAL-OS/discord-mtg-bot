@@ -41,7 +41,15 @@ class GameDisplay:
             
             # Commander damage received
             if game.format in ["commander", "edh"]:
-                cmd_dmg = [f"{game.players[j].name}: {dmg}" 
+                # Keys are commander names (CR 903.10a per-commander, Aug 1);
+                # legacy int keys from old saves fall back to the player name.
+                def _cd_label(k):
+                    if isinstance(k, int) or (isinstance(k, str) and k.isdigit()):
+                        _i = int(k)
+                        return (game.players[_i].name
+                                if 0 <= _i < len(game.players) else str(k))
+                    return str(k)
+                cmd_dmg = [f"{_cd_label(j)}: {dmg}"
                           for j, dmg in player.commander_damage.items() if dmg > 0]
                 if cmd_dmg:
                     lines.append(f"   ⚔️ Commander damage: {', '.join(cmd_dmg)}")

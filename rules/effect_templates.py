@@ -3283,6 +3283,26 @@ class EffectTemplateLibrary:
             )
         )
 
+        # Thrasios, Triton Hero's {4} activation (Aug 1 batch-12, reviewer,
+        # partner game): the name-keyed template was UNREACHABLE — the
+        # activation dispatch passes event_type="activated", which
+        # _NAME_KEYED_EVENT_TYPES deliberately excludes (Apr 29, the Thassa
+        # double-fire fix) — so every activation escalated to Tier 3, which
+        # resolved only the scry and dropped the land/draw payoff. A PATTERN
+        # runs on activation (the Feldon precedent, July 28). The scry-1
+        # ahead of the reveal is deliberately skipped (the generator cannot
+        # know the scry decision the executor would make; reveal-top is the
+        # dominant clause).
+        self._add_pattern(
+            r"reveal the top card of your library\W+if it'?s a land card, "
+            r"put it onto the battlefield tapped\W+otherwise,? draw a card",
+            EffectTemplate(
+                name="Thrasios-style reveal",
+                description="Reveal top: land onto battlefield tapped, else draw",
+                action_generator=self._gen_reveal_top_land_or_draw,
+            )
+        )
+
         # Proliferate (Atraxa end-step, Flux Channeler cast-trigger, Evolution
         # Sage landfall, Tezzeret's Gambit). May 26 audit: proliferate had NO
         # lower-tier handler, so it escalated to Tier 3 — which hallucinated a
@@ -4822,6 +4842,23 @@ class EffectTemplateLibrary:
             description=("Glissa Sunslayer deals combat damage to a player: "
                          "destroy an enchantment, or draw a card and lose 1 life"),
             action_generator=self._gen_glissa_sunslayer,
+        ))
+        # --- Aug 1 batch-12 audit: the batch-15327 refused-trigger tail ---
+        # Both queued 6x to [COMBAT-TRIGGER-UNHANDLED] and can never resolve
+        # via Tier 3 (judge.py's combat-shape guard). Same damage_dealt gate
+        # as the rest of the family.
+        self._add_attack_card("stromkirk occultist", EffectTemplate(
+            name="Stromkirk Occultist",
+            description=("Stromkirk Occultist deals combat damage to a "
+                         "player: exile the top card of your library, "
+                         "playable this turn"),
+            action_generator=self._gen_stromkirk_occultist,
+        ))
+        self._add_attack_card("drana, liberator of malakir", EffectTemplate(
+            name="Drana, Liberator of Malakir",
+            description=("Drana deals combat damage to a player: put a +1/+1 "
+                         "counter on each attacking creature you control"),
+            action_generator=self._gen_drana_liberator,
         ))
         self._add_attack_card("ancient bronze dragon", EffectTemplate(
             name="Ancient Bronze Dragon",
@@ -8104,6 +8141,65 @@ class EffectTemplateLibrary:
                  "types": "Token Creature — Dinosaur Beast", "count": 1,
                  "keywords": ["trample"]}]
 
+    def _gen_reveal_top_land_or_draw(self, ctrl, opp, ctx) -> List[Dict]:
+        """Thrasios-class: reveal top of library — land → battlefield tapped,
+        otherwise draw a card. Reads the ACTUAL library top from ctx."""
+        library = ctx.get('controller_library', []) or []
+        if not library:
+            return [{"action": "no_action",
+                     "reason": "library is empty — nothing to reveal"}]
+        top = library[0]
+        top_name = getattr(top, 'name', str(top))
+        type_line = (getattr(top, 'type_line', '') or '').lower()
+        if 'land' in type_line:
+            return [{"action": "move_card", "card": top_name,
+                     "from_zone": "library", "to_zone": "battlefield",
+                     "player": ctrl, "tapped": True}]
+        return [{"action": "draw_cards", "player": ctrl, "amount": 1}]
+
+    def _gen_stromkirk_occultist(self, ctrl, opp, ctx) -> List[Dict]:
+        """Stromkirk Occultist: connect → impulse-exile the top of YOUR library.
+
+        Same shape as Light Up the Stage's playable exile (the Aug 1 impulse
+        machinery): the exiled card is marked playable_from_exile for the
+        controller. Gated on damage_dealt so a declare-time scan can't misfire.
+        """
+        dmg = int(ctx.get('damage_dealt') or 0)
+        if dmg <= 0:
+            return []
+        return [{"action": "exile_top_of_library", "player": ctrl, "count": 1,
+                 "playable": True}]
+
+    def _gen_drana_liberator(self, ctrl, opp, ctx) -> List[Dict]:
+        """Drana, Liberator of Malakir: connect → +1/+1 counter on each
+        attacking creature you control.
+
+        Drana has first strike, so on the printed card the counters land
+        between the FS and regular damage steps; our dispatch drains at the
+        end of combat resolution, so the pump benefits NEXT combat rather
+        than the same swing's regular step — the counters themselves are
+        never lost. Gated on damage_dealt like the rest of the family.
+        """
+        dmg = int(ctx.get('damage_dealt') or 0)
+        if dmg <= 0:
+            return []
+        battlefield = ctx.get('controller_battlefield', []) or []
+        # Prefer game.attackers (authoritative combat list) over battlefield
+        # .attacking flags — the Boros Elite stale-flag lesson, same batch.
+        _g = ctx.get('_game')
+        _atk_ids = set(getattr(_g, 'attackers', None) or []) if _g else None
+        def _is_attacking(c):
+            if _atk_ids is not None:
+                return getattr(c, 'id', None) in _atk_ids
+            return getattr(c, 'attacking', False)
+        actions = [
+            {"action": "add_counters", "card": creature.name,
+             "counter_type": "+1/+1", "amount": 1}
+            for creature in battlefield
+            if _is_attacking(creature)
+        ]
+        return actions
+
     # --- July 31 batch-10 generators (the batch-15324 refused-trigger tail) ---
 
     def _gen_attack_self_counter(self, ctrl, opp, ctx) -> List[Dict]:
@@ -8191,9 +8287,20 @@ class EffectTemplateLibrary:
         ctrl_player = ctx.get('_controller_player')
         if ctrl_player is None:
             return []
-        attackers = sum(
-            1 for c in (getattr(ctrl_player, 'battlefield', []) or [])
-            if getattr(c, 'attacking', False))
+        # Aug 1 batch-12: count from game.attackers (the authoritative
+        # per-combat list, cleared unconditionally at each resolution)
+        # rather than battlefield .attacking flags — a stale flag from an
+        # earlier combat fired Battalion with only TWO declared attackers
+        # (game_1532756674203619470: Blade Instructor + Boros Elite, one
+        # surviving Cavalry Pegasus carrying a leaked flag). Flag fallback
+        # kept for callers with no _game in ctx.
+        _g = ctx.get('_game')
+        if _g is not None and getattr(_g, 'attackers', None) is not None:
+            attackers = len(_g.attackers)
+        else:
+            attackers = sum(
+                1 for c in (getattr(ctrl_player, 'battlefield', []) or [])
+                if getattr(c, 'attacking', False))
         if attackers < 3:
             return [{"action": "no_action",
                      "reason": "Battalion: fewer than three attackers"}]
@@ -9034,9 +9141,12 @@ class EffectTemplateLibrary:
             target = ctx.get('best_own_etb_creature', '')
         if target.lower() == source or 'angel' in target.lower():
             target = ''
-        # Try non-creature permanent as fallback
-        if not target:
-            target = ctx.get('best_own_noncreature', '')
+        # Aug 1 batch-12 (reviewer, partner game): the best_own_noncreature
+        # fallback that lived here was a copy-paste from the Felidar/Oath
+        # "another target permanent" family — Restoration Angel's printed
+        # ability targets a CREATURE only, and the fallback flickered
+        # Aminatou the planeswalker (CR 601.2c). No creature = the "you may"
+        # declines.
         if not target or target.lower() == source:
             return [{"action": "no_action", "reason": "No valid non-Angel creature to flicker"}]
         return [{"action": "flicker", "player": ctrl, "target": target}]

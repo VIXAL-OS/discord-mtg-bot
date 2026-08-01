@@ -706,29 +706,20 @@ def apply_combat_damage_to_player(rules, game: GameState, player: 'PlayerState',
         events.emit(events.COMBAT_DAMAGE_DEALT, game, source=source_card,
                     target=player, amount=amount, target_kind="player")
 
-    # CR 903.10a / 704.5b — Commander damage tracking. If the source is a
-    # commander dealing combat damage to a player, accumulate per source-controller.
-    # commander_damage maps source_controller_index -> total damage.
+    # CR 903.10a / 704.5b — Commander damage tracking, PER COMMANDER.
+    # Aug 1 batch-12 (reviewer, partner game): the dict was keyed by the
+    # source's CONTROLLER index, so Thrasios's 22 and Tymna's 23 summed into
+    # one bucket ("total from player 0: 45/21") — under partners a player
+    # could be ruled dead off 11+10 from two sub-lethal commanders. CR
+    # 903.10a is "by the same commander"; key by the commander's name (two
+    # commanders can never share one).
     if is_combat and getattr(source_card, 'is_commander', False):
-        # Find the controller of the source (commander)
-        source_controller_idx = None
-        for idx, p in enumerate(game.players):
-            if source_card in p.battlefield or source_card in getattr(p, 'command_zone', []):
-                source_controller_idx = idx
-                break
-        if source_controller_idx is None and hasattr(source_card, '_find_controller'):
-            ctrl = source_card._find_controller(game)
-            if ctrl:
-                for idx, p in enumerate(game.players):
-                    if p is ctrl:
-                        source_controller_idx = idx
-                        break
-        if source_controller_idx is not None:
-            prior = player.commander_damage.get(source_controller_idx, 0)
-            player.commander_damage[source_controller_idx] = prior + amount
-            total = player.commander_damage[source_controller_idx]
-            print(f"[COMMANDER-DAMAGE] {player.name} takes {amount} commander damage from "
-                  f"{source_card.name} (total from player {source_controller_idx}: {total}/21)")
+        _cd_key = source_card.name
+        prior = player.commander_damage.get(_cd_key, 0)
+        player.commander_damage[_cd_key] = prior + amount
+        total = player.commander_damage[_cd_key]
+        print(f"[COMMANDER-DAMAGE] {player.name} takes {amount} commander damage from "
+              f"{source_card.name} (total from {_cd_key}: {total}/21)")
     return amount
 
 
@@ -996,11 +987,7 @@ def deal_combat_damage(rules, game: GameState, attackers: List[Tuple[Card, Playe
                 # rule from their own death message in 9/139 games. Surface the
                 # tally whenever a commander connects.
                 if getattr(attacker, 'is_commander', False):
-                    _cd_total = None
-                    for _cd_idx, _cd_p in enumerate(game.players):
-                        if attacker in _cd_p.battlefield:
-                            _cd_total = defending_player.commander_damage.get(_cd_idx)
-                            break
+                    _cd_total = defending_player.commander_damage.get(attacker.name)
                     if _cd_total:
                         messages.append(
                             f"👑 Commander damage: {defending_player.name} has taken "
@@ -1254,11 +1241,7 @@ def deal_combat_damage(rules, game: GameState, attackers: List[Tuple[Card, Playe
                     # June 11 audit: surface commander-damage tally (see the
                     # unblocked path above for rationale).
                     if getattr(attacker, 'is_commander', False):
-                        _cd_total = None
-                        for _cd_idx, _cd_p in enumerate(game.players):
-                            if attacker in _cd_p.battlefield:
-                                _cd_total = defending_player.commander_damage.get(_cd_idx)
-                                break
+                        _cd_total = defending_player.commander_damage.get(attacker.name)
                         if _cd_total:
                             messages.append(
                                 f"👑 Commander damage: {defending_player.name} has taken "

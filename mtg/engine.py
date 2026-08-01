@@ -250,6 +250,18 @@ def _satisfies_sacrifice_cost(card, cost_text: str, game=None,
     if ('sacrifice a creature' in _cost
             or 'sacrifice another creature' in _cost):
         return card.is_creature(game)
+    # Aug 1 batch-12 (reviewer, escape game): type-restricted non-creature
+    # sacrifice costs ("Sacrifice an artifact" — Grinding Station) matched
+    # no branch anywhere, so the cost silently evaporated: the Station
+    # milled twice for {T} alone with no other artifact ever in play
+    # (game_1532756737780879551).
+    _tl = (getattr(card, 'type_line', '') or '').lower()
+    if 'sacrifice an artifact' in _cost:
+        return 'artifact' in _tl
+    if 'sacrifice an enchantment' in _cost:
+        return 'enchantment' in _tl
+    if 'sacrifice a land' in _cost:
+        return card.is_land()
     return True
 
 
@@ -1908,11 +1920,12 @@ class GameEngine:
             actual = amount
 
         if is_commander and source and actual > 0:
-            # Track commander damage
-            source_owner = source.owner_index
-            if source_owner not in target_player.commander_damage:
-                target_player.commander_damage[source_owner] = 0
-            target_player.commander_damage[source_owner] += actual
+            # Track commander damage — keyed by commander NAME (CR 903.10a is
+            # per-commander; Aug 1 batch-12, the partner-deck finding).
+            _cd_key = source.name
+            if _cd_key not in target_player.commander_damage:
+                target_player.commander_damage[_cd_key] = 0
+            target_player.commander_damage[_cd_key] += actual
     
     def check_state_based_actions(self, game: GameState) -> List[str]:
         """Check for state-based actions using rules engine.
@@ -3539,7 +3552,13 @@ class GameEngine:
                       # The manual !activate path (mtg/cog.py) already had
                       # this phrase — the documented two-paths divergence.
                       or 'sacrifice another creature' in cost_lower
-                      or 'sacrifice a permanent' in cost_lower):
+                      or 'sacrifice a permanent' in cost_lower
+                      # Aug 1 batch-12: type-restricted non-creature sac
+                      # costs (Grinding Station's "Sacrifice an artifact")
+                      # previously matched NOTHING and evaporated.
+                      or 'sacrifice an artifact' in cost_lower
+                      or 'sacrifice an enchantment' in cost_lower
+                      or 'sacrifice a land' in cost_lower):
                     # "Sacrifice a creature" as cost (e.g. Altar of Dementia, Ashnod's Altar)
                     # Find a creature to sacrifice (prefer target_name if provided, else weakest)
                     sac_target = None
@@ -3554,17 +3573,49 @@ class GameEngine:
                                   f"cannot pay {perm.name}'s sacrifice cost")
                             sac_target = None
                     if not sac_target:
-                        # Auto-select: weakest creature (or a token)
-                        creatures = [c for c in player.battlefield if c.is_creature() and c.id != perm.id]
-                        if not creatures:
-                            print(f"[ACTIVATE-CLAUDE] No creature to sacrifice for {perm.name}")
+                        # Auto-select a candidate matching the cost's TYPE.
+                        # Aug 1 batch-12: was creatures-only, so a matched
+                        # "sacrifice an artifact" cost had no candidates.
+                        # Non-"another" costs may sacrifice the source
+                        # itself (Grinding Station), as a last resort.
+                        if 'sacrifice an artifact' in cost_lower:
+                            _typed = [c for c in player.battlefield
+                                      if 'artifact' in (getattr(c, 'type_line', '') or '').lower()]
+                        elif 'sacrifice an enchantment' in cost_lower:
+                            _typed = [c for c in player.battlefield
+                                      if 'enchantment' in (getattr(c, 'type_line', '') or '').lower()]
+                        elif 'sacrifice a land' in cost_lower:
+                            _typed = [c for c in player.battlefield if c.is_land()]
+                        elif 'sacrifice a permanent' in cost_lower:
+                            _typed = list(player.battlefield)
+                        else:
+                            _typed = [c for c in player.battlefield if c.is_creature()]
+                        _allow_self = 'another' not in cost_lower
+                        candidates = [c for c in _typed
+                                      if c.id != perm.id or _allow_self]
+                        # The source itself is always the LAST resort.
+                        non_self = [c for c in candidates if c.id != perm.id]
+                        if not candidates:
+                            print(f"[ACTIVATE-CLAUDE] No permanent matching "
+                                  f"'{cost_lower.split(':')[0].strip()}' to sacrifice for {perm.name}")
                             return None  # Can't pay sacrifice cost
-                        # Prefer tokens, then lowest power
-                        tokens = [c for c in creatures if getattr(c, 'is_token', False)]
+                        pool = non_self or candidates
+                        # Prefer tokens, then lowest power/cmc
+                        tokens = [c for c in pool if getattr(c, 'is_token', False)]
                         if tokens:
                             sac_target = tokens[0]
                         else:
-                            sac_target = min(creatures, key=lambda c: c.get_effective_power(game) if hasattr(c, 'get_effective_power') else (int(c.power) if c.power and str(c.power).lstrip('-').isdigit() else 0))
+                            def _sac_rank(c):
+                                if hasattr(c, 'get_effective_power') and c.is_creature():
+                                    try:
+                                        return c.get_effective_power(game)
+                                    except (ValueError, TypeError):
+                                        pass
+                                try:
+                                    return int(getattr(c, 'cmc', 0) or 0)
+                                except (TypeError, ValueError):
+                                    return 0
+                            sac_target = min(pool, key=_sac_rank)
                     if sac_target and sac_target in player.battlefield:
                         # June 10 (C2): snapshot BEFORE removal — anthems and
                         # equipment stop applying once it leaves play.
@@ -4192,7 +4243,18 @@ class GameEngine:
                           or 'equal to its power' in effect_lower2):
                         _mill_n = sac_power_snapshot
                     if _mill_n > 0:
+                        # Aug 1 batch-12 (reviewer, escape game): honor the
+                        # AI's declared target — this branch hardcoded the
+                        # opponent, so a self-mill deck (Grinding Station
+                        # under Meren/escape) could never mill itself even
+                        # when it asked to.
                         _mill_target = game.players[1 - player_index].name
+                        _decl = (action.get('target') or '').strip().lower()
+                        if _decl:
+                            for _tp in game.players:
+                                if _tp.name.lower() == _decl:
+                                    _mill_target = _tp.name
+                                    break
                         _mm = self.rules._execute_action_on_state(game, {
                             "action": "mill", "player": _mill_target, "amount": _mill_n})
                         if _mm:

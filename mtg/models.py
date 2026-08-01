@@ -1675,7 +1675,13 @@ class Player:
     life: int = 20
     poison: int = 0
     energy: int = 0
-    commander_damage: Dict[int, int] = field(default_factory=dict)  # player_index -> damage
+    # commander NAME -> combat damage taken from that commander. CR 903.10a
+    # is per-COMMANDER ("by the same commander"), not per-player — keying by
+    # controller index summed partner commanders into one bucket (Aug 1
+    # batch-12: Thrasios 22 + Tymna 23 displayed as 45/21). Legacy saves may
+    # carry int / digit-string keys (old per-player buckets); consumers
+    # treat those as frozen legacy tallies.
+    commander_damage: Dict[str, int] = field(default_factory=dict)
     # Bloodchief Ascension and similar "lost N life this turn" conditions.
     # Reset for every player when a new turn begins in GameEngine.end_turn.
     life_lost_this_turn: int = 0

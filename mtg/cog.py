@@ -2296,16 +2296,37 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
                     game._pending_sac_trigger_msgs = []
         elif ('sacrifice a creature' in cost_lower
               or 'sacrifice another creature' in cost_lower
-              or 'sacrifice a permanent' in cost_lower):
+              or 'sacrifice a permanent' in cost_lower
+              # Aug 1 batch-12: type-restricted non-creature sac costs
+              # (Grinding Station's "Sacrifice an artifact") — same gap the
+              # AI path had; the two paths extend together per convention.
+              or 'sacrifice an artifact' in cost_lower
+              or 'sacrifice an enchantment' in cost_lower
+              or 'sacrifice a land' in cost_lower):
             # May 7 audit fix #4: "Sacrifice a creature" as cost (Viscera Seer,
             # Altar of Dementia, Ashnod's Altar). The human path was missing
             # this — Viscera Seer would scry without paying the sacrifice cost.
-            # Auto-select weakest creature (prefer tokens) to sacrifice.
-            allow_self = 'another creature' not in cost_lower
-            sac_pool = [c for c in player.battlefield
-                        if c.is_creature() and (allow_self or c.id != card.id)]
+            # Auto-select weakest matching permanent (prefer tokens).
+            allow_self = 'another' not in cost_lower
+            if 'sacrifice an artifact' in cost_lower:
+                _typed = [c for c in player.battlefield
+                          if 'artifact' in (getattr(c, 'type_line', '') or '').lower()]
+            elif 'sacrifice an enchantment' in cost_lower:
+                _typed = [c for c in player.battlefield
+                          if 'enchantment' in (getattr(c, 'type_line', '') or '').lower()]
+            elif 'sacrifice a land' in cost_lower:
+                _typed = [c for c in player.battlefield if c.is_land()]
+            elif 'sacrifice a permanent' in cost_lower:
+                _typed = list(player.battlefield)
+            else:
+                _typed = [c for c in player.battlefield if c.is_creature()]
+            sac_pool = [c for c in _typed if (allow_self or c.id != card.id)]
+            # The source itself is always the LAST resort.
+            _non_self = [c for c in sac_pool if c.id != card.id]
+            if _non_self:
+                sac_pool = _non_self
             if not sac_pool:
-                await ctx.send(f"❌ Cannot pay sacrifice cost for **{card.name}** (no creatures available).")
+                await ctx.send(f"❌ Cannot pay sacrifice cost for **{card.name}** (no legal permanent available).")
                 # Roll back the tap from earlier — we couldn't actually activate.
                 if ability['needs_tap']:
                     card.tapped = False

@@ -1868,6 +1868,15 @@ def _get_action_error(engine, game: GameState, player_index: int, action: Dict) 
                         effective_cmc += sum(half_upper.count(f'{{{c}}}') for c in ['W', 'U', 'B', 'R', 'G'])
                         display_name = sname
                     break
+        elif card.adventure_cost and ' // ' in effective_mana_cost:
+            # Creature-half cast of an adventure card: the cache stores the
+            # COMBINED "creature // adventure" cost string, so pricing from it
+            # double-counts pips (Beanstalk Giant {6}{G} // {G} would demand
+            # {G}{G}) and the [MANA-DIVERGENCE] trace lies about the req
+            # (Oakhame Ranger printed req={'other': 8} for a 4-pip half in
+            # batch 15327). Price only the creature face; effective_cmc is
+            # already the face cmc via the loader's recompute.
+            effective_mana_cost = effective_mana_cost.split(' // ')[0]
 
         # Check total mana
         available = player.available_mana()

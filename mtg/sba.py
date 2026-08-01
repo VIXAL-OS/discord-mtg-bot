@@ -168,20 +168,30 @@ def check_state_based_actions(rules, game: GameState) -> List[Dict]:
     for i, player in enumerate(game.players):
         # Commander damage (21+) — game-specific, not in CR 704.5
         cant_lose_source = rules._player_cant_lose(game, i)
-        for source_idx, damage in player.commander_damage.items():
+        for source_key, damage in player.commander_damage.items():
             if damage >= 21:
+                # Aug 1 batch-12: keys are commander NAMES now (CR 903.10a is
+                # per-commander — the partner-deck finding). Legacy int /
+                # digit-string keys from pre-fix saves still count (their
+                # per-player semantics are frozen into the old bucket); map
+                # them to a player name for the message when possible.
+                if isinstance(source_key, int) or (
+                        isinstance(source_key, str) and source_key.isdigit()):
+                    _idx = int(source_key)
+                    _src_name = (game.players[_idx].name
+                                 if 0 <= _idx < len(game.players)
+                                 else f'player {source_key}')
+                else:
+                    _src_name = str(source_key)
                 if cant_lose_source:
-                    print(f"[SBA-RULES] PLAYER_LOSES_COMMANDER_DAMAGE suppressed: {player.name} can't lose ({cant_lose_source}) — {damage} cmd damage from p{source_idx}")
+                    print(f"[SBA-RULES] PLAYER_LOSES_COMMANDER_DAMAGE suppressed: {player.name} can't lose ({cant_lose_source}) — {damage} cmd damage from {_src_name}")
                 else:
                     # May 7 audit: this inline check works but never surfaced in
                     # the [SBA-RULES] log because it bypasses the rules module
                     # (rules.Player has no per-source commander_damage). Tag it
                     # explicitly so auditors can grep for it and verify the
                     # loss condition fires even when zero-life doesn't.
-                    print(f"[SBA-RULES] PLAYER_LOSES_COMMANDER_DAMAGE({player.name}): {damage} cmd damage from p{source_idx}")
-                    _src_name = (game.players[source_idx].name
-                                 if 0 <= source_idx < len(game.players)
-                                 else f'player {source_idx}')
+                    print(f"[SBA-RULES] PLAYER_LOSES_COMMANDER_DAMAGE({player.name}): {damage} cmd damage from {_src_name}")
                     actions.append({
                         'type': 'player_loses',
                         'player_index': i,

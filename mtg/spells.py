@@ -723,6 +723,22 @@ def _compute_alt_costs(engine, game: GameState, player: Player, card: Card,
         # Check if caller specified X value via _x_value attribute
         if hasattr(card, '_x_value') and card._x_value is not None:
             x_value_chosen = card._x_value
+            # Aug 1 batch-12: clamp AI-supplied X to the same one-tap
+            # physical budget the auto-size branch uses. The AI sizes X off
+            # the advertised per-color availability, which double-counts
+            # OR-duals — Genesis Wave arrived with x=5 off "mana=10" on a
+            # board whose one-tap ceiling was 5, failed at payment, and the
+            # plan's remaining actions were skipped. Clamp only when it
+            # leaves X ≥ 1; at 0 the cast fails with a recorded reason and
+            # the card stays in hand (an X=0 Genesis Wave would burn it).
+            # The tap engine stays the arbiter for colored pips.
+            _budget = player.one_tap_mana_total() if pay_mana else 0
+            _budget_x = max(0, (_budget - fixed_cost - additional_cost
+                                - cost_increase + raw_reduction)) // max(x_count, 1)
+            if pay_mana and x_value_chosen > _budget_x >= 1:
+                print(f"[X-COST] {card.name}: clamping AI-requested "
+                      f"X={x_value_chosen} to one-tap budget X={_budget_x}")
+                x_value_chosen = _budget_x
             total_cost = (fixed_cost + (x_value_chosen * x_count)
                           + additional_cost + cost_increase)
         else:
@@ -3728,7 +3744,38 @@ def _resolve_suspend_spell(engine, game: GameState, player: Player, card: Card, 
     if damage_match:
         damage = int(damage_match.group(1))
         if "to any target" in oracle or "target creature or player" in oracle:
-            # Default to opponent
+            # Aug 1 batch-12 (reviewer, companion game): this suspend-cast
+            # resolution hardcoded the opponent's FACE — a suspended Rift
+            # Bolt could never kill a creature (Dragon's Rage Channeler
+            # survived and dealt 5 more over four turns). Casting off
+            # suspend is still casting (CR 702.62e): pick the target the
+            # way the burn heuristics do — a killable opponent creature
+            # whose loss matters, else the face. Sync path, so the choice
+            # is deterministic (no Tier-3 consult available here).
+            _best_kill = None
+            for _c in opponent.battlefield:
+                if not _c.is_creature(game):
+                    continue
+                try:
+                    _tough = _c.get_effective_toughness(game)
+                    _pow = _c.get_effective_power(game)
+                except (ValueError, TypeError, AttributeError):
+                    continue
+                _remaining = _tough - getattr(_c, 'damage_marked', 0)
+                if 0 < _remaining <= damage and _pow >= 2:
+                    if _best_kill is None or _pow > _best_kill[1]:
+                        _best_kill = (_c, _pow)
+            if _best_kill is not None:
+                _victim = _best_kill[0]
+                _victim.damage_marked += damage
+                messages.append(f"🔥 {card.name} deals {damage} damage to "
+                                f"{_victim.name}!")
+                print(f"[SUSPEND-TARGET] {card.name}: targeting "
+                      f"{_victim.name} (killable threat) instead of face")
+                game._recently_died = getattr(game, '_recently_died', [])
+                sba_msgs = engine.rules.process_state_based_actions(game)
+                messages.extend(sba_msgs)
+                return messages
             actual_dmg = engine.rules._apply_noncombat_damage_to_player(game, opponent, damage, card.name)
             if actual_dmg > 0:
                 messages.append(f"🔥 {card.name} deals {actual_dmg} damage to {opponent.name}!")

@@ -717,6 +717,20 @@
       ]
     },
     {
+      "key": "vile entomber",
+      "name": "Vile Entomber",
+      "event": "etb",
+      "description": "ETB: search your library for a card, put it into your graveyard, then shuffle",
+      "actions": [
+        {
+          "action": "search_library",
+          "player": "$controller",
+          "card_type": "Any",
+          "to_zone": "graveyard"
+        }
+      ]
+    },
+    {
       "key": "fact or fiction",
       "name": "Fact or Fiction",
       "event": "etb",
@@ -2443,7 +2457,10 @@
           "player": "$controller",
           "duration": "end_of_turn",
           "source": "Yawgmoth's Will",
-          "reason": "Yawgmoth's Will: cast spells from graveyard this turn"
+          "reason": "Yawgmoth's Will: cast spells from graveyard this turn",
+          "grant_all": true,
+          "card_types": "any",
+          "announce_empty": true
         }
       ]
     },
