@@ -1874,6 +1874,85 @@ async def _check_cast_triggers(engine, game: GameState, caster: Player, card: Ca
                 trigger_text = sentence.strip()
                 print(f"[OPP-CAST-TRIGGER] {bf_card.name} (controlled by {opp_player.name}) triggers from {caster.name} casting {card.name}: {trigger_text}")
 
+                # Aug 1 deferred slate (batch-12 companion reviewer, CR 603.3):
+                # the own-cast scan has pushed a StackEntry + opened the
+                # APNAP-5 priority window since May 20; THIS scan applied
+                # effects inline unconditionally — Eidolon's ping on the
+                # opponent's cast skipped the response window every time.
+                # Engine convention preserved: push + window ONLY when the
+                # caster holds a trigger-counter (Stifle-shape) — otherwise
+                # the inline fast path stays, so the ~290-fires/batch common
+                # case has zero added overhead.
+                _opp_trig_entry = None
+                if getattr(game, 'stack_enabled', False):
+                    _caster_has_stifle = False
+                    try:
+                        for _hc in caster.hand:
+                            if not _hc.oracle_text:
+                                continue
+                            _o = _hc.oracle_text.lower()
+                            if ('counter target triggered ability' in _o
+                                    or 'counter target activated or triggered ability' in _o):
+                                _caster_has_stifle = True
+                                break
+                    except (AttributeError, TypeError):
+                        pass
+                    if _caster_has_stifle:
+                        try:
+                            from mtg.models import StackEntry
+                            _opp_trig_entry = StackEntry(
+                                card=bf_card,
+                                controller_name=opp_player.name,
+                                controller_index=opp_idx,
+                                is_spell=False,
+                                trigger_source=bf_card.name,
+                                trigger_text=trigger_text,
+                            )
+                            game.stack.append(_opp_trig_entry)
+                            print(f"[OPP-CAST-TRIGGER-STACK] {bf_card.name}'s "
+                                  f"trigger pushed on stack (depth: "
+                                  f"{len(game.stack)}) — {caster.name} may "
+                                  f"respond (CR 603.3)")
+                        except (TypeError, ValueError) as _se:
+                            print(f"[OPP-CAST-TRIGGER-STACK] Push failed: {_se}")
+                            _opp_trig_entry = None
+                    if _opp_trig_entry is not None:
+                        send_fn = getattr(game, '_stack_send_func', None)
+                        if send_fn:
+                            game._trigger_window_depth = getattr(
+                                game, '_trigger_window_depth', 0) + 1
+                            try:
+                                await engine._combat_priority_round(
+                                    game, send_fn,
+                                    f"trigger response: {bf_card.name} "
+                                    f"(opponent-cast trigger)")
+                            except Exception as _pe:
+                                # Crash barrier around the LLM response
+                                # window (swallow in production, visible
+                                # under MTG_STRICT).
+                                print(f"[OPP-CAST-TRIGGER-STACK] window error: {_pe}")
+                                from mtg.util import maybe_reraise
+                                maybe_reraise(_pe)
+                            finally:
+                                game._trigger_window_depth = max(
+                                    0, getattr(game, '_trigger_window_depth', 1) - 1)
+                        # Only the counter handler's explicit flag counts —
+                        # a vanished entry resolves inline anyway (the July
+                        # 21 [CAST-TRIGGER-VANISHED] lesson).
+                        if getattr(_opp_trig_entry, 'countered', False):
+                            print(f"[OPP-CAST-TRIGGER-COUNTERED] {bf_card.name}'s "
+                                  f"trigger was countered during the priority "
+                                  f"window — skipping resolution")
+                            if _opp_trig_entry in game.stack:
+                                game.stack.remove(_opp_trig_entry)
+                            break  # next bf_card (one trigger per source per cast)
+                        # Not countered: pop the entry before inline
+                        # resolution (the own-cast scan's manual-cleanup
+                        # pattern — the effect applies inline, not via the
+                        # stack resolver).
+                        if _opp_trig_entry in game.stack:
+                            game.stack.remove(_opp_trig_entry)
+
                 # Handle Rhystic Study inline: "draw a card unless that player pays {1}"
                 if 'draw a card' in sentence_lower and ('unless' in sentence_lower or 'pay' in sentence_lower):
                     # Extract the tax amount (usually {1})

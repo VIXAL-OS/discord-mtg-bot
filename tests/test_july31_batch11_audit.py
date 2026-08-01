@@ -265,9 +265,14 @@ class TestRefusedTailTemplates:
             attacking_creature_power=4,
             controller="Rick", opponent="Claude",
             game_context={"damage_dealt": 4, "_controller_player": rick})
-        assert actions == [{"action": "untap", "card": "Goblin Guide"}], (
-            "only the TAPPED creature untaps; artifacts and untapped "
-            "creatures are excluded")
+        # Aug 1 deferred slate: the additional combat phase is GRANTED now
+        # (the Moraug consumption machinery) — the action rides after the
+        # untaps.
+        assert actions == [{"action": "untap", "card": "Goblin Guide"},
+                           {"action": "additional_combat",
+                            "source": "Port Razer"}], (
+            "only the TAPPED creature untaps (artifacts and untapped "
+            "creatures excluded), then the extra combat is granted")
 
     def test_port_razer_declare_time_no_fire(self, game, make_card):
         rick = game.players[0]

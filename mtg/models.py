@@ -436,6 +436,13 @@ class Card:
     # resolution ("If this spell's spectacle cost was paid..."). Reset at
     # the start of every cast alongside _spell_resolved.
     _was_spectacled: bool = field(default=False, repr=False, compare=False)
+    # Kicker (CR 702.33, Aug 1 2026): set by _compute_alt_costs when the
+    # kicker cost is paid (v1 gate: kick whenever affordable — the printed
+    # kicked mode is the designed-better mode). Replaces the Gatekeeper
+    # mana-paid>=N guess as the source of truth for ctx['kicked']. Reset at
+    # the start of every cast alongside _was_spectacled; free casts and
+    # madness casts never kick (documented at the cost site).
+    _kicked: bool = field(default=False, repr=False, compare=False)
     # Animate-land duration (Aug 1 2026): player index whose NEXT turn ends
     # the animation ("Until your next turn, all lands you control become
     # 2/2..." — Sylvan Awakening). _animated_until_eot stays SET alongside
@@ -3693,6 +3700,15 @@ class GameState:
     # Whisperer beneath the Arcane Denial targeting it because the window's
     # evaluation outlived the whole budget (CR 608 violation, counter robbed).
     _trigger_window_depth: int = field(default=0, repr=False, compare=False)
+    # Aug 1 2026 (deferred slate): pending additional combat phases this
+    # turn (Moraug landfall — the original producer — plus Port Razer's
+    # connect and Karlach's attack trigger via the additional_combat
+    # action). Consumed by the autoplay HUMAN turn loop only; the Claude
+    # path breadcrumbs + resets (documented gap, pre-existing for Moraug),
+    # and end_turn resets it so a producer firing on one player's turn can
+    # never grant the NEXT player a phantom extra combat (the stale-value
+    # leak the sweep exists for).
+    _additional_combats: int = field(default=0, repr=False, compare=False)
     # July 29 batch audit: True once a final=True game-summary send has gone
     # out. The post-game flush gate in cog._autoplay_send suppresses only
     # AFTER this — the ended→summary window carries the lethal combat's own

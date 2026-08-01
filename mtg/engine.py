@@ -2495,6 +2495,36 @@ class GameEngine:
         # (Slice 6a's PHASE_CHANGED parity report retired at the 6b flip,
         # July 31 — [EVENT-PARITY-PHASE] is a stale-code tripwire now.)
 
+        # [COMBAT-SWEEP] Aug 1 batch-12 follow-up: combat state NEVER
+        # legitimately survives a turn boundary (extra combats live inside
+        # one turn), yet stale .attacking flags demonstrably leaked across
+        # turns — a surviving Cavalry Pegasus carried one into a Battalion
+        # over-fire two turns later (game_1532756674203619470), and the
+        # create-token-attacking path never joined game.attackers, so the
+        # id-list clears couldn't see it. The per-combat clears stay (they
+        # are the CR-correct point); this sweep is the structural net that
+        # kills every leak shape at end of turn, whatever its origin.
+        for _sw_p in game.players:
+            for _sw_c in _sw_p.battlefield:
+                if getattr(_sw_c, 'attacking', False):
+                    print(f"[COMBAT-SWEEP] Clearing stale attacking flag on "
+                          f"{_sw_c.name} at end of turn (leaked past its "
+                          f"combat's clear)")
+                _sw_c.attacking = False
+                _sw_c.attacking_player = None
+                _sw_c.blocking = []
+                _sw_c.blocked_by = []
+        game.attackers = []
+        game.blockers = {}
+        # Unconsumed extra combats die with the turn — a Moraug/Port Razer
+        # produced on one player's turn must never grant the NEXT player a
+        # phantom combat (the autoplay human loop reads this at its next
+        # combat otherwise).
+        if getattr(game, '_additional_combats', 0):
+            print(f"[COMBAT-SWEEP] Discarding {game._additional_combats} "
+                  f"unconsumed additional combat phase(s) at end of turn")
+        game._additional_combats = 0
+
         # [TRANSFORM] Save spell count for day/night and werewolf transform tracking
         game.active_player.spells_cast_prev_turn = game.active_player.spells_cast_this_turn
         # The day/night check runs at the NEXT upkeep and must see the turn that

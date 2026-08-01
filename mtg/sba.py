@@ -595,7 +595,17 @@ def process_state_based_actions(rules, game: GameState) -> List[str]:
                     # Commanders can go to command zone instead of graveyard.
                     # June 10 audit (C7, CR 903.9a): the OWNER's command zone,
                     # not the battlefield-holder's — see command_zone_owner.
-                    if card.is_commander and game.format in COMMAND_ZONE_FORMATS:
+                    from mtg.helpers import commander_declines_graveyard_redirect
+                    if (card.is_commander and game.format in COMMAND_ZONE_FORMATS
+                            and commander_declines_graveyard_redirect(card)):
+                        card.reset_battlefield_state()
+                        owner_of(game, card, player).graveyard.append(card)
+                        messages.append(f"☠️ {card.name} dies → stays in the "
+                                        f"graveyard (declines the command-zone "
+                                        f"redirect — escape available) ({action['reason']})")
+                        print(f"[CR-903.9] {card.name} declines the redirect "
+                              f"(escape) — graveyard")
+                    elif card.is_commander and game.format in COMMAND_ZONE_FORMATS:
                         card.reset_battlefield_state()  # Clear damage/modifiers so recast starts clean
                         _zone_owner = command_zone_owner(game, card, player)
                         _zone_owner.command_zone.append(card)

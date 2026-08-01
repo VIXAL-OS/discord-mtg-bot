@@ -316,11 +316,17 @@ class TestTriggerWindowAwareness:
 
     def test_window_depth_is_balanced_in_triggers(self):
         src = (ROOT / "mtg/triggers.py").read_text(encoding="utf-8")
-        assert src.count("game._trigger_window_depth = getattr") == 1, \
-            "exactly one increment site (the [CAST-TRIGGER-PRIORITY] window)"
-        assert "finally:" in src.split(
-            "game._trigger_window_depth = getattr", 1)[1][:2000], \
-            "the decrement must sit in a finally so a window error can't wedge the depth"
+        # Aug 1 deferred slate: TWO increment sites now — the own-cast
+        # [CAST-TRIGGER-PRIORITY] window and the opponent-cast
+        # [OPP-CAST-TRIGGER-STACK] window (CR 603.3). Each must pair its
+        # increment with a finally-decrement so a window error can't wedge
+        # the depth and starve the LIFO wait loop.
+        parts = src.split("game._trigger_window_depth = getattr")
+        assert len(parts) - 1 == 2, \
+            "exactly two increment sites (own-cast + opponent-cast windows)"
+        for i, tail in enumerate(parts[1:], 1):
+            assert "finally:" in tail[:2000], \
+                f"increment site #{i} lacks a nearby finally-decrement"
 
 
 # ---------------------------------------------------------------------------

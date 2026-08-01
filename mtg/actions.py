@@ -1846,6 +1846,13 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                     src_atk_player = action.get("attacking_player")
                     if src_atk_player:
                         token.attacking_player = src_atk_player
+                    # Aug 1 batch-12 follow-up: an attacking token must JOIN
+                    # game.attackers — every per-combat clear (and the damage
+                    # resolution itself) iterates that list, so a token that
+                    # only set the flag neither dealt combat damage via the
+                    # normal loop nor ever got its flag cleared (the stale-
+                    # flag leak class).
+                    game.attackers.append(token.id)
                 player.battlefield.append(token)
                 created_tokens.append(token)
                 # Pub/sub slice 2: one PERMANENT_ENTERED per token entering.
@@ -2165,6 +2172,18 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                 return f"❄️ Tapped **{card.name}** (won't untap next turn)"
             return f"↩️ Tapped **{card.name}**"
     
+    elif action_type == "additional_combat":
+        # Aug 1 deferred slate: Port Razer's connect / Karlach's attack
+        # trigger grant an additional combat phase. The autoplay HUMAN turn
+        # loop consumes game._additional_combats (the Moraug machinery);
+        # the Claude path breadcrumbs + discards (documented gap), and
+        # end_turn discards unconsumed phases so they can never leak into
+        # the next player's turn.
+        game._additional_combats = getattr(game, '_additional_combats', 0) + 1
+        _ac_src = action.get("source", "")
+        return (f"⚔️ {(_ac_src + ': ') if _ac_src else ''}an additional combat "
+                f"phase follows this one (#{game._additional_combats} pending)")
+
     elif action_type == "untap":
         result = find_card_on_battlefield(action.get("card", ""))
         if result:
@@ -2973,7 +2992,13 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
             # Dies triggers below still fire (CR 903.9b — they see the death
             # regardless of the redirect).
             _cmd_redirected = False
+            from mtg.helpers import commander_declines_graveyard_redirect
             if (getattr(card, 'is_commander', False)
+                    and getattr(game, 'format', '') in ('commander', 'edh', 'brawl', 'oathbreaker')
+                    and commander_declines_graveyard_redirect(card)):
+                print(f"  [CR-903.9] {card.name} declines the command-zone "
+                      f"redirect (escape available) — stays in graveyard")
+            elif (getattr(card, 'is_commander', False)
                     and getattr(game, 'format', '') in ('commander', 'edh', 'brawl', 'oathbreaker')):
                 from mtg.helpers import command_zone_owner
                 _zone_owner = command_zone_owner(game, card, owner)
@@ -4918,7 +4943,15 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
             moved_to_command_zone = False
             # Commanders go to command zone — the OWNER's, not the
             # battlefield-holder's (June 10 audit C7, CR 903.9a).
-            if getattr(victim, 'is_commander', False) and hasattr(game, 'format') and game.format in ('commander', 'edh', 'brawl', 'oathbreaker'):
+            from mtg.helpers import commander_declines_graveyard_redirect
+            if (getattr(victim, 'is_commander', False) and hasattr(game, 'format')
+                    and game.format in ('commander', 'edh', 'brawl', 'oathbreaker')
+                    and commander_declines_graveyard_redirect(victim)):
+                p.graveyard.append(victim)
+                print(f"[SACRIFICE] {p.name} sacrifices {victim.name} — "
+                      f"declines the command-zone redirect (escape available), "
+                      f"stays in graveyard ({reason})")
+            elif getattr(victim, 'is_commander', False) and hasattr(game, 'format') and game.format in ('commander', 'edh', 'brawl', 'oathbreaker'):
                 from mtg.helpers import command_zone_owner
                 _zone_owner = command_zone_owner(game, victim, p)
                 if not hasattr(_zone_owner, 'command_zone'):

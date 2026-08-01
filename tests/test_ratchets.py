@@ -113,7 +113,11 @@ EXCEPT_BASELINE = {
     # route the card to the graveyard in production, not corrupt the drain;
     # both carry maybe_reraise so strict batches/pytest still see failures.
     "spells.py": 32,
-    "triggers.py": 51,
+    # Aug 1 deferred slate: +1 for the opponent-cast trigger window's
+    # crash barrier around the LLM response evaluation — carries
+    # maybe_reraise so strict batches see it; the sibling own-cast
+    # window barrier is already in this baseline.
+    "triggers.py": 52,
     "util.py": 6,
 }
 

@@ -1456,6 +1456,18 @@ class EffectTemplateLibrary:
                 action_generator=wheel_action,
             ))
 
+        # Wheel of Misfortune (Aug 1 batch-12 reviewer, escape game): Tier 2
+        # half-captured the card — the caster discarded their hand with NO
+        # draw (actively harmful) and the number-choice damage clause mapped
+        # to the power-based damage branch (silent no-op). Deterministic
+        # secret-number model per the Mana Crypt / d20 hash convention.
+        self._add_card("wheel of misfortune", EffectTemplate(
+            name="Wheel of Misfortune",
+            description=("Secret numbers: caster picks high (takes that "
+                         "damage, wheels); opponent picks low (keeps hand)"),
+            action_generator=self._gen_wheel_of_misfortune,
+        ))
+
 
         # Unbreakable Formation: creatures you control gain indestructible until EOT
         self._add_card("unbreakable formation", EffectTemplate(
@@ -2167,10 +2179,12 @@ class EffectTemplateLibrary:
         # grant; the ADDITIONAL combat phase isn't modeled — breadcrumb in
         # console keeps that honest instead of letting Tier 3 hallucinate it.
         def _gen_karlach_attack(ctrl, opp, ctx):
-            print("[ATTACK-TEMPLATE] Karlach: additional combat phase not modeled — "
-                  "applying untap + first strike only")
+            # Aug 1 deferred slate: the additional combat phase is granted
+            # now (additional_combat action → the Moraug consumption loop).
             acts = [{"action": "grant_keywords", "player": ctrl,
-                     "target": "all_own_creatures", "keywords": ["first strike"]}]
+                     "target": "all_own_creatures", "keywords": ["first strike"]},
+                    {"action": "additional_combat",
+                     "source": "Karlach, Fury of Avernus"}]
             g = ctx.get('_game')
             if g is not None:
                 for _atk_id in list(getattr(g, 'attackers', []) or []):
@@ -2181,7 +2195,7 @@ class EffectTemplateLibrary:
 
         self._add_attack_card("karlach, fury of avernus", EffectTemplate(
             name="Karlach, Fury of Avernus (attack)",
-            description="Whenever you attack: untap attacking creatures, they gain first strike (additional combat phase not modeled)",
+            description="Whenever you attack: untap attacking creatures, they gain first strike, and there is an additional combat phase",
             action_generator=_gen_karlach_attack,
         ))
 
@@ -4566,23 +4580,28 @@ class EffectTemplateLibrary:
             action_generator=lambda ctrl, opp, ctx: [
                 {"action": "create_copy_token", "player": ctrl,
                  "target": "best_creature", "filter": "any",
-                 "count": 5 if (ctx.get('kicked', False) or (ctx.get('mana_paid_total', 0) or 0) >= 9) else 1}
+                 # Aug 1: ctx['kicked'] is the STAMPED truth when present
+                 # (kicker payment is modeled now); the mana-paid guess
+                 # survives only for card-less ctx shapes.
+                 "count": 5 if (ctx['kicked'] if 'kicked' in ctx
+                                else (ctx.get('mana_paid_total', 0) or 0) >= 9) else 1}
             ],
         ))
 
         # Gatekeeper of Malakir — kicked ETB ("if it was kicked, target player
-        # sacrifices a creature"). Kicker payment isn't modeled at cast time,
-        # so today the intervening-if (CR 603.4) correctly no-ops — this
-        # template exists to say so instead of [ETB-UNHANDLED] (15289 batch
-        # ×2). Base {B}{B}, kicker {B}: mana_paid_total >= 3 reads as kicked,
-        # same heuristic as Rite of Replication above, so the sacrifice half
-        # goes live the moment kicker payment starts being recorded.
+        # sacrifices a creature"). Aug 1 2026: kicker payment IS modeled now
+        # (_compute_alt_costs stamps card._kicked, surfaced as ctx['kicked'])
+        # — the stamped truth decides when present; the old mana_paid >= 3
+        # guess survives only for card-less ctx shapes (it reads commander
+        # tax / cost increases as "kicked", which is why it can't stay
+        # primary).
         self._add_card("gatekeeper of malakir", EffectTemplate(
             name="Gatekeeper of Malakir",
             description="When this creature enters, if it was kicked, target player sacrifices a creature",
             action_generator=lambda ctrl, opp, ctx: (
                 self._force_sacrifice_creature(ctrl, opp, ctx)
-                if (ctx.get('kicked', False) or (ctx.get('mana_paid_total', 0) or 0) >= 3)
+                if (ctx['kicked'] if 'kicked' in ctx
+                    else (ctx.get('mana_paid_total', 0) or 0) >= 3)
                 else [{"action": "no_action",
                        "reason": "Gatekeeper of Malakir: not kicked (intervening if, CR 603.4)"}]
             ),
@@ -8065,8 +8084,9 @@ class EffectTemplateLibrary:
             # reads as kicked.
             _oracle = ctx.get('_oracle') or ''
             if ('kicked' in _oracle and 'draw' in _oracle
-                    and (ctx.get('kicked', False)
-                         or (ctx.get('mana_paid_total', 0) or 0) >= 4)):
+                    # Aug 1: stamped kicker truth first (see Gatekeeper note)
+                    and (ctx['kicked'] if 'kicked' in ctx
+                         else (ctx.get('mana_paid_total', 0) or 0) >= 4)):
                 actions.append({"action": "draw_cards", "player": ctrl, "amount": 1})
             return actions
         return [{"action": "no_action", "reason": "No nonland permanent to bounce"}]
@@ -8140,6 +8160,29 @@ class EffectTemplateLibrary:
                  "name": "Dinosaur Beast", "power": dmg, "toughness": dmg,
                  "types": "Token Creature — Dinosaur Beast", "count": 1,
                  "keywords": ["trample"]}]
+
+    def _gen_wheel_of_misfortune(self, ctrl, opp, ctx) -> List[Dict]:
+        """Wheel of Misfortune: each player secretly picks a number ≥ 0; the
+        highest chooser(s) take that much damage; everyone except the lowest
+        chooser wheels (discard hand, draw 7).
+
+        Deterministic model (the Mana Crypt coin-flip / Ancient Bronze
+        Dragon d20 convention — no randomness, reproducible per turn): the
+        CASTER wants the wheel and picks high (5-7 from a turn hash), so
+        they take that damage and wheel; the OPPONENT picks low (0-2),
+        dodges the damage, and as the lowest chooser keeps their hand. The
+        true hidden-choice game is not modeled — documented approximation,
+        strictly better than the prior misresolution (caster discarded with
+        no draw, no damage anywhere).
+        """
+        turn = ctx.get('turn_number') or ctx.get('turn') or 0
+        hi = 5 + (sum(ord(ch) for ch in f"wom-hi-{turn}") % 3)  # 5-7
+        return [
+            {"action": "deal_damage", "amount": hi, "target_player": ctrl,
+             "source": "Wheel of Misfortune"},
+            {"action": "discard", "player": ctrl, "card": "all"},
+            {"action": "draw_cards", "player": ctrl, "amount": 7},
+        ]
 
     def _gen_reveal_top_land_or_draw(self, ctrl, opp, ctx) -> List[Dict]:
         """Thrasios-class: reveal top of library — land → battlefield tapped,
@@ -8228,11 +8271,13 @@ class EffectTemplateLibrary:
     def _gen_port_razer(self, ctrl, opp, ctx) -> List[Dict]:
         """Port Razer connects: 'untap each creature you control. After this
         phase, there is an additional combat phase.' (bulk-verified July 31).
-        The untap is deterministic; the additional combat phase is NOT
-        modeled (the Karlach precedent — the phase system has no extra-combat
-        insertion), and the 'can't attack a player it has already attacked
-        this turn' rider only matters with that extra combat. Breadcrumb on
-        console so audits see the known gap, not a silent drop."""
+        Aug 1 deferred slate: the additional combat phase IS granted now via
+        the additional_combat action (the Moraug consumption loop runs it on
+        the autoplay human path; the Claude path discards with a
+        breadcrumb). The 'can't attack a player it has already attacked
+        this turn' rider stays unmodeled (needs per-defender attack
+        tracking; irrelevant in two-player where the extra combat targets
+        the same opponent anyway)."""
         if not ctx.get('damage_dealt'):
             return []
         ctrl_player = ctx.get('_controller_player')
@@ -8242,10 +8287,10 @@ class EffectTemplateLibrary:
                    for c in (getattr(ctrl_player, 'battlefield', []) or [])
                    if 'creature' in self._cd_type_line(c)
                    and getattr(c, 'tapped', False)]
-        print("[ATTACK-TEMPLATE] Port Razer: untapping "
-              f"{len(actions)} creature(s); additional combat phase "
-              "NOT modeled (phase system has no extra-combat insertion)")
-        return actions  # [] when nothing tapped = handled no-op
+        actions.append({"action": "additional_combat", "source": "Port Razer"})
+        print(f"[ATTACK-TEMPLATE] Port Razer: untapping {len(actions) - 1} "
+              f"creature(s) + granting an additional combat phase")
+        return actions
 
     def _gen_frenzied_trapbreaker(self, ctrl, opp, ctx) -> List[Dict]:
         """Frenzied Trapbreaker (Outland Liberator's night face) attacks:
@@ -10072,6 +10117,13 @@ def build_game_context(game, player, opponent, card=None, entering_creature=None
     # Mana paid total (for overload check on Cyclonic Rift etc.)
     if card and hasattr(card, '_mana_paid') and card._mana_paid:
         ctx['mana_paid_total'] = card._mana_paid
+
+    # Kicker truth (Aug 1 2026): _compute_alt_costs stamps _kicked when the
+    # kicker cost was actually paid. Surfacing it ALWAYS (True or False)
+    # lets consumers stop guessing from mana_paid_total — the guess reads
+    # commander-tax and cost-increase mana as "kicked".
+    if card is not None:
+        ctx['kicked'] = bool(getattr(card, '_kicked', False))
 
     # Escape: "sacrifice it unless it escaped" (Kroxa). This key was READ in two
     # places and written NOWHERE in production — the two tests that exercised it

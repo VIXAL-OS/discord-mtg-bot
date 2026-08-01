@@ -312,6 +312,8 @@ def _validate_cast(engine, game: GameState, player: Player, card: Card,
     # Spectacle stamp is per-cast state — a recast (flashback, returned to
     # hand) must re-evaluate the condition, not inherit last cast's answer.
     card._was_spectacled = False
+    # Kicker stamp likewise (CR 702.33 — kicking is chosen per cast).
+    card._kicked = False
 
     # June 11 audit: flashback/escape casts arrive here with the card in the
     # GRAVEYARD (marked playable by the castable-list generator), but this
@@ -680,6 +682,28 @@ def _compute_alt_costs(engine, game: GameState, player: Player, card: Card,
 
     # Block suspend-only cards from being cast normally (Mox Tantalite, Lotus Bloom, etc.)
     # These have no mana cost and can only be suspended, not cast from hand
+    # Kicker (CR 702.33, Aug 1 2026): an ADDITIVE optional cost, unlike the
+    # madness/spectacle/adventure selectors above which REPLACE the cost.
+    # v1 gate: kick whenever the kicked total is payable (the kicked mode is
+    # the designed-better mode — Gatekeeper's edict, Rite's five copies,
+    # Into the Roil's draw). Appending the kicker pips to
+    # effective_mana_cost means the payment tap pays the COLORED kicker
+    # pips too, not just a bumped generic total, and an X-block below sees
+    # the enlarged fixed portion (auto-X shrinks accordingly). Free casts
+    # (pay_mana=False) and madness casts never kick — CR-legal to pay
+    # additional costs on free casts, but out of v1 scope, documented here.
+    if pay_mana and not getattr(card, '_cast_via_madness', False):
+        _kick_cost = helpers.parse_kicker(card.oracle_text)
+        if _kick_cost and effective_mana_cost:
+            _kicked_string = effective_mana_cost + _kick_cost
+            _kick_ok, _ = player.can_pay_mana_cost(_kicked_string)
+            if _kick_ok:
+                effective_mana_cost = _kicked_string
+                effective_cmc = helpers.cmc_of_cost_string(_kicked_string)
+                card._kicked = True
+                print(f"[KICKER] {card.name}: paying kicker {_kick_cost} "
+                      f"(total {_kicked_string}, CMC {effective_cmc})")
+
     if not effective_mana_cost and card.oracle_text:
         oracle_lower = card.oracle_text.lower()
         if re.search(r'suspend\s+\d', oracle_lower) and card in player.hand:

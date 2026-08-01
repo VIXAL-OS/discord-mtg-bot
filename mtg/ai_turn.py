@@ -1548,6 +1548,18 @@ async def execute_claude_turn(engine, game: GameState) -> List[str]:
                         creature.blocked_by = []
                 game.attackers = []
                 game.blockers = {}
+                # Aug 1 deferred slate: the Claude turn path does NOT run
+                # the Moraug-style additional-combat loop (autoplay human
+                # path only — pre-existing for Moraug, now shared by Port
+                # Razer/Karlach). Discard with a visible breadcrumb so
+                # audits see the drop instead of silence, and so the stale
+                # value can't grant the OTHER player a phantom combat.
+                if getattr(game, '_additional_combats', 0):
+                    print(f"[EXTRA-COMBAT] {game._additional_combats} additional "
+                          f"combat phase(s) pending on Claude's turn — not "
+                          f"consumed by this path (known gap: autoplay human "
+                          f"loop only)")
+                    game._additional_combats = 0
                 _, _ph_msgs = engine.advance_phase(game)  # → MAIN2
                 if _ph_msgs:
                     actions_taken.extend(_ph_msgs)

@@ -1025,6 +1025,39 @@ def owns_card(card, player_index):
     return idx == player_index
 
 
+def parse_kicker(oracle_text):
+    """Parse a printed "Kicker {cost}" line (CR 702.33). Returns the kicker
+    cost string ("{2}", "{1}{W}", ...) or None.
+
+    v1 scope (Aug 1, 2026): single kicker only — multikicker (negative
+    lookbehind below) and the "Kicker {A} and/or {B}" double-kicker shape
+    are not modeled; no card in the test inventory carries either. The
+    match anchors on the ability word + brace costs, so "if this spell was
+    kicked" condition text and reminder text never match.
+    """
+    if not oracle_text:
+        return None
+    m = re.search(r'(?<!multi)\bkicker ((?:\{[^}]+\})+)', oracle_text,
+                  re.IGNORECASE)
+    return m.group(1) if m else None
+
+
+def commander_declines_graveyard_redirect(card) -> bool:
+    """CR 903.9a's command-zone redirect is a MAY, and autoplay always took
+    it — which made escape commanders structurally unable to reach the
+    graveyard they cast from (Aug 1 batch-12 reviewer: Kroxa was hardcast
+    four times at tax 2/4/6/8 for one discard each while his flat escape
+    cost sat unreachable). Escape commanders now decline the DEATH →
+    graveyard redirect in the autoplay choice model. Redirects from
+    exile / hand / library still happen (escape can't cast from those
+    zones), and the countered-spell + legend-rule sites keep redirecting
+    (conservative scope — noted at the sites)."""
+    try:
+        return parse_escape_cost(getattr(card, 'oracle_text', '') or '') is not None
+    except (TypeError, AttributeError):
+        return False
+
+
 def command_zone_owner(game, card, fallback):
     """Resolve which player's command zone a commander belongs in.
 
