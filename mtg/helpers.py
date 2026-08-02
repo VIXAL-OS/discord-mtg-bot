@@ -1042,6 +1042,35 @@ def parse_kicker(oracle_text):
     return m.group(1) if m else None
 
 
+def parse_crew(oracle_text):
+    """Parse a printed "Crew N" line (CR 702.121). Returns int N or None.
+
+    Aug 2, 2026 (the corners-of-corners pass): Vehicles became non-creatures
+    at the PW-token fix (batch-13) — crew is what makes them usable again.
+    Anchors on the keyword + number so reminder text can't false-positive.
+    """
+    if not oracle_text:
+        return None
+    m = re.search(r'\bcrew (\d+)\b', oracle_text, re.IGNORECASE)
+    return int(m.group(1)) if m else None
+
+
+# Multikicker consumers with a template that actually READS kicked_times —
+# the auto-kick gate is registry-limited so a card whose kicked mode isn't
+# modeled (Comet Storm's extra targets) never overpays for nothing.
+MULTIKICKER_MODELED = frozenset({"everflowing chalice"})
+
+
+def parse_multikicker(oracle_text):
+    """Parse a printed "Multikicker {cost}" line (CR 702.33c). Returns the
+    cost string or None. The single-kicker parser deliberately excludes
+    multikicker (its lookbehind); this is the other half."""
+    if not oracle_text:
+        return None
+    m = re.search(r'\bmultikicker ((?:\{[^}]+\})+)', oracle_text, re.IGNORECASE)
+    return m.group(1) if m else None
+
+
 def parse_entwine(oracle_text):
     """Parse a printed "Entwine {cost}" line (CR 702.42). Returns the entwine
     cost string ("{2}", "{1}{G}", ...) or None.

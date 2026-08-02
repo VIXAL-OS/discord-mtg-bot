@@ -1393,15 +1393,6 @@ class EffectTemplateLibrary:
             action_generator=self._gen_shamanic_revelation,
         ))
 
-        # --- Life from the Loam: return up to 3 land cards from GY to hand ---
-        # Named template takes priority over generic "mill N" pattern that would otherwise
-        # match the Dredge 3 reminder text in the oracle and produce the wrong effect.
-        self._add_card("life from the loam", EffectTemplate(
-            name="Life from the Loam",
-            description="Return up to three target land cards from your graveyard to your hand",
-            action_generator=self._gen_life_from_the_loam,
-        ))
-
         # --- Apr 28 audit: top template-backlog cards (silent "X resolves") ---
 
         # Diabolic Intent: sacrifice a creature, search your library for a card
@@ -2721,6 +2712,29 @@ class EffectTemplateLibrary:
 
         # --- Creature-enters triggers (for other permanents) ---
         # Trostani: whenever a creature enters, gain life equal to its toughness
+        # Aug 2 (corners-of-corners): Everflowing Chalice enters with a
+        # charge counter per multikicker payment — the production side has
+        # read charge counters since forever (models._get_mana_production);
+        # the PAYMENT -> counters half never existed, so it entered dead.
+        self._add_card("everflowing chalice", EffectTemplate(
+            name="Everflowing Chalice",
+            description=("Enters with a charge counter for each time it was "
+                         "kicked; taps for {C} per charge counter"),
+            action_generator=self._gen_everflowing_chalice,
+        ))
+        # Aug 2 (corners-of-corners): Chandra, Spark Hunter's beginning-of-
+        # combat vehicle animate — the other half of the batch-13 PW-token
+        # fix (her Vehicle token is a real non-creature artifact now; this
+        # trigger is what lets it attack). Suffix key per the scheduled-
+        # lookup convention; "up to one target" resolves none-chosen when no
+        # Vehicle is out (CR 601.2c).
+        self._add_card("chandra, spark hunter beginningcombat", EffectTemplate(
+            name="Chandra, Spark Hunter (combat)",
+            description=("Beginning of combat: up to one target Vehicle you "
+                         "control becomes an artifact creature with haste "
+                         "until end of turn"),
+            action_generator=self._gen_chandra_spark_hunter_combat,
+        ))
         # Aug 2 batch-13: Life from the Loam was a zero-action Tier-3
         # escalation (no template anywhere).
         self._add_card("life from the loam", EffectTemplate(
@@ -9051,34 +9065,12 @@ class EffectTemplateLibrary:
             actions.append({"action": "gain_life", "player": ctrl, "amount": greatest_power})
         return actions
 
-    def _gen_life_from_the_loam(self, ctrl, opp, ctx) -> List[Dict]:
-        """Life from the Loam: return up to 3 land cards from your graveyard to hand.
-        Dredge 3 in the oracle text would otherwise be mis-matched by the generic mill pattern.
-        """
-        player = ctx.get('_player')
-        if player is None:
-            # May 7 audit fix #7: this is an internal context-missing diagnostic,
-            # not something a Discord user can act on. Log to console instead
-            # and return an empty action list so nothing leaks to Discord.
-            print("[TEMPLATE] Life from the Loam: no _player context — skipping")
-            return []
-        # Pick up to 3 land cards from graveyard (non-token)
-        def _is_land(c):
-            if hasattr(c, 'is_land') and callable(c.is_land):
-                return c.is_land()
-            return 'land' in (c.type_line or '').lower()
-
-        lands = [
-            c for c in player.graveyard
-            if not getattr(c, 'is_token', False) and _is_land(c)
-        ]
-        if not lands:
-            return [{"action": "no_action", "reason": "Life from the Loam: no land cards in graveyard"}]
-        actions = []
-        for land in lands[:3]:
-            actions.append({"action": "move_card", "card": land.name,
-                            "from_zone": "graveyard", "to_zone": "hand", "player": ctrl})
-        return actions
+    # (The April 2026 _gen_life_from_the_loam lived here — it read a ctx key
+    # ('_player') no builder populates, so it silently skipped in live games
+    # and the card escalated to Tier 3 anyway. The batch-13 audit added a
+    # working replacement WITHOUT the grep-for-existing-def step, creating a
+    # shadowing duplicate — deleted Aug 2; the duplicate-def structural pin
+    # now makes the whole class unshippable.)
 
     def _gen_finale_of_glory(self, ctrl, opp, ctx) -> List[Dict]:
         """Finale of Glory: Create X 2/2 white Soldier tokens with vigilance.
@@ -9148,23 +9140,59 @@ class EffectTemplateLibrary:
             return [{"action": "search_library", "player": ctrl, "count": 2,
                      "card_type": "creature", "to_zone": "battlefield",
                      "reason": "Tooth and Nail (entwined): 2 creatures to battlefield"}]
-        # Un-entwined: ONE mode. Prefer putting from hand when a creature
-        # card is actually there (the classic use — slam the held bomb);
-        # otherwise search up to two creature cards to HAND.
+        # Un-entwined: ONE mode. Battlefield mode only when the hand holds a
+        # real BOMB (power >= 4 or MV >= 5) — Aug 2 mode-choice refinement:
+        # the first heuristic took ANY hand creature, so a pair of mana
+        # dorks would eat the put-onto-battlefield mode while searching two
+        # threats to hand was strictly better. Otherwise search to hand.
         hand = ctx.get('controller_hand') or []
-        creatures_in_hand = [
+        bombs = [
             c for c in hand
-            if 'creature' in self._cd_type_line(c)]
-        if creatures_in_hand:
-            creatures_in_hand.sort(
-                key=lambda c: self._cd_power_int(c), reverse=True)
+            if 'creature' in self._cd_type_line(c)
+            and (self._cd_power_int(c) >= 4 or self._cd_cmc(c) >= 5)]
+        if bombs:
+            bombs.sort(key=lambda c: self._cd_power_int(c), reverse=True)
             return [{"action": "move_card", "card": self._cd_name(c),
                      "from_zone": "hand", "to_zone": "battlefield",
                      "player": ctrl}
-                    for c in creatures_in_hand[:2]]
+                    for c in bombs[:2]]
         return [{"action": "search_library", "player": ctrl, "count": 2,
                  "card_type": "creature", "to_zone": "hand",
                  "reason": "Tooth and Nail: search two creature cards to hand"}]
+
+    def _gen_everflowing_chalice(self, ctrl, opp, ctx) -> List[Dict]:
+        """Everflowing Chalice — 'Multikicker {2} ... enters with a charge
+        counter for each time it was kicked.' Reads the kicked_times truth
+        (stamped by _compute_alt_costs when the multikicker cost was PAID).
+        Unkicked = a real zero-counter entry, handled no-op."""
+        k = int(ctx.get('kicked_times') or 0)
+        if k <= 0:
+            return [{"action": "no_action",
+                     "reason": "not kicked — enters with no charge counters"}]
+        return [{"action": "add_counters", "card": "Everflowing Chalice",
+                 "counter_type": "charge", "amount": k}]
+
+    def _gen_chandra_spark_hunter_combat(self, ctrl, opp, ctx) -> List[Dict]:
+        """Chandra, Spark Hunter — 'At the beginning of combat on your turn,
+        choose up to one target Vehicle you control. Until end of turn, it
+        becomes an artifact creature and gains haste.' Picks the biggest
+        un-animated Vehicle; none = handled none-chosen no-op."""
+        ctrl_player = ctx.get('_controller_player')
+        best, best_pw = None, -1
+        for c in (getattr(ctrl_player, 'battlefield', None) or []):
+            tl = self._cd_type_line(c)
+            if 'vehicle' in tl and 'creature' not in tl:
+                pw = self._cd_power_int(c)
+                if pw > best_pw:
+                    best, best_pw = c, pw
+        if best is None:
+            return [{"action": "no_action",
+                     "reason": "no Vehicle to animate (up to one target — "
+                               "resolves with none chosen)"}]
+        return [{"action": "animate_permanent", "player": ctrl,
+                 "scope": "target", "card": self._cd_name(best),
+                 "required_type": "artifact", "use_printed_pt": True,
+                 "keywords": "haste"}]
 
     def _gen_life_from_the_loam(self, ctrl, opp, ctx) -> List[Dict]:
         """Life from the Loam — 'Return up to three target land cards from
@@ -10263,6 +10291,8 @@ def build_game_context(game, player, opponent, card=None, entering_creature=None
         # _compute_alt_costs stamps _entwined when the cost was actually
         # paid; Tooth and Nail's template resolves both modes only then.
         ctx['entwined'] = bool(getattr(card, '_entwined', False))
+        # Multikicker truth (Aug 2): same contract — 0 when never kicked.
+        ctx['kicked_times'] = int(getattr(card, '_kicked_times', 0) or 0)
 
     # Escape: "sacrifice it unless it escaped" (Kroxa). This key was READ in two
     # places and written NOWHERE in production — the two tests that exercised it

@@ -316,6 +316,7 @@ def _validate_cast(engine, game: GameState, player: Player, card: Card,
     card._kicked = False
     # Entwine stamp likewise (CR 702.42 — chosen per cast).
     card._entwined = False
+    card._kicked_times = 0
 
     # June 11 audit: flashback/escape casts arrive here with the card in the
     # GRAVEYARD (marked playable by the castable-list generator), but this
@@ -722,6 +723,38 @@ def _compute_alt_costs(engine, game: GameState, player: Player, card: Card,
                 card._entwined = True
                 print(f"[ENTWINE] {card.name}: paying entwine {_ent_cost} "
                       f"(total {_ent_string}, CMC {effective_cmc})")
+
+    # Multikicker (CR 702.33c, Aug 2 2026) — REGISTRY-gated: only kick when
+    # a template actually consumes kicked_times (helpers.MULTIKICKER_MODELED
+    # — Everflowing Chalice v1). Auto-kicking a card whose kicked mode isn't
+    # modeled (Comet Storm's extra targets) would overpay for nothing. K =
+    # as many as the one-tap budget affords, capped at 8 (the loop-
+    # protection convention).
+    if (pay_mana and not getattr(card, '_cast_via_madness', False)
+            and card.name.lower() in helpers.MULTIKICKER_MODELED):
+        _mk_cost = helpers.parse_multikicker(card.oracle_text)
+        _mk_cmc = helpers.cmc_of_cost_string(_mk_cost) if _mk_cost else 0
+        if _mk_cost and _mk_cmc > 0:
+            _base_cmc = (helpers.cmc_of_cost_string(effective_mana_cost)
+                         if effective_mana_cost else 0)
+            try:
+                _budget = player.one_tap_mana_total() - _base_cmc
+            except AttributeError:
+                _budget = 0
+            _k = min(max(_budget, 0) // _mk_cmc, 8)
+            while _k > 0:
+                _mk_string = (effective_mana_cost or "") + _mk_cost * _k
+                _mk_ok, _ = player.can_pay_mana_cost(_mk_string)
+                if _mk_ok:
+                    break
+                _k -= 1
+            if _k > 0:
+                effective_mana_cost = (effective_mana_cost or "") + _mk_cost * _k
+                effective_cmc = helpers.cmc_of_cost_string(effective_mana_cost)
+                card._kicked_times = _k
+                print(f"[MULTIKICKER] {card.name}: kicked {_k}x for "
+                      f"{_mk_cost} each (total {effective_mana_cost}, "
+                      f"CMC {effective_cmc})")
 
     if not effective_mana_cost and card.oracle_text:
         oracle_lower = card.oracle_text.lower()
@@ -3494,6 +3527,81 @@ async def resolve_pending_madness(engine, game: GameState) -> List[str]:
             messages.append(f"🗑️ **{card.name}** goes to the graveyard "
                             f"(madness cost {cost} not paid)")
     return messages
+
+
+def crew_vehicle(game: GameState, player: Player, vehicle_name: str):
+    """Crew a Vehicle (CR 702.121): tap untapped creatures with total power
+    >= the printed Crew N; the Vehicle becomes an artifact creature with its
+    printed P/T until end of turn. Returns (ok, message).
+
+    Aug 2, 2026 (the corners-of-corners pass): the ONE shared implementation
+    for both executor branches (the two-activation-paths divergence rule).
+    Selection is greedy largest-power-first (fewest crewers tapped).
+    Summoning-sick creatures CAN crew — tapping as a crew cost is not a {T}
+    ability of the creature (CR 702.121c). Animation rides the established
+    _animated machinery, so effective P/T, the SBA promotion, and the
+    end-of-turn revert all work unchanged.
+    """
+    from mtg.helpers import parse_crew
+    vehicle = None
+    _vn = (vehicle_name or '').lower()
+    for c in player.battlefield:
+        if ('vehicle' in (c.type_line or '').lower()
+                and _vn and _vn in c.name.lower()):
+            vehicle = c
+            break
+    if vehicle is None:
+        return False, f"'{vehicle_name}' is not a Vehicle on your battlefield"
+    if vehicle.is_creature(game=game):
+        return False, f"{vehicle.name} is already crewed (it's a creature)"
+    n = parse_crew(getattr(vehicle, 'oracle_text', ''))
+    if n is None:
+        return False, f"{vehicle.name} has no parseable Crew cost"
+    candidates = [c for c in player.battlefield
+                  if c is not vehicle and c.is_creature(game=game)
+                  and not c.tapped]
+    def _pw(c):
+        try:
+            return c.get_effective_power(game)
+        except (AttributeError, TypeError, ValueError):
+            try:
+                return int(c.power or 0)
+            except (TypeError, ValueError):
+                return 0
+    candidates.sort(key=_pw, reverse=True)
+    crewers, total = [], 0
+    for c in candidates:
+        if total >= n:
+            break
+        crewers.append(c)
+        total += _pw(c)
+    if total < n:
+        return False, (f"Can't crew {vehicle.name} — need total power {n}, "
+                       f"only {total} available among untapped creatures")
+    for c in crewers:
+        c.tapped = True
+    # Animate with the PRINTED P/T (Vehicles carry real power/toughness).
+    try:
+        _pp = int(vehicle.power or 0)
+        _pt = int(vehicle.toughness or 0)
+    except (TypeError, ValueError):
+        _pp, _pt = 0, 0
+    vehicle._animated_until_eot = True
+    vehicle._animated_power = _pp
+    vehicle._animated_toughness = _pt
+    if 'creature' not in (vehicle.type_line or '').lower():
+        vehicle._original_type_line = vehicle.type_line
+        if '—' in (vehicle.type_line or ''):
+            _head, _tail = vehicle.type_line.split('—', 1)
+            vehicle.type_line = f"{_head.strip()} Creature — {_tail.strip()}"
+        else:
+            vehicle.type_line = f"{vehicle.type_line or 'Artifact'} Creature — Vehicle"
+    crew_names = ", ".join(c.name for c in crewers)
+    print(f"[CREW] {player.name} crews {vehicle.name} (crew {n}) by tapping "
+          f"{crew_names} (total power {total})")
+    return True, (f"🚗 {player.name} crews **{vehicle.name}** ({_pp}/{_pt}) "
+                  f"by tapping {crew_names} — it's an artifact creature "
+                  f"until end of turn")
 
 
 def suspend_card_from_hand(game: GameState, player: Player, card: Card):

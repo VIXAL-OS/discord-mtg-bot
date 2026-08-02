@@ -148,8 +148,44 @@ def _card_legality_note(card, game, opp_player) -> str:
             if (targets_creature and not targets_own_gy
                     and not targets_own_creature
                     and not targets_any_permanent):
+                # Aug 2 (hint-scoping, July-29 carry): own creatures ARE
+                # CR-legal targets, so "no legal targets" was a false claim
+                # whenever the caster had a board (Fatal Push read
+                # unplayable while the caster's own Dragon's Rage Channeler
+                # was legal). Keep the deterrent, drop the lie.
+                caster2 = next(
+                    (p for p in game.players if p is not opp_player), None)
+                if caster2 is not None and any(
+                        c.is_creature() for c in caster2.battlefield):
+                    return ("only your own creatures are legal targets — "
+                            "usually a waste")
                 return "no legal targets — opponent has 0 creatures"
     return ""
+
+
+def prose_hold_veto(raw_text: str, action: dict) -> bool:
+    """Aug 2 (the prose-says-pass class): True when the model's own prose
+    says to HOLD the exact card its JSON action casts (batch evidence:
+    Teferi's Protection burned against the model's own written reasoning —
+    the F13 pass-intent check existed only in decide_response).
+
+    Conservative on purpose: the hold marker must PRECEDE the card's name
+    within the same sentence fragment (<=40 chars between), so "cast Bolt
+    and hold Counterspell" vetoes only a Counterspell action, never the
+    Bolt. Applies to cast/activate actions with a real card name.
+    """
+    if not raw_text or not isinstance(action, dict):
+        return False
+    if action.get('type') not in ('cast', 'activate'):
+        return False
+    name = (action.get('card') or action.get('permanent') or '')
+    if not name or len(name) < 4:
+        return False
+    pat = re.compile(
+        r"\b(?:hold(?:ing)?|sav(?:e|ing)|keep(?:ing)?|don'?t cast|"
+        r"do not cast|shouldn'?t cast|wait(?:ing)? (?:on|to cast))\b"
+        r"[^.!?\n]{0,40}?" + re.escape(name.lower()))
+    return bool(pat.search(raw_text.lower()))
 
 
 def _card_target_hint(card, game, opp_player) -> str:
@@ -670,6 +706,7 @@ COMMANDER DEPLOYMENT: in commander formats your commander is usually your engine
 PLANESWALKER ABILITIES: read ALL loyalty modes, not just [+1]. Minus abilities are usually the removal/value mode (Teferi -3 bounces a threat). If loyalty meets the ultimate's cost and the ultimate wins or locks the game, USE IT — clicking [+1] forever with a game-winning -8 available is a misplay.
 SACRIFICE DISCIPLINE: never sacrifice more than one creature per turn to a free outlet (Viscera Seer, Carrion Feeder, Altars) unless a death-payoff permanent (Blood Artist, Zulaport Cutthroat, Korvold, Mayhem Devil, Bastion of Remembrance) is on YOUR battlefield, or you're dodging exile/theft. Sacrificing your board — especially your commander — for scry value loses games.
 EQUIPMENT: an Equipment in play but unattached does nothing. If you control unattached Equipment and a creature, equipping is usually better than casting another Equipment.
+CARD-ADVANTAGE ENGINES: a repeatable draw/loot/scry activation you can afford with SPARE mana (Anje Falkenrath's {T} discard-draw, Thrasios's {4}, Azcanta) is almost always worth using every turn — leaving it idle is discarding a card a turn. A CHEAP value commander (Tymna at 3 mana, any 2-3 mana commander with a triggered engine) should hit the battlefield in the first few turns, not sit in the command zone; its value compounds per turn on the battlefield and is zero in the zone. If your deck has a COMPANION (Lurrus), pay the {3} to bring it to hand as soon as you have spare mana — it's a free extra card you already paid for in deckbuilding. (Aug 2: batch audits show Tymna/Anje/Lurrus fully offered and never chosen, entire games.)
 
 THREAT EVALUATION:
 - Indestructible/hexproof/protection creatures need bounce/exile/sacrifice.
@@ -1913,6 +1950,36 @@ What is your best play? Respond with a JSON action."""
                     + f"\n  Use: {{\"type\": \"suspend\", \"card\": \"{_suspendable[0][0]}\"}}"
                 )
 
+            # Aug 2 (corners-of-corners): CREW hint — an uncrewed Vehicle is
+            # not a creature (CR 301.6) and does nothing until crewed. Offer
+            # it whenever untapped creature power can cover the crew cost.
+            from mtg.helpers import parse_crew as _parse_crew
+            _crewable = []
+            _untapped_power = 0
+            for c in player.battlefield:
+                if c.is_creature(game=game) and not c.tapped:
+                    try:
+                        _untapped_power += c.get_effective_power(game)
+                    except Exception:
+                        try:
+                            _untapped_power += int(c.power or 0)
+                        except (TypeError, ValueError):
+                            pass
+            for c in player.battlefield:
+                if ('vehicle' in (c.type_line or '').lower()
+                        and not c.is_creature(game=game)):
+                    _cn2 = _parse_crew(c.oracle_text)
+                    if _cn2 is not None and _untapped_power >= _cn2:
+                        _crewable.append((c.name, _cn2))
+            if _crewable:
+                castable_section += (
+                    "\n🚗 CREW available (tap creatures with total power ≥ N; "
+                    "the Vehicle becomes an artifact creature THIS turn — crew "
+                    "before declaring attackers to attack with it): "
+                    + ", ".join(f"{n} (crew {k})" for n, k in _crewable)
+                    + f"\n  Use: {{\"type\": \"crew\", \"vehicle\": \"{_crewable[0][0]}\"}}"
+                )
+
         # Fetchland activation hint — uncracked fetchlands produce 0 mana and should be activated.
         # At critical life totals (≤1), cracking a fetch costs 1 life and would kill us — suppress
         # the suggestion entirely. At low life (≤5) downgrade to a warning rather than a directive.
@@ -2090,6 +2157,15 @@ Based on this game state, what is your best play?
                 print(f"{self.provider_tag} [REASONING] {action['reasoning'][:200]}")
                 del action['reasoning']  # Don't pass to game engine
             print(f"{self.provider_tag} Parsed action: {action}")
+            # Aug 2 (prose-says-pass): veto a cast the model's own prose says
+            # to hold. raw_text carries the think-tag content and the
+            # stripped 'reasoning' value, so the check sees everything the
+            # model wrote.
+            if prose_hold_veto(raw_text, action):
+                print(f"{self.provider_tag} [PASS-INTENT] prose says to hold "
+                      f"{action.get('card') or action.get('permanent')} — "
+                      f"vetoing to pass")
+                action = {"type": "pass"}
 
             # Append assistant response to conversation if in conversation mode
             if conversation is not None:
@@ -2461,6 +2537,7 @@ ACTION GRAMMAR:
 - {"type": "play_land", "card": "Forest"}
 - {"type": "cast", "card": "Arcane Signet"}
 - {"type": "suspend", "card": "Rift Bolt"} — pay the Suspend cost, exile with time counters, casts free later (the ⏳ hint lists candidates)
+- {"type": "crew", "vehicle": "Smuggler's Copter"} — tap creatures with total power ≥ the crew cost; the Vehicle becomes an artifact creature until end of turn (the 🚗 hint lists candidates; crew BEFORE attacking)
 - {"type": "activate", "permanent": "Chandra, Pyromaster", "ability": 0}
 - {"type": "resolve", "description": "<one short imperative clause, no reasoning>"}
 - {"type": "pass"}
@@ -2655,6 +2732,13 @@ IMPORTANT: Always end with {"type": "pass"}. No text outside the JSON array."""
                     continue
                 if "type" not in step:
                     step["type"] = "cast" if step.get("card") else "pass"
+                # Aug 2 (prose-says-pass): drop a planned cast the model's
+                # own prose says to hold (same veto as decide_action).
+                if prose_hold_veto(raw_text, step):
+                    print(f"{self.provider_tag} [PASS-INTENT] plan prose says "
+                          f"to hold {step.get('card') or step.get('permanent')}"
+                          f" — dropping the step")
+                    continue
                 tgt = step.get("target")
                 if isinstance(tgt, (list, tuple)):
                     step["target"] = tgt[0] if tgt else None

@@ -2260,8 +2260,19 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
             else:
                 # Mark as permanently animated so EOT cleanup leaves it alone.
                 land._animated_permanent = True
-            land._animated_power = power
-            land._animated_toughness = toughness
+            # Aug 2 (crew/Chandra): Vehicles carry PRINTED P/T — "it becomes
+            # an artifact creature" animations use them instead of a stamped
+            # value ("use_printed_pt": true on the action).
+            if action.get("use_printed_pt"):
+                try:
+                    land._animated_power = int(land.power or 0)
+                    land._animated_toughness = int(land.toughness or 0)
+                except (TypeError, ValueError):
+                    land._animated_power = power
+                    land._animated_toughness = toughness
+            else:
+                land._animated_power = power
+                land._animated_toughness = toughness
             # Land/artifact becomes a creature in addition to its other types.
             # Preserve original types so end-of-turn cleanup can restore them.
             if 'Creature' not in (land.type_line or ''):

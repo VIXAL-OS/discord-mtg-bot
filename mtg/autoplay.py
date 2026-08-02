@@ -2012,6 +2012,18 @@ async def _autoplay_execute_action(cog, thread, game: GameState, player_idx: int
             await cog._autoplay_send(thread, result_msg)
         return result_msg
 
+    elif action_type == "crew":
+        # Aug 2 (corners-of-corners): crew a Vehicle — twin of the engine.py
+        # branch, one shared core (the two-activation-paths divergence rule).
+        from mtg.spells import crew_vehicle
+        _veh_name = action.get("vehicle") or action.get("card") or ""
+        ok, msg = crew_vehicle(game, player, _veh_name)
+        if not ok:
+            game._last_activation_failure = (
+                game.turn_number, _veh_name or "?", msg)
+            return None
+        return msg
+
     elif action_type == "suspend":
         # July 30 (batch-9 reviewer R2): suspend initiation on the human code
         # path — twin of the engine.py branch, one shared core (the

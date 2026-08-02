@@ -3121,6 +3121,19 @@ class GameEngine:
                 "x": action.get("X") or action.get("x") or 0,
             })
 
+        elif action_type == "crew":
+            # Aug 2 (corners-of-corners): crew a Vehicle — twin of the
+            # autoplay branch, one shared core (the two-activation-paths
+            # divergence rule).
+            from mtg.spells import crew_vehicle
+            _veh_name = action.get("vehicle") or action.get("card") or ""
+            ok, msg = crew_vehicle(game, player, _veh_name)
+            if not ok:
+                game._last_activation_failure = (
+                    game.turn_number, _veh_name or "?", msg)
+                return None
+            return msg
+
         elif action_type == "suspend":
             # July 30 (batch-9 reviewer R2): suspend initiation. Rather than
             # cast from hand, pay the suspend cost and exile with N time

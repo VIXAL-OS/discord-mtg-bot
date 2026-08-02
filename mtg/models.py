@@ -448,6 +448,10 @@ class Card:
     # it as ctx['entwined']; without it Tooth and Nail resolved both modes
     # off the base cost. Reset alongside _kicked at every cast start.
     _entwined: bool = field(default=False, repr=False, compare=False)
+    # Aug 2 2026: how many times the printed Multikicker cost was paid this
+    # cast (CR 702.33c). Registry-gated auto-kick (helpers.MULTIKICKER_
+    # MODELED); templates read it as ctx['kicked_times']. Reset per cast.
+    _kicked_times: int = field(default=0, repr=False, compare=False)
     # Animate-land duration (Aug 1 2026): player index whose NEXT turn ends
     # the animation ("Until your next turn, all lands you control become
     # 2/2..." — Sylvan Awakening). _animated_until_eot stays SET alongside
