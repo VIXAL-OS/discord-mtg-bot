@@ -2561,8 +2561,8 @@ async def _run_single_autoplay(cog, channel, game_format: str, deck1_name: str, 
         # its own reasoning models selectable via --openrouter).
         if cog._deepseek_reasoner_adapter and use_alt_adapter is cog._deepseek_adapter:
             cog.engine.claude_ai.strategist_client = cog._deepseek_reasoner_adapter
-            cog.engine.claude_ai.strategist_model = "deepseek-v4-pro"
-            print("[AUTOPLAY] Phase 3 split: actor=deepseek-v4-flash (non-thinking), strategist=deepseek-v4-pro (reasoning_effort=medium since May 23)")
+            cog.engine.claude_ai.strategist_model = "deepseek-v4-flash"
+            print("[AUTOPLAY] Phase 3 split: actor=deepseek-v4-flash (non-thinking), strategist=deepseek-v4-flash THINKING (0731 A/B — was v4-pro, Aug 2)")
         else:
             # OpenRouter or single-model path: actor and strategist share one model
             cog.engine.claude_ai.strategist_client = None
@@ -3317,9 +3317,15 @@ async def _run_single_autoplay(cog, channel, game_format: str, deck1_name: str, 
             ACTOR_INPUT_MISS_RATE = 0.14   / 1_000_000
             ACTOR_INPUT_HIT_RATE  = 0.0028 / 1_000_000
             ACTOR_OUTPUT_RATE     = 0.28   / 1_000_000
-            STRAT_INPUT_MISS_RATE = 0.435  / 1_000_000
-            STRAT_INPUT_HIT_RATE  = 0.0036 / 1_000_000
-            STRAT_OUTPUT_RATE     = 0.87   / 1_000_000
+            # Aug 2 (the flash A/B): the strategist is V4-FLASH thinking mode
+            # now, so it bills at Flash rates. Thinking tokens bill as OUTPUT
+            # on DeepSeek, so expect strat completion_tokens to RISE while
+            # the rate drops ~3x — net strat cost should still fall hard.
+            # (Revert with the llm_adapter factory: Pro rates were
+            # hit $0.0036 / miss $0.435 / out $0.87.)
+            STRAT_INPUT_MISS_RATE = 0.14   / 1_000_000
+            STRAT_INPUT_HIT_RATE  = 0.0028 / 1_000_000
+            STRAT_OUTPUT_RATE     = 0.28   / 1_000_000
             # PARALLEL-MODE CAVEAT: with real rates the CUMULATIVE
             # [STATS-CUMULATIVE] est_cost tracks the real bill. The per-game
             # [STATS-GAME] delta is UNRELIABLE under `!autoplay-parallel` — all

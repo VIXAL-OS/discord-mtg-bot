@@ -325,7 +325,7 @@ class ClaudePlayer:
         # Phase 3: split Actor (self.client) from Strategist (strategist_client).
         # None = fall back to self.client / self.model (Anthropic or single-model DeepSeek).
         # Set by IntegratedGameEngine when DEEPSEEK_API_KEY is available.
-        self.strategist_client = None   # deepseek-v4-pro for deep strategy reasoning
+        self.strategist_client = None   # the deep-reasoning strategist (v4-flash THINKING since the Aug 2 A/B; was v4-pro)
         self.strategist_model = None    # model name string for the strategist client
 
     @property
@@ -870,7 +870,12 @@ RULES (apply to your output, not your reasoning):
                 # Per-game state, not adapter state — 25 concurrent games
                 # share one adapter and a good game must not be degraded by
                 # a bad one.
-                if game._strategist_fires >= 2:
+                # Aug 2 (the flash A/B): reasoning_effort is a V4-PRO knob —
+                # the flash strategist would reject/ignore it, so the degrade
+                # is model-gated. On flash, the deadman/hard-cap remains the
+                # only (and hypothesis: rarely needed) backstop.
+                if (game._strategist_fires >= 2
+                        and 'pro' in (self.strategist_model or '')):
                     strat_kwargs['reasoning_effort'] = 'low'
                     if not game._strategist_degraded:
                         game._strategist_degraded = True

@@ -657,11 +657,11 @@ def create_openrouter_adapter(model: str = "openrouter/optimus-alpha",
 
 
 def create_deepseek_reasoner_adapter(api_key: str = None) -> 'OpenAICompatibleAdapter | None':
-    """Create a DeepSeek adapter for the Strategist role (V4-Pro + high reasoning).
+    """Create a DeepSeek adapter for the Strategist role.
 
-    Uses deepseek-v4-pro (1.6T MoE, 49B activated) with reasoning_effort=high.
-    V4-Pro defaults to thinking mode enabled on the server side, so we don't
-    pass thinking_enabled explicitly — the default is what we want.
+    Aug 2, 2026: V4-FLASH (0731 build) in THINKING mode — the Sarah-approved
+    A/B replacing V4-Pro (see the inline comment below for rationale and the
+    full revert path).
 
     Intended for the Strategist in the parallel CoT split: deep reasoning
     fires once per turn, output is a free-text strategy memo (not JSON),
@@ -669,8 +669,8 @@ def create_deepseek_reasoner_adapter(api_key: str = None) -> 'OpenAICompatibleAd
 
     Function name kept as `_reasoner_adapter` for backward compatibility with
     existing call sites (mtg.cog._deepseek_reasoner_adapter, mtg.autoplay
-    swap block). The role is "deep-reasoning strategist"; the underlying
-    model is now V4-Pro instead of the deprecated deepseek-reasoner alias.
+    swap block). The role is "deep-reasoning strategist" regardless of which
+    model backs it.
 
     Falls back gracefully to None if DEEPSEEK_API_KEY is not set.
     """
@@ -680,16 +680,24 @@ def create_deepseek_reasoner_adapter(api_key: str = None) -> 'OpenAICompatibleAd
     try:
         return OpenAICompatibleAdapter(
             api_key=key,
-            model="deepseek-v4-pro",
+            # Aug 2, 2026 (Sarah-approved A/B): strategist moved from
+            # deepseek-v4-pro (reasoning_effort=medium since May 23) to
+            # V4-FLASH THINKING MODE. Rationale: the strategist's chronic
+            # instability — density nukes, deadman/hard-cap fires,
+            # scaffolding leaks — has been V4-Pro reasoning all along, and
+            # the 0731 Flash re-post-train reports agent scores PASSING
+            # V4-Pro-Preview at ~6x lower cost. thinking_enabled=True is
+            # REQUIRED (flash defaults per-endpoint; explicit beats
+            # assumption — the cube-draft 0-token lesson in reverse).
+            # reasoning_effort is a PRO knob — flash doesn't take it (the
+            # per-game degrade in claude_player is model-gated to match).
+            # REVERT PATH: model back to "deepseek-v4-pro", drop
+            # thinking_enabled, restore reasoning_effort="medium", restore
+            # the Pro STRAT_* rates in mtg/autoplay.py, and the swap-block
+            # strings there — five edits, all tagged "Aug 2" + "A/B".
+            model="deepseek-v4-flash",
             log_tag="DEEPSEEK:REASONER",
-            # May 23 audit (CRITICAL #7): dropped from "high" → "medium" after
-            # the May 23 batch showed only 54.7% labeled-memo compliance (target
-            # ≥95%) and 48.2% cap_binding=yes (target <30%) — V4-Pro at
-            # reasoning_effort=high produces 4500+ char rambles 50% of the time,
-            # ignoring the "Aim for ~800 max" framing. Deadman fires were 0
-            # in May 23 so we have headroom to reduce effort.
-            reasoning_effort="medium",
-            # thinking defaults to enabled on V4-Pro — no need to set explicitly
+            thinking_enabled=True,
         )
     except ImportError:
         print("[DEEPSEEK:REASONER] openai package not installed. Run: pip install openai>=1.40.0")
