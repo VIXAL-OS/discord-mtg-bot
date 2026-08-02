@@ -4076,8 +4076,10 @@ class GameEngine:
                     player.battlefield.append(target_creature)
                     target_creature.entered_this_turn = True
                     if 'haste' in effect_text:
-                        if 'Haste' not in target_creature.keywords:
-                            target_creature.keywords.append('Haste')
+                        # Aug 2: temp_keywords — the printed-keywords list
+                        # aliased the card cache (phantom-Haste pollution).
+                        if 'Haste' not in target_creature.temp_keywords:
+                            target_creature.temp_keywords.append('Haste')
                     # Mark for end-step sacrifice (Sneak Attack)
                     if 'sacrifice' in effect_text and 'end' in effect_text:
                         target_creature._sneak_attack_sac = True

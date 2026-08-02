@@ -5257,8 +5257,7 @@
    "R"
   ],
   "keywords": [
-   "Magecraft",
-   "Haste"
+   "Magecraft"
   ],
   "produced_mana": [
    "R"
@@ -9435,8 +9434,7 @@
   "keywords": [
    "Indestructible",
    "Trample",
-   "Infect",
-   "Haste"
+   "Infect"
   ],
   "all_parts": [
    {
@@ -10862,8 +10860,7 @@
   ],
   "keywords": [
    "Flying",
-   "Flash",
-   "Haste"
+   "Flash"
   ],
   "legalities": {
    "standard": "not_legal",
@@ -21008,8 +21005,7 @@
   "color_identity": [],
   "keywords": [
    "Indestructible",
-   "Trample",
-   "Haste"
+   "Trample"
   ],
   "legalities": {
    "standard": "legal",
@@ -24221,8 +24217,7 @@
    "R"
   ],
   "keywords": [
-   "Flying",
-   "Haste"
+   "Flying"
   ],
   "legalities": {
    "standard": "legal",
@@ -27422,8 +27417,7 @@
   "keywords": [
    "Flying",
    "Protection",
-   "Trample",
-   "Haste"
+   "Trample"
   ],
   "legalities": {
    "standard": "not_legal",
@@ -27557,8 +27551,7 @@
   "keywords": [
    "Flying",
    "Madness",
-   "Protection",
-   "Haste"
+   "Protection"
   ],
   "legalities": {
    "standard": "not_legal",
@@ -47575,8 +47568,7 @@
    "R"
   ],
   "keywords": [
-   "Choose a background",
-   "Haste"
+   "Choose a background"
   ],
   "legalities": {
    "standard": "not_legal",
@@ -50038,8 +50030,7 @@
   "colors": [],
   "color_identity": [],
   "keywords": [
-   "Manifest",
-   "Haste"
+   "Manifest"
   ],
   "all_parts": [
    {
@@ -51513,8 +51504,7 @@
    "R"
   ],
   "keywords": [
-   "Flying",
-   "Haste"
+   "Flying"
   ],
   "legalities": {
    "standard": "not_legal",
@@ -59481,8 +59471,7 @@
    "R"
   ],
   "keywords": [
-   "Landfall",
-   "Haste"
+   "Landfall"
   ],
   "legalities": {
    "standard": "not_legal",
@@ -64133,8 +64122,7 @@
   "colors": [],
   "color_identity": [],
   "keywords": [
-   "Manifest",
-   "Haste"
+   "Manifest"
   ],
   "all_parts": [
    {
@@ -78719,8 +78707,7 @@
    "R"
   ],
   "keywords": [
-   "Flying",
-   "Haste"
+   "Flying"
   ],
   "legalities": {
    "standard": "not_legal",
@@ -96963,8 +96950,7 @@
   "keywords": [
    "Daybound",
    "Transform",
-   "Nightbound",
-   "flying"
+   "Nightbound"
   ],
   "card_faces": [
    {
@@ -105481,8 +105467,7 @@
   ],
   "keywords": [
    "Flying",
-   "Trample",
-   "Haste"
+   "Trample"
   ],
   "legalities": {
    "standard": "not_legal",
@@ -141512,8 +141497,7 @@
    "R"
   ],
   "keywords": [
-   "Flying",
-   "Haste"
+   "Flying"
   ],
   "legalities": {
    "standard": "legal",

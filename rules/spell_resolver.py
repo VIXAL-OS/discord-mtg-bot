@@ -808,11 +808,14 @@ class SpellResolver:
             if hasattr(target, 'toughness_modifier'):
                 target.toughness_modifier = getattr(target, 'toughness_modifier', 0) + effect.toughness_mod
             
-            # Add temporary keywords
+            # Add temporary keywords — into temp_keywords (Aug 2): the
+            # message below says "until end of turn" but this wrote the
+            # PRINTED list, which aliased the card cache (Tovolar's phantom
+            # lowercase 'flying' on disk came from here).
             if effect.keywords_granted:
                 for kw in effect.keywords_granted:
-                    if kw not in target.keywords:
-                        target.keywords.append(kw)
+                    if kw not in target.temp_keywords:
+                        target.temp_keywords.append(kw)
             
             pump_str = f"{effect.power_mod:+}/{effect.toughness_mod:+}"
             kw_str = f" and gains {', '.join(effect.keywords_granted)}" if effect.keywords_granted else ""

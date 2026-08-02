@@ -243,6 +243,31 @@ def find_oracle_mismatches(cache: dict, oracle_index: dict) -> list:
     return mismatches
 
 
+def find_keyword_pollution(cache: dict, oracle_index: dict) -> list:
+    """Cache entries whose keywords contain words NOT on the Scryfall record.
+
+    Aug 2, 2026: runtime keyword grants (the Sneak Attack haste class) wrote
+    through Card.keywords, which ALIASED the in-memory card cache, and the
+    next cache save persisted phantom keywords to disk — 20 committed
+    entries carried Haste no printing has (plus Tovolar's lowercase
+    'flying' from the Tier-2 pump exec). Additions-only check: Scryfall
+    ADDING keywords over time is legitimate upstream drift; the cache
+    carrying keywords Scryfall lacks is pollution.
+    """
+    polluted = []
+    for cache_key, card in cache.items():
+        if not isinstance(card, dict):
+            continue
+        name = (card.get("name") or cache_key).strip().lower()
+        ref = oracle_index.get(name)
+        if ref is None or "keywords" not in ref:
+            continue  # face records carry no keywords field — skip
+        extra = set(card.get("keywords") or []) - set(ref.get("keywords") or [])
+        if extra:
+            polluted.append((name, sorted(extra)))
+    return polluted
+
+
 def collect_hardcoded_names():
     """Yield (raw_key, lookup_name, source) for every hardcoded card name."""
     out = []
@@ -416,6 +441,17 @@ def main(argv=None) -> int:
                 print(f"  ... and {len(mismatches) - 50} more")
         else:
             print("[VALIDATOR] OK — cached oracle text matches Scryfall")
+        polluted = find_keyword_pollution(cache, oracle_index)
+        if polluted:
+            failed = True
+            print(f"[VALIDATOR] {len(polluted)} cache entr{'y' if len(polluted) == 1 else 'ies'} "
+                  f"with PHANTOM keywords (runtime-grant pollution — no printing has them):")
+            for name, extra in polluted[:30]:
+                print(f"  - {name}: {extra}")
+            print("Re-sync the entry's keywords from the bulk; find the grant "
+                  "site writing through card.keywords instead of temp_keywords.")
+        else:
+            print("[VALIDATOR] OK — no phantom keywords in the cache")
 
     # Templating-drift stage (July 30, 2026): full runs only — it needs the
     # live pattern registry, which the names stage already imported.

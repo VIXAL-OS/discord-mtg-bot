@@ -33,13 +33,23 @@ def _front_face_keywords(scryfall_data: dict) -> list:
     share one physical face, so their aggregate genuinely belongs to the
     object. Cache entries with no layout field pass through unchanged.
     """
+    # Aug 2, 2026 (cache-pollution root cause): ALWAYS return a COPY. The
+    # passthrough branches returned the cache dict's own list object, so
+    # Card.keywords ALIASED the in-memory card cache — any runtime keyword
+    # grant that appended to card.keywords (the Sneak Attack haste class)
+    # mutated the cache entry, and the next cache save persisted it to disk.
+    # 20 committed entries carried phantom keywords (19x Haste on the mythic
+    # deck's sneak targets — Emrakuls, Kozileks, Wurmcoil — plus a lowercase
+    # 'flying' on Tovolar from the Tier-2 pump exec). This also explains the
+    # July 30 "wrong Twinflame Tyrant haste edit" mystery: not a hallucinated
+    # edit, the bot's own pollution snapshotted mid-recovery.
     kws = scryfall_data.get("keywords", []) or []
     faces = scryfall_data.get("card_faces") or []
     if len(faces) < 2 or not kws:
-        return kws
+        return list(kws)
     if (scryfall_data.get("layout") or "").lower() not in (
             "transform", "modal_dfc"):
-        return kws
+        return list(kws)
     front_oracle = (faces[0].get("oracle_text") or "").lower()
     return [k for k in kws if k.lower() in front_oracle]
 

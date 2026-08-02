@@ -385,12 +385,17 @@ class TestAdditionalCombat:
         engine.end_turn(game)
         assert game._additional_combats == 0
 
-    def test_claude_path_breadcrumbs_and_resets(self):
-        # Source pin: the Claude turn path must make the drop VISIBLE and
-        # reset the counter (audits see the gap; the other player never
-        # inherits it). Consumption on that path is the documented gap.
+    def test_claude_path_defers_to_the_consumption_loop(self):
+        # Aug 2 (B1): ai_turn DEFERS instead of discarding — the autoplay
+        # main loop's _claude_extra_combats consumes after
+        # execute_claude_turn returns (both Claude flows), and the end_turn
+        # sweep remains the non-autoplay backstop, so the other player
+        # still never inherits a stale grant.
         src = (REPO / "mtg" / "ai_turn.py").read_text(encoding="utf-8")
-        assert "[EXTRA-COMBAT]" in src
+        assert "deferring to the autoplay consumption loop" in src
         idx = src.index("[EXTRA-COMBAT]")
-        assert "game._additional_combats = 0" in src[idx:idx + 800], \
-            "the breadcrumb must be paired with the reset"
+        assert "game._additional_combats = 0" not in src[idx:idx + 800], \
+            "ai_turn must not zero the grants the main loop now consumes"
+        auto = (REPO / "mtg" / "autoplay.py").read_text(encoding="utf-8")
+        assert auto.count("await _claude_extra_combats(cog, thread, game)") >= 2, \
+            "both Claude flows (human-blocks + internal-resolution) consume"

@@ -326,6 +326,14 @@ class TestUnhandledDiesQueued:
         execute_action_on_state(engine.rules, game,
                                 {"action": "destroy", "card": "Bear"})
         assert bear in rick.graveyard
+        # Aug 2 (B2, the bus unification): the destroy action QUEUES the
+        # death via CREATURE_DIED; the dispatcher drains at the next SBA
+        # check — the same deferred semantics wipes have had since July.
+        # The original guarantee is unchanged: Judith's untemplated trigger
+        # reaches the Tier-3 queue, not the void.
+        assert any(c is bear for c, _p in (game._recently_died or [])), (
+            "the death must sit on the bus-fed queue before the drain")
+        engine.check_state_based_actions(game)
         assert any(q.get('source_card') is judith
                    for q in (game.pending_async_triggers or [])), (
             "Judith's untemplated dies trigger must queue for Tier 3, "

@@ -3027,31 +3027,19 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
             game.recalculate_power_toughness()
             rules.log_event(f"{card.name} destroyed")
             is_token = bool(getattr(card, 'is_token', False))
-            # [DIES-TRIGGER] Single-target destroy bypasses SBA, so fire dies
-            # triggers inline (Bastion of Remembrance, Grave Pact, Blood Artist,
-            # Syr Konrad). Only for creatures — non-creature destroy doesn't trigger.
-            dies_msgs = []
-            if card.is_creature() and hasattr(rules, 'engine_ref') and rules.engine_ref:
-                try:
-                    trigger_msgs, _unhandled = rules.engine_ref._check_dies_triggers_sync(game, card, owner)
-                    if trigger_msgs:
-                        dies_msgs.extend(trigger_msgs)
-                    # July 21 batch audit (R1-3): the unhandled tail was
-                    # dropped here — no display, no Tier 3.
-                    if hasattr(rules.engine_ref, 'queue_unhandled_dies'):
-                        rules.engine_ref.queue_unhandled_dies(game, card, owner, _unhandled)
-                except Exception as e:
-                    print(f"[DIES-TRIGGER] Error firing inline dies-triggers for {card.name}: {e}")
-                    maybe_reraise(e)
-            # Aug 2 batch-13 (escape/graveyard reviewer): this path resolves
-            # dies triggers INLINE and never emits CREATURE_DIED, so the
-            # bus-choke-point experience grant (Meren, Ezuri) missed every
-            # destroy-action death (Birds via Fleshbag's ETB-as-destroy).
-            # Queueing here would double-fire the dies dispatcher — the
-            # shared helper is the no-double-fire seam.
+            # [DIES-TRIGGER] Aug 2 (B2, the bus unification): single-target
+            # destroy now QUEUES the death via the CREATURE_DIED choke point
+            # like every other death path (wipes, SBA, sacrifice) instead of
+            # resolving dies triggers inline — this was the last death path
+            # invisible to the bus. The dispatcher drains at the next
+            # check_state_based_actions (the same deferred semantics the
+            # July-24 FP-ledger entry documents for wipes), and its drain
+            # pipeline subsumes the old inline scan + July-21 unhandled-tail
+            # queue. The subscriber grants Meren/Ezuri experience — the
+            # batch-13 direct grant call is gone (queueing + calling would
+            # double-grant, and the ==1 pin catches exactly that).
             if card.is_creature():
-                from mtg.triggers import grant_experience_for_death
-                grant_experience_for_death(game, card, owner)
+                _queue_deaths_3a(game, [(card, owner)])
             # June 10 audit (V13): undying / persist return (CR 702.92/702.77).
             # The creature DID die (dies triggers above are correct); it
             # returns as a new object with the appropriate counter.
@@ -3104,8 +3092,6 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                 msg = f"💀 **{card.name}** destroyed"
             if ltb_msgs:
                 msg += "\n" + "\n".join(ltb_msgs)
-            if dies_msgs:
-                msg += "\n" + "\n".join(dies_msgs)
             if save_msgs:
                 msg += "\n" + "\n".join(save_msgs)
             return msg

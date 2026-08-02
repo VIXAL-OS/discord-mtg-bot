@@ -226,14 +226,17 @@ async def _resolve_combat(cog, ctx, game: GameState):
         # If it's Claude's turn (human was blocking Claude's attack),
         # continue with Claude's MAIN2 actions, then end Claude's turn
         if game.active_player.is_claude:
-            # Aug 2 batch-13: same third-path extra-combat drop visibility as
-            # the autoplay batch loop (see the twin comment there).
+            # Aug 2: LIVE play (a real human was blocking) — consumption
+            # would need the human's interactive blocks for the extra
+            # combat, so this path still discards visibly. Autoplay's
+            # Claude turns consume via _claude_extra_combats now.
             if getattr(game, '_additional_combats', 0) and not game.ended:
                 print(f"[EXTRA-COMBAT] {game._additional_combats} additional "
                       f"combat phase(s) pending on Claude's turn — not "
-                      f"consumed by this path (known gap)")
+                      f"consumed on the LIVE-play path (interactive blocks "
+                      f"needed; autoplay consumes)")
                 await ctx.send("⚔️ _(the additional combat phase is not taken "
-                               "— extra combats on Claude's turn are a known "
+                               "— extra combats in live games are a known "
                                "engine gap)_")
                 game._additional_combats = 0
             post_combat = await cog.engine.continue_claude_post_combat(game)
@@ -521,6 +524,137 @@ AUTOPLAY_PHASES = {
     "reverses": (144, 152),  # July 21 batch-4 follow-up: AI-path reverses for the coverage decks' specialty matchups
     "all": (1, 152),
 }
+
+
+async def _claude_extra_combats(cog, thread, game: GameState) -> None:
+    """Consume additional combat phases on CLAUDE's turn (Aug 2, 2026).
+
+    The Moraug-loop twin for the Claude-attacks paths. Before this, only the
+    autoplay HUMAN loop consumed `game._additional_combats` — batch-13's
+    rashmi/mythic reviewer traced Port Razer's earned phase being promised in
+    Discord ("#1 pending") and then silently discarded (the third combat
+    path had neither consumption nor a breadcrumb). Same conventions as the
+    human loop: local countdown (a phase granted DURING an extra combat —
+    Port Razer connecting again — is discarded VISIBLY at the tail, the
+    bounded-loop-protection choice), `_in_extra_combat` set so Karlach's
+    intervening-if declines (CR 603.4), and a fresh attacker list per
+    declaration. Rick's blocks come from decide_blocks with the can_block
+    guard (CR 509.1) — the May 30 devotion-god class.
+    """
+    extra = getattr(game, '_additional_combats', 0)
+    if not extra or game.ended:
+        return
+    claude_idx = game.active_player_index
+    claude_p = game.players[claude_idx]
+    combat_round = 0
+    while extra > 0 and not game.ended:
+        extra -= 1
+        game._additional_combats = extra
+        combat_round += 1
+        game._in_extra_combat = True
+        await cog._autoplay_send(
+            thread, f"⚔️ **Additional Combat Phase #{combat_round}!**")
+        game.set_phase(Phase.DECLARE_ATTACKERS,
+                       via="autoplay:claude_extra_combat")
+        game.attackers = []
+        game.blockers = {}
+        attacker_names = await cog.engine.claude_ai.decide_attackers(
+            game, claude_idx)
+        declared = []
+        if attacker_names:
+            used_ids = set()
+            for name in attacker_names:
+                card = None
+                for c in claude_p.get_zone(Zone.BATTLEFIELD):
+                    if (c.name.lower() == name.lower() and c.id not in used_ids
+                            and c.is_creature(game=game) and not c.tapped):
+                        can_atk, _r = cog.engine.rules.can_attack_with(
+                            game, claude_p, c)
+                        if can_atk:
+                            paid, _tr = cog.engine.rules.pay_attack_tax(
+                                game, claude_p, c)
+                            if paid:
+                                card = c
+                                break
+                if card:
+                    card.attacking = True
+                    card.attacking_player = 1 - claude_idx
+                    if not card.has_vigilance():
+                        cog.engine.tap_permanent(card)
+                    game.attackers.append(card.id)
+                    used_ids.add(card.id)
+                    declared.append(card.name)
+                else:
+                    print(f"[COMBAT] Proposed attacker '{name}' skipped — no "
+                          f"untapped, eligible, unclaimed instance on "
+                          f"{claude_p.name}'s battlefield")
+        if not declared:
+            await cog._autoplay_send(
+                thread, "⚔️ No attackers for the additional combat — skipping.")
+            continue
+        await cog._autoplay_send(
+            thread, f"⚔️ **{claude_p.name}** attacks with: {', '.join(declared)}")
+        for msg in cog.engine.process_attack_triggers(game, claude_idx):
+            await cog._autoplay_send(thread, msg)
+        for msg in cog.engine.check_state_based_actions(game):
+            await cog._autoplay_send(thread, f"⚡ {msg}")
+        if game.ended or not game.attackers:
+            continue
+        # Defender (Rick) blocks — compact application with the can_block
+        # guard; same-name label disambiguation is skipped here (extra
+        # combats are rare and short).
+        defender_idx = 1 - claude_idx
+        defender = game.players[defender_idx]
+        attacker_cards = []
+        for a_id in game.attackers:
+            res = game.find_card_global(a_id)
+            if res:
+                attacker_cards.append(res[0])
+        blocks = await cog.engine.claude_ai.decide_blocks(
+            game, defender_idx, attacker_cards)
+        block_msgs = []
+        for attacker_id, blocker_ids in (blocks or {}).items():
+            atk_res = game.find_card_global(attacker_id)
+            if not atk_res:
+                continue
+            attacker = atk_res[0]
+            blk_names = []
+            for b_id in blocker_ids or []:
+                b_res = game.find_card_global(b_id)
+                if not b_res:
+                    continue
+                blocker = b_res[0]
+                if not blocker.can_block(attacker, game=game):
+                    print(f"[BLOCK-INVALID] {blocker.name} cannot block "
+                          f"{attacker.name} (evasion mismatch) — skipped")
+                    continue
+                blocker.blocking.append(attacker.id)
+                attacker.blocked_by.append(blocker.id)
+                game.blockers.setdefault(attacker.id, []).append(blocker.id)
+                blk_names.append(blocker.name)
+            blk_names = [n for n in blk_names if n and n.strip()]
+            if blk_names:
+                block_msgs.append(
+                    f"{', '.join(blk_names)} blocks {attacker.name}")
+        if block_msgs:
+            await cog._autoplay_send(
+                thread, f"🛡️ **{defender.name}** blocks:\n"
+                        + "\n".join(f"• {b}" for b in block_msgs))
+        elif blocks is not None:
+            await cog._autoplay_send(
+                thread, f"🛡️ **{defender.name}** doesn't block.")
+        if game.stack_enabled and game.attackers:
+            send_fn = lambda msg: cog._autoplay_send(thread, msg)
+            await cog.engine._combat_priority_round(
+                game, send_fn, "after blockers declared")
+        if game.attackers and not game.ended:
+            await cog._autoplay_resolve_combat(thread, game)
+    game._in_extra_combat = False
+    if getattr(game, '_additional_combats', 0) > 0:
+        print(f"[EXTRA-COMBAT] Discarding {game._additional_combats} phase(s) "
+              f"granted mid-extra-combat (loop-protection cap — one "
+              f"consumption pass per turn)")
+    game._additional_combats = 0
 
 
 async def _advance_phase_with_display(cog, thread, game: GameState):
@@ -2962,26 +3096,13 @@ async def _run_single_autoplay(cog, channel, game_format: str, deck1_name: str, 
                         if game.attackers and not game.ended:
                             await cog._autoplay_resolve_combat(thread, game)
 
-                        # Aug 2 batch-13 (rashmi/mythic reviewer): THIS is the
-                        # third combat path (Claude attacks, Rick blocks, main
-                        # loop resolves) — it has neither the Moraug
-                        # consumption loop nor ai_turn's COMBAT_END breadcrumb,
-                        # so Port Razer's earned extra phase was promised in
-                        # Discord ("#1 pending") and then silently discarded by
-                        # the end_turn sweep (console-only). Full consumption
-                        # on Claude's turns is the documented open gap; until
-                        # then the drop must be Discord-visible.
+                        # Aug 2: Claude's earned extra combats are CONSUMED
+                        # now (the third-path silent discard the batch-13
+                        # reviewer traced — Port Razer's phase promised in
+                        # Discord then eaten). This position is CR-correct:
+                        # the extra combat runs BEFORE the postcombat main.
                         if getattr(game, '_additional_combats', 0) and not game.ended:
-                            print(f"[EXTRA-COMBAT] {game._additional_combats} "
-                                  f"additional combat phase(s) pending on "
-                                  f"Claude's turn — not consumed by this path "
-                                  f"(known gap: autoplay human loop only)")
-                            await cog._autoplay_send(
-                                thread,
-                                "⚔️ _(the additional combat phase is not taken "
-                                "— extra combats on Claude's turn are a known "
-                                "engine gap)_")
-                            game._additional_combats = 0
+                            await _claude_extra_combats(cog, thread, game)
 
                         if game.phase == Phase.MAIN2 and not game.ended:
                             post_combat = await cog.engine.continue_claude_post_combat(game)
@@ -2989,6 +3110,16 @@ async def _run_single_autoplay(cog, channel, game_format: str, deck1_name: str, 
                             if post_combat:
                                 msg = "**Claude (post-combat):**\n" + "\n".join(f"\u2022 {a}" for a in post_combat)
                                 await cog._autoplay_send(thread, msg)
+
+                    # Aug 2: the INTERNAL-resolution flow (execute_claude_turn
+                    # resolved combat itself \u2014 Rick had no blocks to make)
+                    # leaves grants pending too, now that ai_turn DEFERS
+                    # instead of discarding. Consumption here lands after the
+                    # in-turn MAIN2 \u2014 a documented ordering approximation,
+                    # strictly better than the silent discard it replaces.
+                    if (not game.ended
+                            and getattr(game, '_additional_combats', 0)):
+                        await _claude_extra_combats(cog, thread, game)
                 else:
                     actions = await cog._autoplay_human_turn(thread, game, game.active_player_index)
                     if actions:

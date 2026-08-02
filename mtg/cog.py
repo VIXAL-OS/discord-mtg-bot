@@ -2446,8 +2446,12 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
                         target_creature.entered_this_turn = True
                         # Grant haste if mentioned
                         if 'haste' in effect_text:
-                            if 'Haste' not in target_creature.keywords:
-                                target_creature.keywords.append('Haste')
+                            # Aug 2: temp_keywords, not the printed list —
+                            # keywords aliased the card cache and persisted
+                            # phantom Haste to disk (sneak sacs at end step,
+                            # so the end-of-turn clear is the right duration).
+                            if 'Haste' not in target_creature.temp_keywords:
+                                target_creature.temp_keywords.append('Haste')
                         messages.append(f"🎭 **{target_creature.name}** enters the battlefield with haste!")
                         # Note sacrifice clause
                         if 'sacrifice' in effect_text:
@@ -2833,8 +2837,9 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
                 
                 # Grant haste
                 if 'haste' in effect_text or 'Sneak Attack' in game.pending_action.get('card_id', ''):
-                    if 'Haste' not in target_creature.keywords:
-                        target_creature.keywords.append('Haste')
+                    # Aug 2: temp_keywords (see the twin comment above).
+                    if 'Haste' not in target_creature.temp_keywords:
+                        target_creature.temp_keywords.append('Haste')
                 
                 await ctx.send(f"🎭 **{target_creature.name}** enters the battlefield with haste!")
                 if 'sacrifice' in effect_text:
