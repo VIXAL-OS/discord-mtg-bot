@@ -659,7 +659,7 @@ def create_openrouter_adapter(model: str = "openrouter/optimus-alpha",
 def create_deepseek_reasoner_adapter(api_key: str = None) -> 'OpenAICompatibleAdapter | None':
     """Create a DeepSeek adapter for the Strategist role.
 
-    Aug 2, 2026: V4-FLASH (0731 build) in THINKING mode — the Sarah-approved
+    Aug 2, 2026: V4-FLASH (0731 build) in THINKING mode — the approved
     A/B replacing V4-Pro (see the inline comment below for rationale and the
     full revert path).
 
@@ -680,7 +680,7 @@ def create_deepseek_reasoner_adapter(api_key: str = None) -> 'OpenAICompatibleAd
     try:
         return OpenAICompatibleAdapter(
             api_key=key,
-            # Aug 2, 2026 (Sarah-approved A/B): strategist moved from
+            # Aug 2, 2026 (approved A/B): strategist moved from
             # deepseek-v4-pro (reasoning_effort=medium since May 23) to
             # V4-FLASH THINKING MODE. Rationale: the strategist's chronic
             # instability — density nukes, deadman/hard-cap fires,

@@ -1,4 +1,4 @@
-"""Aug 2, 2026 — the strategist V4-Flash A/B (Sarah-approved).
+"""Aug 2, 2026 — the strategist V4-Flash A/B (operator-approved).
 
 The strategist's chronic instability (density nukes, deadman/hard-cap
 fires, scaffolding leaks) has been V4-PRO reasoning all along; the 0731
