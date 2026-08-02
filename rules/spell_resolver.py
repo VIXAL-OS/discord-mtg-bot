@@ -598,15 +598,24 @@ class SpellResolver:
         """Execute draw effect."""
         messages = []
         amount = effect.amount
-        
+
         # Draw for controller by default
         player = ctx.source_controller
-        
-        # Check if there's a target player
-        for target in ctx.targets:
-            if hasattr(target, 'life') and hasattr(target, 'hand'):
-                player = target
-                break
+
+        # Aug 2 batch-13 (delve reviewer): ctx.targets is shared across the
+        # WHOLE spell's clauses, so an unconditional "Draw a card." was being
+        # redirected to whichever player another clause auto-targeted
+        # (Thought Scour: the dropped mill clause targeted the opponent, who
+        # then received the caster's draw). Only redirect when the draw
+        # clause ITSELF names a target/that player.
+        _draw_clause = (effect.raw_text or '').lower()
+        _clause_targets_player = bool(re.search(
+            r'\b(target|that) (player|opponent)\b[^.]*draw', _draw_clause))
+        if _clause_targets_player:
+            for target in ctx.targets:
+                if hasattr(target, 'life') and hasattr(target, 'hand'):
+                    player = target
+                    break
         
         drawn = []
         for _ in range(amount):

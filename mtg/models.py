@@ -443,6 +443,11 @@ class Card:
     # the start of every cast alongside _was_spectacled; free casts and
     # madness casts never kick (documented at the cost site).
     _kicked: bool = field(default=False, repr=False, compare=False)
+    # Aug 2 2026 (batch-13): True when the printed Entwine cost was actually
+    # paid this cast (CR 702.42 — the kicker pattern's twin). Templates read
+    # it as ctx['entwined']; without it Tooth and Nail resolved both modes
+    # off the base cost. Reset alongside _kicked at every cast start.
+    _entwined: bool = field(default=False, repr=False, compare=False)
     # Animate-land duration (Aug 1 2026): player index whose NEXT turn ends
     # the animation ("Until your next turn, all lands you control become
     # 2/2..." — Sylvan Awakening). _animated_until_eot stays SET alongside
@@ -2836,8 +2841,18 @@ class Player:
                     continue
                 if generic_still_needed <= 0:
                     break
-                tapped_cards.add(id(card))
                 prod_amount = sum(production.values())
+                # Aug 2 batch-13 (the ~4% +1 over-tap): ZERO-producers land in
+                # this bucket — fetchlands ({'C': 0} by design), Temple of the
+                # False God under 5 lands, an empty Gaea's Cradle — because the
+                # produces_colors filter is v>0 and they have no 'any'. Tapping
+                # one yields nothing, burns the tap, and the loop then reaches a
+                # real source anyway (Flooded Strand tapped alongside two duals
+                # for a {1}{W} Wall of Omens, game_1533272913728372764). Never
+                # tap a source that produces nothing.
+                if prod_amount <= 0:
+                    continue
+                tapped_cards.add(id(card))
                 mana_produced['C'] = mana_produced.get('C', 0) + prod_amount
                 generic_still_needed -= prod_amount
 
@@ -3709,6 +3724,24 @@ class GameState:
     # never grant the NEXT player a phantom extra combat (the stale-value
     # leak the sweep exists for).
     _additional_combats: int = field(default=0, repr=False, compare=False)
+    # Aug 2 2026 (batch-13 audit): True while the Moraug consumption loop is
+    # running an ADDITIONAL combat phase. Karlach, Fury of Avernus's trigger
+    # carries an intervening-if ("if it's the first combat phase of the
+    # turn", CR 603.4) that must decline in extra combats — without the gate
+    # her generator granted untap + first strike + another phase on every
+    # attack, masked only by the loop-tail discard.
+    _in_extra_combat: bool = field(default=False, repr=False, compare=False)
+    # Aug 2 2026 (batch-13 audit): card name → turn number, stamped when a
+    # "for the first time each turn" attack trigger fires (Aurelia, the
+    # Warleader). A second attack the same turn (only reachable via an extra
+    # combat) finds the stamp and declines per the printed condition.
+    _attack_trigger_turn_stamps: dict = field(default_factory=dict, repr=False, compare=False)
+    # Aug 2 2026 (batch-13): card id → turn number the impulse exile
+    # happened. "Until the end of your NEXT turn" (Light Up the Stage) —
+    # the old unconditional every-player end_turn clear ended the window the
+    # same turn it opened. end_turn expires only the ENDING player's
+    # previous-turn entries.
+    _impulse_cast_turns: dict = field(default_factory=dict, repr=False, compare=False)
     # July 29 batch audit: True once a final=True game-summary send has gone
     # out. The post-game flush gate in cog._autoplay_send suppresses only
     # AFTER this — the ended→summary window carries the lethal combat's own

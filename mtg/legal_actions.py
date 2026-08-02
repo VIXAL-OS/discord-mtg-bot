@@ -238,6 +238,20 @@ def castable_entries(game, player, mana_by_color: Dict, any_color_mana: int,
     entries: List[Dict] = []
     labels_seen: List[str] = []
 
+    # Aug 2 batch-13 (standard reviewer): the advertised total double-counts
+    # OR-duals (mana_by_color credits EVERY color a dual can produce) — the
+    # July 20 one-tap gate fixed the PAYMENT side, and the July 30
+    # legal_actions unification preserved the old computation on the
+    # ADVERTISEMENT side, so Solitude ({3}{W}{W}) was offered castable off 3
+    # physical sources and the cast failed at payment
+    # (game_1533284211195252827). Cap the total at the physical one-tap
+    # ceiling; the per-color sums stay as the necessary-condition check
+    # (never over-rejects — the tap engine remains the arbiter).
+    try:
+        total_mana = min(total_mana, player.one_tap_mana_total())
+    except AttributeError:
+        pass  # duck-typed test players without the method keep their claim
+
     def add(e: Dict):
         entries.append(e)
         labels_seen.append(e["label"])

@@ -366,7 +366,13 @@ def _find_any_valid_target(game, card, caster_name):
             # PLANESWALKER restriction via the tail. The target TYPE is what
             # precedes the qualifier; dropping it errs permissive (an
             # existence check, not full validation).
-            phrase = re.split(r'\s+that\s+', phrase)[0]
+            # Aug 2 batch-13 (standard reviewer): "if"/"unless" tails are
+            # resolution-time conditions, not targeting restrictions (CR
+            # 601.2c) — Prismatic Ending's "target nonland permanent if its
+            # mana value is ... to cast this spell" kept the word "spell" in
+            # the phrase, parsed as TargetType.SPELL, and read unplayable on
+            # every empty stack for the whole game.
+            phrase = re.split(r'\s+(?:that|if|unless)\s+', phrase)[0]
             restriction = TargetTextParser.parse(phrase)
             if not _restriction_satisfiable(restriction):
                 return False
@@ -647,6 +653,25 @@ def _check_resolution_targets(game, stack_entry):
                         return False, ""
                 return True, f"{card.name} fizzles — {target.name} is no longer on the stack"
 
+            # Aug 2 batch-13 (escape/graveyard reviewer): a spell whose LEGAL
+            # target lives in a graveyard/exile ("Choose two target creature
+            # cards in your graveyard" — Victimize) resolved its target to a
+            # Card object at cast time and then this branch, which only ever
+            # scanned battlefields, declared it "no longer on the
+            # battlefield" — a guaranteed fizzle for the whole class
+            # (game_1533284299858514130: Gray Merchant sat untouched in the
+            # caster's graveyard). When the source's oracle targets a
+            # non-battlefield zone, the target being IN that zone is legal.
+            _src_oracle = (card.oracle_text or '').lower()
+            _targets_gy = bool(re.search(
+                r'target [^.]*card[^.]*\b(?:in|from) (?:a |your |an opponent\'s )?graveyard',
+                _src_oracle))
+            _targets_exile = 'target' in _src_oracle and 'in exile' in _src_oracle
+            if _targets_gy or _targets_exile:
+                for pl in game.players:
+                    zone = pl.graveyard if _targets_gy else pl.exile
+                    if target in zone:
+                        return False, ""
             # Otherwise target should be a permanent on the battlefield.
             card_still_on_bf = False
             for pl in game.players:
@@ -692,6 +717,20 @@ def _parse_target_restriction_from_oracle(card):
         stripped = re.sub(r'\([^)]*\)', '', oracle.lower())
         if 'target' not in stripped:
             return None
+        # Aug 2 batch-13 (rashmi/mythic reviewer): "any target" is the modern
+        # Oracle templating for creature/player/planeswalker (CR glossary) —
+        # the descriptor precedes the word "target", so the primary-phrase
+        # capture below starts mid-sentence and picks up garbage instead.
+        # July 30 gave _find_any_valid_target (the CAST gate) this
+        # recognition; the RESOLUTION-time re-check never got it, so a
+        # legally-cast Comet Storm fizzled against a player with "players
+        # are not creatures" (game_1533272987539734779).
+        if re.search(r'\bany target\b', stripped):
+            restriction = TargetRestriction()
+            restriction.target_types = {TargetType.CREATURE,
+                                        TargetType.PLAYER,
+                                        TargetType.PLANESWALKER}
+            return restriction
         # Primary restriction (first phrase) — preserves controller, P/T,
         # color, keyword, and zone fields for the fizzle check.
         tm = re.search(r'target\s+([\w\s,/-]+?)(?:\.|;|\band\b|\bor\b|$)', stripped)

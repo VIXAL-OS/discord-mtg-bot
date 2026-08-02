@@ -1170,10 +1170,28 @@ class PlaneswalkerManager:
                            'tapped', 'attacking', 'a', 'an'}
             _name_words = [w for w in _desc_words if w.lower() not in _skip_words]
             _tok_name = ' '.join(w.capitalize() for w in _name_words) or 'Token'
+            # Aug 2 batch-13 (rashmi/mythic reviewer): the type line was
+            # hardcoded "Token Creature — X" regardless of what the ability
+            # SAYS — Chandra, Spark Hunter's "3/2 colorless Vehicle artifact
+            # token with crew 1" entered as a Creature and attacked without
+            # ever being crewed (CR 301.6/509 violation). Derive the card
+            # type from the descriptor: only call it a creature when the
+            # descriptor says so; Vehicles are artifacts until crewed (the
+            # crew/animate machinery itself stays unmodeled — but an
+            # un-crewed Vehicle correctly can't attack or block now).
+            _desc_lower = (token_desc or '').lower()
+            if 'vehicle' in _desc_lower:
+                _tok_type_line = "Token Artifact — Vehicle"
+            elif 'artifact' in _desc_lower and 'creature' not in _desc_lower:
+                _tok_type_line = f"Token Artifact — {_tok_name}"
+            elif 'enchantment' in _desc_lower and 'creature' not in _desc_lower:
+                _tok_type_line = f"Token Enchantment — {_tok_name}"
+            else:
+                _tok_type_line = f"Token Creature — {_tok_name}"
             for i in range(amount):
                 token = Card(
                     name=_tok_name,
-                    type_line=f"Token Creature — {_tok_name}",
+                    type_line=_tok_type_line,
                     power=power,
                     toughness=toughness,
                     owner_index=game.players.index(player),

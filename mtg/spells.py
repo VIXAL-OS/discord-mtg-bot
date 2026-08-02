@@ -314,6 +314,8 @@ def _validate_cast(engine, game: GameState, player: Player, card: Card,
     card._was_spectacled = False
     # Kicker stamp likewise (CR 702.33 — kicking is chosen per cast).
     card._kicked = False
+    # Entwine stamp likewise (CR 702.42 — chosen per cast).
+    card._entwined = False
 
     # June 11 audit: flashback/escape casts arrive here with the card in the
     # GRAVEYARD (marked playable by the castable-list generator), but this
@@ -703,6 +705,23 @@ def _compute_alt_costs(engine, game: GameState, player: Player, card: Card,
                 card._kicked = True
                 print(f"[KICKER] {card.name}: paying kicker {_kick_cost} "
                       f"(total {_kicked_string}, CMC {effective_cmc})")
+
+    # Entwine (CR 702.42, Aug 2 2026 batch-13): the kicker branch's twin —
+    # an ADDITIVE optional cost that unlocks "choose both" on a modal spell.
+    # v1 gate: entwine whenever the entwined total is payable (both modes is
+    # the designed-better resolution — Tooth and Nail's whole point). The
+    # template reads ctx['entwined'] and resolves ONE mode when unpaid.
+    if pay_mana and not getattr(card, '_cast_via_madness', False):
+        _ent_cost = helpers.parse_entwine(card.oracle_text)
+        if _ent_cost and effective_mana_cost:
+            _ent_string = effective_mana_cost + _ent_cost
+            _ent_ok, _ = player.can_pay_mana_cost(_ent_string)
+            if _ent_ok:
+                effective_mana_cost = _ent_string
+                effective_cmc = helpers.cmc_of_cost_string(_ent_string)
+                card._entwined = True
+                print(f"[ENTWINE] {card.name}: paying entwine {_ent_cost} "
+                      f"(total {_ent_string}, CMC {effective_cmc})")
 
     if not effective_mana_cost and card.oracle_text:
         oracle_lower = card.oracle_text.lower()
@@ -1978,6 +1997,20 @@ async def _dispatch_resolution(engine, game: GameState, player: Player,
                                 ""
                             )
                             print(f"[SPELL-TEMPLATE] Conditional not met for {card.name}: {_cond_reason or tmpl_explanation}")
+                            # Aug 2 batch-13 (delve reviewer): a paid cast that
+                            # resolution-declines returns success=True, so the
+                            # AI got NO feedback and cast a second Searing
+                            # Blaze into the same empty board the same turn.
+                            # Feed the rejection loop the way _validate_plan_
+                            # mana's _reject does (same tuple shape, same
+                            # consumer prunes/dedupes it).
+                            try:
+                                game._recent_plan_rejections.append(
+                                    (card.name,
+                                     f"resolved with no effect — {_cond_reason or 'condition not met'}",
+                                     game.turn_number))
+                            except AttributeError:
+                                pass
                         if not hasattr(game, '_recently_resolved_spells'):
                             game._recently_resolved_spells = set()
                         game._recently_resolved_spells.add(card.name)

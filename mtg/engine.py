@@ -1899,7 +1899,21 @@ class GameEngine:
                 card.toughness_modifier = 0
                 card.temp_keywords = []
             # Clear playable from exile
-            player.playable_from_exile = []
+            # Aug 2 batch-13 (delve reviewer): "until the end of your NEXT
+            # turn" — the unconditional every-player clear ended the impulse
+            # window the same turn it opened (Light Up the Stage's exiles
+            # were unplayable before the opponent's turn began). Only the
+            # player whose turn is ENDING expires entries, and only those
+            # exiled on a PREVIOUS turn; unstamped legacy entries keep the
+            # old owner's-end-turn clear.
+            _imp_stamps = getattr(game, '_impulse_cast_turns', {}) or {}
+            if player is game.active_player:
+                _imp_kept = [cid for cid in (player.playable_from_exile or [])
+                             if _imp_stamps.get(cid) == game.turn_number]
+                for cid in (player.playable_from_exile or []):
+                    if cid not in _imp_kept:
+                        _imp_stamps.pop(cid, None)
+                player.playable_from_exile = _imp_kept
             # Clear playable from graveyard (Snapcaster flashback)
             if hasattr(player, 'playable_from_graveyard'):
                 player.playable_from_graveyard = []
@@ -2159,6 +2173,12 @@ class GameEngine:
                 print(f"[UPKEEP-TRIGGER] Error processing upkeep triggers: {e}")
         
         elif game.phase == Phase.DRAW:
+            # Aug 2 batch-13 (CR 104.2a): defense-in-depth twin of the
+            # autoplay chain gate — no draw-step mutation once the game has
+            # ended (an upkeep trigger's lethal damage can end it one phase
+            # earlier in the same caller's chain).
+            if game.ended:
+                return game.phase, messages
             # July 29 (CR 611.2c): computed live from the battlefield — the old
             # sticky _skip_draw flag had no expiry and no removal cleanup, so
             # an exiled Solitary Confinement kept eating draw steps forever.
@@ -2524,6 +2544,7 @@ class GameEngine:
             print(f"[COMBAT-SWEEP] Discarding {game._additional_combats} "
                   f"unconsumed additional combat phase(s) at end of turn")
         game._additional_combats = 0
+        game._in_extra_combat = False
 
         # [TRANSFORM] Save spell count for day/night and werewolf transform tracking
         game.active_player.spells_cast_prev_turn = game.active_player.spells_cast_this_turn

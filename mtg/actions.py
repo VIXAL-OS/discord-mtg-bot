@@ -2592,7 +2592,12 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
         winner = find_player(winner_name)
         if winner:
             game.ended = True
-            game.winner = winner
+            # game.winner is an INDEX everywhere else (every consumer does
+            # game.players[game.winner]) — storing the Player object here
+            # crashed the autoplay summary the first time an alternate win
+            # condition fired live (Hellkite Tyrant's 20-artifact upkeep win,
+            # batch 15332).
+            game.winner = game.players.index(winner)
             print(f"[WIN_GAME] {winner.name} wins! Reason: {reason}")
             return f"🏆 **{winner.name} wins the game!** ({reason})"
         return f"🏆 Win condition triggered but player '{winner_name}' not found"
@@ -3038,6 +3043,15 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                 except Exception as e:
                     print(f"[DIES-TRIGGER] Error firing inline dies-triggers for {card.name}: {e}")
                     maybe_reraise(e)
+            # Aug 2 batch-13 (escape/graveyard reviewer): this path resolves
+            # dies triggers INLINE and never emits CREATURE_DIED, so the
+            # bus-choke-point experience grant (Meren, Ezuri) missed every
+            # destroy-action death (Birds via Fleshbag's ETB-as-destroy).
+            # Queueing here would double-fire the dies dispatcher — the
+            # shared helper is the no-double-fire seam.
+            if card.is_creature():
+                from mtg.triggers import grant_experience_for_death
+                grant_experience_for_death(game, card, owner)
             # June 10 audit (V13): undying / persist return (CR 702.92/702.77).
             # The creature DID die (dies triggers above are correct); it
             # returns as a new object with the appropriate counter.
@@ -4771,6 +4785,15 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                 return f"🚫 {p.name} can't search their library ({blocker})"
             import random as _rng
             type_parts = [t.strip().lower() for t in card_type.split(" or ")] if card_type else []
+            # Aug 2 batch-13 (escape/graveyard reviewer): the JSON templates
+            # use "card_type": "Any" as an unrestricted-tutor sentinel
+            # (Demonic Tutor, Entomb, Vile Entomber, Vampiric Tutor), but
+            # this filter matched it as a literal type-line SUBSTRING — the
+            # word "any" appears in no type line, so every candidate was
+            # rejected and the searches "found nothing matching", twice live
+            # in game_1533284299858514130. Sentinel words mean NO filter.
+            type_parts = [t for t in type_parts
+                          if t not in ('any', 'all', 'card', 'any card')]
 
             def _candidate(lib_card):
                 type_line = (lib_card.type_line or "").lower()
@@ -4815,6 +4838,14 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                     p.battlefield.append(chosen_card)
                 elif to_zone == "library_top":
                     p.library.insert(0, chosen_card)
+                elif to_zone == "graveyard":
+                    # Aug 2 batch-13: this branch didn't exist — Entomb-class
+                    # searches printed "→ graveyard" while appending to HAND.
+                    # Invisible until the "Any" filter fix made these searches
+                    # find anything at all (the pin caught it on first run).
+                    p.graveyard.append(chosen_card)
+                elif to_zone == "exile":
+                    p.exile.append(chosen_card)
                 else:
                     p.hand.append(chosen_card)
                 found_names.append(chosen_card.name)
@@ -5046,6 +5077,7 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
             if not hasattr(p, 'playable_from_exile'):
                 p.playable_from_exile = []
             p.playable_from_exile.append(card.id)
+            game._impulse_cast_turns[card.id] = game.turn_number
             opponent = game.players[1 - game.players.index(p)] if len(game.players) > 1 else None
             if opponent:
                 rules._apply_noncombat_damage_to_player(game, opponent, damage, "Chandra")
@@ -5083,6 +5115,7 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
             p.exile.append(top)
             if _mark_playable:
                 p.playable_from_exile.append(top.id)
+                game._impulse_cast_turns[top.id] = game.turn_number
             exiled_names.append(top.name)
         if not exiled_names:
             return f"📚 {p.name}'s library is empty — nothing to exile"
@@ -5556,6 +5589,10 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
         player_name = action.get("player")
         card_name = (action.get("card_name") or action.get("card") or "").lower()
         filter_type = (action.get("filter_type") or "").lower()
+        # Aug 2 batch-13: same "Any" no-filter sentinel as the template-path
+        # search handler above (Tier-3 emissions use this vocabulary).
+        if filter_type in ('any', 'all', 'card', 'any card'):
+            filter_type = ""
         max_cmc = action.get("max_cmc")
         to_zone = (action.get("to_zone") or "hand").lower()
         tapped = action.get("tapped", False)

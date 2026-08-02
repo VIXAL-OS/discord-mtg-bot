@@ -1042,6 +1042,21 @@ def parse_kicker(oracle_text):
     return m.group(1) if m else None
 
 
+def parse_entwine(oracle_text):
+    """Parse a printed "Entwine {cost}" line (CR 702.42). Returns the entwine
+    cost string ("{2}", "{1}{G}", ...) or None.
+
+    Aug 2, 2026 (batch-13 rashmi/mythic reviewer): Tooth and Nail's template
+    granted BOTH modes at the base cost — entwine appeared nowhere in the
+    codebase. Same additive-optional-cost family as kicker (the parse
+    anchors on the ability word + brace costs, so reminder text never
+    matches)."""
+    if not oracle_text:
+        return None
+    m = re.search(r'\bentwine ((?:\{[^}]+\})+)', oracle_text, re.IGNORECASE)
+    return m.group(1) if m else None
+
+
 def commander_declines_graveyard_redirect(card) -> bool:
     """CR 903.9a's command-zone redirect is a MAY, and autoplay always took
     it — which made escape commanders structurally unable to reach the

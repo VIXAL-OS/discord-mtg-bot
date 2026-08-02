@@ -368,6 +368,16 @@ class TargetValidator:
                 return True
             if target_type == TargetType.SPELL and "spell" in target.types:
                 return True
+            # Aug 2 batch-13 (escape/graveyard reviewer): CARD had NO branch
+            # — the loop fell through and every "target card in/from a
+            # graveyard" restriction rejected every candidate, making the
+            # whole spell class permanently uncastable through autoplay
+            # (Cling to Dust flagged unplayable all game, its one escape
+            # cast rolled back). A CARD restriction constrains the ZONE, not
+            # the card type — the zone check runs separately in can_target,
+            # so any non-player object satisfies the type gate.
+            if target_type == TargetType.CARD and not target.is_player:
+                return True
 
         return False
     

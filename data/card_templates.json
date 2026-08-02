@@ -181,7 +181,7 @@
       "actions": [
         {
           "action": "no_action",
-          "reason": "Meren: experience counter tracked by engine; return resolves at end step"
+          "reason": "Meren gets an experience counter — her return resolves at end step"
         }
       ]
     },
@@ -280,18 +280,6 @@
           "keywords": [
             "Flying"
           ]
-        }
-      ]
-    },
-    {
-      "key": "aurelia, the warleader",
-      "name": "Aurelia, the Warleader",
-      "event": "etb",
-      "description": "First attack each turn: untap all creatures, get extra combat + main phase",
-      "actions": [
-        {
-          "action": "no_action",
-          "reason": "Aurelia: extra combat phase! Untap all creatures, additional combat + main (use !fix)"
         }
       ]
     },
@@ -1925,7 +1913,7 @@
       ]
     },
     {
-      "key": "spell queller_ltb",
+      "key": "spell queller ltb",
       "name": "Spell Queller (LTB)",
       "event": "etb",
       "description": "When Spell Queller leaves, the exiled card returns to its owner's hand (approximation of free-cast LTB)",
@@ -2199,22 +2187,6 @@
           "action": "draw_cards",
           "player": "$controller",
           "amount": 2
-        }
-      ]
-    },
-    {
-      "key": "tooth and nail",
-      "name": "Tooth and Nail",
-      "event": "etb",
-      "description": "Search for 2 creatures and put them onto the battlefield",
-      "actions": [
-        {
-          "action": "search_library",
-          "player": "$controller",
-          "count": 2,
-          "card_type": "creature",
-          "to_zone": "battlefield",
-          "reason": "Tooth and Nail (entwined): 2 creatures to battlefield"
         }
       ]
     },

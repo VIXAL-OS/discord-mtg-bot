@@ -398,7 +398,16 @@ class EffectTemplateLibrary:
         # ETB-steal template fire every turn, cascading control-theft from
         # Rick's Mind Stone → Painter's Servant → Honor of the Pure across
         # consecutive end steps in game_1508575038356455638.
-        if event_type in ("upkeep", "end_step", "beginning_combat"):
+        # Aug 2 batch-13: "ltb" added — the Spell Queller / Detention Sphere
+        # release templates were DOUBLY unreachable: "ltb" was missing from
+        # this tuple AND from _NAME_KEYED_EVENT_TYPES (the latter exclusion
+        # is deliberate — a bare ETB name key must not fire on LTB), so the
+        # suffix key is the only sanctioned vehicle. Queller's first-ever
+        # real exile (batch 15332) escalated its LTB to Tier 3, which knew
+        # nothing about the linked exile. The JSON key also carried an
+        # underscore ("spell queller_ltb") where this lookup builds
+        # space-separated keys — both halves fixed together.
+        if event_type in ("upkeep", "end_step", "beginning_combat", "ltb"):
             suffix_key = f"{card_key} {event_type.replace('_', '')}"
             # Also try the "card_name endstep"-style key (no underscore) which
             # matches the registration convention used at line ~6138.
@@ -2181,11 +2190,20 @@ class EffectTemplateLibrary:
         def _gen_karlach_attack(ctrl, opp, ctx):
             # Aug 1 deferred slate: the additional combat phase is granted
             # now (additional_combat action → the Moraug consumption loop).
+            # Aug 2 batch-13: Karlach's printed intervening-if ("if it's the
+            # first combat phase of the turn", CR 603.4) — the whole trigger
+            # declines in an extra combat. Without the gate she re-granted
+            # untap + first strike + another phase on every attack, masked
+            # only by the consumption loop's tail discard.
+            g = ctx.get('_game')
+            if g is not None and getattr(g, '_in_extra_combat', False):
+                return [{"action": "no_action",
+                         "reason": "Karlach: not the first combat phase of "
+                                   "the turn (intervening if, CR 603.4)"}]
             acts = [{"action": "grant_keywords", "player": ctrl,
                      "target": "all_own_creatures", "keywords": ["first strike"]},
                     {"action": "additional_combat",
                      "source": "Karlach, Fury of Avernus"}]
-            g = ctx.get('_game')
             if g is not None:
                 for _atk_id in list(getattr(g, 'attackers', []) or []):
                     _res = g.find_card_global(_atk_id)
@@ -2703,6 +2721,24 @@ class EffectTemplateLibrary:
 
         # --- Creature-enters triggers (for other permanents) ---
         # Trostani: whenever a creature enters, gain life equal to its toughness
+        # Aug 2 batch-13: Life from the Loam was a zero-action Tier-3
+        # escalation (no template anywhere).
+        self._add_card("life from the loam", EffectTemplate(
+            name="Life from the Loam",
+            description=("Return up to three land cards from your graveyard "
+                         "to your hand"),
+            action_generator=self._gen_life_from_the_loam,
+        ))
+        # Aug 2 batch-13: moved from card_templates.json — JSON can't branch
+        # on ctx['entwined'], and the flat entry resolved the entwined result
+        # unconditionally (both modes at base cost).
+        self._add_card("tooth and nail", EffectTemplate(
+            name="Tooth and Nail",
+            description=("Tooth and Nail: one mode (search to hand, or put "
+                         "from hand onto battlefield); both modes with "
+                         "entwine paid"),
+            action_generator=self._gen_tooth_and_nail,
+        ))
         self._add_card("trostani, selesnya's voice", EffectTemplate(
             name="Trostani, Selesnya's Voice",
             description="Whenever a creature enters, gain life equal to its toughness",
@@ -4896,8 +4932,8 @@ class EffectTemplateLibrary:
         self._add_attack_card("port razer", EffectTemplate(
             name="Port Razer",
             description=("Port Razer deals combat damage to a player: untap "
-                         "each creature you control (the additional combat "
-                         "phase is unmodeled — console breadcrumb)"),
+                         "each creature you control, and an additional combat "
+                         "phase follows this one"),
             action_generator=self._gen_port_razer,
         ))
         self._add_attack_card("frenzied trapbreaker", EffectTemplate(
@@ -4905,6 +4941,16 @@ class EffectTemplateLibrary:
             description=("Frenzied Trapbreaker attacks: destroy target "
                          "artifact or enchantment defending player controls"),
             action_generator=self._gen_frenzied_trapbreaker,
+        ))
+        # Aug 2 batch-13: replaces the JSON no_action "use !fix" placeholder
+        # (the pre-slate breadcrumb class) — the additional_combat action
+        # exists now, so Aurelia's whole ability is modelable.
+        self._add_attack_card("aurelia, the warleader", EffectTemplate(
+            name="Aurelia, the Warleader",
+            description=("Aurelia attacks for the first time each turn: untap "
+                         "all creatures you control, and an additional combat "
+                         "phase follows this one"),
+            action_generator=self._gen_aurelia_warleader,
         ))
         self._add_attack_card("boros elite", EffectTemplate(
             name="Boros Elite",
@@ -8130,6 +8176,16 @@ class EffectTemplateLibrary:
         return n or str(c)
 
     @staticmethod
+    def _cd_power_int(c) -> int:
+        p = getattr(c, 'power', None)
+        if p is None and isinstance(c, dict):
+            p = c.get('power')
+        try:
+            return int(p)
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
     def _cd_cmc(c) -> int:
         v = getattr(c, 'cmc', None)
         if v is None and isinstance(c, dict):
@@ -8290,6 +8346,43 @@ class EffectTemplateLibrary:
         actions.append({"action": "additional_combat", "source": "Port Razer"})
         print(f"[ATTACK-TEMPLATE] Port Razer: untapping {len(actions) - 1} "
               f"creature(s) + granting an additional combat phase")
+        return actions
+
+    def _gen_aurelia_warleader(self, ctrl, opp, ctx) -> List[Dict]:
+        """Aurelia, the Warleader — 'Whenever Aurelia attacks for the first
+        time each turn, untap all creatures you control. After this phase,
+        there is an additional combat phase.' (bulk-verified Aug 2).
+
+        Declare-time trigger (damage_dealt-gated out so the combat-damage
+        dispatch sharing this registry can't re-fire it). The first-time-
+        each-turn condition is tracked in game._attack_trigger_turn_stamps —
+        a second Aurelia attack the same turn (only reachable inside an
+        extra combat, usually one she granted) finds the stamp and declines
+        per the printed condition."""
+        if ctx.get('damage_dealt'):
+            return []
+        g = ctx.get('_game')
+        if g is not None:
+            stamps = getattr(g, '_attack_trigger_turn_stamps', None)
+            turn = getattr(g, 'turn_number', 0)
+            if stamps is not None:
+                if stamps.get('aurelia, the warleader') == turn:
+                    return [{"action": "no_action",
+                             "reason": "Aurelia: not her first attack this "
+                                       "turn (first-time-each-turn condition)"}]
+                stamps['aurelia, the warleader'] = turn
+        ctrl_player = ctx.get('_controller_player')
+        actions = []
+        if ctrl_player is not None:
+            actions = [{"action": "untap", "card": self._cd_name(c)}
+                       for c in (getattr(ctrl_player, 'battlefield', []) or [])
+                       if 'creature' in self._cd_type_line(c)
+                       and getattr(c, 'tapped', False)]
+        actions.append({"action": "additional_combat",
+                        "source": "Aurelia, the Warleader"})
+        print(f"[ATTACK-TEMPLATE] Aurelia, the Warleader: untapping "
+              f"{len(actions) - 1} creature(s) + granting an additional "
+              f"combat phase")
         return actions
 
     def _gen_frenzied_trapbreaker(self, ctrl, opp, ctx) -> List[Dict]:
@@ -9038,13 +9131,55 @@ class EffectTemplateLibrary:
         ]
 
     def _gen_tooth_and_nail(self, ctrl, opp, ctx) -> List[Dict]:
-        """Tooth and Nail (entwined): search 2 creatures + put 2 from hand onto battlefield."""
-        return [
-            {"action": "search_library_creature", "player": ctrl, "count": 2,
-             "destination": "hand", "reason": "Tooth and Nail: search for 2 creatures"},
-            {"action": "put_creatures_from_hand", "player": ctrl, "count": 2,
-             "reason": "Tooth and Nail: put 2 creatures from hand onto battlefield"}
-        ]
+        """Tooth and Nail — 'Choose one — search up to two creature cards to
+        hand; or put up to two creature cards from your hand onto the
+        battlefield. Entwine {2}.'
+
+        Aug 2 batch-13 (rashmi/mythic reviewer): the old JSON entry resolved
+        the ENTWINED result (search 2 → battlefield) unconditionally, so a
+        base-cost cast got both modes for {2} less than any legal line. Now
+        gated on ctx['entwined'] (stamped by _compute_alt_costs when the
+        cost was actually paid — the kicker truth-plumbing pattern). The
+        prior Python version of this generator was DEAD (never registered)
+        and emitted action types that exist nowhere in actions.py — the
+        silent-no-op class; this one uses verified vocabulary only
+        (search_library, move_card)."""
+        if ctx.get('entwined'):
+            return [{"action": "search_library", "player": ctrl, "count": 2,
+                     "card_type": "creature", "to_zone": "battlefield",
+                     "reason": "Tooth and Nail (entwined): 2 creatures to battlefield"}]
+        # Un-entwined: ONE mode. Prefer putting from hand when a creature
+        # card is actually there (the classic use — slam the held bomb);
+        # otherwise search up to two creature cards to HAND.
+        hand = ctx.get('controller_hand') or []
+        creatures_in_hand = [
+            c for c in hand
+            if 'creature' in self._cd_type_line(c)]
+        if creatures_in_hand:
+            creatures_in_hand.sort(
+                key=lambda c: self._cd_power_int(c), reverse=True)
+            return [{"action": "move_card", "card": self._cd_name(c),
+                     "from_zone": "hand", "to_zone": "battlefield",
+                     "player": ctrl}
+                    for c in creatures_in_hand[:2]]
+        return [{"action": "search_library", "player": ctrl, "count": 2,
+                 "card_type": "creature", "to_zone": "hand",
+                 "reason": "Tooth and Nail: search two creature cards to hand"}]
+
+    def _gen_life_from_the_loam(self, ctrl, opp, ctx) -> List[Dict]:
+        """Life from the Loam — 'Return up to three target land cards from
+        your graveyard to your hand.' (Aug 2 batch-13: was a zero-action
+        Tier-3 escalation; deterministic template returns up to three lands.
+        Dredge stays unmodeled.)"""
+        gy = ctx.get('controller_graveyard') or []
+        lands = [c for c in gy if 'land' in self._cd_type_line(c)]
+        if not lands:
+            return [{"action": "no_action",
+                     "reason": "no land cards in graveyard (up to-targets — "
+                               "resolves with none chosen)"}]
+        return [{"action": "move_card", "card": self._cd_name(c),
+                 "from_zone": "graveyard", "to_zone": "hand", "player": ctrl}
+                for c in lands[:3]]
 
     def _gen_worldgorger_dragon(self, ctrl, opp, ctx) -> List[Dict]:
         """Worldgorger Dragon: exile all other permanents you control.
@@ -10124,6 +10259,10 @@ def build_game_context(game, player, opponent, card=None, entering_creature=None
     # commander-tax and cost-increase mana as "kicked".
     if card is not None:
         ctx['kicked'] = bool(getattr(card, '_kicked', False))
+        # Entwine truth (Aug 2 2026, batch-13): same contract as 'kicked' —
+        # _compute_alt_costs stamps _entwined when the cost was actually
+        # paid; Tooth and Nail's template resolves both modes only then.
+        ctx['entwined'] = bool(getattr(card, '_entwined', False))
 
     # Escape: "sacrifice it unless it escaped" (Kroxa). This key was READ in two
     # places and written NOWHERE in production — the two tests that exercised it

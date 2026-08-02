@@ -191,6 +191,9 @@ class TestSpectacle:
         card = _light_up(make_card)
         rick.hand.append(card)
         # Pool: exactly one red — printed {2}{R} fails, spectacle {R} passes.
+        # (Real Mountain backing the claim — the provider caps the advertised
+        # total at the physical one-tap ceiling, Aug 2 batch-13.)
+        _one_mountain(rick, make_card)
         pool = {'W': 0, 'U': 0, 'B': 0, 'R': 1, 'G': 0, 'C': 0}
         entries = castable_entries(game, rick, pool, 0, 1)
         assert not any("Light Up the Stage" in e["label"] for e in entries), (

@@ -226,6 +226,16 @@ async def _resolve_combat(cog, ctx, game: GameState):
         # If it's Claude's turn (human was blocking Claude's attack),
         # continue with Claude's MAIN2 actions, then end Claude's turn
         if game.active_player.is_claude:
+            # Aug 2 batch-13: same third-path extra-combat drop visibility as
+            # the autoplay batch loop (see the twin comment there).
+            if getattr(game, '_additional_combats', 0) and not game.ended:
+                print(f"[EXTRA-COMBAT] {game._additional_combats} additional "
+                      f"combat phase(s) pending on Claude's turn — not "
+                      f"consumed by this path (known gap)")
+                await ctx.send("⚔️ _(the additional combat phase is not taken "
+                               "— extra combats on Claude's turn are a known "
+                               "engine gap)_")
+                game._additional_combats = 0
             post_combat = await cog.engine.continue_claude_post_combat(game)
             post_combat = cog._sanitize_action_bullets(post_combat)
             if post_combat:
@@ -740,6 +750,14 @@ async def _autoplay_human_turn(cog, thread, game: GameState, player_idx: int):
             await cog._autoplay_send(thread, _m)
 
     if game.phase == Phase.DECLARE_ATTACKERS and not game.ended:
+        # Aug 2 (batch-13): a fresh declaration starts from an EMPTY attacker
+        # list. Claude's combat path can leave the previous turn's ids in
+        # game.attackers (its COMBAT_END branch doesn't run on every flow),
+        # and this site only appended — a stale Omenspeaker id inflated
+        # len(game.attackers) to 3 and fired Boros Elite's Battalion gate
+        # with two real attackers (game_1533284171202429108; the gate itself
+        # was right, the list was stale).
+        game.attackers = []
         attacker_names = await cog.engine.claude_ai.decide_attackers(game, player_idx)
         attacked = []
 
@@ -959,10 +977,15 @@ async def _autoplay_human_turn(cog, thread, game: GameState, player_idx: int):
         additional_combats -= 1
         game._additional_combats = additional_combats
         combat_round += 1
+        # Karlach's intervening-if ("if it's the first combat phase of the
+        # turn", CR 603.4) reads this flag to decline in extra combats.
+        game._in_extra_combat = True
         await cog._autoplay_send(thread, f"⚔️ **Additional Combat Phase #{combat_round}!**")
 
-        # Reset to declare attackers
+        # Reset to declare attackers (fresh list — same staleness class as
+        # the main declare site above)
         game.set_phase(Phase.DECLARE_ATTACKERS, via="autoplay:moraug_combat")
+        game.attackers = []
         attacker_names = await cog.engine.claude_ai.decide_attackers(game, player_idx)
         attacked = []
         if attacker_names:
@@ -1034,7 +1057,17 @@ async def _autoplay_human_turn(cog, thread, game: GameState, player_idx: int):
         else:
             await cog._autoplay_send(thread, f"⚔️ No attackers for additional combat — skipping.")
         print(f"[MORAUG] Additional combat #{combat_round} complete, {additional_combats} remaining")
-    # Clear additional combats counter for next turn
+    game._in_extra_combat = False
+    # Clear additional combats counter for next turn. A phase granted DURING
+    # an extra combat (Port Razer connecting again) lands on the live field
+    # while the loop counts down its local copy — discarding it here is the
+    # deliberate bounded-loop-protection choice (the Arena-caps convention),
+    # but it must be VISIBLE, not silent (batch-13: 2 grants vanished with
+    # no line anywhere).
+    if getattr(game, '_additional_combats', 0) > 0:
+        print(f"[EXTRA-COMBAT] Discarding {game._additional_combats} phase(s) "
+              f"granted mid-extra-combat (loop-protection cap — one consumption "
+              f"pass per turn)")
     game._additional_combats = 0
 
     # Advance to MAIN2 if we're stuck in combat phases
@@ -2785,9 +2818,17 @@ async def _run_single_autoplay(cog, channel, game_format: str, deck1_name: str, 
                     game._last_emitted_turn_key = _turn_key
 
                 if game.phase == Phase.UNTAP:
+                    # Aug 2 batch-13 (standard reviewer, CR 104.2a): an upkeep
+                    # trigger can END the game mid-chain (a suspended Rift
+                    # Bolt's damage hit lethal in _p2), and the unguarded _p3
+                    # call still ran the DRAW step — the winner drew a card
+                    # and posted Draw/Main banners AFTER the loss line.
                     _, _p1 = cog.engine.advance_phase(game)  # UNTAP → UPKEEP
-                    _, _p2 = cog.engine.advance_phase(game)  # UPKEEP → DRAW (upkeep triggers here)
-                    _, _p3 = cog.engine.advance_phase(game)  # DRAW → MAIN1
+                    _p2 = _p3 = []
+                    if not game.ended:
+                        _, _p2 = cog.engine.advance_phase(game)  # UPKEEP → DRAW (upkeep triggers here)
+                    if not game.ended:
+                        _, _p3 = cog.engine.advance_phase(game)  # DRAW → MAIN1
                     for _m in _p1 + _p2 + _p3:
                         await cog._autoplay_send(thread, _m)
                     # Drain sync-queued triggers via Tier 3 (Meren/Abyss/Emeria/etc.)
@@ -2920,6 +2961,27 @@ async def _run_single_autoplay(cog, channel, game_format: str, deck1_name: str, 
 
                         if game.attackers and not game.ended:
                             await cog._autoplay_resolve_combat(thread, game)
+
+                        # Aug 2 batch-13 (rashmi/mythic reviewer): THIS is the
+                        # third combat path (Claude attacks, Rick blocks, main
+                        # loop resolves) — it has neither the Moraug
+                        # consumption loop nor ai_turn's COMBAT_END breadcrumb,
+                        # so Port Razer's earned extra phase was promised in
+                        # Discord ("#1 pending") and then silently discarded by
+                        # the end_turn sweep (console-only). Full consumption
+                        # on Claude's turns is the documented open gap; until
+                        # then the drop must be Discord-visible.
+                        if getattr(game, '_additional_combats', 0) and not game.ended:
+                            print(f"[EXTRA-COMBAT] {game._additional_combats} "
+                                  f"additional combat phase(s) pending on "
+                                  f"Claude's turn — not consumed by this path "
+                                  f"(known gap: autoplay human loop only)")
+                            await cog._autoplay_send(
+                                thread,
+                                "⚔️ _(the additional combat phase is not taken "
+                                "— extra combats on Claude's turn are a known "
+                                "engine gap)_")
+                            game._additional_combats = 0
 
                         if game.phase == Phase.MAIN2 and not game.ended:
                             post_combat = await cog.engine.continue_claude_post_combat(game)

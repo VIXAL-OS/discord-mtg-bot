@@ -1872,6 +1872,18 @@ async def _check_cast_triggers(engine, game: GameState, caster: Player, card: Ca
                 if not engine._spell_matches_cast_trigger(sentence_lower, card, caster, game):
                     continue
                 trigger_text = sentence.strip()
+                # Aug 2 batch-13: reminder-text periods split mid-parenthetical,
+                # gluing a leading ")\n" onto the real sentence (Mystic Remora's
+                # cumulative-upkeep reminder → "casting X: )" console artifact).
+                # Keep the line that actually carries the trigger phrase.
+                if '\n' in trigger_text:
+                    for _ln in trigger_text.split('\n'):
+                        _lnl = _ln.lower()
+                        if ('whenever an opponent casts' in _lnl
+                                or 'whenever a player casts' in _lnl):
+                            trigger_text = _ln.strip()
+                            break
+                trigger_text = trigger_text.lstrip(')').strip()
                 print(f"[OPP-CAST-TRIGGER] {bf_card.name} (controlled by {opp_player.name}) triggers from {caster.name} casting {card.name}: {trigger_text}")
 
                 # Aug 1 deferred slate (batch-12 companion reviewer, CR 603.3):
@@ -3253,6 +3265,7 @@ def _check_attack_triggers_sync(engine, game: GameState, attacker_card: Card, at
                             game_context=ctx,
                         )
                         if actions is not None:  # [] = deliberate template no-op (handled); only None means unhandled → Tier 3
+                            _any_real_action = False
                             for action in actions:
                                 if action.get("action") == "no_action":
                                     reason = action.get("reason", "")
@@ -3261,13 +3274,23 @@ def _check_attack_triggers_sync(engine, game: GameState, attacker_card: Card, at
                                         if msg:
                                             messages.append(msg.replace("📍", "⚔️", 1))
                                     continue
+                                _any_real_action = True
                                 try:
                                     msg = engine.rules._execute_action_on_state(game, action)
                                     if msg:
                                         messages.append(msg)
                                 except Exception as e:
                                     print(f"[ATTACK-TEMPLATE] Action failed for {attacker_card.name}: {e}")
-                            print(f"[ATTACK-TEMPLATE] Resolved {attacker_card.name} attack trigger: {explanation}")
+                            # Aug 2 batch-13: don't print "Resolved" for an
+                            # all-no_action decline — the truthy-label class
+                            # (3rd sibling: end-step fixed batch-11 C3, upkeep
+                            # fixed July 31). The echo made a correctly-gated
+                            # Boros Elite Battalion decline read as an
+                            # over-fire in the audit sweep.
+                            if _any_real_action:
+                                print(f"[ATTACK-TEMPLATE] Resolved {attacker_card.name} attack trigger: {explanation}")
+                            else:
+                                print(f"[ATTACK-TEMPLATE] {attacker_card.name}: handled no-op (condition not met)")
                             handled = True
                     except Exception as e:
                         print(f"[ATTACK-TEMPLATE] Error for {attacker_card.name}: {e}")
@@ -4935,6 +4958,44 @@ def _snow_permanent_entered_watcher(game, card=None, controller=None,
                   f"engine in payload, scry skipped")
 
 
+def grant_experience_for_death(game, card, player, batch=None):
+    """The Meren/Ezuri experience-counter grant (July 29, extracted Aug 2).
+
+    July 29: the bump lived only in process_state_based_actions' LOCAL death
+    list, so the sacrifice-as-cost class never granted XP; it moved to the
+    CREATURE_DIED choke point. Aug 2 batch-13 (escape/graveyard reviewer)
+    found the two remaining gaps: (1) the single-target `destroy` action
+    resolves its dies triggers INLINE and never emits CREATURE_DIED — it now
+    calls this helper directly (queueing there would double-fire the dies
+    dispatcher, so the shared helper is the no-double-fire seam); (2) the SBA
+    sweep removes every dying creature BEFORE queueing, so a watcher dying in
+    the same batch missed its batch-mates — the `batch` pool restores CR
+    603.10 visibility (Meren died in her own Toxic Deluge and lost 3
+    counters).
+    """
+    try:
+        if player is None or not card.is_creature():
+            return
+        pool = list(getattr(player, 'battlefield', None) or [])
+        for b_card, b_player in (batch or []):
+            if b_player is player and b_card is not card:
+                pool.append(b_card)
+        for perm in pool:
+            if perm is card:
+                continue
+            otext = (getattr(perm, 'oracle_text', '') or '').lower()
+            if ('experience counter' in otext
+                    and 'another creature you control dies' in otext):
+                prev = int(getattr(player, '_experience_counters', 0) or 0)
+                player._experience_counters = prev + 1
+                print(f"[EXPERIENCE] {player.name} gains an experience counter "
+                      f"({prev} → {prev + 1}) from {card.name} dying ({perm.name})")
+                break
+    except (AttributeError, TypeError, ValueError) as e:
+        print(f"[EXPERIENCE] increment failed: {e}")
+        maybe_reraise(e)
+
+
 def queue_death(game, card, player) -> None:
     """Slice 3b (July 23, 2026): the single choke-point for queueing a death is
     now the CREATURE_DIED emit.
@@ -4954,9 +5015,18 @@ def queue_death(game, card, player) -> None:
 
 
 def queue_deaths(game, pairs) -> None:
-    """Batch form of queue_death (board wipes, SBA sweeps)."""
-    for card, player in (pairs or []):
-        queue_death(game, card, player)
+    """Batch form of queue_death (board wipes, SBA sweeps).
+
+    Aug 2 batch-13: the whole batch travels with each emit — the SBA sweep
+    removes every dying creature from the battlefield BEFORE queueing any of
+    them, so a watcher that died in the same sweep (Meren in her own Toxic
+    Deluge) was invisible to the experience scan for its batch-mates
+    regardless of processing order (CR 603.10: simultaneous deaths see each
+    other)."""
+    pairs = list(pairs or [])
+    for card, player in pairs:
+        events.emit(events.CREATURE_DIED, game, card=card, player=player,
+                    batch=pairs)
 
 
 def _accumulate_death_subscriber(game, card=None, player=None, **_):
@@ -4982,30 +5052,7 @@ def _accumulate_death_subscriber(game, card=None, player=None, **_):
     if card is None:
         return
     game._recently_died.append((card, player))
-    # July 29 batch audit: the Meren/Ezuri experience-counter bump lived only
-    # in process_state_based_actions' LOCAL death list, so the whole
-    # sacrifice-as-cost death class (Viscera Seer, Altar of Dementia,
-    # Phyrexian Tower) never granted XP — every Meren end-step return went to
-    # hand all game (game_1531564156203827213). The bus is the one choke-point
-    # EVERY death path reaches (slice 3b), and at emit time the granter is
-    # still on the battlefield, which is closer to the CR 603.6e pre-event
-    # state the post-batch SBA sweep got wrong for simultaneous deaths.
-    try:
-        if player is not None and card.is_creature():
-            for perm in getattr(player, 'battlefield', None) or []:
-                if perm is card:
-                    continue
-                otext = (getattr(perm, 'oracle_text', '') or '').lower()
-                if ('experience counter' in otext
-                        and 'another creature you control dies' in otext):
-                    prev = int(getattr(player, '_experience_counters', 0) or 0)
-                    player._experience_counters = prev + 1
-                    print(f"[EXPERIENCE] {player.name} gains an experience counter "
-                          f"({prev} → {prev + 1}) from {card.name} dying ({perm.name})")
-                    break
-    except (AttributeError, TypeError, ValueError) as e:
-        print(f"[EXPERIENCE] increment failed: {e}")
-        maybe_reraise(e)
+    grant_experience_for_death(game, card, player, batch=_.get('batch'))
 
 
 def fire_counters_a_spell_triggers(game, controller_name):

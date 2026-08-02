@@ -957,9 +957,23 @@ def _validate_plan_mana(engine, game: GameState, player_idx: int, plan: list) ->
                     # effects like Oath of Teferi let a PW activate twice. Respect
                     # the engine's can_activate verdict before pruning the second
                     # in-plan activation.
+                    # Aug 2 batch-13 (rashmi/mythic reviewer): this pre-check
+                    # runs BEFORE any plan action executes, so can_activate is
+                    # trivially True for an in-plan second activation (nothing
+                    # has consumed the once-per-turn budget yet) — the old
+                    # code read that as "an Oath of Teferi-class enabler must
+                    # exist" and printed a confident lie. Only trust the
+                    # verdict when a real multi-activation enabler is on the
+                    # battlefield; otherwise prune the duplicate here (the
+                    # execution gate blocked it anyway — pruning saves the
+                    # wasted action + feeds the rejection loop).
+                    _pw_enablers = ('oath of teferi', 'the chain veil')
+                    _has_pw_enabler = any(
+                        any(e in (c.name or '').lower() for e in _pw_enablers)
+                        for c in player.battlefield)
                     pw_mgr = getattr(engine, 'planeswalker_manager', None)
                     allow_second = False
-                    if pw_mgr:
+                    if pw_mgr and _has_pw_enabler:
                         ability_idx_val = action.get("ability", 0)
                         try:
                             ability_idx_val = int(ability_idx_val)
@@ -971,7 +985,7 @@ def _validate_plan_mana(engine, game: GameState, player_idx: int, plan: list) ->
                         _reject("activate", action.get('permanent', '?'),
                                 "planeswalker already activated this turn (CR 606.3 — one loyalty ability per turn)")
                         continue
-                    print(f"[PLAN-VALIDATE] Allowed 2nd activation of {action.get('permanent')} — Oath of Teferi / similar")
+                    print(f"[PLAN-VALIDATE] Allowed 2nd activation of {action.get('permanent')} — multi-activation enabler on battlefield")
                 # Bug 2b: also reject if the PW already used its once-per-turn activation
                 # before this plan was generated (can happen when plan_turn is called
                 # after a prior MAIN1 activation, or across split main phases).
@@ -1375,6 +1389,10 @@ async def execute_claude_turn(engine, game: GameState) -> List[str]:
         print(f"[EXECUTE_CLAUDE] Advanced to DECLARE_ATTACKERS")
 
     if game.phase == Phase.DECLARE_ATTACKERS and not game.ended:
+        # Aug 2 (batch-13): fresh declaration = empty attacker list — the
+        # twin of the autoplay-side clear (a stale id from a previous combat
+        # inflated an attacker-count gate; see mtg/autoplay.py).
+        game.attackers = []
         # Ask Claude which creatures to attack with (separate from MAIN1 decisions)
         attacker_names = await engine.claude_ai.decide_attackers(game, claude_index)
 

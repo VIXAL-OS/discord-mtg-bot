@@ -166,8 +166,17 @@ class EffectExecutor:
             (r"discards? their hand", lambda m: Effect(EffectType.DISCARD, amount=-1, raw_text="all")),
             
             # Mill
-            (r"mills? (\d+) cards?", self._parse_mill),
-            (r"puts? the top (\d+) cards? .* into .* graveyard", self._parse_mill),
+            # Aug 2 batch-13 (delve reviewer): Scryfall spells mill counts as
+            # WORDS ("Target player mills two cards" — Thought Scour), so the
+            # digit-only pattern matched zero of the delve deck's mill
+            # cantrips and the clause was silently dropped (the same
+            # word-number class as the July 28 escape-cost fix; the
+            # planeswalker parser at rules/planeswalker.py:992 already
+            # accepted words and was never ported here).
+            (r"mills? (\d+|a|an|one|two|three|four|five|six|seven|eight|nine|ten) cards?",
+             self._parse_mill),
+            (r"puts? the top (\d+|a|an|one|two|three|four|five|six|seven|eight|nine|ten) cards? .* into .* graveyard",
+             self._parse_mill),
             
             # Destroy
             (r"destroys? (target [\w\s]+|all [\w\s]+|each [\w\s]+)",
@@ -245,7 +254,19 @@ class EffectExecutor:
                         prefix = text[start:match.start()]
                         if "you may" in prefix:
                             effect.optional = True
-                        
+                        # Aug 2 batch-13: stamp the SENTENCE the pattern
+                        # matched in, so executors can make per-clause
+                        # decisions. ExecutionContext.targets is one shared
+                        # list for the whole spell — Thought Scour's
+                        # unconditional "Draw a card." was redirected to the
+                        # opponent auto-targeted for the (separate) mill
+                        # clause, handing the caster's draw to the wrong
+                        # player.
+                        if not effect.raw_text:
+                            _s = text.rfind('.', 0, match.start()) + 1
+                            _e = text.find('.', match.end())
+                            effect.raw_text = text[_s:(_e if _e != -1
+                                                       else len(text))].strip()
                         effects.append(effect)
                 except Exception as e:
                     print(f"Parse error for pattern {pattern}: {e}")
@@ -290,8 +311,14 @@ class EffectExecutor:
     def _parse_discard(self, match) -> Effect:
         return Effect(effect_type=EffectType.DISCARD, amount=int(match.group(1)))
     
+    _NUMBER_WORDS = {'a': 1, 'an': 1, 'one': 1, 'two': 2, 'three': 3,
+                     'four': 4, 'five': 5, 'six': 6, 'seven': 7,
+                     'eight': 8, 'nine': 9, 'ten': 10}
+
     def _parse_mill(self, match) -> Effect:
-        return Effect(effect_type=EffectType.MILL, amount=int(match.group(1)))
+        raw = match.group(1)
+        amount = int(raw) if raw.isdigit() else self._NUMBER_WORDS.get(raw, 1)
+        return Effect(effect_type=EffectType.MILL, amount=amount)
     
     def _parse_destroy(self, match) -> Effect:
         return Effect(effect_type=EffectType.DESTROY, target_type=match.group(1))

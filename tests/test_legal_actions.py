@@ -24,11 +24,31 @@ def _labels(game, player, mana, any_color=0):
     return castable_labels(game, player, mana, any_color, total)
 
 
+def _fund(player, make_card, forests=0, islands=0, wastes=0):
+    """Real untapped sources backing the synthetic mana dicts — the provider
+    caps the advertised total at the physical one-tap ceiling (Aug 2,
+    batch-13: the OR-dual double-count reached the castable list), so a
+    fixture claiming mana it has no board for now correctly advertises 0."""
+    for _ in range(forests):
+        player.battlefield.append(make_card(
+            "Forest", type_line="Basic Land — Forest",
+            oracle_text="({T}: Add {G}.)", power=None, toughness=None))
+    for _ in range(islands):
+        player.battlefield.append(make_card(
+            "Island", type_line="Basic Land — Island",
+            oracle_text="({T}: Add {U}.)", power=None, toughness=None))
+    for _ in range(wastes):
+        player.battlefield.append(make_card(
+            "Wastes", type_line="Basic Land",
+            oracle_text="({T}: Add {C}.)", power=None, toughness=None))
+
+
 class TestHandEntries:
     def test_plain_cast_label_shape(self, make_game, make_card):
         game = make_game()
         rick = game.players[0]
         rick.hand.append(make_card("Grizzly Bears", mana_cost="{1}{G}", cmc=2))
+        _fund(rick, make_card, forests=1, wastes=1)
         assert _labels(game, rick, _mana(G=1, C=1)) == [
             "Grizzly Bears ({1}{G})"]
 
@@ -41,6 +61,7 @@ class TestHandEntries:
         rick.hand.append(make_card(
             "Commit // Memory", type_line="Instant // Sorcery",
             mana_cost="{3}{U} // {4}{U}{U}", cmc=10))
+        _fund(rick, make_card, islands=1, wastes=3)
         labels = _labels(game, rick, _mana(U=1, C=3))
         assert any("Commit // Memory" in l for l in labels)
 
@@ -65,6 +86,7 @@ class TestHandEntries:
                          "Cycling {X}{1}{U}\n"
                          "When you cycle Shark Typhoon, create an X/X blue "
                          "Shark creature token with flying.")))
+        _fund(rick, make_card, islands=2, wastes=2)
         labels = _labels(game, rick, _mana(U=2, C=2))
         assert any("cycle for" in l for l in labels), labels
         # 6-mana hardcast unaffordable at 4 — cycling is the only entry.
@@ -81,6 +103,7 @@ class TestOtherZones:
         cmdr.is_commander = True
         cmdr.times_cast_from_command_zone = 1
         rick.command_zone.append(cmdr)
+        _fund(rick, make_card, forests=1, islands=1, wastes=3)
         labels = _labels(game, rick, _mana(G=1, U=1, C=3))
         assert labels == ["Jorn, God of Winter ({1}{G}{U} +{2} tax) [COMMANDER]"]
 
@@ -88,6 +111,7 @@ class TestOtherZones:
         game = make_game()
         rick = game.players[0]
         rick.hand.append(make_card("Bear", mana_cost="{1}{G}", cmc=2))
+        _fund(rick, make_card, forests=2)
         entries = castable_entries(game, rick, _mana(G=2), 0, 2)
         assert entries[0]["zone"] == "hand"
         assert entries[0]["action"] == {"type": "cast", "card": "Bear"}
@@ -98,6 +122,7 @@ class TestOtherZones:
         rick.hand.append(make_card("Bear", mana_cost="{1}{G}", cmc=2))
         game.turn_effects.append({"type": "free_cast", "controller": 0,
                                   "max_mv": 5, "source": "Sneak Attack"})
+        _fund(rick, make_card, forests=2)
         labels = _labels(game, rick, _mana(G=2))
         assert labels == ["Bear ({1}{G})"], (
             "already-affordable cards don't get a duplicate FREE entry")
