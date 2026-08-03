@@ -616,6 +616,15 @@ def process_state_based_actions(rules, game: GameState) -> List[str]:
                     else:
                         # [REPLACEMENT] Check for death replacement (Rest in Peace → exile instead)
                         destination = "graveyard"
+                        # Unearth (CR 702.83a) exiles it "if it would leave the
+                        # battlefield" — otherwise the creature dies to the
+                        # graveyard and can be unearthed again, the recursion
+                        # the printed clause forbids.
+                        from mtg.helpers import unearthed_leaves_to_exile
+                        if unearthed_leaves_to_exile(card):
+                            destination = "exile"
+                            print(f"  [UNEARTH] {card.name} left the battlefield "
+                                  f"— exiled instead of dying (CR 702.83a)")
                         if HAS_REPLACEMENT_ENGINE and game._replacement_engine and game._replacement_engine.effects:
                             event = GameEvent(
                                 event_type=EventType.DEATH,

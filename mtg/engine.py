@@ -44,7 +44,8 @@ from mtg.deck_loader import DeckLoader
 from mtg.helpers import (
     _collapse_repeated_life_gain, _should_emit_resolve_hint,
     _normalize_pw_ability_idx, _resolve_player_or_card_target,
-    get_mdfc_info,
+    exile_after_resolution_reason, get_mdfc_info, note_miracle_on_draw,
+    try_dredge,
 )
 from mtg.models import Card, Player, GameState, StackEntry, FormatValidator
 from mtg import events
@@ -1245,9 +1246,18 @@ class GameEngine:
                 if final.is_prevented:
                     print(f"  [REPLACEMENT-APPLY] Draw prevented for {player.name} ({', '.join(final.replacement_chain)})")
                     continue
+            # Dredge (CR 702.52a) REPLACES the draw, so it runs before the
+            # card leaves the library.
+            if game and try_dredge(game, player) is not None:
+                continue
             card = player.library.pop(0)
             player.hand.append(card)
             drawn.append(card)
+            # Miracle (CR 702.94a) reacts to the draw and needs the per-turn
+            # count, which nothing tracked before this.
+            player.cards_drawn_this_turn += 1
+            if game:
+                note_miracle_on_draw(game, player, card)
 
         # Check "whenever an opponent draws" triggers (Smothering Tithe, Consecrated Sphinx, etc.)
         # Messages are pushed to game._pending_messages so callers can flush them to Discord.
@@ -2562,7 +2572,9 @@ class GameEngine:
             _p.spells_cast_this_turn = 0
             _p.noncreature_spells_cast_this_turn = 0  # Reset for Esper Sentinel
             _p.instant_sorcery_spells_cast_this_turn = 0  # Arclight Phoenix
+            _p.cards_drawn_this_turn = 0  # miracle (CR 702.94)
         game._creature_died_this_turn = False  # morbid (CR 207.2c)
+        game._dredged_this_turn = False  # dredge (CR 702.52) — one per turn
 
         # Reset per-turn flicker dedup tracker (see actions.py flicker handler)
         if hasattr(game, '_flicker_announce_seen'):
@@ -2861,9 +2873,15 @@ class GameEngine:
             if not card and player.exile:
                 for c in player.exile:
                     _castable_from_exile = (c.id in player.playable_from_exile
-                                            or getattr(c, '_adventure_exiled', False))
+                                            or getattr(c, '_adventure_exiled', False)
+                                            or getattr(c, '_foretold', False))
                     if _castable_from_exile and card_name and c.name.lower() == card_name.lower():
                         card = c
+                        if getattr(c, '_foretold', False):
+                            # CR 702.143b: cast for the foretell cost.
+                            c._foretold = False
+                            c._face_down = False
+                            c._cast_via_foretell = True
                         player.exile.remove(c)
                         # cast_spell_async gates on zone membership first (July
                         # 20), so a card pulled out of exile with no home is
@@ -2879,32 +2897,87 @@ class GameEngine:
             # Bug #28: Check if it's playable from graveyard (Snapcaster flashback, native flashback, escape)
             from_graveyard = False
             _gy_escape_exiled = []
+            _gy_jumpstart_discarded = []
             if not card and player.playable_from_graveyard:
                 for c in player.graveyard:
-                    if c.id in player.playable_from_graveyard and card_name and c.name.lower() == card_name.lower():
-                        card = c
-                        from_graveyard = True
-                        player.graveyard.remove(c)
-                        player.playable_from_graveyard.remove(c.id)
-                        # Pay escape exile cost if applicable
-                        if c.oracle_text:
-                            from mtg.helpers import parse_escape_cost
-                            _esc = parse_escape_cost(c.oracle_text)
-                            if _esc:
-                                _esc_cost, exile_count = _esc
-                                c._escape_cost = _esc_cost
-                                c._was_escaped = True
-                                for _ in range(exile_count):
-                                    if player.graveyard:
-                                        exiled = player.graveyard.pop()
-                                        player.exile.append(exiled)
-                                        _gy_escape_exiled.append(exiled)
-                                print(f"[ESCAPE] AI casting {c.name} from graveyard, exiling {exile_count}: {', '.join(e.name for e in _gy_escape_exiled)}")
-                            else:
-                                print(f"[FLASHBACK] AI casting {c.name} from graveyard via flashback")
+                    if c.id not in player.playable_from_graveyard or not card_name:
+                        continue
+                    # Aug 3: also match a SPLIT HALF name, so an aftermath
+                    # half (Memory, Dawn, Injury) — the only half castable
+                    # from the graveyard, and the name the AI is offered —
+                    # actually resolves to its card. Mirrors autoplay.
+                    _matched_half = None
+                    if c.name.lower() != card_name.lower():
+                        for _i, _sname in enumerate(getattr(c, 'split_names', []) or []):
+                            if _sname.lower() == card_name.lower():
+                                _matched_half = _i
+                                break
+                        if _matched_half is None:
+                            continue
+                    card = c
+                    if _matched_half is not None:
+                        c.cast_as_split_half = _matched_half
+                    from_graveyard = True
+                    player.graveyard.remove(c)
+                    player.playable_from_graveyard.remove(c.id)
+                    # Pay escape exile cost if applicable
+                    if c.oracle_text:
+                        from mtg.helpers import parse_escape_cost
+                        _esc = parse_escape_cost(c.oracle_text)
+                        if _esc:
+                            _esc_cost, exile_count = _esc
+                            c._escape_cost = _esc_cost
+                            c._was_escaped = True
+                            for _ in range(exile_count):
+                                if player.graveyard:
+                                    exiled = player.graveyard.pop()
+                                    player.exile.append(exiled)
+                                    _gy_escape_exiled.append(exiled)
+                            print(f"[ESCAPE] AI casting {c.name} from graveyard, exiling {exile_count}: {', '.join(e.name for e in _gy_escape_exiled)}")
                         else:
                             print(f"[FLASHBACK] AI casting {c.name} from graveyard via flashback")
-                        break
+                    else:
+                        print(f"[FLASHBACK] AI casting {c.name} from graveyard via flashback")
+                    # Jump-start's additional discard (CR 702.132a).
+                    from mtg.helpers import pay_jump_start_discard
+                    _gy_jumpstart_discarded = pay_jump_start_discard(
+                        game, player, c)
+                    break
+
+            def _rollback_graveyard_cast():
+                """Undo a graveyard cast that never legally happened.
+
+                Aug 3: this closure is NEW on the engine path. The post-cast
+                rollback further down has existed since July 29, but the two
+                PRE-cast gates below (the counterspell-empty-stack guard and
+                the CR 601.2c targeting guard) sit BETWEEN the graveyard
+                extraction — which has already paid escape's exile cost and
+                now jump-start's discard — and the hand-append, and both
+                returned bare. That is exactly the July 30 stranding fixed on
+                the autoplay twin, where the fix's own note said "both exits"
+                and meant both exits in autoplay.py. Same class, sibling file.
+                """
+                if card in player.hand:
+                    player.hand.remove(card)
+                if card not in player.graveyard:
+                    player.graveyard.append(card)
+                if card.id not in player.playable_from_graveyard:
+                    player.playable_from_graveyard.append(card.id)
+                for _ex in _gy_escape_exiled:
+                    if _ex in player.exile:
+                        player.exile.remove(_ex)
+                        player.graveyard.append(_ex)
+                for _dc in _gy_jumpstart_discarded:
+                    for _zone in (player.graveyard, player.exile):
+                        if _dc in _zone:
+                            _zone.remove(_dc)
+                            break
+                    if _dc not in player.hand:
+                        player.hand.append(_dc)
+                card._was_escaped = False
+                card._escape_cost = ""
+                card._cast_from_graveyard = False
+                card.cast_as_split_half = -1
 
             # Check command zone (commander)
             from_command_zone = False
@@ -2949,6 +3022,10 @@ class GameEngine:
                 is_creature_with_counter_etb = card.is_creature() and ('enters' in oracle_lower or 'enter' in oracle_lower)
                 if 'counter target' in oracle_lower and not game.stack and not is_modal and not is_creature_with_counter_etb:
                     print(f"[EXECUTE] {card.name} has no valid target (stack empty)")
+                    if from_graveyard:
+                        _rollback_graveyard_cast()
+                        print(f"[GRAVEYARD-CAST] {card.name} blocked pre-cast — "
+                              f"rolled back (card + costs restored)")
                     return None
 
                 # [TARGETING] Pre-cast target validation — block AI from casting
@@ -2956,6 +3033,13 @@ class GameEngine:
                 if HAS_TARGETING and _spell_requires_targets(card):
                     if not _find_any_valid_target(game, card, player.name):
                         print(f"[TARGETING] AI tried to cast {card.name} with no valid targets")
+                        game._last_cast_failure = (
+                            game.turn_number, card.name,
+                            f"no valid targets for {card.name} (CR 601.2c)")
+                        if from_graveyard:
+                            _rollback_graveyard_cast()
+                            print(f"[GRAVEYARD-CAST] {card.name} targeting failed "
+                                  f"pre-cast — rolled back (card + costs restored)")
                         return None
 
                 # Set X value if AI provided one (Blue Sun's Zenith, etc.)
@@ -3027,29 +3111,32 @@ class GameEngine:
                 # paid — the same cost-paid-no-effect trap the autoplay twin
                 # exhibited live. Roll the whole graveyard cast back.
                 if not success and from_graveyard:
-                    if card in player.hand:
-                        player.hand.remove(card)
-                    if card not in player.graveyard:
-                        player.graveyard.append(card)
-                    if card.id not in player.playable_from_graveyard:
-                        player.playable_from_graveyard.append(card.id)
-                    for _ex in _gy_escape_exiled:
-                        if _ex in player.exile:
-                            player.exile.remove(_ex)
-                            player.graveyard.append(_ex)
-                    card._was_escaped = False
-                    card._escape_cost = ""
-                    card._cast_from_graveyard = False
-                    print(f"[ESCAPE] {card.name} cast failed — graveyard cast rolled back (card + exile cost restored)")
+                    _rollback_graveyard_cast()
+                    print(f"[GRAVEYARD-CAST] {card.name} cast failed — rolled back "
+                          f"(card + escape/jump-start costs restored)")
                 if success:
                     if from_command_zone:
                         card.times_cast_from_command_zone += 1
-                    # Flashback/escape: exile the card after resolution instead of graveyard
-                    if from_graveyard:
-                        if card in player.graveyard:
+                    # Graveyard casts: exile the card after resolution ONLY
+                    # for the mechanics that print an exile clause. This was a
+                    # blanket "if from_graveyard: exile", which is right for
+                    # flashback/jump-start/aftermath and wrong for escape
+                    # (CR 702.139 — no exile clause), so an escaped Cling to
+                    # Dust could never escape a second time.
+                    if from_graveyard and card in player.graveyard:
+                        _why = exile_after_resolution_reason(card)
+                        if _why:
                             player.graveyard.remove(card)
                             player.exile.append(card)
-                            print(f"[FLASHBACK] {card.name} exiled after casting from graveyard")
+                            print(f"[EXILE-ON-RESOLVE] {card.name} exiled after "
+                                  f"casting from graveyard ({_why})")
+                # The graveyard-origin stamp is PER CAST — resolution has read
+                # it by now (Ash Zealot's condition). Leaving it set made a
+                # later cast from hand look like a graveyard cast; newly
+                # reachable now that an escaped card survives in the graveyard
+                # and can be returned to hand.
+                if from_graveyard:
+                    card._cast_from_graveyard = False
                     # May 7 audit fix #1: if cast_spell_async already announced
                     # the cast (before the priority window), don't duplicate it.
                     # Drop the prefix line and just return the effect messages.
@@ -3159,6 +3246,49 @@ class GameEngine:
                     f"'{card_name}' is not in hand to suspend")
                 return None
             ok, msg = suspend_card_from_hand(game, player, card)
+            if not ok:
+                game._last_activation_failure = (
+                    game.turn_number, card.name, msg)
+                return None
+            return msg
+
+        elif action_type == "foretell":
+            # Aug 3: foretell initiation (CR 702.143a) — pay {2}, exile face
+            # down; the card is cast from exile for its foretell cost on a
+            # later turn. Twin of the autoplay branch, one shared core.
+            from mtg.spells import foretell_card_from_hand
+            card_name = action.get("card", "")
+            card = player.find_card(card_name, Zone.HAND)
+            if not card:
+                game._last_activation_failure = (
+                    game.turn_number, card_name or "?",
+                    f"'{card_name}' is not in hand to foretell")
+                return None
+            ok, msg = foretell_card_from_hand(game, player, card)
+            if not ok:
+                game._last_activation_failure = (
+                    game.turn_number, card.name, msg)
+                return None
+            return msg
+
+        elif action_type == "graveyard_activate":
+            # Aug 3: embalm / eternalize / unearth. These are ACTIVATED
+            # abilities of a card in the graveyard, not casts, so they
+            # deliberately bypass cast_spell_async and its cast-trigger
+            # fan-out. Twin of the autoplay branch, one shared core.
+            from mtg.spells import activate_from_graveyard
+            card_name = action.get("card", "")
+            card = None
+            if card_name:
+                _cn = card_name.lower()
+                card = next((c for c in player.graveyard
+                             if c.name.lower() == _cn), None)
+            if not card:
+                game._last_activation_failure = (
+                    game.turn_number, card_name or "?",
+                    f"'{card_name}' is not in your graveyard")
+                return None
+            ok, msg = activate_from_graveyard(self, game, player, card)
             if not ok:
                 game._last_activation_failure = (
                     game.turn_number, card.name, msg)

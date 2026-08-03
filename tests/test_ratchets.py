@@ -112,7 +112,11 @@ EXCEPT_BASELINE = {
     # probe and the cast_spell_async call) — a madness resolution crash must
     # route the card to the graveyard in production, not corrupt the drain;
     # both carry maybe_reraise so strict batches/pytest still see failures.
-    "spells.py": 32,
+    # Aug 3 (+2): resolve_pending_miracles's two crash barriers, the exact
+    # twins of the madness pair above (same drain shape, same reasons) — a
+    # miracle resolution crash must leave the card in hand in production
+    # rather than corrupt the drain; both carry maybe_reraise.
+    "spells.py": 34,
     # Aug 1 deferred slate: +1 for the opponent-cast trigger window's
     # crash barrier around the LLM response evaluation — carries
     # maybe_reraise so strict batches see it; the sibling own-cast

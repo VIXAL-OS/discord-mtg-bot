@@ -170,6 +170,12 @@ class RulesEngine:
         # a creature/sorcery that wasn't on the owner's own main phase.
         if getattr(card, '_cast_via_madness', False):
             has_flash = True
+        # Miracle (CR 702.94a): the cast happens as the miracle trigger
+        # resolves, which is during the DRAW STEP — so the sorcery-speed gate
+        # would reject every miracle sorcery, i.e. most of them (Terminus,
+        # Entreat the Angels, Reforge the Soul are all sorceries).
+        if getattr(card, '_cast_via_miracle', False):
+            has_flash = True
 
         # Split card: check if the half being cast is an instant (instant-speed)
         if getattr(card, 'cast_as_split_half', -1) >= 0 and card.split_types:
@@ -242,6 +248,15 @@ class RulesEngine:
             # printed cost would wrongly reject casts the payment stage can
             # cover (the FoW-waiver class, cost-selection flavor).
             mana_cost_to_check = card._madness_cost
+        elif getattr(card, '_cast_via_miracle', False) and getattr(card, '_miracle_cost', None):
+            # Miracle (CR 702.94a) — same cost-selection waiver as madness,
+            # and a much bigger gap: Terminus is {4}{W}{W} printed and {W}
+            # for its miracle cost, so the printed-cost gate would reject
+            # nearly every miracle the payment stage could actually pay.
+            mana_cost_to_check = card._miracle_cost
+        elif getattr(card, '_cast_via_foretell', False) and getattr(card, '_foretell_cost', None):
+            # Foretell (CR 702.143b) — likewise cheaper than printed.
+            mana_cost_to_check = card._foretell_cost
         # July 20 (queued from the cast-gate characterization pins): the mana
         # pre-gate is convoke/delve/improvise-aware. The payment stage covers
         # part of the GENERIC portion by tapping creatures (convoke), exiling

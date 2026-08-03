@@ -231,6 +231,32 @@ def _validate_plan_mana(engine, game: GameState, player_idx: int, plan: list) ->
     if game.format in COMMAND_ZONE_FORMATS:
         for c in player.command_zone:
             hand_names.add(c.name.lower())
+    # Aug 3, 2026 — the graveyard and exile are cast sources too, and this
+    # validator knew about neither. Every card the castable list OFFERS from
+    # those zones (flashback, escape, jump-start, aftermath, Snapcaster
+    # grants, adventure halves in exile, impulse exiles, foretold cards) was
+    # dropped here as "not in hand" before the executor ever saw it, so the
+    # whole class was reachable only from the per-action fallback path.
+    # Pre-existing for flashback/escape; the wave-3 mechanics all land in the
+    # same hole, so widening the set is what makes them reachable from
+    # plan_turn at all. The pricing below reads `player.hand` for the cost, so
+    # `_alt_zone_cards` carries the objects for those names.
+    _alt_zone_cards = {}
+    for c in player.graveyard:
+        if c.id in (getattr(player, 'playable_from_graveyard', None) or []):
+            hand_names.add(c.name.lower())
+            _alt_zone_cards[c.name.lower()] = c
+            # An aftermath half is offered — and cast — under the HALF name.
+            for _sname in (getattr(c, 'split_names', None) or []):
+                if _sname:
+                    hand_names.add(_sname.lower())
+                    _alt_zone_cards[_sname.lower()] = c
+    for c in (getattr(player, 'exile', None) or []):
+        if (c.id in (getattr(player, 'playable_from_exile', None) or [])
+                or getattr(c, '_adventure_exiled', False)
+                or getattr(c, '_foretold', False)):
+            hand_names.add(c.name.lower())
+            _alt_zone_cards[c.name.lower()] = c
     land_played = player.lands_played_this_turn >= player.max_lands_per_turn
 
     validated = []
@@ -463,9 +489,34 @@ def _validate_plan_mana(engine, game: GameState, player_idx: int, plan: list) ->
                         card_obj = c
                         _adv_half_cost = getattr(c, 'adventure_cost', '') or ''
                         break
+            # Graveyard / exile cast sources (see _alt_zone_cards above).
+            _alt_cost = None
+            if card_obj is None and card_name:
+                _alt = _alt_zone_cards.get(card_name.lower())
+                if _alt is not None:
+                    card_obj = _alt
+                    # Price the ALTERNATIVE cost, not the printed one — these
+                    # are overwhelmingly cheaper (Terminus {4}{W}{W} → {W}),
+                    # so pricing the printed cost would reject casts the
+                    # payment stage can comfortably pay.
+                    _alt_cost = (getattr(_alt, '_escape_cost', '')
+                                 or getattr(_alt, '_flashback_cost', '')
+                                 or getattr(_alt, '_foretell_cost', ''))
+                    if not _alt_cost:
+                        # An aftermath half is named and priced by its half.
+                        for _i, _sname in enumerate(getattr(_alt, 'split_names', None) or []):
+                            if _sname.lower() == card_name.lower():
+                                _costs = getattr(_alt, 'split_costs', None) or []
+                                if _i < len(_costs):
+                                    _alt_cost = _costs[_i]
+                                break
             if card_obj:
                 cost = card_obj.cmc or 0
                 _sim_cost = card_obj.mana_cost
+                if _alt_cost:
+                    from mtg.helpers import cmc_of_cost_string as _cmc_of
+                    _sim_cost = _alt_cost
+                    cost = _cmc_of(_alt_cost)
                 # An adventure card's mana_cost is the combined
                 # "{creature} // {adventure}" string. A bare-name cast is
                 # the creature half (CR 715.2b); a half-name cast is the

@@ -317,6 +317,9 @@ def _validate_cast(engine, game: GameState, player: Player, card: Card,
     # Entwine stamp likewise (CR 702.42 — chosen per cast).
     card._entwined = False
     card._kicked_times = 0
+    # Buyback is chosen per cast too (CR 702.26a); a spell that was bought
+    # back and re-cast without paying it again must not return to hand twice.
+    card._buyback_paid = False
 
     # June 11 audit: flashback/escape casts arrive here with the card in the
     # GRAVEYARD (marked playable by the castable-list generator), but this
@@ -336,6 +339,30 @@ def _validate_cast(engine, game: GameState, player: Player, card: Card,
     )
     if card not in player.hand and not _cast_from_graveyard:
         return (False, "Card not in hand", []), False, target
+
+    # Aftermath (CR 702.127a), Aug 3: the aftermath half may be cast ONLY from
+    # the graveyard, and the other half may NOT be. Neither restriction
+    # existed, so Commit // Memory could be cast as Memory straight out of
+    # hand — its printed "cast this spell only from your graveyard" was text
+    # nothing enforced. The executors pre-move a graveyard cast into HAND, so
+    # zone membership can't answer this; `_cast_from_graveyard` (set by both
+    # executors) is the authoritative signal.
+    _half = getattr(card, 'cast_as_split_half', -1)
+    if _half is not None and _half >= 0:
+        _after = helpers.aftermath_half_index(card)
+        _from_gy = _cast_from_graveyard or getattr(card, '_cast_from_graveyard', False)
+        _half_name = (getattr(card, 'split_names', None) or [card.name])[_half] \
+            if _half < len(getattr(card, 'split_names', None) or []) else card.name
+        if _after == _half and not _from_gy:
+            return ((False,
+                     f"{_half_name} has aftermath — it can only be cast from "
+                     f"your graveyard (CR 702.127a)", []),
+                    _cast_from_graveyard, target)
+        if _after is not None and _after != _half and _from_gy:
+            return ((False,
+                     f"{_half_name} can't be cast from your graveyard — only "
+                     f"the aftermath half can (CR 702.127a)", []),
+                    _cast_from_graveyard, target)
 
     # Check rules
     can_cast, reason = engine.rules.can_cast_spell(game, player, card)
@@ -554,10 +581,29 @@ def _validate_cast(engine, game: GameState, player: Player, card: Card,
     # [TARGETING] Pre-cast target validation (CR 601.2c) — block spells with
     # no legal targets.  Only checks instant/sorcery spells that require targets.
     # Permissive: if the targeting module errors or can't parse, allows the cast.
-    if HAS_TARGETING and _spell_requires_targets(card):
-        if not _find_any_valid_target(game, card, player.name):
-            print(f"[TARGETING] {card.name} has no valid targets — cast blocked")
-            return ((False, f"{card.name} has no valid targets", []),
+    #
+    # Aug 3: evaluate the HALF being cast, not the whole card. Card.oracle_text
+    # for a split card is face 0 only, so casting Memory (which targets
+    # nothing) was gated on Commit's "target spell or nonland permanent" and
+    # refused as "no valid targets" — with aftermath now enforcing that Memory
+    # is castable ONLY from the graveyard, that made the half uncastable
+    # anywhere. Mirrors the synthetic half-card _dispatch_resolution builds.
+    _gate_card = card
+    _gate_half = getattr(card, 'cast_as_split_half', -1)
+    if (_gate_half is not None and _gate_half >= 0
+            and len(getattr(card, 'split_texts', None) or []) > _gate_half):
+        _names = getattr(card, 'split_names', None) or []
+        _types = getattr(card, 'split_types', None) or []
+        _gate_card = Card(
+            name=_names[_gate_half] if _gate_half < len(_names) else card.name,
+            mana_cost=card.split_costs[_gate_half] if card.split_costs else card.mana_cost,
+            type_line=_types[_gate_half] if _gate_half < len(_types) else card.type_line,
+            oracle_text=card.split_texts[_gate_half],
+        )
+    if HAS_TARGETING and _spell_requires_targets(_gate_card):
+        if not _find_any_valid_target(game, _gate_card, player.name):
+            print(f"[TARGETING] {_gate_card.name} has no valid targets — cast blocked")
+            return ((False, f"{_gate_card.name} has no valid targets", []),
                     _cast_from_graveyard, target)
 
         # Validate the target actually declared by the caller, not merely the
@@ -656,6 +702,27 @@ def _compute_alt_costs(engine, game: GameState, player: Player, card: Card,
         effective_cmc = helpers.cmc_of_cost_string(card._madness_cost)
         print(f"[MADNESS] Using madness cost {card._madness_cost} "
               f"(CMC {effective_cmc}) instead of {card.mana_cost}")
+    # Miracle (CR 702.94a, Aug 3): cast for the miracle cost, which is much
+    # cheaper than printed (Terminus {4}{W}{W} → {W}) — the same cost-
+    # SELECTION seam as madness. Stamped by the drain, not by the executors:
+    # the miracle window opens on the draw, not on a player action.
+    if (getattr(card, '_cast_via_miracle', False)
+            and getattr(card, '_miracle_cost', None)):
+        effective_mana_cost = card._miracle_cost
+        effective_cmc = helpers.cmc_of_cost_string(card._miracle_cost)
+        print(f"[MIRACLE] Using miracle cost {card._miracle_cost} "
+              f"(CMC {effective_cmc}) instead of {card.mana_cost}")
+    # Foretell (CR 702.143b, Aug 3): a foretold card is cast from exile for
+    # its foretell cost, which is usually cheaper than printed — the same
+    # cost-SELECTION seam as flashback / escape / madness above. The stamp is
+    # set by the executors' exile pre-move, which is the only place that
+    # knows the cast came out of the foretell exile.
+    if (getattr(card, '_cast_via_foretell', False)
+            and getattr(card, '_foretell_cost', None)):
+        effective_mana_cost = card._foretell_cost
+        effective_cmc = helpers.cmc_of_cost_string(card._foretell_cost)
+        print(f"[FORETELL] Using foretell cost {card._foretell_cost} "
+              f"(CMC {effective_cmc}) instead of {card.mana_cost}")
     # Spectacle (CR 702.137, Aug 1): take the spectacle cost whenever the
     # condition is met ("an opponent lost life this turn") and the cost is
     # payable — when its condition is on, spectacle is the designed-better
@@ -743,6 +810,42 @@ def _compute_alt_costs(engine, game: GameState, player: Player, card: Card,
                 card._entwined = True
                 print(f"[ENTWINE] {card.name}: paying entwine {_ent_cost} "
                       f"(total {_ent_string}, CMC {effective_cmc})")
+
+    # Buyback (CR 702.26, Aug 3 2026): an optional ADDITIONAL cost — the
+    # kicker family again — whose payoff is a zone change rather than a bigger
+    # effect: the spell returns to its owner's HAND as it resolves. Two
+    # printed forms, both live in the inventory's decks:
+    #   mana    ("Buyback {2}{U}") — appended to effective_mana_cost like
+    #           kicker, so the payment tap charges the colored pips too;
+    #   discard ("Buyback—Discard two cards." — Forbid) — a non-mana cost,
+    #           paid in _pay_costs AFTER the mana succeeds, because paying it
+    #           here would discard the cards even when the cast then fails
+    #           for mana (the cost-paid-no-effect class).
+    # Life-payment and sacrifice forms parse to None and simply don't buy
+    # back (see parse_buyback) — declining is the safe direction.
+    buyback_discard = 0
+    if pay_mana and not getattr(card, '_cast_via_madness', False):
+        _bb = helpers.parse_buyback(card.oracle_text)
+        if _bb and _bb.get('mana') and effective_mana_cost:
+            _bb_string = effective_mana_cost + _bb['mana']
+            _bb_ok, _ = player.can_pay_mana_cost(_bb_string)
+            if _bb_ok:
+                effective_mana_cost = _bb_string
+                effective_cmc = helpers.cmc_of_cost_string(_bb_string)
+                card._buyback_paid = True
+                print(f"[BUYBACK] {card.name}: paying buyback {_bb['mana']} "
+                      f"(total {_bb_string}, CMC {effective_cmc})")
+        elif _bb and _bb.get('discard'):
+            # Unlike a mana buyback, "affordable" is not the whole question —
+            # emptying your hand to keep one spell is usually a losing trade.
+            # v1 heuristic, deliberately conservative: buy back only while a
+            # two-card reserve survives the discard (the spell itself is
+            # still in hand at this point, hence the -1).
+            _need = _bb['discard']
+            if len(player.hand) - 1 >= _need + 2:
+                buyback_discard = _need
+                print(f"[BUYBACK] {card.name}: will discard {_need} card(s) "
+                      f"for buyback after mana is paid")
 
     # Multikicker (CR 702.33c, Aug 2 2026) — REGISTRY-gated: only kick when
     # a template actually consumes kicked_times (helpers.MULTIKICKER_MODELED
@@ -1099,6 +1202,7 @@ def _compute_alt_costs(engine, game: GameState, player: Player, card: Card,
         'free_cast_source': free_cast_source,
         'total_alt_reduction': total_alt_reduction,
         'cost_increase': cost_increase,
+        'buyback_discard': buyback_discard,
     }
 
 
@@ -1148,6 +1252,30 @@ def _pay_costs(engine, game: GameState, player: Player, card: Card,
             return False, f"Not enough mana to cast {cast_name} (needs {effective_cmc}{tax_note} = {total_cost} total)", []
         # Track mana paid for X spell calculations
         card._mana_paid = total_cost
+
+    # Buyback's non-mana form (CR 702.26a — Forbid's "Discard two cards"),
+    # paid HERE rather than in the cost stage so a cast that dies at the mana
+    # tap above never discards. Routes through the madness choke point, so
+    # discarding a madness card to buy back a spell exiles it and offers the
+    # madness cast, exactly as any other discard does.
+    _bb_discard = costs.get('buyback_discard', 0)
+    if _bb_discard:
+        _pitchable = [c for c in player.hand if c is not card]
+        if len(_pitchable) >= _bb_discard:
+            _pitched = []
+            for _ in range(_bb_discard):
+                _worst = max(_pitchable, key=lambda c: (c.is_land(), -(c.cmc or 0)))
+                _pitchable.remove(_worst)
+                player.hand.remove(_worst)
+                if helpers.madness_discard_to_exile(game, player, _worst) is None:
+                    player.graveyard.append(_worst)
+                _pitched.append(_worst.name)
+            card._buyback_paid = True
+            print(f"[BUYBACK] {card.name}: discarded {', '.join(_pitched)} — "
+                  f"returns to hand as it resolves")
+        else:
+            print(f"[BUYBACK] {card.name}: not enough cards to discard — "
+                  f"cast proceeds without buyback")
     return None
 
 
@@ -1836,8 +1964,17 @@ async def _dispatch_resolution(engine, game: GameState, player: Player,
                 _ht = _ht[:497].rstrip() + '…'
             split_msgs = [f"🧙 **{half_name}** resolves — {_ht}"]
         effect_messages.extend(split_msgs)
-        # Split cards go to graveyard after resolving
-        player.graveyard.append(card)
+        # Split cards go to graveyard after resolving — EXCEPT an aftermath
+        # half, which is exiled (CR 702.127a). This early return bypasses the
+        # main resolution zone-routing cascade entirely, so the aftermath
+        # branch has to live here too.
+        if helpers.aftermath_half_index(card) == half_idx:
+            player.exile.append(card)
+            effect_messages.append(f"📤 {card.name} is exiled (aftermath)")
+            print(f"[EXILE-ON-RESOLVE] {card.name} resolved → exiled (aftermath)")
+        else:
+            player.graveyard.append(card)
+        card._exile_after_resolution = ""
         card.cast_as_split_half = -1  # Reset flag
         engine.rules.log_event(f"{player.name} casts {half_name} (split half of {card.name})")
         return True, f"Cast {half_name}", effect_messages
@@ -2217,14 +2354,33 @@ async def _dispatch_resolution(engine, game: GameState, player: Player,
             player.command_zone.append(card)
             effect_messages.append(f"📜 {card.name} returns to command zone (signature spell)")
             print(f"[OATHBREAKER] {card.name} resolved → returns to command zone")
-        elif getattr(card, '_resolving_flashback', False):
-            # CR 702.34a: flashbacked spells exile instead of going to the
-            # graveyard (June 11 audit — flashback casts previously either
-            # failed outright or would have recycled into the graveyard).
-            card._resolving_flashback = False
+        elif getattr(card, '_exile_after_resolution', ''):
+            # ONE branch for every "exiled as it resolves" mechanic, carrying
+            # the printed reason: flashback (CR 702.34a), jump-start
+            # (CR 702.132a), aftermath (CR 702.127a).
+            #
+            # Aug 3, 2026: this used to be a flashback-only flag, and the
+            # three EXECUTORS compensated with a blanket "if from_graveyard:
+            # graveyard → exile" after every graveyard cast. That is right
+            # for the three mechanics above and WRONG for escape, which has
+            # no exile clause (CR 702.139) — an escaped Cling to Dust was
+            # exiled after its first cast and could never escape again, in
+            # the deck built around escape. Making the destination a
+            # per-mechanic decision here, and deleting the blanket executor
+            # exile, is what fixes it.
+            _reason = card._exile_after_resolution
+            card._exile_after_resolution = ""
             player.exile.append(card)
-            effect_messages.append(f"📤 {card.name} is exiled (flashback)")
-            print(f"[FLASHBACK] {card.name} resolved → exiled (CR 702.34a)")
+            effect_messages.append(f"📤 {card.name} is exiled ({_reason})")
+            print(f"[EXILE-ON-RESOLVE] {card.name} resolved → exiled ({_reason})")
+        elif getattr(card, '_buyback_paid', False):
+            # Buyback (CR 702.26a): the optional additional cost was paid, so
+            # the spell returns to its owner's HAND as it resolves instead of
+            # going to the graveyard. Cleared at the start of the next cast
+            # alongside the other per-cast stamps.
+            player.hand.append(card)
+            effect_messages.append(f"↩️ {card.name} returns to your hand (buyback)")
+            print(f"[BUYBACK] {card.name} resolved → returned to hand (CR 702.26a)")
         elif 'rebound' in oracle_lower and not getattr(card, '_from_rebound', False):
             # Rebound: exile instead of graveyard, recast at next upkeep
             player.exile.append(card)
@@ -2249,15 +2405,11 @@ async def _dispatch_resolution(engine, game: GameState, player: Player,
             player.library.append(card)
             random.shuffle(player.library)
             effect_messages.append(f"🔀 {card.name} is shuffled into its owner's library")
-        elif getattr(card, 'is_signature_spell', False) and game.format == "oathbreaker":
-            # CR Oathbreaker: Signature spell returns to command zone on resolve.
-            if not hasattr(player, 'command_zone') or player.command_zone is None:
-                player.command_zone = []
-            player.command_zone.append(card)
-            effect_messages.append(f"👑 {card.name} returns to command zone")
-            print(f"[OATHBREAKER] {card.name} resolved → returns to command zone")
         else:
             player.graveyard.append(card)
+        # (A second signature-spell branch sat here and was UNREACHABLE — the
+        # identical condition at the top of this chain always won. Removed
+        # Aug 3, 2026 rather than left as decorative defence.)
         engine.rules.log_event(f"{player.name} casts {card.name} (instant/sorcery)")
         # [TARGETING] Clear resolution source context
         game._current_resolution_source = None
@@ -3385,10 +3537,16 @@ async def cast_spell_async(engine, game: GameState, player: Player, card: Card, 
             player.playable_from_graveyard.remove(card.id)
         except (ValueError, AttributeError):
             pass
-        # CR 702.34a: a flashbacked spell is exiled as it resolves —
-        # consumed by the resolution zone-routing below.
-        card._resolving_flashback = True
-        print(f"[FLASHBACK] {card.name} cast from graveyard (leaves graveyard)")
+        # Which graveyard-cast mechanics exile the card as it resolves is a
+        # PER-MECHANIC question (helpers.exile_after_resolution_reason):
+        # flashback / jump-start / aftermath do, escape does not. Stamping
+        # every graveyard cast as "flashback" would exile escaped
+        # instants (CR 702.139 gives escape no exile clause).
+        _why = helpers.exile_after_resolution_reason(card)
+        if _why:
+            card._exile_after_resolution = _why
+        print(f"[GRAVEYARD-CAST] {card.name} cast from graveyard "
+              f"(leaves graveyard{'; exiled on resolve: ' + _why if _why else ''})")
     else:
         player.hand.remove(card)
 
@@ -3536,6 +3694,88 @@ def _advance_sagas(engine, game: GameState, player: Player) -> List[str]:
         saga_chapters = engine._get_saga_total_chapters(card)
         if new_lore >= saga_chapters:
             print(f"[SAGA] {card.name}: final chapter reached ({new_lore}/{saga_chapters}), will sacrifice via SBA")
+    return messages
+
+
+def _miracle_would_wipe_own_board(game, player, card) -> bool:
+    """Decline a mass-removal miracle that hits nothing worth hitting.
+
+    The one guard on the otherwise-madness-shaped "affordable = cast" gate:
+    Terminus for {W} is a fine deal and a terrible play when the opponent
+    controls no creatures and you control several. Mirrors the plan-validate
+    board-wipe rejection, which the miracle drain bypasses entirely.
+    """
+    oracle = (getattr(card, 'oracle_text', '') or '').lower()
+    if not re.search(r'\ball creatures\b', oracle):
+        return False
+    opponents = [p for p in game.players if p is not player]
+    opp_creatures = sum(1 for p in opponents for c in p.battlefield
+                        if c.is_creature(game=game))
+    own_creatures = sum(1 for c in player.battlefield if c.is_creature(game=game))
+    return opp_creatures == 0 and own_creatures > 0
+
+
+async def resolve_pending_miracles(engine, game: GameState) -> List[str]:
+    """Resolve the miracle cast-or-keep choice (CR 702.94a).
+
+    Draws are sync and casting is not, so helpers.note_miracle_on_draw parks
+    (card, owner_index) on game._miracle_pending and this drain — invoked at
+    the front of drain_pending_triggers, beside the madness drain it is
+    modelled on — makes the call: cast for the miracle cost when the owner
+    can pay it, else the card simply stays in hand (unlike madness, declining
+    costs nothing).
+
+    Snapshot + clear first so a card drawn DURING one of these casts pends
+    for the NEXT drain rather than this loop.
+    """
+    messages: List[str] = []
+    pending = list(getattr(game, '_miracle_pending', None) or [])
+    if not pending:
+        return messages
+    game._miracle_pending = []
+    for card, owner_idx in pending:
+        if not (0 <= owner_idx < len(game.players)):
+            continue
+        player = game.players[owner_idx]
+        if card not in player.hand:
+            continue  # zone changed since the draw — stale entry
+        cost = getattr(card, '_miracle_cost', '') or ''
+        if not cost or getattr(game, 'ended', False):
+            continue
+        try:
+            can_pay, _reason = player.can_pay_mana_cost(cost)
+        except Exception as e:
+            print(f"[MIRACLE] can_pay check failed for {card.name}: {e}")
+            from mtg.util import maybe_reraise
+            maybe_reraise(e)
+            continue
+        if not can_pay:
+            print(f"[MIRACLE] {player.name} declines {card.name} — can't pay "
+                  f"{cost}")
+            continue
+        if _miracle_would_wipe_own_board(game, player, card):
+            print(f"[MIRACLE] {player.name} declines {card.name} — it would "
+                  f"wipe only their own board")
+            continue
+        card._cast_via_miracle = True
+        try:
+            success, msg, effect_msgs = await engine.cast_spell_async(
+                game, player, card)
+        except Exception as e:
+            print(f"[MIRACLE] cast_spell_async raised for {card.name}: {e}")
+            from mtg.util import maybe_reraise
+            maybe_reraise(e)
+            success, msg, effect_msgs = False, str(e), []
+        card._cast_via_miracle = False
+        if success:
+            print(f"[MIRACLE] {player.name} casts {card.name} for its miracle "
+                  f"cost {cost}")
+            messages.append(f"✨ **{player.name}** reveals and casts "
+                            f"**{card.name}** for its miracle cost {cost}")
+            messages.extend(effect_msgs or [])
+        else:
+            print(f"[MIRACLE] {player.name}'s miracle cast of {card.name} "
+                  f"failed ({msg}) — it stays in hand")
     return messages
 
 
@@ -3692,6 +3932,141 @@ def crew_vehicle(game: GameState, player: Player, vehicle_name: str):
     return True, (f"🚗 {player.name} crews **{vehicle.name}** ({_pp}/{_pt}) "
                   f"by tapping {crew_names} — it's an artifact creature "
                   f"until end of turn")
+
+
+def foretell_card_from_hand(game: GameState, player: Player, card: Card):
+    """Foretell a card (CR 702.143a): pay {2}, exile it FACE DOWN. It can be
+    cast from exile for its foretell cost on a LATER turn. Returns (ok, msg).
+
+    The shared core for both executors' `foretell` action and any future
+    manual command — the suspend precedent, for the same reason: three
+    independent copies of a cost-paying zone move is how the two activation
+    paths diverged.
+
+    The persistent marker is Card._foretold rather than
+    Player.playable_from_exile, which end_turn expires: a foretold card stays
+    castable for the rest of the game (the _adventure_exiled precedent).
+    """
+    from mtg.helpers import parse_foretell
+    cost = parse_foretell(getattr(card, 'oracle_text', ''))
+    if cost is None:
+        return False, f"{card.name} has no Foretell ability"
+    if card not in player.hand:
+        return False, f"{card.name} is not in your hand"
+    # CR 702.143a: foretelling is a special action taken only during your own
+    # turn, at sorcery speed.
+    if game.active_player is not player:
+        return False, f"Can only foretell on your own turn"
+    if not player.tap_sources_for_cost("{2}", game=game):
+        return False, f"Can't pay {{2}} to foretell {card.name}"
+    player.hand.remove(card)
+    player.exile.append(card)
+    card._foretold = True
+    card._foretell_cost = cost
+    card._foretold_turn = game.turn_number
+    # CR 702.143a exiles it face down — hidden information, so the name is
+    # never surfaced to Discord (the Necropotence / Gonti convention).
+    card._face_down = True
+    print(f"[FORETELL] {player.name} foretells {card.name} for {{2}} "
+          f"(foretell cost {cost}, turn {game.turn_number})")
+    return True, (f"🔮 **{player.name}** foretells a card "
+                  f"(exiled face down for {{2}})")
+
+
+def activate_from_graveyard(engine, game: GameState, player: Player,
+                            card: Card):
+    """Embalm / eternalize / unearth — the three graveyard-ACTIVATED recursion
+    mechanics (CR 702.87 / 702.129 / 702.83). Returns (ok, message).
+
+    All three are activated abilities, not casts, so this deliberately does
+    NOT route through cast_spell_async: casting them would fire Rhystic
+    Study, Ash Zealot and the rest of the cast-trigger family for an ability
+    that never uses the stack's cast machinery.
+
+    Shape shared by all three: sorcery-speed only, the card is EXILED from
+    the graveyard as part of the cost, and something arrives on the
+    battlefield — a token copy for embalm/eternalize, the card itself for
+    unearth.
+    """
+    from mtg.helpers import parse_graveyard_activation
+    parsed = parse_graveyard_activation(getattr(card, 'oracle_text', ''))
+    if not parsed:
+        return False, f"{card.name} has no embalm / eternalize / unearth ability"
+    mechanic, cost = parsed
+    if card not in player.graveyard:
+        return False, f"{card.name} is not in your graveyard"
+    # "Only as a sorcery" — your main phase, your turn, empty stack (CR 307.1).
+    if game.active_player is not player:
+        return False, f"{mechanic.capitalize()} only as a sorcery (not your turn)"
+    if getattr(game, 'stack', None):
+        return False, (f"{mechanic.capitalize()} only as a sorcery "
+                       f"(something is on the stack)")
+    if not player.tap_sources_for_cost(cost, game=game):
+        return False, f"Can't pay {cost} to {mechanic} {card.name}"
+
+    # Exile from the graveyard — part of the activation cost for all three.
+    player.graveyard.remove(card)
+    try:
+        player.playable_from_graveyard.remove(card.id)
+    except (ValueError, AttributeError):
+        pass
+
+    if mechanic == 'unearth':
+        # CR 702.83a: return the CARD itself, with haste, and exile it at the
+        # beginning of the next end step (or if it would leave the
+        # battlefield — the leave-replacement half stays unmodeled, noted).
+        card.reset_battlefield_state()
+        card.summoning_sick = False   # it has haste
+        card.entered_this_turn = True
+        card._unearthed = True
+        if 'Haste' not in (card.keywords or []):
+            card.temp_keywords = list(getattr(card, 'temp_keywords', []) or [])
+            card.temp_keywords.append('Haste')
+        player.battlefield.append(card)
+        game.delayed_triggers.append({
+            "trigger_at": "end_step",
+            "source": f"{card.name} (unearth)",
+            "controller": game.players.index(player),
+            "once": True,
+            "turn_delay": 0,
+            "actions": [{"action": "move_card", "card": card.name,
+                         "from_zone": "battlefield", "to_zone": "exile",
+                         "player": player.name}],
+        })
+        from mtg.actions import _fire_noncast_battlefield_entry
+        entry_msgs = _fire_noncast_battlefield_entry(
+            engine.rules, game, player, card)
+        events.emit(events.PERMANENT_ENTERED, game, card=card,
+                    controller=player, via="unearth", rules=engine.rules)
+        extra = "".join(f"\n{m}" for m in entry_msgs if m)
+        print(f"[UNEARTH] {player.name} unearths {card.name} for {cost} "
+              f"(haste; exiled at the next end step)")
+        return True, (f"⚰️ **{player.name}** unearths **{card.name}** "
+                      f"({cost}) — it has haste and is exiled at end of "
+                      f"turn{extra}")
+
+    # Embalm / eternalize: the card goes to EXILE and a token copy arrives.
+    player.exile.append(card)
+    action = {
+        "action": "create_copy_token",
+        "player": player.name,
+        "zone": "exile",
+        "target": card.name,
+        "count": 1,
+        "extra_types": ["Zombie"],
+        "clear_mana_cost": True,
+    }
+    if mechanic == 'embalm':
+        action["colors"] = ["W"]          # "except it's a white Zombie ..."
+    else:
+        action["colors"] = ["B"]          # "... a 4/4 black Zombie ..."
+        action["power"] = 4
+        action["toughness"] = 4
+    msg = engine.rules._execute_action_on_state(game, action)
+    print(f"[{mechanic.upper()}] {player.name} {mechanic}s {card.name} for "
+          f"{cost} (card exiled, token copy created)")
+    return True, (f"⚱️ **{player.name}** {mechanic}s **{card.name}** ({cost})"
+                  + (f"\n{msg}" if msg else ""))
 
 
 def suspend_card_from_hand(game: GameState, player: Player, card: Card):

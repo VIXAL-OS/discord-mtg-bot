@@ -485,6 +485,37 @@ class Card:
     # Player.playable_from_exile, which end_turn wipes every turn — adventure
     # castability persists for as long as the card stays exiled.
     _adventure_exiled: bool = field(default=False, repr=False, compare=False)
+    # Aug 3 2026 — the alternate-cost / graveyard-casting wave.
+    #
+    # ONE routing marker for "this spell is exiled as it resolves instead of
+    # going to the graveyard", carrying the printed reason for the display
+    # line: flashback (CR 702.34a), jump-start (CR 702.132a), aftermath
+    # (CR 702.127a). Three near-identical branches in the resolution zone
+    # routing would have drifted; the flashback branch's old private flag was
+    # folded into this one.
+    _exile_after_resolution: str = field(default="", repr=False, compare=False)
+    # Buyback (CR 702.26): the optional additional cost was PAID, so the
+    # spell returns to its owner's hand as it resolves. Reset per cast
+    # alongside _kicked / _entwined.
+    _buyback_paid: bool = field(default=False, repr=False, compare=False)
+    # Foretell (CR 702.143). `_foretold` is the persistent exile marker
+    # (twin of _adventure_exiled — foretold cards stay castable for the rest
+    # of the game, so Player.playable_from_exile, which end_turn expires,
+    # is the wrong home); `_foretell_cost` is the alternative cost the
+    # payment stage charges; `_foretold_turn` enforces CR 702.143b, which
+    # forbids casting it the turn it was foretold.
+    _foretold: bool = field(default=False, repr=False, compare=False)
+    _foretell_cost: str = field(default="", repr=False, compare=False)
+    _foretold_turn: Optional[int] = field(default=None, repr=False, compare=False)
+    _cast_via_foretell: bool = field(default=False, repr=False, compare=False)
+    # Unearth (CR 702.83): the permanent came back from the graveyard and is
+    # exiled at the next end step or if it would leave the battlefield.
+    _unearthed: bool = field(default=False, repr=False, compare=False)
+    # Miracle (CR 702.94). Stamped when the card is drawn as the first card
+    # of the turn and its owner may cast it for the miracle cost; the cast
+    # pipeline reads _cast_via_miracle exactly as it reads _cast_via_madness.
+    _miracle_cost: str = field(default="", repr=False, compare=False)
+    _cast_via_miracle: bool = field(default=False, repr=False, compare=False)
     _declared_graveyard_target_id: Optional[str] = field(default=None, repr=False, compare=False)
     _declared_graveyard_target_owner: str = field(default="", repr=False, compare=False)
     _imprinted_card_id: Optional[str] = field(default=None, repr=False, compare=False)
@@ -1766,6 +1797,11 @@ class Player:
     # it also counts artifacts, enchantments and planeswalkers.
     instant_sorcery_spells_cast_this_turn: int = 0
     landfall_count_this_turn: int = 0  # Lands that entered under your control this turn (for Omnath, etc.)
+    # Aug 3 2026 — miracle (CR 702.94) needs "is this the FIRST card you drew
+    # this turn?", and nothing tracked per-turn draws at all. Incremented in
+    # GameEngine.draw_cards (the draw choke point) and reset with the other
+    # per-turn counters at turn advance.
+    cards_drawn_this_turn: int = 0
 
     # ---- Transient runtime state (reset/derived during play; NOT serialized) ----
     # Same convention as Card: declare runtime flags, don't staple
@@ -3671,6 +3707,14 @@ class GameState:
     # list bridges — the same sync-gap convention as the Tier-3 trigger
     # queue ([QUEUE-*] → [DRAIN-*]).
     _madness_pending: list = field(default_factory=list, repr=False, compare=False)
+    # Miracle (CR 702.94), Aug 3 2026 — the same sync-gap bridge as madness:
+    # draws are sync and casting is not, so the draw hook parks
+    # (card, owner_index) here and spells.resolve_pending_miracles makes the
+    # cast-or-keep call at the next async drain.
+    _miracle_pending: list = field(default_factory=list, repr=False, compare=False)
+    # Dredge (CR 702.52) replaces at most ONE draw per turn — see
+    # helpers.try_dredge for why. Reset with the per-turn counters.
+    _dredged_this_turn: bool = field(default=False, repr=False, compare=False)
     # Spell Queller bookkeeping: source card name → [(exiled_card, owner_name)]
     # (exile_from_stack records; release_queller_exile drains on LTB).
     _queller_exiles: dict = field(default_factory=dict, repr=False, compare=False)

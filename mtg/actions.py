@@ -835,9 +835,16 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                     if final.is_prevented:
                         print(f"  [REPLACEMENT-APPLY] Draw prevented for {player.name} ({', '.join(final.replacement_chain)})")
                         continue
+                # Dredge REPLACES the draw (CR 702.52a) — before the pop.
+                from mtg.helpers import note_miracle_on_draw, try_dredge
+                if try_dredge(game, player) is not None:
+                    continue
                 card = player.library.pop(0)
                 player.hand.append(card)
                 drawn.append(card.name)
+                # Miracle (CR 702.94a) reacts to it — after.
+                player.cards_drawn_this_turn += 1
+                note_miracle_on_draw(game, player, card)
             actual_drawn = len(drawn)
             rules.log_event(f"{player.name} draws {actual_drawn}")
             if actual_drawn == 0:
@@ -1968,13 +1975,19 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
         if p:
             # Find the creature to copy
             source_card = None
-            if zone == "graveyard":
+            if zone in ("graveyard", "exile"):
+                # Aug 3: "exile" joined "graveyard" for embalm/eternalize
+                # (CR 702.87a / 702.129a) — the card is exiled as the
+                # activation COST, so by the time the copy is made the source
+                # sits in exile, not the graveyard.
                 zone_owner = (action.get("zone_owner") or "controller").lower()
                 pools = [p] if zone_owner == "controller" else list(game.players)
+                _pool_attr = "graveyard" if zone == "graveyard" else "exile"
                 # Plain is_creature() is correct here: the devotion type-flip
                 # (CR 207.4) only applies to permanents on the battlefield, so a
                 # devotion-gated god in a graveyard IS a creature card.
-                candidates = [c for pl in pools for c in pl.graveyard
+                candidates = [c for pl in pools
+                              for c in getattr(pl, _pool_attr, [])
                               if c.is_creature()]
                 if target_name and target_name not in (
                         "best_creature", "best_attacking_creature"):
@@ -1987,7 +2000,7 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                 if source_card is None:
                     print(f"[COPY-TOKEN] No creature card in the "
                           f"{'controller' if zone_owner == 'controller' else 'targeted'} "
-                          f"graveyard to copy")
+                          f"{_pool_attr} to copy")
                     return None
             elif target_name and target_name not in ("best_creature", "best_attacking_creature"):
                 result = find_card_on_battlefield(target_name)
@@ -2036,16 +2049,30 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                 extra_keywords = action.get("keywords") or []
                 if isinstance(extra_keywords, str):
                     extra_keywords = [k.strip() for k in extra_keywords.split(",") if k.strip()]
+                # Aug 3: copy-with-EXCEPTIONS (CR 706.2 lets a copy effect
+                # name changes). Embalm's copy is "a white Zombie <types> with
+                # no mana cost"; eternalize's is "a 4/4 black Zombie <types>
+                # with no mana cost" — three characteristics the handler could
+                # not express, so it produced a plain copy of the original.
+                override_p = action.get("power")
+                override_t = action.get("toughness")
+                override_colors = action.get("colors")
+                if isinstance(override_colors, str):
+                    override_colors = [c.strip() for c in override_colors.split(",")
+                                       if c.strip()]
+                clear_mana_cost = bool(action.get("clear_mana_cost", False))
                 for i in range(actual_count):
                     # Create a token copy with the source creature's stats
                     copy_token = Card(
                         name=source_card.name,
-                        mana_cost=source_card.mana_cost or "",
-                        cmc=source_card.cmc or 0,
+                        mana_cost="" if clear_mana_cost else (source_card.mana_cost or ""),
+                        cmc=0 if clear_mana_cost else (source_card.cmc or 0),
                         type_line=source_card.type_line or "Creature",
                         oracle_text=source_card.oracle_text or "",
-                        power=source_card.power or "0",
-                        toughness=source_card.toughness or "0",
+                        power=(str(override_p) if override_p is not None
+                               else (source_card.power or "0")),
+                        toughness=(str(override_t) if override_t is not None
+                                   else (source_card.toughness or "0")),
                     )
                     # July 27 fanout: is_token was never set here, so a copy
                     # token that died did NOT cease to exist (CR 111.7) — it sat
@@ -2065,8 +2092,12 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                     for t in extra_types:
                         if t and t.lower() not in (copy_token.type_line or "").lower():
                             copy_token.type_line = f"{str(t).capitalize()} {copy_token.type_line}".strip()
-                    # Copy color identity
-                    if source_card.color_identity:
+                    # Copy color identity — unless the copy effect replaces
+                    # the colors outright ("except it's a white Zombie ...").
+                    if override_colors is not None:
+                        copy_token.color_identity = list(override_colors)
+                        copy_token.colors = list(override_colors)
+                    elif source_card.color_identity:
                         copy_token.color_identity = list(source_card.color_identity)
                     copy_token.summoning_sick = True
                     copy_token.entered_this_turn = True
@@ -3072,8 +3103,15 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                 # under Claude's control and landing in CLAUDE's graveyard,
                 # permanently changing hands. The commander branch above
                 # already resolved ownership properly; this one didn't.
-                from mtg.helpers import owner_of
-                owner_of(game, card, owner).graveyard.append(card)
+                from mtg.helpers import owner_of, unearthed_leaves_to_exile
+                _dest_owner = owner_of(game, card, owner)
+                # Unearth (CR 702.83a) — see the SBA and sacrifice twins.
+                if unearthed_leaves_to_exile(card):
+                    _dest_owner.exile.append(card)
+                    print(f"[UNEARTH] {card.name} destroyed → exiled "
+                          f"(CR 702.83a)")
+                else:
+                    _dest_owner.graveyard.append(card)
             game.recalculate_granted_keywords()
             game.recalculate_power_toughness()
             rules.log_event(f"{card.name} destroyed")
@@ -5029,8 +5067,17 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                 print(f"[SACRIFICE] {p.name} sacrifices {victim.name} → "
                       f"{_zone_owner.name}'s command zone ({reason})")
             else:
-                p.graveyard.append(victim)
-                print(f"[SACRIFICE] {p.name} sacrifices {victim.name} ({reason})")
+                # Unearth (CR 702.83a): exiled if it would LEAVE the
+                # battlefield, sacrifice included — otherwise it can be
+                # unearthed again out of the graveyard.
+                from mtg.helpers import unearthed_leaves_to_exile
+                if unearthed_leaves_to_exile(victim):
+                    p.exile.append(victim)
+                    print(f"[UNEARTH] {p.name} sacrifices {victim.name} → exiled "
+                          f"(CR 702.83a) ({reason})")
+                else:
+                    p.graveyard.append(victim)
+                    print(f"[SACRIFICE] {p.name} sacrifices {victim.name} ({reason})")
 
             # A sacrificed commander dies before the engine's direct
             # command-zone approximation (CR 903.9a is an SBA choice), so it

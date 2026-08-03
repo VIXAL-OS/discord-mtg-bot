@@ -264,6 +264,11 @@ async def drain_pending_triggers(engine, game: GameState) -> List[str]:
     if getattr(game, '_madness_pending', None):
         from mtg.spells import resolve_pending_madness
         messages.extend(await resolve_pending_madness(engine, game))
+    # Miracle (CR 702.94a, Aug 3, 2026): same sync-gap bridge — the draw hook
+    # is sync, the cast is not. Drained beside madness for the same reason.
+    if getattr(game, '_miracle_pending', None):
+        from mtg.spells import resolve_pending_miracles
+        messages.extend(await resolve_pending_miracles(engine, game))
     if not hasattr(game, 'pending_async_triggers') or not game.pending_async_triggers:
         return messages
     # Snapshot + clear so reentrant triggers enqueued during resolution

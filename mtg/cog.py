@@ -45,7 +45,9 @@ from mtg.constants import (
 from mtg.deck_loader import DeckLoader
 from mtg.display import GameDisplay
 from mtg.engine import GameEngine
-from mtg.helpers import _normalize_pw_ability_idx, _resolve_player_or_card_target
+from mtg.helpers import (_normalize_pw_ability_idx,
+                         _resolve_player_or_card_target,
+                         exile_after_resolution_reason)
 from mtg.models import Card, Player, GameState, FormatValidator
 from mtg.rules_engine import RulesEngine
 from mtg.util import GameLogger, StdoutTee, StderrTee
@@ -1577,12 +1579,20 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
                 additional_cost=commander_tax
             )
             if success:
-                # Flashback/escape: exile the card after resolution instead of graveyard
-                if from_graveyard:
-                    if card in player.graveyard:
+                # Graveyard casts: exile after resolution only for the
+                # mechanics that print an exile clause (mirror of the engine
+                # and autoplay cast branches). The old blanket exile also
+                # caught ESCAPE, which has none (CR 702.139).
+                if from_graveyard and card in player.graveyard:
+                    _why = exile_after_resolution_reason(card)
+                    if _why:
                         player.graveyard.remove(card)
                         player.exile.append(card)
-                        print(f"[FLASHBACK] {card.name} exiled after casting from graveyard")
+                        print(f"[EXILE-ON-RESOLVE] {card.name} exiled after "
+                              f"casting from graveyard ({_why})")
+                # Per-cast stamp; resolution has read it by now (engine twin).
+                if from_graveyard:
+                    card._cast_from_graveyard = False
                 source = " from exile" if from_exile else (" from command zone" if from_command_zone else (" from graveyard" if from_graveyard else ""))
                 tax_msg = f" (paid {{{commander_tax}}} commander tax)" if commander_tax > 0 else ""
                 x_msg = ""

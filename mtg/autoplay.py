@@ -49,7 +49,9 @@ from typing import Any, Dict, List, Optional, Tuple
 import aiohttp, discord
 
 from mtg.constants import Phase, Zone, COMMAND_ZONE_FORMATS, PHASE_NAMES
-from mtg.helpers import _normalize_pw_ability_idx, _resolve_player_or_card_target, coerce_ai_string
+from mtg.helpers import (_normalize_pw_ability_idx,
+                         _resolve_player_or_card_target, coerce_ai_string,
+                         exile_after_resolution_reason)
 from mtg.models import Card, Player, GameState
 from mtg.util import GameLogger
 
@@ -1533,7 +1535,8 @@ async def _autoplay_execute_action(cog, thread, game: GameState, player_idx: int
         if not card:
             exile_card = player.find_card(card_name, Zone.EXILE)
             if exile_card and (exile_card.id in player.playable_from_exile
-                               or getattr(exile_card, '_adventure_exiled', False)):
+                               or getattr(exile_card, '_adventure_exiled', False)
+                               or getattr(exile_card, '_foretold', False)):
                 card = exile_card
                 from_exile = True
 
@@ -1543,30 +1546,53 @@ async def _autoplay_execute_action(cog, thread, game: GameState, player_idx: int
         # graveyard" castable list pointed at cards the cast resolver would never find.
         from_graveyard = False
         _gy_escape_exiled = []
+        _gy_jumpstart_discarded = []
         if not card and player.playable_from_graveyard:
             for c in player.graveyard:
-                if c.id in player.playable_from_graveyard and c.name.lower() == card_name.lower():
-                    card = c
-                    from_graveyard = True
-                    player.graveyard.remove(c)
-                    player.playable_from_graveyard.remove(c.id)
-                    # Pay escape exile cost if applicable
-                    if c.oracle_text:
-                        from mtg.helpers import parse_escape_cost
-                        _esc = parse_escape_cost(c.oracle_text)
-                        if _esc:
-                            _esc_cost, exile_count = _esc
-                            c._escape_cost = _esc_cost
-                            c._was_escaped = True
-                            for _ in range(exile_count):
-                                if player.graveyard:
-                                    exiled = player.graveyard.pop()
-                                    player.exile.append(exiled)
-                                    _gy_escape_exiled.append(exiled)
-                            print(f"[AUTOPLAY-ESCAPE] {c.name} cast from graveyard, exiled {exile_count} cards")
-                        else:
-                            print(f"[AUTOPLAY-FLASHBACK] {c.name} cast from graveyard")
-                    break
+                if c.id not in player.playable_from_graveyard:
+                    continue
+                # Aug 3: also match a SPLIT HALF name. An aftermath half
+                # (Memory, Dawn, Injury) is the only half castable from the
+                # graveyard, and the AI is offered it by that name — but the
+                # graveyard scan matched the full card name only, so the
+                # offer pointed at a card the executor could never find.
+                _matched_half = None
+                if c.name.lower() != card_name.lower():
+                    for _i, _sname in enumerate(getattr(c, 'split_names', []) or []):
+                        if _sname.lower() == card_name.lower():
+                            _matched_half = _i
+                            break
+                    if _matched_half is None:
+                        continue
+                card = c
+                if _matched_half is not None:
+                    c.cast_as_split_half = _matched_half
+                from_graveyard = True
+                player.graveyard.remove(c)
+                player.playable_from_graveyard.remove(c.id)
+                # Pay escape exile cost if applicable
+                if c.oracle_text:
+                    from mtg.helpers import parse_escape_cost
+                    _esc = parse_escape_cost(c.oracle_text)
+                    if _esc:
+                        _esc_cost, exile_count = _esc
+                        c._escape_cost = _esc_cost
+                        c._was_escaped = True
+                        for _ in range(exile_count):
+                            if player.graveyard:
+                                exiled = player.graveyard.pop()
+                                player.exile.append(exiled)
+                                _gy_escape_exiled.append(exiled)
+                        print(f"[AUTOPLAY-ESCAPE] {c.name} cast from graveyard, exiled {exile_count} cards")
+                    else:
+                        print(f"[AUTOPLAY-FLASHBACK] {c.name} cast from graveyard")
+                # Jump-start (CR 702.132a): discard a card in addition to the
+                # printed cost. Paid here, alongside escape's exile cost, and
+                # refunded by the same rollback closure.
+                from mtg.helpers import pay_jump_start_discard
+                _gy_jumpstart_discarded = pay_jump_start_discard(
+                    game, player, c)
+                break
 
         # Check command zone (like !play does)
         from_command_zone = False
@@ -1602,9 +1628,19 @@ async def _autoplay_execute_action(cog, thread, game: GameState, player_idx: int
                 if _ex in player.exile:
                     player.exile.remove(_ex)
                     player.graveyard.append(_ex)
+            # Jump-start's discard is a cost too — refund it on the same
+            # terms, or the card is destroyed for a cast that never happened.
+            for _dc in _gy_jumpstart_discarded:
+                for _zone in (player.graveyard, player.exile):
+                    if _dc in _zone:
+                        _zone.remove(_dc)
+                        break
+                if _dc not in player.hand:
+                    player.hand.append(_dc)
             card._was_escaped = False
             card._escape_cost = ""
             card._cast_from_graveyard = False
+            card.cast_as_split_half = -1
 
         # [TARGETING] Pre-cast target validation — block autoplay from casting
         # targeted spells when no legal target exists (CR 601.2c)
@@ -1654,6 +1690,13 @@ async def _autoplay_execute_action(cog, thread, game: GameState, player_idx: int
             if card.id in player.playable_from_exile:
                 player.playable_from_exile.remove(card.id)
             card._adventure_exiled = False
+            if getattr(card, '_foretold', False):
+                # CR 702.143b: cast for the foretell cost. The stamp is what
+                # tells the cost stage to use it; _face_down clears because
+                # the card is no longer hidden once it's cast.
+                card._foretold = False
+                card._face_down = False
+                card._cast_via_foretell = True
 
         # Graveyard cast (flashback/escape): mirror engine.py — cast_spell_async
         # gates on zone membership FIRST (July 20), so a card pulled out of the
@@ -1728,12 +1771,19 @@ async def _autoplay_execute_action(cog, thread, game: GameState, player_idx: int
             if from_command_zone:
                 card.times_cast_from_command_zone += 1
 
-            # Flashback/escape: exile the card after resolution instead of
-            # graveyard (mirror of engine.py's _execute_action cast branch).
+            # Graveyard casts: exile after resolution only for the mechanics
+            # that print an exile clause (mirror of engine.py's cast branch).
+            # The old blanket exile also caught ESCAPE, which has none.
             if from_graveyard and card in player.graveyard:
-                player.graveyard.remove(card)
-                player.exile.append(card)
-                print(f"[AUTOPLAY-FLASHBACK] {card.name} exiled after casting from graveyard")
+                _why = exile_after_resolution_reason(card)
+                if _why:
+                    player.graveyard.remove(card)
+                    player.exile.append(card)
+                    print(f"[EXILE-ON-RESOLVE] {card.name} exiled after casting "
+                          f"from graveyard ({_why})")
+            # Per-cast stamp; resolution has read it by now (see engine twin).
+            if from_graveyard:
+                card._cast_from_graveyard = False
 
             for em in (effect_msgs or []):
                 await cog._autoplay_send(thread, em)
@@ -2097,6 +2147,47 @@ async def _autoplay_execute_action(cog, thread, game: GameState, player_idx: int
                 f"'{card_name}' is not in hand to suspend")
             return None
         ok, msg = suspend_card_from_hand(game, player, card)
+        if not ok:
+            game._last_activation_failure = (game.turn_number, card.name, msg)
+            return None
+        return msg
+
+    elif action_type == "foretell":
+        # Aug 3: foretell initiation (CR 702.143a) — pay {2}, exile face down;
+        # the card is cast from exile for its foretell cost on a later turn.
+        # Twin of the engine.py branch, one shared core.
+        from mtg.spells import foretell_card_from_hand
+        card_name = action.get("card", "")
+        card = player.find_card(card_name, Zone.HAND)
+        if not card:
+            game._last_activation_failure = (
+                game.turn_number, card_name or "?",
+                f"'{card_name}' is not in hand to foretell")
+            return None
+        ok, msg = foretell_card_from_hand(game, player, card)
+        if not ok:
+            game._last_activation_failure = (game.turn_number, card.name, msg)
+            return None
+        return msg
+
+    elif action_type == "graveyard_activate":
+        # Aug 3: embalm / eternalize / unearth. Activated abilities of a card
+        # in the graveyard, NOT casts — so they deliberately bypass
+        # cast_spell_async and its cast-trigger fan-out. Twin of the engine.py
+        # branch, one shared core.
+        from mtg.spells import activate_from_graveyard
+        card_name = action.get("card", "")
+        card = None
+        if card_name:
+            _cn = card_name.lower()
+            card = next((c for c in player.graveyard
+                         if c.name.lower() == _cn), None)
+        if not card:
+            game._last_activation_failure = (
+                game.turn_number, card_name or "?",
+                f"'{card_name}' is not in your graveyard")
+            return None
+        ok, msg = activate_from_graveyard(cog.engine, game, player, card)
         if not ok:
             game._last_activation_failure = (game.turn_number, card.name, msg)
             return None

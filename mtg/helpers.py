@@ -1086,6 +1086,379 @@ def parse_entwine(oracle_text):
     return m.group(1) if m else None
 
 
+# ---------------------------------------------------------------------------
+# Aug 3, 2026 — THE ALTERNATE-COST / GRAVEYARD-CASTING CLUSTER.
+#
+# buyback, embalm, eternalize, foretell, unearth, jump-start, aftermath (wave
+# 1) and miracle + dredge (wave 2). Every main EFFECT in this cluster already
+# resolved before this pass; what was missing in each case was the alternate
+# COST or the zone-change ability, so the cards were played at their printed
+# cost or not at all.
+#
+# ONE anchor discipline for the whole family, because Scryfall's bulk data
+# shows the same trap on every one of these keywords: a card can GRANT the
+# ability to other cards ("Each Sliver creature card in your graveyard has
+# unearth {2}", "Land cards in your graveyard have dredge 2", "Each instant
+# and sorcery card in your hand has miracle {2}"). A naive
+# `<keyword>\s*(\{...\})` match reads the grant as the SOURCE's own cost —
+# the July-21 Yidris cascade-grant class, which the wave-1 attack-keyword
+# parser hit and which mutation testing caught there. _own_keyword_clause is
+# the shared guard so the eight parsers below cannot drift apart on it.
+# ---------------------------------------------------------------------------
+
+_GRANT_LANGUAGE = re.compile(r'\b(have|has|gains?|gain)\b')
+
+
+def _own_keyword_clause(oracle_text: str, keyword: str):
+    """Text following the card's OWN printed `keyword`, or None.
+
+    Reminder text is stripped first (every one of these keywords ships a
+    parenthetical that repeats the keyword). A line whose text BEFORE the
+    keyword carries grant language is skipped: that line gives the ability
+    to other cards and says nothing about this one.
+    """
+    if not oracle_text:
+        return None
+    pattern = re.compile(r'\b' + re.escape(keyword) + r'\b', re.IGNORECASE)
+    for raw in oracle_text.split('\n'):
+        line = re.sub(r'\([^)]*\)', '', raw).strip()
+        if not line:
+            continue
+        match = pattern.search(line)
+        if not match:
+            continue
+        if _GRANT_LANGUAGE.search(line[:match.start()].lower()):
+            continue
+        return line[match.end():]
+    return None
+
+
+def _own_keyword_cost(oracle_text: str, keyword: str):
+    """The mana cost printed directly after the card's own `keyword`.
+
+    Accepts the plain form ("Embalm {5}{W}") and the em-dash form
+    ("Eternalize—{2}{W}{W}, Discard a card."); returns None when the
+    keyword is present but not followed by a cost, which is how the
+    static-grant and rules-text lines ("Buyback costs cost {2} less",
+    "...rather than pay the unearth cost...") decline to match.
+    """
+    clause = _own_keyword_clause(oracle_text, keyword)
+    if clause is None:
+        return None
+    match = re.match(r'\s*(?:[—–-]\s*)?((?:\{[^}]+\})+)', clause)
+    return match.group(1).upper() if match else None
+
+
+def _has_bare_keyword(oracle_text: str, keyword: str) -> bool:
+    """True when `keyword` appears as a costless keyword ability of this card.
+
+    jump-start and aftermath print no cost, so they are read off the keyword
+    LINE (via the shared tokenizer, which already drops grant lines and any
+    line carrying sentence punctuation). That rejects every rules-text
+    mention: "Spells you cast with jump-start aren't exiled",
+    "Vehicles in your graveyard have jump-start".
+    """
+    return keyword.lower() in set(_keyword_line_tokens(oracle_text or ''))
+
+
+def parse_buyback(oracle_text):
+    """Buyback (CR 702.26) — an optional ADDITIONAL cost; if paid, the spell
+    returns to its owner's HAND as it resolves instead of going to the
+    graveyard.
+
+    Returns a dict describing the cost, or None:
+        {'mana': '{2}{U}'}   — the common printed form
+        {'discard': 2}       — "Buyback—Discard two cards." (Forbid, the
+                               only buyback card in the test inventory)
+
+    Deliberately returns None for the life-payment and sacrifice forms
+    ("Buyback—Pay 4 life.", "Buyback—Sacrifice a land."): they exist on
+    real cards but none are in any deck, and buying back for an unmodeled
+    cost would be a free recursion engine. Declining is the safe direction —
+    the spell simply resolves to the graveyard as it does today.
+    """
+    cost = _own_keyword_cost(oracle_text, 'buyback')
+    if cost:
+        return {'mana': cost}
+    clause = _own_keyword_clause(oracle_text, 'buyback')
+    if clause is None:
+        return None
+    match = re.match(
+        r'\s*[—–-]\s*discard\s+(\d+|a|an|one|two|three|four|five)\s+cards?\b',
+        clause, re.IGNORECASE)
+    if not match:
+        return None
+    raw = match.group(1).lower()
+    if raw.isdigit():
+        count = int(raw)
+    elif raw in ('a', 'an'):
+        count = 1
+    else:
+        count = _NUMBER_WORDS.get(raw, 0)
+    return {'discard': count} if count else None
+
+
+# The three graveyard-activated recursion mechanics. All share one shape:
+# an activated ability of a card IN A GRAVEYARD, sorcery-speed only, that
+# exiles the card as part of the cost. Grouping them lets the offer list and
+# both executors carry ONE branch instead of three near-copies.
+GRAVEYARD_ACTIVATION_KEYWORDS = ('embalm', 'eternalize', 'unearth')
+
+
+def parse_graveyard_activation(oracle_text):
+    """(mechanic, mana_cost) for embalm / eternalize / unearth, else None.
+
+    embalm     (CR 702.87) — exile from GY: token copy, white Zombie <types>,
+                             no mana cost, same P/T.
+    eternalize (CR 702.129) — exile from GY: token copy, 4/4 black Zombie
+                             <types>, no mana cost.
+    unearth    (CR 702.83) — return the card itself to the battlefield with
+                             haste; exile it at the next end step or if it
+                             would leave the battlefield.
+
+    All three are ACTIVATED abilities, not casts (CR 702.87a etc.) — casting
+    them would wrongly fire Rhystic Study and the rest of the cast-trigger
+    family, which is why they are dispatched as their own action type rather
+    than folded into the graveyard-cast branch that serves flashback/escape.
+    """
+    for mechanic in GRAVEYARD_ACTIVATION_KEYWORDS:
+        cost = _own_keyword_cost(oracle_text, mechanic)
+        if cost:
+            return mechanic, cost
+    return None
+
+
+def parse_foretell(oracle_text):
+    """Foretell (CR 702.143). Returns the foretell cost string or None.
+
+    Two halves: any card in hand may be exiled FACE DOWN for {2} during your
+    turn, and a foretold card may be cast from exile for its foretell cost on
+    a later turn. "{0}" is a real printed cost (Foretell {0}), so the caller
+    must test `is not None` rather than truthiness.
+    """
+    return _own_keyword_cost(oracle_text, 'foretell')
+
+
+def parse_miracle(oracle_text):
+    """Miracle (CR 702.94). Returns the miracle cost string or None.
+
+    "You may cast this card for its miracle cost when you draw it if it's
+    the first card you drew this turn." Costs range from {0} through {3}{W}
+    and include bare single pips ({W}, {R}, {U}, {G}) — again, test against
+    None, not truthiness.
+    """
+    return _own_keyword_cost(oracle_text, 'miracle')
+
+
+def parse_dredge(oracle_text):
+    """Dredge (CR 702.52). Returns int N or None.
+
+    "If you would draw a card, you may mill N cards instead. If you do,
+    return this card from your graveyard to your hand." A replacement on the
+    draw, so it needs the same draw-time hook miracle does — which is why
+    the two shipped as one wave.
+    """
+    clause = _own_keyword_clause(oracle_text, 'dredge')
+    if clause is None:
+        return None
+    match = re.match(r'\s*(\d+)\b', clause)
+    return int(match.group(1)) if match else None
+
+
+def has_jump_start(oracle_text) -> bool:
+    """Jump-start (CR 702.132): cast from your graveyard by discarding a card
+    in addition to paying its other costs, then exile it. No printed cost of
+    its own — the cost is the printed mana cost plus the discard."""
+    return _has_bare_keyword(oracle_text, 'jump-start')
+
+
+def aftermath_half_index(card):
+    """Index of the AFTERMATH half of a split card, or None (CR 702.127).
+
+    An aftermath half may be cast ONLY from the graveyard, and the card is
+    exiled after it resolves; the non-aftermath half may not be cast from
+    the graveyard at all. Reads `split_texts`, which the deck loader fills
+    from Scryfall's `card_faces` — the cache's top-level `oracle_text` for a
+    split card is face 0 only, so this deliberately does not consult it.
+    """
+    texts = getattr(card, 'split_texts', None) or []
+    for index, text in enumerate(texts):
+        if _has_bare_keyword(text, 'aftermath'):
+            return index
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Aug 3, 2026 — WAVE 2: the two DRAW-time mechanics.
+#
+# Miracle (CR 702.94) and dredge (CR 702.52) both hook the draw, which is why
+# they shipped together and separately from wave 1: dredge REPLACES the draw
+# (it must run before the card leaves the library), miracle reacts to it (the
+# card must already be in hand and be the first one drawn this turn).
+#
+# COVERAGE, stated honestly: both hooks live in GameEngine.draw_cards and in
+# the `draw_cards` ACTION handler. Those two cover the draw step — which is
+# where miracle's "first card you drew this turn" almost always resolves and
+# where dredge's once-per-turn replacement lands — plus every template and
+# Tier-3 draw. They do NOT cover the ~8 remaining raw `library.pop(0)` draws
+# in rules/effects.py, rules/spell_resolver.py and rules/planeswalker.py,
+# which are independent draw implementations. Routing those through one choke
+# point is a real refactor and is deliberately NOT smuggled into this wave;
+# tests/test_aug3_altcost_wave2.py pins the covered set so the gap is visible
+# rather than assumed closed.
+# ---------------------------------------------------------------------------
+
+def dredge_candidates(player):
+    """[(card, N)] for every dredge card in the player's graveyard whose mill
+    the library can actually afford (CR 702.52a — you may only dredge if your
+    library has at least N cards)."""
+    out = []
+    for card in (getattr(player, 'graveyard', []) or []):
+        n = parse_dredge(getattr(card, 'oracle_text', '') or '')
+        if n and len(getattr(player, 'library', []) or []) >= n:
+            out.append((card, n))
+    return out
+
+
+def try_dredge(game, player):
+    """Replace a draw with a dredge (CR 702.52a). Returns the returned card,
+    or None to let the draw happen normally.
+
+    v1 policy, and its reasoning: dredge is a "may", and always taking it
+    means never drawing a new card again — strictly worse for most decks. It
+    is capped at ONE replaced draw per turn, which in practice is the draw
+    step, matching how the mechanic is actually played, and requires the mill
+    to leave a real library behind so it can never deck its own controller.
+    Among affordable candidates it takes the LARGEST N: the decks holding
+    these cards (Meren, Kroxa escape, the cube's Loam pile) want graveyard
+    fuel, which is the whole reason to dredge instead of drawing.
+    """
+    if getattr(game, '_dredged_this_turn', False):
+        return None
+    candidates = [(c, n) for c, n in dredge_candidates(player)
+                  if len(player.library) >= n + 10]
+    if not candidates:
+        return None
+    card, n = max(candidates, key=lambda cn: cn[1])
+    milled = []
+    for _ in range(n):
+        if not player.library:
+            break
+        milled.append(player.library.pop(0))
+    player.graveyard.extend(milled)
+    player.graveyard.remove(card)
+    player.hand.append(card)
+    game._dredged_this_turn = True
+    print(f"[DREDGE] {player.name} dredges {card.name} (mills {len(milled)} "
+          f"instead of drawing)")
+    game._pending_messages = getattr(game, '_pending_messages', None) or []
+    game._pending_messages.append(
+        f"⛏️ **{player.name}** dredges **{card.name}** "
+        f"(milling {len(milled)} instead of drawing)")
+    return card
+
+
+def note_miracle_on_draw(game, player, card):
+    """CR 702.94a: if this is the FIRST card its controller drew this turn and
+    it has miracle, they may cast it for the miracle cost.
+
+    Records (card, owner_index) on game._miracle_pending; the async drain
+    (spells.resolve_pending_miracles) makes the cast-or-keep call, because
+    draws are sync and casting is not — the same sync-gap bridge madness uses.
+    Returns True when a miracle was recorded.
+    """
+    cost = parse_miracle(getattr(card, 'oracle_text', '') or '')
+    if cost is None:
+        return False
+    # cards_drawn_this_turn has already been incremented for THIS draw, so
+    # the first card of the turn is 1, not 0.
+    if getattr(player, 'cards_drawn_this_turn', 0) != 1:
+        return False
+    card._miracle_cost = cost
+    try:
+        owner_idx = game.players.index(player)
+    except ValueError:
+        return False
+    game._miracle_pending = getattr(game, '_miracle_pending', None) or []
+    game._miracle_pending.append((card, owner_idx))
+    print(f"[MIRACLE] {player.name} drew {card.name} as the first card this "
+          f"turn (miracle {cost})")
+    return True
+
+
+def pay_jump_start_discard(game, player, card):
+    """Pay jump-start's additional cost (CR 702.132a — "by discarding a card
+    in addition to paying its other costs"). Returns the list of discarded
+    cards so the caller's rollback can refund them; empty when the card has
+    no jump-start or there was nothing to pitch.
+
+    Routes through the madness choke point, so pitching a madness card to
+    jump-start a spell exiles it and offers the madness cast — the same
+    behavior every other discard in the engine has.
+    """
+    if not has_jump_start(getattr(card, 'oracle_text', '') or ''):
+        return []
+    pitchable = [c for c in player.hand if c is not card]
+    if not pitchable:
+        print(f"[JUMP-START] {card.name}: no card to discard — cost unpaid")
+        return []
+    worst = max(pitchable, key=lambda c: (c.is_land(), -(c.cmc or 0)))
+    player.hand.remove(worst)
+    if madness_discard_to_exile(game, player, worst) is None:
+        player.graveyard.append(worst)
+    print(f"[JUMP-START] {card.name}: discarded {worst.name} as the "
+          f"additional cost")
+    return [worst]
+
+
+def unearthed_leaves_to_exile(card) -> bool:
+    """CR 702.83a: an unearthed permanent is exiled "at the beginning of the
+    next end step OR if it would leave the battlefield".
+
+    The end-step half is a scheduled delayed trigger; this is the other half,
+    and it is the one that matters in practice — an unearthed creature is a
+    hasty attacker, so it usually dies in combat before the end step ever
+    arrives. Without this it lands in the graveyard and can simply be
+    unearthed AGAIN, which is exactly the recursion the printed exile clause
+    exists to forbid.
+
+    Death sites only, deliberately: bouncing your own unearthed creature is
+    not a line anyone takes, and the zone-change replacement that would cover
+    every departure is a bigger seam than this wave should open.
+    """
+    return bool(getattr(card, '_unearthed', False))
+
+
+def exile_after_resolution_reason(card) -> str:
+    """Why a spell cast FROM THE GRAVEYARD is exiled as it resolves, or "".
+
+    Whether the card is exiled depends on which permission allowed the cast:
+
+      flashback  (CR 702.34a)  exiles — native, or granted by Snapcaster Mage
+      jump-start (CR 702.132a) exiles
+      aftermath  (CR 702.127a) exiles
+      escape     (CR 702.139)  does NOT — it has no exile clause at all, which
+                               is the entire point: Cling to Dust escapes
+                               again and again out of the same graveyard.
+
+    Aug 3, 2026: before this, all three executors ran a blanket
+    "if from_graveyard: graveyard → exile" after every graveyard cast, so an
+    escaped instant was exiled after its first cast and the mechanic's
+    recursion never worked. Escape is the ONLY behavior this changes —
+    everything else keeps today's default of "exile", so a Snapcaster-granted
+    flashback (which has no printed keyword to detect) still exiles.
+    """
+    oracle = getattr(card, 'oracle_text', '') or ''
+    if parse_escape_cost(oracle):
+        return ""
+    if has_jump_start(oracle):
+        return "jump-start"
+    index = getattr(card, 'cast_as_split_half', -1)
+    if index is not None and index >= 0 and aftermath_half_index(card) == index:
+        return "aftermath"
+    return "flashback"
+
+
 def commander_declines_graveyard_redirect(card) -> bool:
     """CR 903.9a's command-zone redirect is a MAY, and autoplay always took
     it — which made escape commanders structurally unable to reach the

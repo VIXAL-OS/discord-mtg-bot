@@ -122,27 +122,44 @@ def _entry(label: str, name: str, zone: str, action: Dict,
 
 def graveyard_castable_entries(player, mana_by_color: Dict,
                                any_color_mana: int,
-                               total_mana: int) -> List[Dict]:
-    """Cards castable from the graveyard (flashback, escape, Snapcaster
-    grant) + adventure creature halves waiting in exile (CR 715.3).
+                               total_mana: int,
+                               turn_number: int = None) -> List[Dict]:
+    """Everything playable from the graveyard or exile.
 
-    Moved verbatim from ClaudePlayer._get_graveyard_castable (July 30) —
-    the label strings are unchanged.
+    Graveyard CASTS — flashback, escape, jump-start, aftermath, and the
+    Snapcaster grant. Graveyard ACTIVATIONS — embalm, eternalize, unearth
+    (their own action type; they are abilities, not casts). Exile — adventure
+    creature halves (CR 715.3), foretold cards (CR 702.143b), and impulse
+    exiles.
+
+    `turn_number` is optional so existing callers keep working; without it the
+    foretell "not the turn you foretold it" gate can't be applied, so those
+    offers are made a turn early rather than not at all.
     """
-    from mtg.helpers import parse_escape_cost
+    from mtg.helpers import (aftermath_half_index, has_jump_start,
+                             parse_escape_cost, parse_graveyard_activation)
     results = []
 
     for card in player.graveyard:
-        source_tag = None  # Will be set if castable
-        cast_cost = None   # Mana cost string to check affordability
+        source_tag = None   # Will be set if castable
+        cast_cost = None    # Mana cost string to check affordability
+        offer_name = card.name  # What the AI must name to cast it
+        extra = {}          # Extra keys threaded into the action dict
 
-        # 1. Snapcaster-granted flashback (playable_from_graveyard list)
-        if card.id in player.playable_from_graveyard:
-            source_tag = "FLASHBACK from graveyard"
-            cast_cost = card.mana_cost  # Same cost as original
+        # NATIVE mechanics are read off the card FIRST and are authoritative.
+        #
+        # Aug 3, 2026: the Snapcaster-grant branch used to run first, keyed on
+        # `card.id in player.playable_from_graveyard` — but the escape and
+        # flashback branches BELOW add the id to that very list. So on the
+        # second build of the turn an escape card matched the grant branch and
+        # was advertised at its PRINTED cost under a FLASHBACK tag: Cling to
+        # Dust offered as "({B}) [FLASHBACK from graveyard]" when escape
+        # actually costs {1}{B} and exiles two cards. Membership is now only
+        # consulted as the fallback for a card with no native keyword, which
+        # is the one case it genuinely means "granted by Snapcaster".
 
-        # 2. Native flashback — card has "Flashback {cost}" in oracle text
-        elif not card.is_creature() and card.oracle_text:
+        # 1. Native flashback — "Flashback {cost}"
+        if not card.is_creature() and card.oracle_text:
             fb_match = re.search(r'flashback\s+(\{[^}]+\}(?:\{[^}]+\})*)',
                                  card.oracle_text.lower())
             if fb_match:
@@ -150,11 +167,8 @@ def graveyard_castable_entries(player, mana_by_color: Dict,
                 cast_cost = fb_match.group(1).upper()
                 # Store flashback cost on card so cast_spell_async uses it
                 card._flashback_cost = cast_cost
-                # Mark it as playable so _execute_action can find it
-                if card.id not in player.playable_from_graveyard:
-                    player.playable_from_graveyard.append(card.id)
 
-        # 3. Escape — "Escape—{cost}, exile N other cards from your graveyard"
+        # 2. Escape — "Escape—{cost}, exile N other cards from your graveyard"
         if not source_tag and card.oracle_text:
             _escape = parse_escape_cost(card.oracle_text)
             if _escape:
@@ -169,17 +183,61 @@ def graveyard_castable_entries(player, mana_by_color: Dict,
                     # branch above. Without this an escaped Kroxa would be
                     # charged {B}{R} instead of {2}{B}{B}{R}{R}.
                     card._escape_cost = escape_cost_str
-                    if card.id not in player.playable_from_graveyard:
-                        player.playable_from_graveyard.append(card.id)
+
+        # 3. Jump-start (CR 702.132) — cast from the graveyard by discarding a
+        #    card in addition to the printed cost, then exile it. The keyword
+        #    prints no cost of its own, so the mana cost is the printed one;
+        #    the discard is paid by the executor and needs a card to pitch.
+        if not source_tag and card.oracle_text and has_jump_start(card.oracle_text):
+            if any(c is not card for c in player.hand):
+                source_tag = "JUMP-START from graveyard, discard a card"
+                cast_cost = card.mana_cost
+
+        # 4. Aftermath (CR 702.127) — the second half of a split card, and the
+        #    ONLY half castable from the graveyard. The AI is offered the HALF
+        #    name (Memory, Dawn, Injury), which is what both executors match
+        #    on, and priced at that half's own cost.
+        if not source_tag:
+            _after = aftermath_half_index(card)
+            if _after is not None and (card.split_costs or []):
+                try:
+                    _half_cost = card.split_costs[_after]
+                    _half_name = (card.split_names or [])[_after]
+                except IndexError:
+                    _half_cost = _half_name = None
+                if _half_cost and _half_name:
+                    source_tag = "AFTERMATH from graveyard"
+                    cast_cost = _half_cost
+                    offer_name = _half_name
+                    # The action names the FULL card (what the executors'
+                    # graveyard scan matches) and routes the half through the
+                    # existing `adventure` key, which both executors already
+                    # map onto cast_as_split_half. The AI also learns the half
+                    # name from the label, and both executors additionally
+                    # accept it directly — see their graveyard split scans.
+                    extra = {"card": card.name, "adventure": _half_name}
+
+        # 5. Snapcaster-granted flashback — the fallback, for a card with no
+        #    native graveyard-cast keyword that something put on the list.
+        if not source_tag and card.id in player.playable_from_graveyard:
+            source_tag = "FLASHBACK from graveyard"
+            cast_cost = card.mana_cost  # Same cost as original
 
         if source_tag and cast_cost:
             # Check mana affordability (uses ManaCost engine when available)
             if _check_color_castable(cast_cost, mana_by_color,
                                      any_color_mana, total_mana):
+                # Mark playable so the executors' graveyard scan can find it.
+                # Done HERE, only for offers we actually make, rather than in
+                # each detection branch — the branches must stay side-effect
+                # free or their own writes feed back into branch 5.
+                if card.id not in player.playable_from_graveyard:
+                    player.playable_from_graveyard.append(card.id)
+                _action = {"type": "cast", "card": offer_name}
+                _action.update(extra)
                 results.append(_entry(
-                    f"{card.name} ({cast_cost}) [{source_tag}]",
-                    card.name, "graveyard",
-                    {"type": "cast", "card": card.name},
+                    f"{offer_name} ({cast_cost}) [{source_tag}]",
+                    offer_name, "graveyard", _action,
                     [source_tag.split(" ")[0]]))
 
     # Adventure creature halves waiting in exile (CR 715.3). The castable
@@ -198,6 +256,54 @@ def graveyard_castable_entries(player, mana_by_color: Dict,
                 card.name, "exile",
                 {"type": "cast", "card": card.name},
                 ["CREATURE HALF"]))
+
+    # Graveyard-ACTIVATED recursion (Aug 3): embalm, eternalize, unearth.
+    # These are activated abilities of a card in the graveyard, not casts
+    # (CR 702.87a / 702.129a / 702.83a) — casting them would wrongly fire the
+    # whole cast-trigger family — so they get their own action type, which
+    # both executors dispatch. Sorcery-speed legality is enforced at
+    # activation; the offer only has to be affordable and in the graveyard.
+    for card in player.graveyard:
+        parsed = parse_graveyard_activation(getattr(card, 'oracle_text', ''))
+        if not parsed:
+            continue
+        mechanic, cost = parsed
+        if not _check_color_castable(cost, mana_by_color, any_color_mana,
+                                     total_mana):
+            continue
+        blurb = {
+            'embalm': 'exile from graveyard → token copy, a white Zombie',
+            'eternalize': 'exile from graveyard → 4/4 black Zombie token copy',
+            'unearth': 'return to the battlefield with haste, exiled at end of turn',
+        }[mechanic]
+        results.append(_entry(
+            f"{card.name} ({cost}) [{mechanic.upper()} from graveyard — {blurb}]",
+            card.name, "graveyard",
+            {"type": "graveyard_activate", "card": card.name,
+             "mechanic": mechanic},
+            [mechanic.upper()]))
+
+    # Foretold cards (CR 702.143b): exiled face down on an earlier turn, now
+    # castable from exile for the foretell cost. Deliberately NOT keyed on
+    # player.playable_from_exile — end_turn expires that list, and a foretold
+    # card stays castable for the rest of the game (the _adventure_exiled
+    # precedent). CR 702.143b forbids casting it the turn it was foretold.
+    for card in getattr(player, 'exile', []) or []:
+        if not getattr(card, '_foretold', False):
+            continue
+        cost = getattr(card, '_foretell_cost', '') or ''
+        if not cost:
+            continue
+        if (turn_number is not None
+                and getattr(card, '_foretold_turn', None) == turn_number):
+            continue
+        if _check_color_castable(cost, mana_by_color, any_color_mana,
+                                 total_mana):
+            results.append(_entry(
+                f"{card.name} ({cost}) [FORETOLD — cast from exile]",
+                card.name, "exile",
+                {"type": "cast", "card": card.name},
+                ["FORETOLD"]))
 
     # Impulse-exiled cards (Aug 1 — Light Up the Stage's real effect:
     # exile_top_of_library with playable=true marks them on
@@ -314,6 +420,22 @@ def castable_entries(game, player, mana_by_color: Dict, any_color_mana: int,
                     {"type": "cast", "card": card.name},
                     ["spectacle"]))
 
+        # Foretell (CR 702.143a): a special action, not a cast — pay {2} to
+        # exile the card face down now and cast it for its (usually cheaper)
+        # foretell cost on a later turn. Offered whenever {2} is payable and
+        # it's this player's turn, which is when the action is legal.
+        if oracle_text_lower and 'foretell' in oracle_text_lower:
+            from mtg.helpers import parse_foretell
+            _ft = parse_foretell(card.oracle_text)
+            if (_ft is not None and total_mana >= 2
+                    and getattr(game, 'active_player', None) is player):
+                add(_entry(
+                    f"{card.name} [FORETELL for {{2}} — exile face down, "
+                    f"cast later for {_ft}]",
+                    card.name, "hand",
+                    {"type": "foretell", "card": card.name},
+                    ["foretell"]))
+
         # Also check adventure half castability
         if card.adventure_name and card.adventure_cost:
             if _check_color_castable(card.adventure_cost, mana_by_color,
@@ -412,9 +534,11 @@ def castable_entries(game, player, mana_by_color: Dict, any_color_mana: int,
                                        {"type": "cast", "card": card.name},
                                        ["free_cast"]))
 
-    # Graveyard (flashback/escape/Snapcaster) + adventure halves in exile
+    # Graveyard casts + graveyard activations + adventure/foretold/impulse
+    # cards waiting in exile.
     entries.extend(graveyard_castable_entries(
-        player, mana_by_color, any_color_mana, total_mana))
+        player, mana_by_color, any_color_mana, total_mana,
+        turn_number=getattr(game, 'turn_number', None)))
 
     return entries
 
