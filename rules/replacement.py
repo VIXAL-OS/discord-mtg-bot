@@ -73,6 +73,14 @@ class GameEvent:
     source_name: str = ""
     source_id: str = ""
     source_controller: str = ""
+    # Aug 2 batch-14 audit: the source's COLORS (CR 202.2 — from its mana
+    # cost, not its color identity, which absorbs colors from oracle text).
+    # Needed by color-conditioned damage replacements: Torbran, Thane of Red
+    # Fell ("if a RED source you control would deal damage ... plus 2"),
+    # Gisela-style effects that name a color, Dictate variants. None means
+    # "unknown" — a color-gated effect must DECLINE rather than guess, so an
+    # unpopulated call site can never silently apply the wrong bonus.
+    source_colors: Optional[Set[str]] = None
     
     # For damage
     is_combat_damage: bool = False
@@ -117,30 +125,31 @@ class GameEvent:
     replacement_chain: List[str] = field(default_factory=list)
     
     def copy(self) -> 'GameEvent':
-        """Create a copy of this event for modification."""
-        return GameEvent(
-            event_type=self.event_type,
-            affected_player=self.affected_player,
-            affected_object=self.affected_object,
-            affected_object_name=self.affected_object_name,
-            amount=self.amount,
-            source_name=self.source_name,
-            source_id=self.source_id,
-            source_controller=self.source_controller,
-            is_combat_damage=self.is_combat_damage,
-            has_deathtouch=self.has_deathtouch,
-            has_lifelink=self.has_lifelink,
-            has_infect=self.has_infect,
-            is_prevented=self.is_prevented,
-            counter_type=self.counter_type,
-            from_zone=self.from_zone,
-            to_zone=self.to_zone,
-            enters_tapped=self.enters_tapped,
-            entering_type_line=self.entering_type_line,
-            applied_replacements=set(self.applied_replacements),
-            was_replaced=self.was_replaced,
-            replacement_chain=list(self.replacement_chain),
-        )
+        """Create a copy of this event for modification.
+
+        Aug 2 batch-14 audit: this used to be a HAND-WRITTEN field list, and
+        every field added after it was written silently vanished on copy —
+        which matters enormously, because process_event_sync copies the
+        event before its first `applies_to` check, so a dropped field is
+        invisible to every condition. Three fields had already been lost:
+        `source_colors` (this audit, Torbran's whole gate), and July 30's
+        `is_token` and `redirect_counter` — meaning Draugr Necromancer's
+        "NONTOKEN creature an opponent controls" filter was reading a field
+        that was always False by the time a condition saw it, so it would
+        have redirected token deaths too.
+
+        Enumerating the dataclass fields makes the copy exhaustive by
+        construction: a field added tomorrow is carried automatically. The
+        mutable ones are still duplicated, not shared, so an effect mutating
+        its copy can't corrupt the caller's event.
+        """
+        import dataclasses
+        dup = dataclasses.replace(self)
+        dup.applied_replacements = set(self.applied_replacements)
+        dup.replacement_chain = list(self.replacement_chain)
+        if self.source_colors is not None:
+            dup.source_colors = set(self.source_colors)
+        return dup
 
 
 @dataclass
@@ -942,6 +951,41 @@ _NAMED_CARD_REPLACEMENTS = {
             replacement_type="exile_instead",
             new_destination="exile",
             redirect_counter="ice",
+        )
+    ],
+    # Aug 2 batch-14 audit (cube reviewer, CRITICAL): "If a red source you
+    # control would deal damage to an opponent or a permanent an opponent
+    # controls, it deals that much damage plus 2 instead." Entirely
+    # unimplemented — Torbran was a vanilla 2/4, and every life total in
+    # game_1533407501872009376 ran 2 high from turn 15 on.
+    #
+    # ADDITIVE (add_amount), not a multiplier: the printed text says "plus
+    # 2". Three gates, all from the printed text:
+    #   1. a RED source (CR 202.2 colors, carried on the event since this
+    #      audit — DECLINE when unknown rather than guess),
+    #   2. that YOU control,
+    #   3. damage to an opponent OR a permanent an opponent controls. Both
+    #      damage funnels set affected_player to the recipient's controller
+    #      (the creature funnel uses creature_controller_name), so a single
+    #      "not mine" test covers both halves of that clause.
+    "torbran, thane of red fell": lambda card_id, controller: [
+        ReplacementEffect(
+            id=f"{card_id}_torbran",
+            source_name="Torbran, Thane of Red Fell",
+            source_id=card_id,
+            controller=controller,
+            replaces_event=EventType.DAMAGE,
+            condition_text=("red sources you control deal +2 damage to "
+                            "opponents and their permanents"),
+            replacement_type="add_damage",
+            add_amount=2,
+            condition=lambda ev, _ctrl=controller: (
+                ev.source_controller == _ctrl
+                and bool(ev.affected_player)
+                and ev.affected_player != _ctrl
+                and bool(ev.source_colors)
+                and 'R' in ev.source_colors
+            ),
         )
     ],
     "furnace of rath": lambda card_id, controller: [

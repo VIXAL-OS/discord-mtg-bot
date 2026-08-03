@@ -578,7 +578,12 @@ class PlaneswalkerManager:
         # activation (effect applied + loyalty back) that also lied to the
         # player about a legal target existing.
         _no_effect = (self._activation_had_no_effect(effect_messages)
-                      and not getattr(self, '_last_ability_executed_state_change', False))
+                      and not getattr(self, '_last_ability_executed_state_change', False)
+                      # Aug 2 batch-14: a template that resolved LAWFULLY with
+                      # nothing to do (Liliana [+1] into two empty hands, CR
+                      # 701.8a) is not an illegal activation — the loyalty
+                      # cost stands, exactly as for the "up to" case below.
+                      and not getattr(self, '_last_ability_legal_noop', False))
         if _no_effect and 'up to' in (getattr(ability, 'text', '') or '').lower():
             # July 30 batch-9 audit: an "up to N target(s)" ability that
             # resolves choosing nothing is a LEGAL activation that simply
@@ -713,6 +718,13 @@ class PlaneswalkerManager:
         # Rhystic Study — no ETB to narrate). Track actual execution so a
         # silent-but-real effect is never refunded as "no legal target".
         self._last_ability_executed_state_change = False
+        # Aug 2 batch-14: the template resolved LAWFULLY but changed nothing
+        # visible (Liliana of the Veil's [+1] with both hands already empty
+        # — discarding from an empty hand is a legal no-op, CR 701.8a).
+        # Distinct from "no legal target": the ability DID resolve, so its
+        # loyalty cost stands and its once-per-turn slot is spent. Same
+        # class as the July-30 "up to N targets" carve-out below.
+        self._last_ability_legal_noop = False
 
         # === TIER 1.5: Check effect template library for PW abilities ===
         # This catches Chandra ToD +1, Garruk Beast tokens, Daretti loot, Elspeth soldiers, etc.
@@ -839,6 +851,20 @@ class PlaneswalkerManager:
                                 messages.append(f"📜 {explanation}")
                     if messages:
                         return messages
+                    # Aug 2 batch-14 audit (legacy reviewer): the template DID
+                    # resolve — this gate just asks whether it produced any
+                    # display TEXT, and a legal no-op produces none. Liliana
+                    # of the Veil's [+1] with both hands empty is a lawful
+                    # discard-nothing (CR 701.8a), and falling through here
+                    # spent a real Tier-3 API call to re-resolve an ability
+                    # that was already correctly done — with the documented
+                    # risk of Tier 3 inventing actions on a zero-context
+                    # resolution. "Attempted" is the right test, not "spoke".
+                    print(f"[PW-TEMPLATE] {card.name}: resolved with no "
+                          f"visible effect (legal no-op) — not escalating")
+                    self._last_ability_legal_noop = True
+                    return [f"📍 {explanation}"] if explanation else [
+                        f"📍 {card.name}'s ability resolves with no effect"]
         except ImportError:
             pass  # effect_templates not available, continue with inline handlers
         except Exception as e:

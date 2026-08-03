@@ -1415,3 +1415,58 @@ def compute_cost_increase(game, player, card):
                     continue
                 sources.append(perm.name)
     return total, sources
+
+
+def damage_source_colors(game, source_card=None, source_name: str = "",
+                         source_id: str = ""):
+    """Colors of a damage SOURCE, for color-gated replacement effects.
+
+    Aug 2 batch-14 audit: Torbran, Thane of Red Fell ("If a RED source you
+    control would deal damage to an opponent or a permanent an opponent
+    controls, it deals that much damage plus 2 instead") was entirely
+    unimplemented — GameEvent carried no notion of the source's color, so
+    every life total in the cube game ran 2 low from turn 15 on.
+
+    Colors come from the mana cost (CR 202.2), never from color_identity —
+    identity absorbs colors from oracle text, which would make a colorless
+    artifact with a {B} activation a "black source". Returns None when the
+    source can't be resolved, and a color-gated effect must DECLINE on None
+    rather than guess: an unpopulated call site can never silently apply
+    the wrong bonus.
+
+    A live card object is preferred. Otherwise the source is searched for by
+    id then by name across the zones a damage source can actually occupy: the
+    battlefield (a permanent), the stack (a burn spell mid-cast), and the
+    graveyard/exile (a burn spell whose damage applies AFTER it has left the
+    stack — `_dispatch_resolution` pops the entry before running the effect,
+    so this is the common case for Chain Lightning and friends).
+    """
+    if source_card is not None:
+        cost = getattr(source_card, 'mana_cost', '') or ''
+        return spell_colors_from_cost(cost)
+    if game is None:
+        return None
+    if not source_name and not source_id:
+        return None
+
+    def _match(c):
+        if source_id and getattr(c, 'id', None) == source_id:
+            return True
+        return bool(source_name) and names_match(getattr(c, 'name', ''),
+                                                 source_name)
+
+    for p in getattr(game, 'players', []) or []:
+        for c in getattr(p, 'battlefield', []) or []:
+            if _match(c):
+                return spell_colors_from_cost(getattr(c, 'mana_cost', '') or '')
+    for entry in getattr(game, 'stack', []) or []:
+        c = getattr(entry, 'card', None)
+        if c is not None and _match(c):
+            return spell_colors_from_cost(getattr(c, 'mana_cost', '') or '')
+    for p in getattr(game, 'players', []) or []:
+        for zone in ('graveyard', 'exile'):
+            for c in getattr(p, zone, []) or []:
+                if _match(c):
+                    return spell_colors_from_cost(
+                        getattr(c, 'mana_cost', '') or '')
+    return None

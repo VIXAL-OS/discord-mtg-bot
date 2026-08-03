@@ -627,7 +627,9 @@ def apply_combat_damage_to_player(rules, game: GameState, player: 'PlayerState',
     if amount <= 0:
         return 0
     # Damage prevention flag (Teferi's Protection, Fog, etc.)
-    from mtg.helpers import damage_prevention_disabled, player_has_prevent_all_static
+    from mtg.helpers import (damage_prevention_disabled,
+                             player_has_prevent_all_static,
+                             damage_source_colors)
     _prevent_flag = getattr(player, '_damage_prevented', False)
     if _prevent_flag:
         # Check turn-based expiration (Teferi's = next untap, Fog = end of turn)
@@ -663,6 +665,9 @@ def apply_combat_damage_to_player(rules, game: GameState, player: 'PlayerState',
             source_name=source_card.name,
             source_id=getattr(source_card, 'id', ''),
             source_controller=source_controller_name,
+            # Aug 2 batch-14: color-gated replacements (Torbran) need the
+            # source's colors — CR 202.2, from the mana cost.
+            source_colors=damage_source_colors(game, source_card=source_card),
             is_combat_damage=is_combat,
             has_deathtouch=source_card.has_deathtouch() if hasattr(source_card, 'has_deathtouch') else False,
             has_lifelink=source_card.has_lifelink() if hasattr(source_card, 'has_lifelink') else False,
@@ -740,6 +745,7 @@ def apply_combat_damage_to_creature(rules, game: GameState, creature: Card,
     if amount <= 0:
         return 0
     if HAS_REPLACEMENT_ENGINE and game._replacement_engine and game._replacement_engine.effects:
+        from mtg.helpers import damage_source_colors
         # CR 614: replacement conditions like Gisela/Fiery Emancipation ("damage to
         # an opponent or a permanent an opponent controls") need affected_player set
         # to the CREATURE'S controller so the condition can compare against the
@@ -763,6 +769,7 @@ def apply_combat_damage_to_creature(rules, game: GameState, creature: Card,
             source_name=source_card.name,
             source_id=getattr(source_card, 'id', ''),
             source_controller=source_controller_name,
+            source_colors=damage_source_colors(game, source_card=source_card),
             is_combat_damage=True,
             has_deathtouch=source_has_deathtouch,
         )
@@ -791,7 +798,9 @@ def apply_noncombat_damage_to_player(rules, game: GameState, player: 'PlayerStat
     if amount <= 0:
         return 0
     # Fallback damage prevention flag (when replacement engine not available)
-    from mtg.helpers import damage_prevention_disabled, player_has_prevent_all_static
+    from mtg.helpers import (damage_prevention_disabled,
+                             player_has_prevent_all_static,
+                             damage_source_colors)
     _prevent_flag = getattr(player, '_damage_prevented', False)
     if _prevent_flag:
         expires = getattr(player, '_damage_prevented_expires_turn', float('inf'))
@@ -820,6 +829,25 @@ def apply_noncombat_damage_to_player(rules, game: GameState, player: 'PlayerStat
                         break
                 if source_controller_name:
                     break
+        if not source_controller_name:
+            # Aug 2 batch-14: a burn SPELL is not a permanent — it is on the
+            # stack (or already off it, mid-resolution), so the battlefield
+            # scan above leaves the controller blank and any printed
+            # "a source YOU control" gate (Torbran) silently never fires.
+            for _entry in getattr(game, 'stack', []) or []:
+                _c = getattr(_entry, 'card', None)
+                if _c is None:
+                    continue
+                if (source_id and getattr(_c, 'id', '') == source_id) or \
+                   (source_name and _c.name == source_name):
+                    source_controller_name = getattr(
+                        _entry, 'controller_name', '') or ''
+                    break
+        # (A spell that has already left the stack mid-resolution is not
+        # resolvable here at all. That case reaches the replacement layer
+        # through mtg/actions.py's deal_damage instead, which carries the
+        # caster explicitly as `_source_controller` — the template and
+        # Tier-3 burn paths both set it.)
         event = GameEvent(
             event_type=EventType.DAMAGE,
             affected_player=player.name,
@@ -827,6 +855,11 @@ def apply_noncombat_damage_to_player(rules, game: GameState, player: 'PlayerStat
             source_name=source_name,
             source_id=source_id,
             source_controller=source_controller_name,
+            # No card object here — resolve by id/name across battlefields,
+            # the stack, and the resolving-spell slot (a burn spell is off
+            # the stack by the time its damage applies).
+            source_colors=damage_source_colors(
+                game, source_name=source_name, source_id=source_id),
             is_combat_damage=False,
         )
         final = game._replacement_engine.process_event_sync(event)

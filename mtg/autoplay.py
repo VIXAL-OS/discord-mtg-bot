@@ -670,9 +670,15 @@ async def _claude_extra_combats(cog, thread, game: GameState) -> None:
             await cog._autoplay_resolve_combat(thread, game)
     game._in_extra_combat = False
     if getattr(game, '_additional_combats', 0) > 0:
-        print(f"[EXTRA-COMBAT] Discarding {game._additional_combats} phase(s) "
-              f"granted mid-extra-combat (loop-protection cap — one "
-              f"consumption pass per turn)")
+        # Aug 2 batch-14 (mythic reviewer): see the twin in the human loop —
+        # when the game ENDED first the loop body never ran (CR 104.2a), so
+        # the dropped phase is the ORIGINAL grant, not a mid-combat re-grant.
+        _why = ("the game ended before it could be taken"
+                if game.ended else
+                "granted mid-extra-combat (loop-protection cap — one "
+                "consumption pass per turn)")
+        print(f"[EXTRA-COMBAT] Discarding {game._additional_combats} "
+              f"phase(s): {_why}")
     game._additional_combats = 0
     game._extra_combat_untaps = 0
 
@@ -1237,9 +1243,18 @@ async def _autoplay_human_turn(cog, thread, game: GameState, player_idx: int):
     # but it must be VISIBLE, not silent (batch-13: 2 grants vanished with
     # no line anywhere).
     if getattr(game, '_additional_combats', 0) > 0:
-        print(f"[EXTRA-COMBAT] Discarding {game._additional_combats} phase(s) "
-              f"granted mid-extra-combat (loop-protection cap — one consumption "
-              f"pass per turn)")
+        # Aug 2 batch-14 audit (mythic reviewer): when the game ENDED
+        # during the preceding regular combat, the loop body never ran
+        # even once (CR 104.2a), so what is being dropped here is the
+        # ORIGINAL grant, not a re-grant earned mid-extra-combat. The
+        # old wording sent a future auditor hunting a Port Razer
+        # re-connect chain that never happened.
+        _why = ("the game ended before it could be taken"
+                if game.ended else
+                "granted mid-extra-combat (loop-protection cap — one "
+                "consumption pass per turn)")
+        print(f"[EXTRA-COMBAT] Discarding {game._additional_combats} "
+              f"phase(s): {_why}")
     game._additional_combats = 0
     game._extra_combat_untaps = 0
 

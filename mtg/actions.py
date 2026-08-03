@@ -542,6 +542,7 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
 
         # [REPLACEMENT] Process damage replacement effects (Furnace of Rath, etc.)
         if HAS_REPLACEMENT_ENGINE and game._replacement_engine and game._replacement_engine.effects:
+            from mtg.helpers import damage_source_colors
             # Resolve affected_player: for card damage, use the target card's controller
             # so conditions like Gisela ("damage to a permanent an opponent controls")
             # fire correctly. CR 614 checks require both object + controller context.
@@ -562,6 +563,13 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                 amount=amount,
                 source_name=source_name,
                 source_controller=action.get("_source_controller", "") or "",
+                # Aug 2 batch-14: color-gated replacements (Torbran) need the
+                # source's colors — CR 202.2, from the mana cost. This is the
+                # template/Tier-3 damage path, so the source is usually a
+                # resolving spell rather than a permanent; the resolver
+                # searches battlefields, the stack, and the resolving slot.
+                source_colors=damage_source_colors(
+                    game, source_name=source_name),
             )
             final = game._replacement_engine.process_event_sync(event)
             if final.is_prevented:
@@ -1092,7 +1100,19 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
             else:
                 card = find_card_in_zone(card_name, "hand", player)
                 if card is None:
-                    print(f"[DISCARD] {player.name}: '{card_name}' not in hand — discard skipped")
+                    # Aug 2 batch-14 audit (legacy reviewer): the sentinel
+                    # selectors ("worst", "random", "best_nonland") only reach
+                    # here when the hand is EMPTY — their own branches above
+                    # all require `player.hand`. The old wording read as if
+                    # the engine had searched for a card literally named
+                    # "worst", and nearly produced a false positive in that
+                    # audit. Say which case it is.
+                    if not player.hand:
+                        print(f"[DISCARD] {player.name}: hand is empty — "
+                              f"discard is a legal no-op (CR 701.8a)")
+                    else:
+                        print(f"[DISCARD] {player.name}: '{card_name}' not in "
+                              f"hand — discard skipped")
 
             if card:
                 player.hand.remove(card)

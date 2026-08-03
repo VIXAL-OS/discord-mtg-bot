@@ -2733,6 +2733,17 @@ class EffectTemplateLibrary:
         # charge counter per multikicker payment — the production side has
         # read charge counters since forever (models._get_mana_production);
         # the PAYMENT -> counters half never existed, so it entered dead.
+        # Aug 2 batch-14 audit: without this name key, the generic ETB-draw
+        # pattern matched across "target opponent may have you draw three
+        # cards" and resolved every Gearhulk as an unconditional draw-3,
+        # silently discarding the opponent's choice and the mill+burn branch.
+        self._add_card("combustible gearhulk", EffectTemplate(
+            name="Combustible Gearhulk",
+            description=("Target opponent may have you draw three cards; if "
+                         "they decline, mill three and deal damage equal to "
+                         "their total mana value"),
+            action_generator=self._gen_combustible_gearhulk,
+        ))
         self._add_card("everflowing chalice", EffectTemplate(
             name="Everflowing Chalice",
             description=("Enters with a charge counter for each time it was "
@@ -9187,6 +9198,70 @@ class EffectTemplateLibrary:
         return [{"action": "search_library", "player": ctrl, "count": 2,
                  "card_type": "creature", "to_zone": "hand",
                  "reason": "Tooth and Nail: search two creature cards to hand"}]
+
+    def _gen_combustible_gearhulk(self, ctrl, opp, ctx) -> List[Dict]:
+        """Combustible Gearhulk — "When this creature enters, target opponent
+        MAY have you draw three cards. If the player doesn't, you mill three
+        cards, then this creature deals damage to that player equal to the
+        total mana value of those cards."
+
+        Aug 2 batch-14 audit (mythic reviewer): no template existed, so the
+        generic "when X enters ... draw N cards" pattern swallowed the
+        sentence — `.+?`/`.*?` matched straight across "target opponent may
+        have you" — and every Gearhulk resolved as an unconditional draw-3
+        for its controller, discarding the opponent's choice AND the entire
+        mill+burn branch.
+
+        The choice is the OPPONENT's, and they make it WITHOUT seeing the
+        cards (CR 601: the mill happens after the decision). Modelling it by
+        peeking at the top three would be cheating with hidden information
+        and would make the card strictly worse than printed, so the decision
+        uses only what that player can actually know: the average mana value
+        of the controller's remaining library, times three. Take the damage
+        when it is affordable; hand over the cards when the expected hit is
+        a serious fraction of remaining life. The RESOLUTION then uses the
+        real milled cards, so the damage is exact even though the choice was
+        made blind.
+        """
+        game = ctx.get('_game')
+        ctrl_player = ctx.get('_controller_player')
+        opp_player = ctx.get('_opponent_player')
+        if game is None or ctrl_player is None or opp_player is None:
+            # No context to reason with — the printed default for an
+            # unmodellable choice is the harmless half.
+            return [{"action": "draw_cards", "player": ctrl, "amount": 3}]
+
+        library = list(getattr(ctrl_player, 'library', []) or [])
+        if len(library) < 3:
+            # Milling three would deck the controller; a rational opponent
+            # takes that line every time.
+            return [{"action": "mill", "player": ctrl, "amount": 3}]
+
+        def _mv(card):
+            try:
+                return int(getattr(card, 'cmc', 0) or 0)
+            except (TypeError, ValueError):
+                return 0
+
+        avg_mv = sum(_mv(c) for c in library) / float(len(library))
+        expected = int(round(avg_mv * 3))
+        opp_life = int(getattr(opp_player, 'life', 0) or 0)
+        # Lethal, or a third of remaining life, is worth three cards.
+        gives_cards = opp_life <= expected or expected * 3 >= opp_life
+        if gives_cards:
+            print(f"[GEARHULK] {opp_player.name} gives {ctrl_player.name} 3 "
+                  f"cards rather than risk ~{expected} damage (life {opp_life})")
+            return [{"action": "draw_cards", "player": ctrl, "amount": 3}]
+
+        actual = sum(_mv(c) for c in library[:3])
+        print(f"[GEARHULK] {opp_player.name} declines (expected ~{expected} "
+              f"vs life {opp_life}) — milling 3 for {actual} damage")
+        actions = [{"action": "mill", "player": ctrl, "amount": 3}]
+        if actual > 0:
+            actions.append({"action": "deal_damage", "amount": actual,
+                            "target_player": opp,
+                            "source": "Combustible Gearhulk"})
+        return actions
 
     def _gen_everflowing_chalice(self, ctrl, opp, ctx) -> List[Dict]:
         """Everflowing Chalice — 'Multikicker {2} ... enters with a charge
