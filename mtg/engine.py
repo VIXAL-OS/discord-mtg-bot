@@ -3496,6 +3496,21 @@ class GameEngine:
                 # were never applied anywhere — equip always charged the
                 # printed cost. Reduce the generic component (CR 601.2f).
                 if ability.get('is_equip'):
+                    # Aug 2, 2026 — METALCRAFT (CR 702.60): "Equipment you
+                    # control have equip {0} as long as you control three or
+                    # more artifacts" (Puresteel Paladin). This is a SET-TO-
+                    # ZERO, not a reduction, so the subtractive reducer below
+                    # could not express it; nothing about the card worked
+                    # before (it probed as resolving NOTHING at any event).
+                    from mtg.helpers import has_metalcraft
+                    _equip_free = any(
+                        'equip {0}' in (_s.oracle_text or '').lower()
+                        and has_metalcraft(player)
+                        for _s in player.battlefield)
+                    if _equip_free:
+                        print(f"[CONDITION] {perm.name}: metalcraft MET — "
+                              f"equip costs {{0}}")
+                        cost_str = "{0}"
                     _equip_red = 0
                     for _src in player.battlefield:
                         _rm = re.search(r'equip (?:abilities you activate|costs you pay) cost \{(\d+)\} less',

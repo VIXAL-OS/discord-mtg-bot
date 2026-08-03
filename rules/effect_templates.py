@@ -2737,6 +2737,27 @@ class EffectTemplateLibrary:
         # Each used its weak half forever — no delirium/morbid predicate
         # existed, so Tragic Slip was a -1/-1 "removal" spell and Unholy Heat
         # never dealt 6.
+        # Consumers for the predicates added alongside them — without these
+        # the predicates were built and never called, which is its own bug
+        # shape (the July-21 `game._rules_engine` class: machinery wired to
+        # nothing). Each of these probed as resolving NOTHING at any event.
+        self._add_card("reaper from the abyss endstep", EffectTemplate(
+            name="Reaper from the Abyss",
+            description=("At end step, if a creature died this turn, destroy "
+                         "target non-Demon creature"),
+            action_generator=self._gen_reaper_from_the_abyss,
+        ))
+        self._add_card("puresteel paladin", EffectTemplate(
+            name="Puresteel Paladin",
+            description="Whenever an Equipment you control enters, draw a card",
+            action_generator=self._gen_puresteel_paladin_etb,
+        ))
+        self._add_card("polukranos, world eater", EffectTemplate(
+            name="Polukranos, World Eater",
+            description=("When it becomes monstrous, deal X damage divided "
+                         "among opposing creatures; each deals its power back"),
+            action_generator=self._gen_polukranos_monstrosity,
+        ))
         self._add_card("tragic slip", EffectTemplate(
             name="Tragic Slip",
             description="Target creature gets -1/-1, or -13/-13 with morbid",
@@ -9261,6 +9282,107 @@ class EffectTemplateLibrary:
     # --- Aug 2, 2026: ABILITY-WORD CONDITION cards (CR 207.2c) ---
     # Every one of these used its WEAK half forever, because no delirium /
     # morbid / metalcraft / coven predicate existed anywhere in the engine.
+
+    def _gen_reaper_from_the_abyss(self, ctrl, opp, ctx) -> List[Dict]:
+        """Reaper from the Abyss — "Morbid — At the beginning of each end
+        step, if a creature died this turn, destroy target non-Demon
+        creature." The whole reason to play a 6-mana 6/6, and it fired
+        never: no morbid predicate existed and no template matched, so the
+        end-step scan produced nothing at all."""
+        from mtg.helpers import has_morbid
+        game = ctx.get('_game')
+        if game is None or not has_morbid(game):
+            return [{"action": "no_action",
+                     "reason": "Reaper from the Abyss: no creature died this turn"}]
+        opp_player = ctx.get('_opponent_player')
+        cands = [c for c in (getattr(opp_player, 'battlefield', []) or [])
+                 if c.is_creature(game=game)
+                 and 'demon' not in (getattr(c, 'type_line', '') or '').lower()
+                 and not getattr(c, '_phased_out', False)] if opp_player else []
+        if not cands:
+            return [{"action": "no_action",
+                     "reason": "Reaper from the Abyss: no non-Demon creature to destroy"}]
+        best = max(cands, key=lambda c: self._eff_power(c, game))
+        print(f"[CONDITION] Reaper from the Abyss: morbid MET — destroying "
+              f"{best.name}")
+        return [{"action": "destroy", "card": self._cd_name(best),
+                 "source": "Reaper from the Abyss"}]
+
+    def _gen_puresteel_paladin_etb(self, ctrl, opp, ctx) -> List[Dict]:
+        """Puresteel Paladin — "Whenever an Equipment you control enters, you
+        may draw a card." (Its metalcraft half — equip {0} with three or more
+        artifacts — is a STATIC cost modification, wired separately in the
+        equip-cost path.) Nothing resolved for this card at all before."""
+        return [{"action": "draw_cards", "player": ctrl, "amount": 1}]
+
+    def _gen_polukranos_monstrosity(self, ctrl, opp, ctx) -> List[Dict]:
+        """Polukranos, World Eater — "When this becomes monstrous, it deals X
+        damage divided as you choose among any number of target creatures
+        your opponents control. Each of those creatures deals damage equal to
+        its power to Polukranos."
+
+        MONSTROSITY (CR 701.32) had no handling: the activation put no
+        counters on and never set the monstrous flag, so the fight-like
+        trigger could not fire either. X comes from the activation's paid X
+        (the July-31 auto-sizing threads it through as ctx['x_value']).
+        Divided damage is modelled as the standard "kill what you can"
+        heuristic: spend X on the biggest creatures it can actually finish.
+        """
+        game = ctx.get('_game')
+        opp_player = ctx.get('_opponent_player')
+        x = int(ctx.get('x_value') or 0)
+        if x <= 0 or opp_player is None:
+            return [{"action": "no_action",
+                     "reason": "Polukranos: monstrosity X was 0"}]
+        cands = sorted(
+            (c for c in (getattr(opp_player, 'battlefield', []) or [])
+             if c.is_creature(game=game)
+             and not getattr(c, '_phased_out', False)),
+            key=lambda c: self._eff_toughness(c, game))
+        actions = []
+        remaining = x
+        for c in cands:
+            need = max(1, self._eff_toughness(c, game)
+                       - int(getattr(c, 'damage_marked', 0) or 0))
+            if need > remaining:
+                continue
+            remaining -= need
+            actions.append({"action": "deal_damage", "amount": need,
+                            "target_card": self._cd_name(c),
+                            "target_controller": opp,
+                            "source": "Polukranos, World Eater"})
+            # CR: each of those creatures deals damage equal to its power
+            # back to Polukranos.
+            back = self._eff_power(c, game)
+            if back > 0:
+                actions.append({"action": "deal_damage", "amount": back,
+                                "target_card": "Polukranos, World Eater",
+                                "target_controller": ctrl,
+                                "source": self._cd_name(c)})
+        if not actions:
+            return [{"action": "no_action",
+                     "reason": "Polukranos: X too small to finish any creature"}]
+        return actions
+
+    @staticmethod
+    def _eff_power(card, game) -> int:
+        try:
+            return int(card.get_effective_power(game))
+        except (AttributeError, TypeError, ValueError):
+            try:
+                return int(card.power or 0)
+            except (TypeError, ValueError):
+                return 0
+
+    @staticmethod
+    def _eff_toughness(card, game) -> int:
+        try:
+            return int(card.get_effective_toughness(game))
+        except (AttributeError, TypeError, ValueError):
+            try:
+                return int(card.toughness or 0)
+            except (TypeError, ValueError):
+                return 1
 
     def _gen_tragic_slip(self, ctrl, opp, ctx) -> List[Dict]:
         """Tragic Slip — "-1/-1. Morbid: -13/-13 instead if a creature died
