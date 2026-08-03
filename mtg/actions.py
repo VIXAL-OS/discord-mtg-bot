@@ -2436,6 +2436,16 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
             elif source_name == 'wash away' and getattr(tcard, '_cast_origin', 'hand') == 'hand':
                 restriction_failed = "target was cast from its owner's hand"
             if restriction_failed:
+                # Aug 2 batch-14 follow-up: this message reached Discord all
+                # along (9 fizzles across the batch) but had NO console tag,
+                # so a console-based audit could not see it — and a reviewer
+                # duly filed "Wash Away's fizzle is invisible" as a bug. It
+                # wasn't: async stack resolution interleaves a response's
+                # effect messages with the cast triggers ahead of it, so the
+                # line landed six entries after the cast rather than next to
+                # it. A greppable tag makes the correct behavior auditable.
+                _src_dbg = (action.get('_source_card_name') or 'counter')
+                print(f"[COUNTER-FIZZLE] {_src_dbg}: {restriction_failed}")
                 return f"🚫 Counter fizzles — {restriction_failed}"
             # Apply max_mv filter (Mesmeric Glare: counter target spell with MV ≤ 3)
             if max_mv is not None and target is not None:

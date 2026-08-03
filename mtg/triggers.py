@@ -3836,7 +3836,20 @@ def _check_beginning_combat_triggers_sync(engine, game: GameState) -> Tuple[List
     opponent = game.players[1 - active_idx]
     lib = get_effect_library() if HAS_EFFECT_TEMPLATES else None
 
-    for card in list(active.battlefield):
+    # Aug 2 batch-14: a few beginning-of-combat triggers function FROM THE
+    # GRAVEYARD ("return this card from your graveyard to the battlefield" —
+    # Arclight Phoenix, CR 603.6d). The scan walked the battlefield only, so
+    # the ability was unreachable in its own zone; the 14 Tier-3 escalations
+    # it produced in batch 15334 were all the already-on-battlefield case,
+    # resolving nothing. Only graveyard cards whose trigger explicitly names
+    # that zone are scanned, so this stays cheap.
+    _gy_triggers = [
+        c for c in list(getattr(active, 'graveyard', []) or [])
+        if (c.oracle_text
+            and "beginning of combat" in c.oracle_text.lower()
+            and "from your graveyard" in c.oracle_text.lower())
+    ]
+    for card in list(active.battlefield) + _gy_triggers:
         if getattr(card, '_phased_out', False) or not card.oracle_text:
             continue
         oracle_lower = card.oracle_text.lower()

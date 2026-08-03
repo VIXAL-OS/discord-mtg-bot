@@ -2561,6 +2561,7 @@ class GameEngine:
         for _p in game.players:
             _p.spells_cast_this_turn = 0
             _p.noncreature_spells_cast_this_turn = 0  # Reset for Esper Sentinel
+            _p.instant_sorcery_spells_cast_this_turn = 0  # Arclight Phoenix
 
         # Reset per-turn flicker dedup tracker (see actions.py flicker handler)
         if hasattr(game, '_flicker_announce_seen'):

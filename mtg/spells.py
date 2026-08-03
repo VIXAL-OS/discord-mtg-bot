@@ -3396,6 +3396,9 @@ async def cast_spell_async(engine, game: GameState, player: Player, card: Card, 
     player.spells_cast_this_turn += 1
     if not card.is_creature():
         player.noncreature_spells_cast_this_turn += 1
+    _tl_cast = (getattr(card, 'type_line', '') or '').lower()
+    if 'instant' in _tl_cast or 'sorcery' in _tl_cast:
+        player.instant_sorcery_spells_cast_this_turn += 1
 
     # May 14 audit (A7): track per-game spell-type counts on the game state so
     # the strategist can detect "opponent has cast 0 noncreature spells in 8

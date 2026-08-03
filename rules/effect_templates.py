@@ -2733,6 +2733,40 @@ class EffectTemplateLibrary:
         # charge counter per multikicker payment — the production side has
         # read charge counters since forever (models._get_mana_production);
         # the PAYMENT -> counters half never existed, so it entered dead.
+        # --- Aug 2 batch-14 Tier-3 shrink (the batch's top escalations) ---
+        # Scheduled keys carry a scheduled-prefix description so the F25
+        # guard lets them fire on their own event; the end-step one uses the
+        # suffix-key convention so a future bare-name registration can't
+        # silently overwrite it (the July-31 Soulherder lesson).
+        self._add_card("sire of insanity endstep", EffectTemplate(
+            name="Sire of Insanity",
+            description="At end step, each player discards their hand",
+            action_generator=self._gen_sire_of_insanity,
+        ))
+        self._add_card("song of the worldsoul", EffectTemplate(
+            name="Song of the Worldsoul",
+            description="Whenever you cast a spell, populate",
+            action_generator=self._gen_song_of_the_worldsoul,
+        ))
+        self._add_dies_card("glissa, the traitor", EffectTemplate(
+            name="Glissa, the Traitor",
+            description=("When a creature an opponent controls dies, return "
+                         "target artifact card from your graveyard to hand"),
+            action_generator=self._gen_glissa_the_traitor,
+        ))
+        self._add_card("the ozolith beginningcombat", EffectTemplate(
+            name="The Ozolith",
+            description=("At beginning of combat, move all counters from The "
+                         "Ozolith onto target creature"),
+            action_generator=self._gen_the_ozolith_combat,
+        ))
+        self._add_card("arclight phoenix beginningcombat", EffectTemplate(
+            name="Arclight Phoenix",
+            description=("At beginning of combat, if you've cast three or "
+                         "more instant and sorcery spells this turn, return "
+                         "this card from your graveyard to the battlefield"),
+            action_generator=self._gen_arclight_phoenix,
+        ))
         # Aug 2 batch-14 audit: without this name key, the generic ETB-draw
         # pattern matched across "target opponent may have you draw three
         # cards" and resolved every Gearhulk as an unconditional draw-3,
@@ -9198,6 +9232,124 @@ class EffectTemplateLibrary:
         return [{"action": "search_library", "player": ctrl, "count": 2,
                  "card_type": "creature", "to_zone": "hand",
                  "reason": "Tooth and Nail: search two creature cards to hand"}]
+
+    # --- Aug 2 batch-14 Tier-3 shrink: the batch's top escalations ---
+    # Each of these was a real, repeated Claude-API call resolving a
+    # deterministic effect. Measured over batch 15334: Sire of Insanity ×17,
+    # Song of the Worldsoul ×16, Arclight Phoenix ×14, Glissa ×11, Ozolith ×8.
+
+    def _gen_sire_of_insanity(self, ctrl, opp, ctx) -> List[Dict]:
+        """Sire of Insanity — "At the beginning of each end step, each player
+        discards their hand." Symmetric and unconditional; the controller
+        discards too."""
+        return [
+            {"action": "discard", "player": ctrl, "card": "all"},
+            {"action": "discard", "player": opp, "card": "all"},
+        ]
+
+    def _gen_song_of_the_worldsoul(self, ctrl, opp, ctx) -> List[Dict]:
+        """Song of the Worldsoul — "Whenever you cast a spell, populate."
+
+        The populate handler is already CR 701.34a-correct (it copies a
+        creature token you control, and does NOTHING when you control none —
+        the July 20 fix after Tier 3 fabricated a token out of thin air).
+        """
+        return [{"action": "populate", "player": ctrl}]
+
+    def _gen_glissa_the_traitor(self, ctrl, opp, ctx) -> List[Dict]:
+        """Glissa, the Traitor — "Whenever a creature an opponent controls
+        dies, you may return target artifact card from your graveyard to your
+        hand."
+
+        The opponent-scope gate lives in the dies scan (July 24), so by the
+        time this runs the death is already known to be an opponent's. The
+        return is a "may" with a target: no artifact in the graveyard means
+        no legal target and the trigger simply does nothing (CR 603.3c).
+        """
+        ctrl_player = ctx.get('_controller_player')
+        if ctrl_player is None:
+            return []
+        artifacts = [c for c in (getattr(ctrl_player, 'graveyard', []) or [])
+                     if 'artifact' in (getattr(c, 'type_line', '') or '').lower()]
+        if not artifacts:
+            return [{"action": "no_action",
+                     "reason": "Glissa: no artifact card in your graveyard"}]
+
+        def _mv(c):
+            try:
+                return int(getattr(c, 'cmc', 0) or 0)
+            except (TypeError, ValueError):
+                return 0
+        best = max(artifacts, key=_mv)
+        return [{"action": "move_card", "card": self._cd_name(best),
+                 "from_zone": "graveyard", "to_zone": "hand", "player": ctrl}]
+
+    def _gen_the_ozolith_combat(self, ctrl, opp, ctx) -> List[Dict]:
+        """The Ozolith — "At the beginning of combat on your turn, if The
+        Ozolith has counters on it, you may move all counters from The
+        Ozolith onto target creature."
+
+        CR 603.4 intervening-if: no counters, no trigger. Moves every counter
+        TYPE it is holding (it accumulates whatever left the battlefield),
+        onto the controller's best creature.
+        """
+        game = ctx.get('_game')
+        ctrl_player = ctx.get('_controller_player')
+        if game is None or ctrl_player is None:
+            return []
+        from mtg.helpers import names_match
+        ozolith = next(
+            (c for c in (getattr(ctrl_player, 'battlefield', []) or [])
+             if names_match(getattr(c, 'name', ''), "The Ozolith")), None)
+        counters = dict(getattr(ozolith, 'counters', {}) or {}) if ozolith else {}
+        counters = {k: v for k, v in counters.items() if v > 0}
+        if not counters:
+            return [{"action": "no_action",
+                     "reason": "The Ozolith has no counters on it"}]
+        target = ctx.get('best_own_creature')
+        if not target:
+            return [{"action": "no_action",
+                     "reason": "The Ozolith: no creature to move counters onto"}]
+        actions = []
+        for ctype, amount in counters.items():
+            actions.append({"action": "remove_counters",
+                            "card": "The Ozolith",
+                            "counter_type": ctype, "amount": amount})
+            actions.append({"action": "add_counters", "card": target,
+                            "counter_type": ctype, "amount": amount})
+        return actions
+
+    def _gen_arclight_phoenix(self, ctrl, opp, ctx) -> List[Dict]:
+        """Arclight Phoenix — "At the beginning of combat on your turn, if
+        you've cast three or more instant and sorcery spells this turn,
+        return this card from your graveyard to the battlefield."
+
+        Two shapes reach here. When the Phoenix is already ON the battlefield
+        (the only zone the beginning-of-combat scan used to walk), the return
+        is a no-op — that accounted for all 14 Tier-3 escalations in batch
+        15334, every one of them resolving nothing. The graveyard pass added
+        alongside this template is what makes the real ability reachable.
+        """
+        game = ctx.get('_game')
+        ctrl_player = ctx.get('_controller_player')
+        if game is None or ctrl_player is None:
+            return []
+        from mtg.helpers import names_match
+        in_graveyard = any(
+            names_match(getattr(c, 'name', ''), "Arclight Phoenix")
+            for c in (getattr(ctrl_player, 'graveyard', []) or []))
+        if not in_graveyard:
+            return [{"action": "no_action",
+                     "reason": "Arclight Phoenix is not in your graveyard"}]
+        cast_count = int(
+            getattr(ctrl_player, 'instant_sorcery_spells_cast_this_turn', 0) or 0)
+        if cast_count < 3:
+            return [{"action": "no_action",
+                     "reason": (f"Arclight Phoenix: only {cast_count} instant/"
+                                f"sorcery spell(s) cast this turn (needs 3)")}]
+        return [{"action": "move_card", "card": "Arclight Phoenix",
+                 "from_zone": "graveyard", "to_zone": "battlefield",
+                 "player": ctrl}]
 
     def _gen_combustible_gearhulk(self, ctrl, opp, ctx) -> List[Dict]:
         """Combustible Gearhulk — "When this creature enters, target opponent

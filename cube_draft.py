@@ -548,6 +548,90 @@ async def claude_make_pick(
 # AUTO DECK BUILDER (for Claude + as suggestion for humans)
 # =============================================================================
 
+def score_card_for_deck(card, main_colors):
+    """Deck-building score for one card given the deck's main colors.
+
+    Aug 2 batch-14: extracted from auto_build_deck so the scoring is
+    SHARED with its tests rather than mirrored by them. The first
+    version of these pins reimplemented this logic inline and duly
+    survived three of its own mutants — a copied predicate passes no
+    matter what production does.
+    """
+    card_colors = _get_card_colors(card)
+    score = 5.0
+
+    # On-color bonus
+    if card_colors:
+        matching = sum(1 for c in card_colors if c in main_colors)
+        # July 31 batch-11 (cube reviewer): the flat "splash" bonus
+        # admitted cards with a HARD off-color pip into a manabase that
+        # only mints main-color basics — Bloodbraid Elf ({2}{R}{G}) made
+        # a BG deck with zero red sources and was a dead card for all 30
+        # turns (game_1532532179492536430). A strict single-color pip
+        # outside main_colors is uncastable here (the builder drafts no
+        # fixing); treat it as off-color. Hybrid pips stay splashable —
+        # either half can pay.
+        strict_off_pip = any(
+            sym in ('W', 'U', 'B', 'R', 'G') and sym not in main_colors
+            for sym in re.findall(r'\{([^}]+)\}', card.mana_cost or '')
+        )
+        if matching == len(card_colors) and not strict_off_pip:
+            score += 5.0
+        elif matching > 0 and not strict_off_pip:
+            score += 2.0  # True splash (hybrid / off-color ability only)
+        else:
+            score -= 10.0  # Off-color, skip unless amazing
+    else:
+        # Aug 2 batch-14 (cube reviewer): COLORLESS cards never entered
+        # the branch above, so they sat at the base 5.0 while any
+        # on-color card started at 10.0 — Sol Ring, Skullclamp, Mind
+        # Stone and both Signets all lost their slots to mediocre
+        # on-color filler, and tied with each other at exactly 5.0 so
+        # Python's stable sort settled it by DRAFT PICK ORDER.
+        # The on-color bonus is really a castability bonus, and a
+        # colorless card is castable in every deck ever built — it
+        # earns the same one.
+        score += 5.0
+
+    oracle_lower = (card.oracle_text or '').lower()
+
+    # Creatures are important in limited
+    if 'creature' in (card.type_line or '').lower():
+        score += 2.0
+
+    # Removal
+    for pattern in REMOVAL_KEYWORDS:
+        if re.search(pattern, oracle_lower):
+            score += 3.0
+            break
+
+    # Aug 2 batch-14: a power signal, so equal-castability cards stop
+    # tying at one number and getting sorted by pick order. Deliberately
+    # HEURISTIC rather than a named-staple list — a name list rots the
+    # moment the cube changes, and nothing would validate it.
+    try:
+        _cmc = int(getattr(card, 'cmc', 0) or 0)
+    except (TypeError, ValueError):
+        _cmc = 0
+
+    # Mana positivity: a rock that produces MORE than it cost accelerates
+    # the whole deck (Sol Ring: {1} for two mana). Count the mana symbols
+    # an "Add ..." clause produces, and compare against the cost.
+    _produced = 0
+    for _m in re.finditer(r'add ((?:\{[^}]+\})+)', oracle_lower):
+        _produced = max(_produced, len(re.findall(r'\{[^}]+\}', _m.group(1))))
+    if _produced:
+        if _produced > _cmc:
+            score += 4.0          # Sol Ring — strictly ahead on mana
+        elif _cmc <= 2:
+            score += 2.0          # Signets / Mind Stone — cheap fixing
+    # Repeatable card advantage at a low cost (Skullclamp, Mind Stone's
+    # cash-in, Sensei's Divining Top).
+    if _cmc <= 2 and re.search(r'draw (a|two|\w+) cards?', oracle_lower):
+        score += 2.0
+    return score
+
+
 def auto_build_deck(pool: List[Card], deck_size: int = 40) -> Tuple[List[Card], List[Card]]:
     """
     Automatically build a limited deck from a draft pool.
@@ -572,43 +656,7 @@ def auto_build_deck(pool: List[Card], deck_size: int = 40) -> Tuple[List[Card], 
 
     scored = []
     for card in nonland_pool:
-        card_colors = _get_card_colors(card)
-        score = 5.0
-
-        # On-color bonus
-        if card_colors:
-            matching = sum(1 for c in card_colors if c in main_colors)
-            # July 31 batch-11 (cube reviewer): the flat "splash" bonus
-            # admitted cards with a HARD off-color pip into a manabase that
-            # only mints main-color basics — Bloodbraid Elf ({2}{R}{G}) made
-            # a BG deck with zero red sources and was a dead card for all 30
-            # turns (game_1532532179492536430). A strict single-color pip
-            # outside main_colors is uncastable here (the builder drafts no
-            # fixing); treat it as off-color. Hybrid pips stay splashable —
-            # either half can pay.
-            strict_off_pip = any(
-                sym in ('W', 'U', 'B', 'R', 'G') and sym not in main_colors
-                for sym in re.findall(r'\{([^}]+)\}', card.mana_cost or '')
-            )
-            if matching == len(card_colors) and not strict_off_pip:
-                score += 5.0
-            elif matching > 0 and not strict_off_pip:
-                score += 2.0  # True splash (hybrid / off-color ability only)
-            else:
-                score -= 10.0  # Off-color, skip unless amazing
-
-        # Creatures are important in limited
-        if 'creature' in (card.type_line or '').lower():
-            score += 2.0
-
-        # Removal
-        oracle_lower = (card.oracle_text or '').lower()
-        for pattern in REMOVAL_KEYWORDS:
-            if re.search(pattern, oracle_lower):
-                score += 3.0
-                break
-
-        scored.append((card, score))
+        scored.append((card, score_card_for_deck(card, main_colors)))
 
     scored.sort(key=lambda x: x[1], reverse=True)
 

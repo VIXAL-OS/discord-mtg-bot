@@ -1729,6 +1729,11 @@ class Player:
     spells_cast_this_turn: int = 0  # For day/night and werewolf transform tracking
     spells_cast_prev_turn: int = 0  # Spells cast during the player's previous turn
     noncreature_spells_cast_this_turn: int = 0  # For Esper Sentinel "first noncreature spell" tracking
+    # Aug 2 batch-14: instants/sorceries only, for the delirium-adjacent
+    # "cast three or more instant and sorcery spells this turn" family
+    # (Arclight Phoenix). The noncreature counter above is too broad —
+    # it also counts artifacts, enchantments and planeswalkers.
+    instant_sorcery_spells_cast_this_turn: int = 0
     landfall_count_this_turn: int = 0  # Lands that entered under your control this turn (for Omnath, etc.)
 
     # ---- Transient runtime state (reset/derived during play; NOT serialized) ----
