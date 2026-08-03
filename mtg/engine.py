@@ -2562,6 +2562,7 @@ class GameEngine:
             _p.spells_cast_this_turn = 0
             _p.noncreature_spells_cast_this_turn = 0  # Reset for Esper Sentinel
             _p.instant_sorcery_spells_cast_this_turn = 0  # Arclight Phoenix
+        game._creature_died_this_turn = False  # morbid (CR 207.2c)
 
         # Reset per-turn flicker dedup tracker (see actions.py flicker handler)
         if hasattr(game, '_flicker_announce_seen'):

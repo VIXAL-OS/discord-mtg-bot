@@ -2223,21 +2223,6 @@
       ]
     },
     {
-      "key": "traverse the ulvenwald",
-      "name": "Traverse the Ulvenwald",
-      "event": "etb",
-      "description": "Search library for a creature or land card",
-      "actions": [
-        {
-          "action": "search_library",
-          "player": "$controller",
-          "count": 1,
-          "card_type": "creature_or_land",
-          "reason": "Traverse the Ulvenwald: tutor creature or land"
-        }
-      ]
-    },
-    {
       "key": "treasure cruise",
       "name": "Treasure Cruise",
       "event": "etb",

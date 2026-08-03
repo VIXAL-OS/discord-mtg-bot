@@ -2659,6 +2659,12 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
         exclude_name = action.get("exclude", "") or action.get("exclude_name", "")
         include_name = action.get("card", "") or action.get("include_name", "")
         include_id = action.get("card_id", "") or action.get("include_id", "")
+        # Aug 2 2026: battle cry (CR 702.92) pumps each OTHER ATTACKING
+        # creature, so it needs both an attacking-only filter and an
+        # id-exclude for the source itself (exclude_name would also hit
+        # a second copy of the same card, which battle cry must pump).
+        only_attacking = bool(action.get("only_attacking"))
+        exclude_id = action.get("exclude_id", "")
         # June 10 audit (V23): support symmetric effects ("All creatures get
         # -X/-X" — Toxic Deluge). The template now emits player="all"; the old
         # single-player handler received "" → find_player(None) → silent no-op,
@@ -2679,6 +2685,10 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                     if include_subtype.lower() not in type_line:
                         continue
                 if include_id and c.id != include_id:
+                    continue
+                if exclude_id and c.id == exclude_id:
+                    continue
+                if only_attacking and not getattr(c, "attacking", False):
                     continue
                 if include_name and c.name.lower() != include_name.lower():
                     continue

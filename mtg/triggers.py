@@ -54,7 +54,9 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from mtg.constants import Phase, Zone, COMMAND_ZONE_FORMATS, MELD_PAIRS
-from mtg.helpers import _collapse_repeated_life_gain, _should_emit_resolve_hint, sanitize_oracle_for_display, format_trigger_line, names_match
+from mtg.helpers import (_collapse_repeated_life_gain, _should_emit_resolve_hint,
+                         sanitize_oracle_for_display, format_trigger_line,
+                         names_match, parse_attack_keywords)
 from mtg.models import Card, Player, GameState, StackEntry
 from mtg.util import maybe_reraise
 from mtg import events
@@ -3276,6 +3278,92 @@ def _check_ltb_triggers_sync(engine, game: GameState, leaving_card: Card, leavin
     return messages
 
 
+def _resolve_attack_keywords(engine, game: GameState, attacker: Card,
+                             controller: Player, opponent: Player,
+                             kws: dict, attacking_power: int) -> List[str]:
+    """Resolve keyword attack triggers (CR 702) deterministically.
+
+    Aug 2, 2026 — these had ZERO handling anywhere in the engine. Each is a
+    printed ability that simply did not happen:
+
+    - annihilator N (CR 702.86): defending player sacrifices N permanents.
+      Emrakul, the Aeons Torn is annihilator 6 and is the mythic deck's
+      top-end bomb; every attack sacrificed nothing.
+    - battle cry (CR 702.92): each OTHER attacking creature gets +1/+0.
+      Hero of Bladehold's token half worked, so the card looked handled.
+    - melee (CR 702.72): +1/+1 until end of turn for each opponent you
+      attacked this combat — exactly +1/+1 in a two-player game.
+    - mentor (CR 702.134): put a +1/+1 counter on target attacking creature
+      with LESSER power.
+    """
+    msgs: List[str] = []
+    _rules = engine.rules if hasattr(engine, 'rules') else engine
+
+    n = kws.get('annihilator')
+    if n:
+        for _ in range(int(n)):
+            m = _rules._execute_action_on_state(game, {
+                "action": "sacrifice_permanent", "player": opponent.name,
+                "source": attacker.name,
+                "reason": f"{attacker.name}'s annihilator {n}"})
+            if m:
+                msgs.append(m)
+        print(f"[ATTACK-KEYWORD] {attacker.name}: annihilator {n} — "
+              f"{opponent.name} sacrifices {n} permanent(s)")
+
+    if kws.get('battle_cry'):
+        others = [c for c in (getattr(controller, 'battlefield', []) or [])
+                  if getattr(c, 'attacking', False) and c.id != attacker.id]
+        if others:
+            m = _rules._execute_action_on_state(game, {
+                "action": "pump_all_creatures", "player": controller.name,
+                "power": 1, "toughness": 0,
+                "only_attacking": True, "exclude_id": attacker.id,
+                "source": attacker.name})
+            if m:
+                msgs.append(m)
+            print(f"[ATTACK-KEYWORD] {attacker.name}: battle cry — "
+                  f"{len(others)} other attacker(s) get +1/+0")
+
+    if kws.get('melee'):
+        # Two-player: you attacked exactly one opponent, so +1/+1.
+        m = _rules._execute_action_on_state(game, {
+            "action": "pump_all_creatures", "player": controller.name,
+            "card": attacker.name, "include_id": attacker.id,
+            "power": 1, "toughness": 1, "source": attacker.name})
+        if m:
+            msgs.append(m)
+        print(f"[ATTACK-KEYWORD] {attacker.name}: melee — +1/+1")
+
+    if kws.get('mentor'):
+        lesser = [c for c in (getattr(controller, 'battlefield', []) or [])
+                  if getattr(c, 'attacking', False) and c.id != attacker.id
+                  and _safe_power(c, game) < attacking_power]
+        if lesser:
+            target = max(lesser, key=lambda c: _safe_power(c, game))
+            m = _rules._execute_action_on_state(game, {
+                "action": "add_counters", "card": target.name,
+                "card_id": target.id, "counter_type": "+1/+1", "amount": 1})
+            if m:
+                msgs.append(m)
+            print(f"[ATTACK-KEYWORD] {attacker.name}: mentor — +1/+1 counter "
+                  f"on {target.name}")
+        else:
+            print(f"[ATTACK-KEYWORD] {attacker.name}: mentor — no attacking "
+                  f"creature with lesser power (CR 603.3c)")
+    return msgs
+
+
+def _safe_power(card: Card, game: GameState) -> int:
+    try:
+        return int(card.get_effective_power(game))
+    except (AttributeError, TypeError, ValueError):
+        try:
+            return int(card.power or 0)
+        except (TypeError, ValueError):
+            return 0
+
+
 def _check_attack_triggers_sync(engine, game: GameState, attacker_card: Card, attacking_player: Player) -> Tuple[List[str], List[Tuple]]:
     """Check for 'whenever [this/a creature] attacks' triggers.
 
@@ -3294,6 +3382,21 @@ def _check_attack_triggers_sync(engine, game: GameState, attacker_card: Card, at
         attacking_power = attacker_card.get_effective_power(game) if hasattr(attacker_card, 'get_effective_power') else 0
     except (ValueError, TypeError):
         pass
+
+    # 0. KEYWORD attack triggers (CR 702). Aug 2, 2026: a keyword ability
+    # states its trigger in REMINDER text, or on a bare keyword line with no
+    # reminder at all — Emrakul, the Aeons Torn's entire annihilator clause is
+    # the tail of "Flying, protection from spells that are one or more colors,
+    # annihilator 6". The paragraph detector below requires a paragraph that
+    # STARTS with "whenever", so this whole family was unreachable: Emrakul
+    # attacked and the defending player sacrificed NOTHING, in the very deck
+    # built around cheating her into play. Resolved deterministically here so
+    # none of it costs a Tier-3 call.
+    _atk_kw = parse_attack_keywords(attacker_card.oracle_text or '')
+    if _atk_kw:
+        messages.extend(_resolve_attack_keywords(
+            engine, game, attacker_card, attacking_player, opponent,
+            _atk_kw, attacking_power))
 
     # 1. Check the attacker itself for "whenever [this] attacks" oracle text
     if attacker_card.oracle_text:
@@ -5130,6 +5233,11 @@ def _accumulate_death_subscriber(game, card=None, player=None, **_):
     if card is None:
         return
     game._recently_died.append((card, player))
+    # Aug 2 2026: MORBID (CR 207.2c) asks 'did a creature die this turn'.
+    # The wave-scoped _recently_died list is reset mid-turn by the
+    # dispatcher, so it cannot answer that; stamp a per-turn flag at the
+    # one choke point every death path reaches. Cleared at turn advance.
+    game._creature_died_this_turn = True
     grant_experience_for_death(game, card, player, batch=_.get('batch'))
 
 

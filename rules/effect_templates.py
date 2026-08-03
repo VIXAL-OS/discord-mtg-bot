@@ -2733,6 +2733,26 @@ class EffectTemplateLibrary:
         # charge counter per multikicker payment — the production side has
         # read charge counters since forever (models._get_mana_production);
         # the PAYMENT -> counters half never existed, so it entered dead.
+        # --- Aug 2, 2026: ability-word CONDITION cards (CR 207.2c) ---
+        # Each used its weak half forever — no delirium/morbid predicate
+        # existed, so Tragic Slip was a -1/-1 "removal" spell and Unholy Heat
+        # never dealt 6.
+        self._add_card("tragic slip", EffectTemplate(
+            name="Tragic Slip",
+            description="Target creature gets -1/-1, or -13/-13 with morbid",
+            action_generator=self._gen_tragic_slip,
+        ))
+        self._add_card("unholy heat", EffectTemplate(
+            name="Unholy Heat",
+            description="Deal 2 damage, or 6 with delirium",
+            action_generator=self._gen_unholy_heat,
+        ))
+        self._add_card("traverse the ulvenwald", EffectTemplate(
+            name="Traverse the Ulvenwald",
+            description=("Search for a basic land, or any creature/land with "
+                         "delirium"),
+            action_generator=self._gen_traverse_the_ulvenwald,
+        ))
         # --- Aug 2 batch-14 Tier-3 shrink (the batch's top escalations) ---
         # Scheduled keys carry a scheduled-prefix description so the F25
         # guard lets them fire on their own event; the end-step one uses the
@@ -9237,6 +9257,63 @@ class EffectTemplateLibrary:
     # Each of these was a real, repeated Claude-API call resolving a
     # deterministic effect. Measured over batch 15334: Sire of Insanity ×17,
     # Song of the Worldsoul ×16, Arclight Phoenix ×14, Glissa ×11, Ozolith ×8.
+
+    # --- Aug 2, 2026: ABILITY-WORD CONDITION cards (CR 207.2c) ---
+    # Every one of these used its WEAK half forever, because no delirium /
+    # morbid / metalcraft / coven predicate existed anywhere in the engine.
+
+    def _gen_tragic_slip(self, ctrl, opp, ctx) -> List[Dict]:
+        """Tragic Slip — "-1/-1. Morbid: -13/-13 instead if a creature died
+        this turn." Without a morbid check this was a permanent -1/-1, i.e.
+        a removal spell that removed nothing."""
+        from mtg.helpers import has_morbid
+        game = ctx.get('_game')
+        target = ctx.get('explicit_target_name') or ctx.get('best_opponent_creature')
+        if not target:
+            return [{"action": "no_action",
+                     "reason": "Tragic Slip: no creature to target"}]
+        morbid = has_morbid(game) if game is not None else False
+        amt = -13 if morbid else -1
+        print(f"[CONDITION] Tragic Slip: morbid={'MET' if morbid else 'not met'}"
+              f" — {amt}/{amt}")
+        return [{"action": "pump_all_creatures", "player": opp,
+                 "card": target, "power": amt, "toughness": amt,
+                 "source": "Tragic Slip"}]
+
+    def _gen_unholy_heat(self, ctrl, opp, ctx) -> List[Dict]:
+        """Unholy Heat — 2 damage, or 6 with delirium."""
+        from mtg.helpers import has_delirium, graveyard_card_types
+        ctrl_player = ctx.get('_controller_player')
+        target = ctx.get('explicit_target_name') or ctx.get('best_opponent_creature')
+        if not target:
+            return [{"action": "no_action",
+                     "reason": "Unholy Heat: no creature or planeswalker to target"}]
+        deli = has_delirium(ctrl_player) if ctrl_player is not None else False
+        types = (len(graveyard_card_types(ctrl_player))
+                 if ctrl_player is not None else 0)
+        print(f"[CONDITION] Unholy Heat: delirium={'MET' if deli else 'not met'}"
+              f" ({types} card type(s)) — {6 if deli else 2} damage")
+        return [{"action": "deal_damage", "amount": 6 if deli else 2,
+                 "target_card": target, "target_controller": opp,
+                 "source": "Unholy Heat"}]
+
+    def _gen_traverse_the_ulvenwald(self, ctrl, opp, ctx) -> List[Dict]:
+        """Traverse the Ulvenwald — basic land, or any creature/land with
+        delirium."""
+        from mtg.helpers import has_delirium
+        ctrl_player = ctx.get('_controller_player')
+        deli = has_delirium(ctrl_player) if ctrl_player is not None else False
+        print(f"[CONDITION] Traverse the Ulvenwald: "
+              f"delirium={'MET' if deli else 'not met'}")
+        # NOTE the handler's filter is a substring match on the type line,
+        # so "creature_or_land" (what the old JSON entry asked for) matches
+        # NOTHING — that template silently tutored nothing at all. With
+        # delirium the strictly better half of "creature or land" is the
+        # creature, so search that; the approximation is documented rather
+        # than silent.
+        return [{"action": "search_library", "player": ctrl,
+                 "card_type": "creature" if deli else "basic land",
+                 "destination": "hand"}]
 
     def _gen_sire_of_insanity(self, ctrl, opp, ctx) -> List[Dict]:
         """Sire of Insanity — "At the beginning of each end step, each player

@@ -1470,3 +1470,148 @@ def damage_source_colors(game, source_card=None, source_name: str = "",
                     return spell_colors_from_cost(
                         getattr(c, 'mana_cost', '') or '')
     return None
+
+
+# ---------------------------------------------------------------------------
+# Aug 2, 2026 — KEYWORD ATTACK TRIGGERS (CR 702).
+#
+# A keyword ability states its trigger in REMINDER text, or on a bare keyword
+# line with no reminder at all: Emrakul, the Aeons Torn's whole annihilator
+# clause is the tail of "Flying, protection from spells that are one or more
+# colors, annihilator 6". The paragraph-shape detector
+# (_is_self_attack_trigger_paragraph) requires a paragraph that STARTS with
+# "whenever", so none of these were reachable — Emrakul attacked and the
+# defending player sacrificed nothing, in the deck built around casting her.
+#
+# Parsed from the keyword LINE rather than the reminder, so a card that omits
+# reminder text (older printings, or a combined keyword line) still works.
+# ---------------------------------------------------------------------------
+
+_KEYWORD_LINE_RE = re.compile(r'^[^.\n]*$')
+
+
+def _keyword_line_tokens(oracle_text: str):
+    """Comma-separated tokens from lines that are keyword lines.
+
+    A keyword line has no sentence punctuation outside reminder text — that
+    is what separates "Flying, protection from X, annihilator 6" from a real
+    sentence that happens to contain a comma.
+    """
+    for raw in (oracle_text or '').split('\n'):
+        line = re.sub(r'\([^)]*\)', '', raw).strip().rstrip('.')
+        if not line or '.' in line:
+            continue
+        low = line.lower()
+        # A GRANT line ("Other creatures you control have flying, melee")
+        # tokenizes to a bare "melee" and would hand the trigger to the
+        # SOURCE, which merely grants it — the July-21 Yidris cascade-grant
+        # class, found by mutation-testing this parser. A keyword line never
+        # contains grant language.
+        if re.search(r'\b(have|has|gains?|gain)\b', low):
+            continue
+        for tok in line.split(','):
+            tok = tok.strip().lower()
+            if tok:
+                yield tok
+
+
+def parse_attack_keywords(oracle_text: str) -> dict:
+    """Keyword abilities that trigger on attack. Returns {name: value}.
+
+    annihilator -> int N (CR 702.85), the others -> True.
+    """
+    out = {}
+    text = oracle_text or ''
+    for tok in _keyword_line_tokens(text):
+        m = re.match(r'annihilator\s+(\d+)$', tok)
+        if m:
+            out['annihilator'] = int(m.group(1))
+        elif tok == 'battle cry':
+            out['battle_cry'] = True
+        elif tok == 'melee':
+            out['melee'] = True
+        elif tok == 'mentor':
+            out['mentor'] = True
+        elif tok == 'exalted':
+            out['exalted'] = True
+    # (A second, line-anchored detection pass lived here for the ability-word
+    # form. Mutation testing showed it was DEAD CODE: all four of these are
+    # keyword ABILITIES, always printed as a bare keyword line or mid-line
+    # among other keywords, so the tokenizer above already catches every real
+    # printing — and the redundancy made a mutant that deleted one path
+    # survive. Removed rather than kept as decorative defence.)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Aug 2, 2026 — ABILITY-WORD CONDITIONS (CR 207.2c).
+#
+# Delirium / metalcraft / morbid / coven / threshold gate an effect on a board
+# or graveyard state. None of them existed, so every card carrying one used
+# its WEAK half forever: Tragic Slip was -1/-1 rather than -13/-13, Unholy
+# Heat dealt 2 instead of 6, Dragon's Rage Channeler never grew or flew.
+#
+# Predicates only — the consumers (templates, static P/T) read them, so a
+# card that gains a new condition gets the check for free.
+# ---------------------------------------------------------------------------
+
+_CARD_TYPES = ("artifact", "creature", "enchantment", "instant", "land",
+               "planeswalker", "sorcery", "battle", "kindred", "tribal")
+
+
+def graveyard_card_types(player) -> set:
+    """Distinct CARD TYPES among cards in a player's graveyard (CR 205.2a)."""
+    found = set()
+    for c in (getattr(player, 'graveyard', []) or []):
+        tl = (getattr(c, 'type_line', '') or '').lower()
+        for t in _CARD_TYPES:
+            if t in tl:
+                found.add(t)
+    return found
+
+
+def has_delirium(player) -> bool:
+    """Four or more card types among cards in your graveyard (CR 702.x)."""
+    return len(graveyard_card_types(player)) >= 4
+
+
+def has_threshold(player) -> bool:
+    """Seven or more cards in your graveyard."""
+    return len(getattr(player, 'graveyard', []) or []) >= 7
+
+
+def has_metalcraft(player) -> bool:
+    """You control three or more artifacts."""
+    return sum(
+        1 for c in (getattr(player, 'battlefield', []) or [])
+        if 'artifact' in (getattr(c, 'type_line', '') or '').lower()
+    ) >= 3
+
+
+def has_morbid(game) -> bool:
+    """A creature died this turn.
+
+    Reads the per-turn flag stamped by the CREATURE_DIED accumulator (the
+    single choke point every death path reaches) and cleared at turn
+    advance — the wave-scoped `_recently_died` list is reset mid-turn and
+    cannot answer this question.
+    """
+    return bool(getattr(game, '_creature_died_this_turn', False))
+
+
+def has_coven(player, game=None) -> bool:
+    """You control three or more creatures with DIFFERENT powers."""
+    powers = set()
+    for c in (getattr(player, 'battlefield', []) or []):
+        try:
+            if not c.is_creature(game=game) if game is not None else not c.is_creature():
+                continue
+        except TypeError:
+            if not c.is_creature():
+                continue
+        try:
+            powers.add(int(c.get_effective_power(game)) if game is not None
+                       else int(c.power or 0))
+        except (AttributeError, TypeError, ValueError):
+            continue
+    return len(powers) >= 3

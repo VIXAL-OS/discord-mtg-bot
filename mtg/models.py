@@ -329,6 +329,21 @@ class FormatValidator:
 # DATA CLASSES
 # =============================================================================
 
+_LANDWALK_RE = re.compile(
+    r'\b(plains|island|swamp|mountain|forest|desert|snow)walk\b', re.I)
+
+
+def _parse_landwalk_types(oracle: str) -> set:
+    """Land subtypes granting landwalk evasion (CR 702.14).
+
+    Aug 2, 2026 — landwalk had NO implementation. Street Wraith's swampwalk
+    is the entire reason to block with it or not, and it was inert. Parsed
+    from the keyword rather than the reminder text so printings that omit
+    reminders still work. Returns e.g. {"swamp"}; empty when absent.
+    """
+    return {m.group(1).lower() for m in _LANDWALK_RE.finditer(oracle or '')}
+
+
 def _restricts_combat(oracle: str, what: str) -> bool:
     """Does this oracle text forbid `what` ('attack' or 'block')?
 
@@ -1544,7 +1559,23 @@ class Card:
             if attacker.has_flying() and not (self.has_flying() or self.has_reach()):
                 return False
             # Menace requires 2+ blockers (handled elsewhere)
-            # Unblockable, fear, intimidate, etc. would go here
+            # Aug 2, 2026 — LANDWALK (CR 702.14). "This creature can't be
+            # blocked as long as defending player controls a <type>." It had
+            # no implementation at all: Street Wraith's swampwalk was inert
+            # against a black deck, which is the only matchup where it does
+            # anything. The check is on the BLOCKER's controller (the
+            # defending player), so it belongs here rather than on the
+            # attacker's evasion list.
+            _lw = _parse_landwalk_types(
+                getattr(attacker, 'oracle_text', '') or '')
+            if _lw and game is not None:
+                _me = self._find_controller(game) if hasattr(
+                    self, '_find_controller') else None
+                if _me is not None:
+                    for _c in (getattr(_me, 'battlefield', []) or []):
+                        _tl = (getattr(_c, 'type_line', '') or '').lower()
+                        if 'land' in _tl and any(t in _tl for t in _lw):
+                            return False
         return True
     
     def display_name(self) -> str:
@@ -3742,6 +3773,12 @@ class GameState:
     # combat then had no eligible attackers. Consumed one-per-phase by the
     # extra-combat loops; reset alongside _additional_combats.
     _extra_combat_untaps: int = field(default=0, repr=False, compare=False)
+    # Aug 2 2026: MORBID (CR 207.2c) — 'if a creature died this turn'.
+    # Stamped by the CREATURE_DIED accumulator (the one choke point every
+    # death path reaches) and cleared at turn advance. The wave-scoped
+    # _recently_died list is reset mid-turn by the dies dispatcher, so it
+    # structurally cannot answer a whole-turn question.
+    _creature_died_this_turn: bool = field(default=False, repr=False, compare=False)
     # Aug 2 2026 (batch-13 audit): True while the Moraug consumption loop is
     # running an ADDITIONAL combat phase. Karlach, Fury of Avernus's trigger
     # carries an intervening-if ("if it's the first combat phase of the
