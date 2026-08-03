@@ -377,7 +377,17 @@ def _check_creature_etb_triggers_sync(engine, game: GameState, entering_player: 
             has_creature_enters = (
                 ("whenever another creature" in oracle_lower and "enters" in oracle_lower) or
                 ("whenever a creature" in oracle_lower and "enters" in oracle_lower) or
-                ("whenever a nontoken creature" in oracle_lower and "enters" in oracle_lower)
+                ("whenever a nontoken creature" in oracle_lower and "enters" in oracle_lower) or
+                # Aug 3, 2026: the three literals above enumerate phrasings and
+                # miss any that carries an adjective between the article and
+                # "creature" — Anafenza, Kin-Tree Spirit says "Whenever another
+                # NONTOKEN creature you control enters" and was never collected
+                # at all, so her bolster never fired once. This alternative is
+                # purely ADDITIVE (same sentence, any adjectives), so it can
+                # only ever collect more watchers, never fewer than the
+                # literals already did.
+                bool(re.search(r'whenever (?:a|another)\b[^.]*?\bcreature\b'
+                               r'[^.]*?\benters\b', oracle_lower))
             )
             if not has_creature_enters:
                 continue
@@ -5297,6 +5307,131 @@ def fire_counters_a_spell_triggers(game, controller_name):
             msgs.append(line)
             print(f"[COUNTER-TRIGGER] {perm.name} loots for {player.name} "
                   f"(a spell they control countered a spell)")
+    return msgs
+
+
+_DISCARD_CLAUSE = re.compile(
+    r'whenever you discard (?:a|one or more) ([a-z, ]*?)cards?\b', re.IGNORECASE)
+
+
+def _discard_filter_matches(filter_text: str, discarded) -> bool:
+    """Does the discarded card satisfy a "whenever you discard <X> card"?
+
+    The four printed filters in the inventory: "" (any), "creature",
+    "land", and "noncreature, nonland". Negation is checked BEFORE the
+    positive test, because `'creature' in 'noncreature'` — the substring trap
+    that has now bitten this codebase six times.
+    """
+    f = (filter_text or '').strip().lower()
+    tl = (getattr(discarded, 'type_line', '') or '').lower()
+    is_creature = 'creature' in tl
+    is_land = 'land' in tl
+    if not f:
+        return True
+    if 'noncreature' in f and is_creature:
+        return False
+    if 'nonland' in f and is_land:
+        return False
+    if 'noncreature' in f or 'nonland' in f:
+        return True
+    if f.startswith('creature'):
+        return is_creature
+    if f.startswith('land'):
+        return is_land
+    return False
+
+
+def fire_discard_triggers(game, player, discarded):
+    """"Whenever you discard a card" watchers (CR 603.2). Returns messages.
+
+    Aug 3, 2026. Discovered while assessing the "partner with Brallin" tail
+    and immediately outgrew it: eight cards across the madness, escape and
+    death-replacement decks carry a discard trigger, and only Anje Falkenrath
+    was handled (by a bespoke untap scan whose own comment recorded the rest
+    as a known gap). Brallin, Skyshark Rider is a legendary whose ENTIRE
+    engine is discard payoff and it did nothing at all — the
+    commander-defining-ability family again (Baral, Tymna, Thrasios, Anje).
+
+    Scans only the discarding player's battlefield, because every printed
+    form says "whenever YOU discard".
+
+    Effects are built as action dicts and run through the tested action
+    interpreter rather than hand-applied. Shapes modeled: a +1/+1 counter on
+    the source, damage to each opponent, a card draw, token creation, and
+    mana. Anything else emits [DISCARD-TRIGGER-UNHANDLED] so the tail is
+    greppable instead of silent — the graveyard-exile/impulse shapes
+    (Necropotence, Containment Construct, Conspiracy Theorist) are that tail
+    on purpose: they need the discarded card to already BE in the graveyard,
+    and this fires before the caller puts it there.
+    """
+    msgs = []
+    rules = getattr(game, '_rules_engine', None)
+    if rules is None or discarded is None:
+        return msgs
+    for perm in list(getattr(player, 'battlefield', []) or []):
+        oracle = getattr(perm, 'oracle_text', '') or ''
+        for raw in oracle.split('\n'):
+            line = re.sub(r'\([^)]*\)', '', raw).strip()
+            match = _DISCARD_CLAUSE.search(line)
+            if not match:
+                continue
+            if not _discard_filter_matches(match.group(1), discarded):
+                continue
+            effect = line[match.end():].lower()
+            # Anje's untap clause is handled at the madness choke point,
+            # which knows whether the discarded card actually had madness.
+            if 'untap' in effect and 'madness' in effect:
+                continue
+            actions = []
+            if re.search(r'\+1/\+1 counter on', effect):
+                actions.append({"action": "add_counters", "card": perm.name,
+                                "counter_type": "+1/+1", "amount": 1})
+            dmg = re.search(r'deals (\d+) damage to each opponent', effect)
+            if dmg:
+                for opp in game.players:
+                    if opp is not player:
+                        actions.append({"action": "deal_damage",
+                                        "amount": int(dmg.group(1)),
+                                        "target_player": opp.name,
+                                        "source": perm.name})
+            if re.search(r'\bdraw a card\b', effect):
+                actions.append({"action": "draw_cards", "player": player.name,
+                                "amount": 1})
+            mana = re.search(r'\badd ((?:\{[^}]+\})+)', effect)
+            if mana:
+                for sym in re.findall(r'\{([^}]+)\}', mana.group(1)):
+                    if len(sym) == 1:
+                        actions.append({"action": "add_mana",
+                                        "player": player.name,
+                                        "color": sym.upper(), "amount": 1})
+            tok = re.search(r'create a (\d+)/(\d+) (\w+) (\w+) creature token',
+                            effect)
+            if tok:
+                actions.append({"action": "create_token", "player": player.name,
+                                "name": tok.group(4).title(),
+                                "power": int(tok.group(1)),
+                                "toughness": int(tok.group(2)),
+                                "types": f"Creature — {tok.group(4).title()}",
+                                "count": 1})
+            elif 'create a treasure token' in effect:
+                actions.append({"action": "create_token", "player": player.name,
+                                "name": "Treasure", "power": 0, "toughness": 0,
+                                "types": "Artifact — Treasure", "count": 1})
+            if not actions:
+                print(f"[DISCARD-TRIGGER-UNHANDLED] {perm.name}: {line}")
+                continue
+            for action in actions:
+                try:
+                    out = rules._execute_action_on_state(game, action)
+                except Exception as e:  # noqa: BLE001 - crash barrier
+                    print(f"[DISCARD-TRIGGER] {perm.name} action failed: {e}")
+                    from mtg.util import maybe_reraise
+                    maybe_reraise(e)
+                    continue
+                if out:
+                    msgs.append(f"🗑️ **{perm.name}**: {out}")
+            print(f"[DISCARD-TRIGGER] {perm.name} fired on "
+                  f"{player.name} discarding {discarded.name}")
     return msgs
 
 

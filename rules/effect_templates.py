@@ -3903,6 +3903,41 @@ class EffectTemplateLibrary:
             )
         )
         
+        # BOLSTER (CR 701.28) — registered BEFORE the generic counter pattern
+        # below, which it would otherwise lose to (first match wins).
+        #
+        # Aug 3, 2026. Bolster N is "choose a creature with the LEAST TOUGHNESS
+        # among creatures you control and put N +1/+1 counters on it", and that
+        # sentence is printed only as REMINDER text. The generic pattern below
+        # matched the reminder's "put a +1/+1 counter on it" and read "it" as
+        # the SOURCE, so Anafenza, Kin-Tree Spirit grew herself every time
+        # instead of the smallest creature — the wrong creature, every trigger.
+        # (She also never fired at all until the same day's fix to the
+        # creature-enters DETECTION gate, which enumerated phrasings and had no
+        # entry for "whenever another NONTOKEN creature you control enters".)
+        def _gen_bolster(ctrl, opp, ctx):
+            n = int(ctx['_match'].group(1))
+            creatures = ctx.get('_controller_creatures') or []
+            if not creatures:
+                return [{"action": "no_action",
+                         "reason": "bolster: you control no creatures"}]
+            # Least toughness; name breaks ties so the choice is deterministic.
+            chosen = min(creatures,
+                         key=lambda c: (c.get('toughness', 0) or 0,
+                                        c.get('name', '')))
+            return [{"action": "add_counters", "card": chosen['name'],
+                     "counter_type": "+1/+1", "amount": n}]
+
+        self._add_pattern(
+            r"whenever (?:a|another)\b[^.]*?\bcreature\b[^.]*?\benters\b"
+            r"[^.]*?\bbolster (\d+)",
+            EffectTemplate(
+                name="Bolster on creature-enters",
+                description="Bolster N — counters on the least-toughness creature",
+                action_generator=_gen_bolster,
+            )
+        )
+
         # "Whenever another creature enters, put a +1/+1 counter on it/itself"
         # The "on it" form means the counter goes on the source permanent (e.g.,
         # Forgotten Ancient-style upkeep growers).
@@ -3922,6 +3957,19 @@ class EffectTemplateLibrary:
                 ]
             )
         )
+
+        # BACKUP (CR 702.165) needs NO pattern of its own: its reminder text
+        # is "When this creature enters, put a +1/+1 counter on target
+        # creature", which the "ETB +1/+1 Counters" pattern above already
+        # matches, placing the counter on the source — a legal choice, since
+        # the source is itself a legal target. A dedicated pattern registered
+        # after that one could never win (first match wins) and would be dead
+        # code. The unmodeled half is the rider that grants the listed
+        # abilities when the target is ANOTHER creature.
+        #
+        # Aug 3, 2026: backup was on the missing-mechanics backlog as
+        # "unassessed" only because the earlier probe used the creature-enters
+        # WATCHER dispatch, which a self-ETB never reaches.
 
         # Generic tutor — "search your library for a [type] card, put it into
         # your hand/onto the battlefield". May 17 audit: tutor effects were
@@ -10645,6 +10693,11 @@ def build_game_context(game, player, opponent, card=None, entering_creature=None
         return {
             'name': c.name,
             'power': c.get_effective_power(game) if hasattr(c, 'get_effective_power') else 0,
+            # Aug 3, 2026: bolster (CR 701.28) chooses the creature with the
+            # LEAST TOUGHNESS, which nothing here reported. Effective, not
+            # printed — the compute-on-read contract.
+            'toughness': (c.get_effective_toughness(game)
+                          if hasattr(c, 'get_effective_toughness') else 0),
             'colors': list(getattr(c, 'color_identity', []) or []),
             'type_line': (c.type_line or "").lower() if hasattr(c, 'type_line') else "",
             # July 29: MV-conditioned removal (Fatal Push) needs to pick a

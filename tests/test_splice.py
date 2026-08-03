@@ -526,6 +526,102 @@ class TestSpliceReviewFindings:
         assert [c.name for c, _ in helpers.splice_candidates(game, rick, split)] \
             == ["Glacial Ray"], "the Kami half IS Arcane"
 
+    def test_a_dead_printed_target_does_not_take_the_spliced_text_with_it(self):
+        """CR 608.2b — a spell fails to resolve only if ALL targets, for EVERY
+        instruction, are illegal. A spliced instruction is one of those
+        (CR 702.46a), and the resolution-time check reads only the base
+        spell's single stored target, so it is structurally blind to them.
+
+        Scenario: Glacial Ray is cast declaring an opponent's creature, with a
+        second Glacial Ray spliced onto it. The declared creature leaves the
+        battlefield during the response window. The printed instruction now
+        has no legal target and does nothing — but the spliced instruction
+        still does, so the spell resolves rather than taking the already-paid
+        splice cost down with it.
+
+        The base check is forced rather than orchestrated: making a declared
+        target evaporate mid-`await` needs the response window, and this pin
+        is about MY branch — given the base check says "fizzle", does the
+        spliced instruction still resolve? Forcing it isolates exactly that.
+
+        Decisive: the identical board WITHOUT a splice must still fizzle."""
+        import mtg.spells as _spells
+
+        original_check = _spells._check_resolution_targets
+        try:
+            _spells._check_resolution_targets = (
+                lambda game, entry: (True, f"{entry.card.name} fizzles — "
+                                           f"all targets are illegal"))
+            for spliced in (False, True):
+                game = _make_game("modern")
+                rick, claude = game.players
+                ray, second = _glacial_ray(), _glacial_ray()
+                rick.hand.append(ray)
+                if spliced:
+                    rick.hand.append(second)
+                _mountains(rick, 4)
+                start = claude.life
+                engine = _engine(game)
+                ok, msg, msgs = _run(engine.cast_spell_async(game, rick, ray))
+                assert ok, msg
+                if spliced:
+                    assert claude.life == start - 2, (
+                        "the spliced Glacial Ray still has a legal target and "
+                        f"must resolve; the printed one does nothing. {msgs}")
+                    assert second in rick.hand, "revealed, never played"
+                else:
+                    assert claude.life == start, "nothing rescues it — it fizzles"
+                    assert ray in rick.graveyard
+        finally:
+            _spells._check_resolution_targets = original_check
+
+    def test_a_splice_whose_own_target_also_died_does_not_rescue_the_spell(self):
+        """The survivors are filtered by whether the SPLICED instruction still
+        has a legal target. Without that filter any splice at all would rescue
+        a spell whose every instruction is now targetless — the opposite of
+        CR 608.2b.
+
+        Decisive where the other 608.2b pin is not: Glacial Ray says "any
+        target" and so is always legal, which makes filtering invisible.
+        Kodama's Might needs a creature, and here the creature that made the
+        splice legal at CAST time is gone by resolution."""
+        import mtg.spells as _spells
+
+        game = _make_game("modern")
+        rick, claude = game.players
+        might = _make_card("Kodama's Might", type_line="Instant — Arcane",
+                           oracle_text=KODAMAS_MIGHT, mana_cost="{G}")
+        ray = _glacial_ray()
+        rick.hand.extend([might, ray])
+        _mountains(rick, 3)
+        rick.battlefield.append(_make_card(
+            "Forest", type_line="Basic Land — Forest",
+            oracle_text="{T}: Add {G}."))
+        doomed = _make_card("Bear", type_line="Creature — Bear")
+        claude.battlefield.append(doomed)
+
+        original_check = _spells._check_resolution_targets
+
+        def _window(game_, entry, _c=claude, _d=doomed):
+            # Stands in for the response window: the creature that made both
+            # the printed and the spliced instruction legal leaves play.
+            if _d in _c.battlefield:
+                _c.battlefield.remove(_d)
+                _c.graveyard.append(_d)
+            return True, f"{entry.card.name} fizzles — all targets are illegal"
+
+        try:
+            _spells._check_resolution_targets = _window
+            engine = _engine(game)
+            ok, msg, msgs = _run(engine.cast_spell_async(game, rick, ray))
+            assert ok, msg
+            assert "fizzled" in msg, (
+                "Kodama's Might has no creature left to target either, so "
+                f"nothing rescues the spell. got {msg!r}; {msgs}")
+            assert might in rick.hand, "still only revealed"
+        finally:
+            _spells._check_resolution_targets = original_check
+
     def test_spliced_cards_is_a_declared_field_not_an_attribute_staple(self):
         """Both reviewers flagged this independently. Its four cost-family
         siblings are declared transients in mtg/models.py; this one holds

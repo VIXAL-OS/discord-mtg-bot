@@ -849,6 +849,19 @@ def madness_discard_to_exile(game, player, card):
     (mtg/spells.py:resolve_pending_madness) because discard sites are sync
     and casting is not — the established sync-gap bridge.
     """
+    # General "whenever you discard" watchers fire on EVERY discard, madness
+    # or not, so they must run ABOVE the madness early-return below (which is
+    # also why the Anje scan further down could never serve them). Their
+    # messages ride game._pending_messages because this function's return
+    # value is reserved for the madness redirect line and most callers
+    # discard anything else.
+    from mtg.triggers import fire_discard_triggers
+    _watcher_msgs = fire_discard_triggers(game, player, card)
+    if _watcher_msgs:
+        if getattr(game, '_pending_messages', None) is None:
+            game._pending_messages = []
+        game._pending_messages.extend(_watcher_msgs)
+
     cost = parse_madness_cost(getattr(card, 'oracle_text', '') or '')
     if cost is None:
         return None
@@ -1648,6 +1661,20 @@ def _splice_choices_are_makeable(game, spliced_text: str) -> bool:
             lambda c: 'artifact' in (getattr(c, 'type_line', '') or '').lower()
             or 'enchantment' in (getattr(c, 'type_line', '') or '').lower())
     return True
+
+
+def splice_legal_target_exists(game, splice_card) -> bool:
+    """Does a spliced card's own instruction still have a legal target?
+
+    The resolution-time twin of the cast-time CR 702.46b check, sharing its
+    one predicate rather than re-expressing it. CR 608.2b fails a spell to
+    resolve only if ALL targets for EVERY instruction are illegal, and a
+    spliced instruction is one of those instructions (CR 702.46a) — so this
+    is what stops a spell whose PRINTED target went away from taking the
+    spliced text (and the mana already paid for it) down with it.
+    """
+    return _splice_choices_are_makeable(
+        game, strip_splice_line(getattr(splice_card, 'oracle_text', '') or ''))
 
 
 def splice_candidates(game, player, spell_card):

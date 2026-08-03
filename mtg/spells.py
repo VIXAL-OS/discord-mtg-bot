@@ -1981,6 +1981,53 @@ async def _await_stack_window(engine, game: GameState, player: Player,
     # If ALL targets are now illegal, the spell fizzles (countered by game rules).
     if HAS_TARGETING:
         should_fizzle, fizzle_reason = _check_resolution_targets(game, stack_entry)
+        # CR 608.2b fails a spell to resolve only if ALL its targets, for
+        # EVERY instruction, are illegal. A spliced instruction IS one of
+        # those instructions (CR 702.46a), and _check_resolution_targets is
+        # structurally blind to them: it reads the single stored
+        # stack_entry.target plus a restriction parsed from the base card.
+        # So a spell whose PRINTED target went away during the response
+        # window used to take the spliced text down with it — and the splice
+        # cost had already been paid.
+        #
+        # Handled HERE rather than inside rules/targeting_helpers.py on
+        # purpose: that function is on the resolution path of every spell in
+        # the game, and this override needs no change to it. The printed
+        # instruction still does nothing (its target is illegal); only the
+        # spliced instructions resolve.
+        if should_fizzle and getattr(card, '_spliced_cards', None):
+            _survivors = [s for s in card._spliced_cards
+                          if helpers.splice_legal_target_exists(game, s)]
+            if _survivors:
+                if stack_entry in game.stack:
+                    game.stack.remove(stack_entry)
+                _drop_from_priority_stack()
+                print(f"[SPLICE-SURVIVES] {fizzle_reason} — but "
+                      f"{len(_survivors)} spliced instruction(s) still have a "
+                      f"legal target, so the spell resolves (CR 608.2b)")
+                effect_messages.append(
+                    f"💨 **{card.name}**'s own target is gone, but its "
+                    f"spliced text still resolves")
+                card._spliced_cards = _survivors
+                effect_messages.extend(
+                    await _resolve_spliced_effects(engine, game, player, card, None))
+                # State hygiene, not a double-resolution guard: returning a
+                # non-None _final makes cast_spell_async return immediately,
+                # so its tail splice block is unreachable from here. Mutation
+                # testing confirms deleting this line changes no behaviour —
+                # it is kept so the card does not carry a stale list into the
+                # graveyard, not because anything downstream depends on it.
+                card._spliced_cards = []
+                if (getattr(card, 'is_signature_spell', False)
+                        and game.format == "oathbreaker"):
+                    player.command_zone.append(card)
+                else:
+                    player.graveyard.append(card)
+                engine.rules.log_event(
+                    f"{card.name}'s printed target was illegal; its spliced "
+                    f"text resolved (CR 608.2b)")
+                return ((True, f"Cast {card.name} (printed target illegal)",
+                         effect_messages), cast_trigger_msgs, player_idx)
         if should_fizzle:
             if stack_entry in game.stack:
                 game.stack.remove(stack_entry)
