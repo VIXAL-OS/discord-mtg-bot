@@ -260,6 +260,23 @@ class TestDredge:
         assert imp in rick.hand
         assert len(rick.library) == lib_before - 5
 
+    def test_the_cap_is_per_player_not_per_game(self):
+        """It was a single game-level flag, so a wheel routed through the
+        draw_cards action with player="all" let the first player dredge and
+        blocked every other player for the rest of the turn — as did a
+        non-active player drawing on the active player's turn."""
+        game = _make_game()
+        rick, claude = game.players
+        engine = _engine(game)
+        for player in (rick, claude):
+            _stock(player, 40)
+            player.graveyard.append(_loam())
+        engine.draw_cards(rick, 1, game)
+        engine.draw_cards(claude, 1, game)
+        assert rick.cards_drawn_this_turn == 0, "Rick dredged"
+        assert claude.cards_drawn_this_turn == 0, (
+            "Claude's own dredge must not be blocked by Rick's")
+
     def test_dredge_candidates_respects_library_size(self):
         game = _make_game()
         rick, _ = game.players
@@ -271,19 +288,37 @@ class TestDredge:
 
 
 class TestDrawHookCoverage:
-    def test_both_draw_choke_points_carry_the_hooks(self):
-        """The hooks live in GameEngine.draw_cards and the `draw_cards`
-        ACTION handler. That covers the draw step and every template/Tier-3
-        draw — NOT the ~8 raw library.pop(0) draws in rules/. This pin makes
-        the covered set explicit so the gap stays visible rather than being
-        assumed closed."""
+    def test_every_draw_to_hand_in_the_mtg_package_is_hooked(self):
+        """Every draw-to-hand inside mtg/ must run the dredge replacement and
+        the miracle note. An unhooked draw is not merely a missed miracle: it
+        puts cards_drawn_this_turn out of step, so miracle can both mis-miss
+        and mis-fire. Structural because the point is COVERAGE — a behavioural
+        pin per site would not notice a NEW unhooked site appearing."""
+        import re
+        from pathlib import Path
+
+        pkg = Path(__file__).resolve().parent.parent / "mtg"
+        offenders = []
+        for path in pkg.glob("*.py"):
+            src = path.read_text(encoding="utf-8")
+            for match in re.finditer(r"\n(\s*)(\w+) = (\w+)\.library\.pop\(0\)\n"
+                                     r"\s*\3\.hand\.append\(\2\)", src):
+                window = src[max(0, match.start() - 900):match.end() + 400]
+                if "try_dredge" not in window:
+                    line = src[:match.start()].count("\n") + 2
+                    offenders.append(f"{path.name}:{line}")
+        assert not offenders, (
+            f"draw-to-hand sites with no dredge/miracle hook: {offenders}")
+
+    def test_the_hooks_are_wired_at_the_named_sites(self):
         import inspect
 
         import mtg.actions as actions
         import mtg.engine as engine_mod
-        for src in (inspect.getsource(engine_mod), inspect.getsource(actions)):
-            assert "try_dredge(game, player)" in src
-            assert "note_miracle_on_draw(game, player, card)" in src
+        import mtg.triggers as triggers
+        for src in (inspect.getsource(engine_mod), inspect.getsource(actions),
+                    inspect.getsource(triggers)):
+            assert "try_dredge" in src and "note_miracle_on_draw" in src
 
     def test_the_uncovered_draw_sites_are_still_uncovered(self):
         """Documents the known gap. If someone routes rules/ draws through

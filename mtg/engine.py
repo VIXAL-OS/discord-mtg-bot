@@ -45,7 +45,7 @@ from mtg.helpers import (
     _collapse_repeated_life_gain, _should_emit_resolve_hint,
     _normalize_pw_ability_idx, _resolve_player_or_card_target,
     exile_after_resolution_reason, get_mdfc_info, note_miracle_on_draw,
-    try_dredge,
+    spell_face_for_gates, try_dredge,
 )
 from mtg.models import Card, Player, GameState, StackEntry, FormatValidator
 from mtg import events
@@ -1156,6 +1156,11 @@ class GameEngine:
         for player in game.players:
             self.draw_cards(player, 7)
             player.has_drawn_for_turn = True  # Don't draw on first turn
+            # The opening hand is not "cards you drew this turn" — leaving the
+            # count at 7 means no card drawn on turn 1 can ever be the first
+            # one (CR 702.94a), so miracle could never fire that turn and any
+            # future consumer of the counter inherits the same off-by-seven.
+            player.cards_drawn_this_turn = 0
         
         # [COMMANDER] Safety check: ensure each player has a commander in command zone
         if game.format in COMMAND_ZONE_FORMATS:
@@ -2574,7 +2579,7 @@ class GameEngine:
             _p.instant_sorcery_spells_cast_this_turn = 0  # Arclight Phoenix
             _p.cards_drawn_this_turn = 0  # miracle (CR 702.94)
         game._creature_died_this_turn = False  # morbid (CR 207.2c)
-        game._dredged_this_turn = False  # dredge (CR 702.52) — one per turn
+        game._dredged_this_turn = set()  # dredge (CR 702.52) — one per player per turn
 
         # Reset per-turn flicker dedup tracker (see actions.py flicker handler)
         if hasattr(game, '_flicker_announce_seen'):
@@ -2869,6 +2874,10 @@ class GameEngine:
                     if card:
                         break
 
+            # Exile-cast bookkeeping, declared BEFORE the scan that
+            # sets it — the failure rollback below reads both.
+            _from_exile_card = None
+            _was_foretold = False
             # Check if it's playable from exile (Chandra impulse draw, Light Up the Stage, etc.)
             if not card and player.exile:
                 for c in player.exile:
@@ -2877,8 +2886,22 @@ class GameEngine:
                                             or getattr(c, '_foretold', False))
                     if _castable_from_exile and card_name and c.name.lower() == card_name.lower():
                         card = c
+                        _from_exile_card = c
                         if getattr(c, '_foretold', False):
-                            # CR 702.143b: cast for the foretell cost.
+                            _was_foretold = True
+                            # CR 702.143b: not the turn you foretold it. The
+                            # offer list gates this, but plan_turn emits a
+                            # whole main phase at once, so a single plan can
+                            # foretell and then cast the same card.
+                            if getattr(c, '_foretold_turn', None) == game.turn_number:
+                                print(f"[FORETELL] {c.name} was foretold this "
+                                      f"turn — can't cast it until your next "
+                                      f"turn (CR 702.143b)")
+                                game._last_cast_failure = (
+                                    game.turn_number, c.name,
+                                    "foretold this turn — castable from your next turn")
+                                return None
+                            # Cast for the foretell cost.
                             c._foretold = False
                             c._face_down = False
                             c._cast_via_foretell = True
@@ -2896,6 +2919,7 @@ class GameEngine:
 
             # Bug #28: Check if it's playable from graveyard (Snapcaster flashback, native flashback, escape)
             from_graveyard = False
+            _rollback_jump_start = False
             _gy_escape_exiled = []
             _gy_jumpstart_discarded = []
             if not card and player.playable_from_graveyard:
@@ -2915,6 +2939,15 @@ class GameEngine:
                         if _matched_half is None:
                             continue
                     card = c
+                    if _matched_half is None:
+                        # Named by its FULL name: from the graveyard the
+                        # aftermath half is the only legal choice, and leaving
+                        # the index at -1 skips the gate, the split cost
+                        # selection AND the split resolution. Resolve it here,
+                        # before this path's own targeting gate, which would
+                        # otherwise judge face 0.
+                        from mtg.helpers import aftermath_half_index
+                        _matched_half = aftermath_half_index(c)
                     if _matched_half is not None:
                         c.cast_as_split_half = _matched_half
                     from_graveyard = True
@@ -2924,6 +2957,15 @@ class GameEngine:
                     if c.oracle_text:
                         from mtg.helpers import parse_escape_cost
                         _esc = parse_escape_cost(c.oracle_text)
+                        if _esc and len(player.graveyard) < _esc[1]:
+                            # CR 601.2g: costs are all-or-nothing. The loop
+                            # below exiles "as many as it can", so a short
+                            # graveyard paid a partial cost and cast anyway.
+                            print(f"[ESCAPE] {c.name}: only {len(player.graveyard)} "
+                                  f"other card(s) in the graveyard, need {_esc[1]} "
+                                  f"— cast refused")
+                            _rollback_jump_start = True   # reuse the refusal path
+                            break
                         if _esc:
                             _esc_cost, exile_count = _esc
                             c._escape_cost = _esc_cost
@@ -2938,10 +2980,15 @@ class GameEngine:
                             print(f"[FLASHBACK] AI casting {c.name} from graveyard via flashback")
                     else:
                         print(f"[FLASHBACK] AI casting {c.name} from graveyard via flashback")
-                    # Jump-start's additional discard (CR 702.132a).
+                    # Jump-start's additional discard (CR 702.132a). None
+                    # means the cost is unpayable — an unpayable cost makes
+                    # the cast illegal (CR 601.2g), so undo the extraction.
                     from mtg.helpers import pay_jump_start_discard
                     _gy_jumpstart_discarded = pay_jump_start_discard(
                         game, player, c)
+                    if _gy_jumpstart_discarded is None:
+                        _gy_jumpstart_discarded = []
+                        _rollback_jump_start = True
                     break
 
             def _rollback_graveyard_cast():
@@ -2978,6 +3025,15 @@ class GameEngine:
                 card._escape_cost = ""
                 card._cast_from_graveyard = False
                 card.cast_as_split_half = -1
+
+            if _rollback_jump_start:
+                _rollback_graveyard_cast()
+                game._last_cast_failure = (
+                    game.turn_number, card.name,
+                    "jump-start needs a card to discard — your hand is empty")
+                print(f"[JUMP-START] {card.name} cast refused — graveyard cast "
+                      f"rolled back")
+                return None
 
             # Check command zone (commander)
             from_command_zone = False
@@ -3030,9 +3086,14 @@ class GameEngine:
 
                 # [TARGETING] Pre-cast target validation — block AI from casting
                 # targeted spells when no legal target exists (CR 601.2c)
-                if HAS_TARGETING and _spell_requires_targets(card):
-                    if not _find_any_valid_target(game, card, player.name):
-                        print(f"[TARGETING] AI tried to cast {card.name} with no valid targets")
+                # Aug 3: judge the split HALF being cast, not face 0 — the
+                # same fix as _validate_cast's gate, which alone left this
+                # executor copy blocking an aftermath half on the OTHER
+                # half's targeting requirement.
+                _gate_card = spell_face_for_gates(card)
+                if HAS_TARGETING and _spell_requires_targets(_gate_card):
+                    if not _find_any_valid_target(game, _gate_card, player.name):
+                        print(f"[TARGETING] AI tried to cast {_gate_card.name} with no valid targets")
                         game._last_cast_failure = (
                             game.turn_number, card.name,
                             f"no valid targets for {card.name} (CR 601.2c)")
@@ -3114,6 +3175,21 @@ class GameEngine:
                     _rollback_graveyard_cast()
                     print(f"[GRAVEYARD-CAST] {card.name} cast failed — rolled back "
                           f"(card + escape/jump-start costs restored)")
+                # This path had NO exile rollback at all, so a failed cast of
+                # an exiled card was a free exile→hand move — and for a
+                # foretold card it also stripped the markers, leaving it
+                # face-up, uncastable, and permanently discounted.
+                if (not success and _from_exile_card is not None
+                        and card in player.hand):
+                    player.hand.remove(card)
+                    player.exile.append(card)
+                    if _was_foretold:
+                        card._foretold = True
+                        card._face_down = True
+                        card._cast_via_foretell = False
+                    elif card.id not in player.playable_from_exile:
+                        player.playable_from_exile.append(card.id)
+                    print(f"[EXILE-CAST] {card.name} cast failed — returned to exile")
                 if success:
                     if from_command_zone:
                         card.times_cast_from_command_zone += 1
@@ -3130,13 +3206,18 @@ class GameEngine:
                             player.exile.append(card)
                             print(f"[EXILE-ON-RESOLVE] {card.name} exiled after "
                                   f"casting from graveyard ({_why})")
-                # The graveyard-origin stamp is PER CAST — resolution has read
-                # it by now (Ash Zealot's condition). Leaving it set made a
-                # later cast from hand look like a graveyard cast; newly
-                # reachable now that an escaped card survives in the graveyard
-                # and can be returned to hand.
-                if from_graveyard:
-                    card._cast_from_graveyard = False
+                    # The graveyard-origin stamp is PER CAST — resolution has
+                    # read it by now (Ash Zealot's condition). Leaving it set
+                    # made a later cast from hand look like a graveyard cast;
+                    # newly reachable now that an escaped card survives in the
+                    # graveyard and can be returned to hand. (The failure path
+                    # clears it inside _rollback_graveyard_cast.)
+                    if from_graveyard:
+                        card._cast_from_graveyard = False
+                    # Likewise per-cast: leaving _cast_via_foretell set makes
+                    # the foretell discount permanent on the card object, and
+                    # can_cast_spell then advertises it a mana early too.
+                    card._cast_via_foretell = False
                     # May 7 audit fix #1: if cast_spell_async already announced
                     # the cast (before the priority window), don't duplicate it.
                     # Drop the prefix line and just return the effect messages.
@@ -4308,15 +4389,15 @@ class GameEngine:
                         and ('put ' + perm.name.lower() in effect_text
                              or 'put this on top' in effect_text
                              or 'put it on top of its owner' in effect_text)):
-                    # Use the engine's draw helper for proper Maralen/etc. handling.
-                    drawn_cards = []
-                    if hasattr(self, 'draw_cards'):
-                        drawn_cards = self.draw_cards(player, 1, game=game) or []
-                    elif player.library:
-                        # Defensive fallback: direct library pop if no draw helper.
-                        c0 = player.library.pop(0)
-                        player.hand.append(c0)
-                        drawn_cards = [c0]
+                    # Use the engine's draw helper for proper Maralen/etc.
+                    # handling. (A `hasattr(self, 'draw_cards')` guard with a
+                    # raw library.pop fallback sat here — draw_cards is a
+                    # method of this very class, so the fallback could never
+                    # run, and being an unhooked draw it would have skipped
+                    # dredge and miracle if it ever had. Removed rather than
+                    # kept as decorative defence; the coverage pin in
+                    # tests/test_aug3_altcost_wave2.py found it.)
+                    drawn_cards = self.draw_cards(player, 1, game=game) or []
                     if perm in player.battlefield:
                         try:
                             game.unregister_static_effects(perm)

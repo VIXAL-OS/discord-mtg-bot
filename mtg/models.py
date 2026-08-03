@@ -3712,9 +3712,10 @@ class GameState:
     # (card, owner_index) here and spells.resolve_pending_miracles makes the
     # cast-or-keep call at the next async drain.
     _miracle_pending: list = field(default_factory=list, repr=False, compare=False)
-    # Dredge (CR 702.52) replaces at most ONE draw per turn — see
-    # helpers.try_dredge for why. Reset with the per-turn counters.
-    _dredged_this_turn: bool = field(default=False, repr=False, compare=False)
+    # Dredge (CR 702.52) replaces at most ONE draw per turn PER PLAYER — see
+    # helpers.try_dredge for why. Seat indices; reset with the per-turn
+    # counters.
+    _dredged_this_turn: set = field(default_factory=set, repr=False, compare=False)
     # Spell Queller bookkeeping: source card name → [(exiled_card, owner_name)]
     # (exile_from_stack records; release_queller_exile drains on LTB).
     _queller_exiles: dict = field(default_factory=dict, repr=False, compare=False)

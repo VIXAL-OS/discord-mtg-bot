@@ -348,17 +348,37 @@ def _validate_cast(engine, game: GameState, player: Player, card: Card,
     # zone membership can't answer this; `_cast_from_graveyard` (set by both
     # executors) is the authoritative signal.
     _half = getattr(card, 'cast_as_split_half', -1)
+    _from_gy_pre = _cast_from_graveyard or getattr(card, '_cast_from_graveyard', False)
+    # Naming the FULL card ("Commit // Memory") rather than a half leaves
+    # cast_as_split_half at -1, which skipped the gate below, the split cost
+    # selection AND the split resolution — so the card was cast out of the
+    # graveyard for its COMBINED cost string and resolved face 0, i.e. the
+    # non-aftermath half, from the one zone that half can never be cast from.
+    # From the graveyard the aftermath half is the only legal choice, so
+    # resolve the ambiguity to it rather than refusing.
+    if (_from_gy_pre and (_half is None or _half < 0)
+            and helpers.aftermath_half_index(card) is not None):
+        card.cast_as_split_half = helpers.aftermath_half_index(card)
+        _half = card.cast_as_split_half
+        print(f"[AFTERMATH] {card.name} cast from graveyard — resolving to its "
+              f"aftermath half (the only half castable from there)")
     if _half is not None and _half >= 0:
         _after = helpers.aftermath_half_index(card)
-        _from_gy = _cast_from_graveyard or getattr(card, '_cast_from_graveyard', False)
+        _from_gy = _from_gy_pre
         _half_name = (getattr(card, 'split_names', None) or [card.name])[_half] \
             if _half < len(getattr(card, 'split_names', None) or []) else card.name
+        # Reset the half on rejection. cast_as_split_half is normally cleared
+        # by the split RESOLUTION, which a rejected cast never reaches — so a
+        # refused half stayed selected on the card object and every later cast
+        # of it, from any zone, silently resolved that same half.
         if _after == _half and not _from_gy:
+            card.cast_as_split_half = -1
             return ((False,
                      f"{_half_name} has aftermath — it can only be cast from "
                      f"your graveyard (CR 702.127a)", []),
                     _cast_from_graveyard, target)
         if _after is not None and _after != _half and _from_gy:
+            card.cast_as_split_half = -1
             return ((False,
                      f"{_half_name} can't be cast from your graveyard — only "
                      f"the aftermath half can (CR 702.127a)", []),
@@ -588,18 +608,7 @@ def _validate_cast(engine, game: GameState, player: Player, card: Card,
     # refused as "no valid targets" — with aftermath now enforcing that Memory
     # is castable ONLY from the graveyard, that made the half uncastable
     # anywhere. Mirrors the synthetic half-card _dispatch_resolution builds.
-    _gate_card = card
-    _gate_half = getattr(card, 'cast_as_split_half', -1)
-    if (_gate_half is not None and _gate_half >= 0
-            and len(getattr(card, 'split_texts', None) or []) > _gate_half):
-        _names = getattr(card, 'split_names', None) or []
-        _types = getattr(card, 'split_types', None) or []
-        _gate_card = Card(
-            name=_names[_gate_half] if _gate_half < len(_names) else card.name,
-            mana_cost=card.split_costs[_gate_half] if card.split_costs else card.mana_cost,
-            type_line=_types[_gate_half] if _gate_half < len(_types) else card.type_line,
-            oracle_text=card.split_texts[_gate_half],
-        )
+    _gate_card = helpers.spell_face_for_gates(card)
     if HAS_TARGETING and _spell_requires_targets(_gate_card):
         if not _find_any_valid_target(game, _gate_card, player.name):
             print(f"[TARGETING] {_gate_card.name} has no valid targets — cast blocked")
@@ -4053,7 +4062,9 @@ def activate_from_graveyard(engine, game: GameState, player: Player,
         "zone": "exile",
         "target": card.name,
         "count": 1,
-        "extra_types": ["Zombie"],
+        # Zombie is a creature SUBTYPE, not a card type — extra_types
+        # would prepend it and produce "Zombie Creature — Angel".
+        "extra_subtypes": ["Zombie"],
         "clear_mana_cost": True,
     }
     if mechanic == 'embalm':

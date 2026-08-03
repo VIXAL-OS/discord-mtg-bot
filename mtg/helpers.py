@@ -1296,16 +1296,22 @@ def aftermath_half_index(card):
 # (it must run before the card leaves the library), miracle reacts to it (the
 # card must already be in hand and be the first one drawn this turn).
 #
-# COVERAGE, stated honestly: both hooks live in GameEngine.draw_cards and in
-# the `draw_cards` ACTION handler. Those two cover the draw step — which is
-# where miracle's "first card you drew this turn" almost always resolves and
-# where dredge's once-per-turn replacement lands — plus every template and
-# Tier-3 draw. They do NOT cover the ~8 remaining raw `library.pop(0)` draws
-# in rules/effects.py, rules/spell_resolver.py and rules/planeswalker.py,
-# which are independent draw implementations. Routing those through one choke
-# point is a real refactor and is deliberately NOT smuggled into this wave;
-# tests/test_aug3_altcost_wave2.py pins the covered set so the gap is visible
-# rather than assumed closed.
+# COVERAGE, stated honestly. Hooked: GameEngine.draw_cards (the draw step and
+# most effect draws), the `draw_cards` ACTION handler (every template and
+# Tier-3 draw), the `cycle` action (cycling into a miracle is the classic
+# line) and the Baral-class "counters a spell -> draw" trigger. That is every
+# draw-to-hand inside the mtg/ package.
+#
+# NOT hooked: the raw `library.pop(0)` draws in rules/effects.py,
+# rules/spell_resolver.py and rules/planeswalker.py — independent draw
+# implementations in the other package. Routing those through one choke point
+# is a real refactor and is deliberately NOT smuggled into this wave;
+# tests/test_aug3_altcost_wave2.py pins both the covered set AND the known
+# gap, so the gap stays visible and the pin fails loudly if someone closes it.
+#
+# An unhooked draw is not merely a missed miracle: cards_drawn_this_turn goes
+# out of step, so miracle can both mis-miss (the real first draw wasn't
+# counted) and mis-fire (a later draw looks like the first).
 # ---------------------------------------------------------------------------
 
 def dredge_candidates(player):
@@ -1333,7 +1339,19 @@ def try_dredge(game, player):
     these cards (Meren, Kroxa escape, the cube's Loam pile) want graveyard
     fuel, which is the whole reason to dredge instead of drawing.
     """
-    if getattr(game, '_dredged_this_turn', False):
+    # Per PLAYER, not per game: a wheel routed through the draw_cards action
+    # with player="all" would otherwise let the first player dredge and block
+    # everyone else for the rest of the turn, as would a non-active player
+    # drawing on the active player's turn.
+    try:
+        seat = game.players.index(player)
+    except ValueError:
+        return None
+    dredged = getattr(game, '_dredged_this_turn', None)
+    if not isinstance(dredged, set):
+        dredged = set()
+        game._dredged_this_turn = dredged
+    if seat in dredged:
         return None
     candidates = [(c, n) for c, n in dredge_candidates(player)
                   if len(player.library) >= n + 10]
@@ -1348,7 +1366,7 @@ def try_dredge(game, player):
     player.graveyard.extend(milled)
     player.graveyard.remove(card)
     player.hand.append(card)
-    game._dredged_this_turn = True
+    dredged.add(seat)
     print(f"[DREDGE] {player.name} dredges {card.name} (mills {len(milled)} "
           f"instead of drawing)")
     game._pending_messages = getattr(game, '_pending_messages', None) or []
@@ -1400,8 +1418,12 @@ def pay_jump_start_discard(game, player, card):
         return []
     pitchable = [c for c in player.hand if c is not card]
     if not pitchable:
-        print(f"[JUMP-START] {card.name}: no card to discard — cost unpaid")
-        return []
+        # CR 702.132a makes the discard an additional COST, and CR 601.2g
+        # forbids casting a spell whose costs can't be paid. Returning [] here
+        # let the cast proceed for free; None says "refuse it".
+        print(f"[JUMP-START] {card.name}: no card to discard — cast refused "
+              f"(CR 601.2g)")
+        return None
     worst = max(pitchable, key=lambda c: (c.is_land(), -(c.cmc or 0)))
     player.hand.remove(worst)
     if madness_discard_to_exile(game, player, worst) is None:
@@ -1409,6 +1431,34 @@ def pay_jump_start_discard(game, player, card):
     print(f"[JUMP-START] {card.name}: discarded {worst.name} as the "
           f"additional cost")
     return [worst]
+
+
+def spell_face_for_gates(card):
+    """The card, or a synthetic Card for the split HALF being cast.
+
+    `Card.oracle_text` on a split card is face 0 only, so any gate that reads
+    it judges the wrong spell whenever the other half is being cast: Commit
+    targets and Memory does not, so Memory was refused for "no valid targets"
+    on Commit's requirement. Every CR 601.2c gate must evaluate the half.
+
+    Shared by `_validate_cast` and BOTH executors' pre-cast targeting gates —
+    fixing only the first left the executors judging face 0, which is the
+    two-paths divergence this codebase keeps paying for.
+    """
+    index = getattr(card, 'cast_as_split_half', -1)
+    texts = getattr(card, 'split_texts', None) or []
+    if index is None or index < 0 or index >= len(texts):
+        return card
+    from mtg.models import Card
+    names = getattr(card, 'split_names', None) or []
+    types = getattr(card, 'split_types', None) or []
+    costs = getattr(card, 'split_costs', None) or []
+    return Card(
+        name=names[index] if index < len(names) else card.name,
+        mana_cost=costs[index] if index < len(costs) else card.mana_cost,
+        type_line=types[index] if index < len(types) else card.type_line,
+        oracle_text=texts[index],
+    )
 
 
 def unearthed_leaves_to_exile(card) -> bool:

@@ -5270,8 +5270,14 @@ def fire_counters_a_spell_triggers(game, controller_name):
         if 'counters a spell' in ot and 'draw a card' in ot:
             if not player.library:
                 continue
+            from mtg.helpers import note_miracle_on_draw as _note_miracle
+            from mtg.helpers import try_dredge as _try_dredge
+            if _try_dredge(game, player) is not None:
+                continue
             drawn = player.library.pop(0)
             player.hand.append(drawn)
+            player.cards_drawn_this_turn += 1
+            _note_miracle(game, player, drawn)
             line = f"🃏 **{perm.name}**: {player.name} draws a card"
             if player.hand:
                 # Aug 1 (madness, CR 702.35): prefer + redirect.

@@ -2061,6 +2061,10 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                     override_colors = [c.strip() for c in override_colors.split(",")
                                        if c.strip()]
                 clear_mana_cost = bool(action.get("clear_mana_cost", False))
+                extra_subtypes = action.get("extra_subtypes") or []
+                if isinstance(extra_subtypes, str):
+                    extra_subtypes = [x.strip() for x in extra_subtypes.split(",")
+                                      if x.strip()]
                 for i in range(actual_count):
                     # Create a token copy with the source creature's stats
                     copy_token = Card(
@@ -2092,6 +2096,24 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                     for t in extra_types:
                         if t and t.lower() not in (copy_token.type_line or "").lower():
                             copy_token.type_line = f"{str(t).capitalize()} {copy_token.type_line}".strip()
+                    # SUBTYPES belong AFTER the em-dash (CR 205.3). Prepending
+                    # them the way extra_types does yields "Zombie Creature —
+                    # Angel", which puts Zombie in the supertype slot — the
+                    # engine's subtype reader looks only after the dash, so an
+                    # embalm token was not a Zombie to anything that checks.
+                    for t in extra_subtypes:
+                        if not t:
+                            continue
+                        tl = copy_token.type_line or "Creature"
+                        if t.lower() in tl.split("—")[-1].lower():
+                            continue
+                        if "—" in tl:
+                            head, tail = tl.split("—", 1)
+                            copy_token.type_line = (
+                                f"{head.strip()} — {str(t).capitalize()} {tail.strip()}")
+                        else:
+                            copy_token.type_line = f"{tl.strip()} — {str(t).capitalize()}"
+
                     # Copy color identity — unless the copy effect replaces
                     # the colors outright ("except it's a white Zombie ...").
                     if override_colors is not None:
@@ -2126,8 +2148,10 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
 
                 print(f"[COPY-TOKEN] {p.name} creates {actual_count}x copy of {source_card.name}"
                       f"{' from graveyard' if zone == 'graveyard' else ''}")
-                ep = source_card.get_effective_power(game)
-                et = source_card.get_effective_toughness(game)
+                # Report the TOKEN's characteristics, not the source's — an
+                # eternalize copy is a 4/4 however big the original was.
+                ep = copy_token.get_effective_power(game)
+                et = copy_token.get_effective_toughness(game)
                 base_copy_msg = (f"📋 **{p.name}** creates {actual_count}x token copy of "
                                  f"**{source_card.name}** ({ep}/{et})")
                 if copy_trigger_msgs:
@@ -5611,10 +5635,17 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
         from mtg.helpers import madness_discard_to_exile
         if madness_discard_to_exile(game, p, cycle_card) is None:
             p.graveyard.append(cycle_card)
-        # Draw a card
-        if p.library:
+        # Draw a card. Hooked for dredge/miracle like the other draw sites —
+        # cycling into a miracle is the classic line, and an unhooked draw
+        # also corrupts cards_drawn_this_turn in both directions.
+        from mtg.helpers import note_miracle_on_draw as _note_miracle
+        from mtg.helpers import try_dredge as _try_dredge
+        drawn = None
+        if _try_dredge(game, p) is None and p.library:
             drawn = p.library.pop(0)
             p.hand.append(drawn)
+            p.cards_drawn_this_turn += 1
+            _note_miracle(game, p, drawn)
         # Fire "When you cycle ~" trigger via Tier 1.5 template library
         cycle_msgs = []
         try:

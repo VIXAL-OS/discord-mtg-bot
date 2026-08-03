@@ -219,9 +219,20 @@ def graveyard_castable_entries(player, mana_by_color: Dict,
 
         # 5. Snapcaster-granted flashback — the fallback, for a card with no
         #    native graveyard-cast keyword that something put on the list.
+        #
+        #    It must NOT claim a card whose own branch above DECLINED. Those
+        #    branches decline for real reasons — jump-start with an empty
+        #    hand (no card to discard), escape without enough graveyard fuel
+        #    — and the id is often already on the list from an earlier build,
+        #    so without this guard the card came back offered at its PRINTED
+        #    cost with a FLASHBACK tag and its actual cost unpaid.
         if not source_tag and card.id in player.playable_from_graveyard:
-            source_tag = "FLASHBACK from graveyard"
-            cast_cost = card.mana_cost  # Same cost as original
+            _native = (has_jump_start(card.oracle_text or '')
+                       or parse_escape_cost(card.oracle_text or '')
+                       or aftermath_half_index(card) is not None)
+            if not _native:
+                source_tag = "FLASHBACK from graveyard"
+                cast_cost = card.mana_cost  # Same cost as original
 
         if source_tag and cast_cost:
             # Check mana affordability (uses ManaCost engine when available)

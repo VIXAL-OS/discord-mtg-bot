@@ -367,6 +367,28 @@ class TestAftermath:
         ok, msg, _ = _run(engine.cast_spell_async(game, rick, cm))
         assert not ok and "aftermath" in msg.lower(), msg
 
+    def test_full_name_from_graveyard_resolves_to_the_aftermath_half(self):
+        """Naming the FULL card left cast_as_split_half at -1, which skipped
+        the gate, the split COST selection and the split RESOLUTION — so the
+        card was cast from the graveyard for its combined "{3}{U} // {4}{U}{U}"
+        string and resolved face 0, the non-aftermath half, out of the one
+        zone that half can never be cast from."""
+        game = _make_game()
+        rick, _ = game.players
+        cm = _commit_memory()
+        cm.cmc = 10
+        rick.graveyard.append(cm)
+        rick.playable_from_graveyard.append(cm.id)
+        _lands(rick, 8, "Island", "U")
+        engine = _engine(game)
+        result = _run(engine._execute_action(
+            game, 0, {"type": "cast", "card": "Commit // Memory"}))
+        assert result, "the aftermath half should be castable"
+        assert cm._mana_paid == 6, (
+            f"Memory's {{4}}{{U}}{{U}} = 6, not the combined 10 "
+            f"(got {cm._mana_paid})")
+        assert _zone_of(cm, rick) == "exile", "and aftermath exiles it"
+
     def test_aftermath_half_casts_from_graveyard_and_is_exiled(self):
         game = _make_game()
         rick, _ = game.players
@@ -431,8 +453,11 @@ class TestGraveyardActivations:
                  if getattr(c, "is_token", False)][0]
         assert (token.power, token.toughness) == ("4", "4")
         assert token.colors == ["B"]
-        assert "Zombie" in token.type_line
+        assert "zombie" in token.type_line.split("—")[-1].lower()
         assert token.mana_cost == ""
+        # The Discord line reported the SOURCE's P/T, so an eternalize copy
+        # announced itself as the original's size rather than 4/4.
+        assert "(4/4)" in msg, msg
 
     def test_unearth_returns_the_card_with_haste_and_schedules_its_exile(self):
         game = _make_game()
@@ -629,6 +654,48 @@ class TestEngineGraveyardRollback:
             "that never happened is the cost-paid-no-effect class")
         assert not rick.exile, "nothing should have stayed exiled"
 
+    def test_an_ordinary_cast_returns_a_success_message(self):
+        """_execute_action's callers read a falsy result as FAILURE
+        (mtg/ai_turn.py's plan loop logs [PLAN-REJECTED] and abandons the
+        rest of the plan). Nothing in the suite asserted the success path
+        returned anything, so a two-line edit that re-parented the whole
+        success-return block under `if from_graveyard:` — making every
+        ordinary cast report failure and every FAILED graveyard cast report
+        success — passed 1428 tests. Two independent reviewers caught it.
+
+        This is the missing assertion. Both branches, because the bug
+        inverted both."""
+        game = _make_game()
+        rick, _ = game.players
+        engine = _engine(game)
+        bolt = _make_card("Shock", type_line="Instant",
+                          oracle_text="Shock deals 2 damage to any target.",
+                          mana_cost="{R}")
+        bolt.cmc = 1
+        rick.hand.append(bolt)
+        _lands(rick, 4, "Mountain", "R")
+        result = _run(engine._execute_action(
+            game, 0, {"type": "cast", "card": "Shock", "target": "opponent"}))
+        assert result, (
+            "a successful hand cast must return a truthy message — a falsy "
+            "return is read as failure and abandons the rest of the plan")
+        assert "Shock" in result
+
+    def test_a_failed_graveyard_cast_does_not_report_success(self):
+        game = _make_game()
+        rick, _ = game.players
+        engine = _engine(game)
+        fb = _make_card("Lingering Souls", type_line="Sorcery",
+                        oracle_text=LINGERING_SOULS, mana_cost="{2}{W}")
+        fb.cmc = 3
+        rick.graveyard.append(fb)
+        rick.playable_from_graveyard.append(fb.id)
+        # No lands at all: the cast cannot be paid for.
+        result = _run(engine._execute_action(
+            game, 0, {"type": "cast", "card": "Lingering Souls"}))
+        assert not result, "a failed graveyard cast must not report success"
+        assert _zone_of(fb, rick) == "graveyard", "and must be rolled back"
+
     def test_engine_and_autoplay_both_dispatch_the_new_action_types(self):
         # The provider advertises them; a type only one executor can dispatch
         # is a silently-dead offer (the batch-13 F-F class).
@@ -757,6 +824,249 @@ class TestPlanPathReachability:
         for action_type in ('"foretell"', '"graveyard_activate"'):
             assert src.count(f'{{"type": {action_type}') >= 2, (
                 f"{action_type} must appear in BOTH action-grammar blocks")
+
+
+# --- the adversarial-review wave -----------------------------------------
+
+class TestReviewWaveFixes:
+    """Findings from the adversarial review of this wave. Each is a real
+    defect the pins above did not cover."""
+
+    def test_the_foretell_stamp_does_not_survive_the_cast(self):
+        """_cast_via_foretell is a "charge me the foretell cost" marker read
+        by BOTH _compute_alt_costs and can_cast_spell. Left set, the discount
+        becomes permanent on the card object — every later cast from any zone
+        is cheap, and the pre-gate advertises it a mana early."""
+        game = _make_game()
+        rick, _ = game.players
+        game.active_player_index = 0
+        game.turn_number = 3
+        qb = _make_card("Quakebringer", type_line="Creature — Giant Berserker",
+                        oracle_text=QUAKEBRINGER, mana_cost="{3}{R}{R}",
+                        power="4", toughness="4")
+        rick.hand.append(qb)
+        _lands(rick, 8, "Mountain", "R")
+        engine = _engine(game)
+        foretell_card_from_hand(game, rick, qb)
+        for land in rick.battlefield:
+            land.tapped = False
+        game.turn_number = 4
+        result = _run(engine._execute_action(
+            game, 0, {"type": "cast", "card": "Quakebringer"}))
+        assert result, "the foretold cast should succeed"
+        assert qb._mana_paid == 4, "cast for the foretell cost"
+        assert not qb._cast_via_foretell, (
+            "the stamp must not survive — it would discount every later cast")
+
+    def test_a_card_foretold_this_turn_cannot_be_cast_this_turn(self):
+        """CR 702.143b. The offer list gates it, but plan_turn emits a whole
+        main phase at once, so one plan can foretell and then cast."""
+        game = _make_game()
+        rick, _ = game.players
+        game.active_player_index = 0
+        game.turn_number = 3
+        qb = _make_card("Quakebringer", type_line="Creature — Giant Berserker",
+                        oracle_text=QUAKEBRINGER, mana_cost="{3}{R}{R}",
+                        power="4", toughness="4")
+        rick.hand.append(qb)
+        _lands(rick, 8, "Mountain", "R")
+        engine = _engine(game)
+        foretell_card_from_hand(game, rick, qb)
+        for land in rick.battlefield:
+            land.tapped = False
+        result = _run(engine._execute_action(   # SAME turn
+            game, 0, {"type": "cast", "card": "Quakebringer"}))
+        assert not result
+        assert _zone_of(qb, rick) == "exile" and qb._foretold
+
+    def test_a_failed_exile_cast_returns_the_card_to_exile(self):
+        """This path had no exile rollback at all — a failed cast was a free
+        exile→hand move, and for a foretold card it also stripped the markers
+        (face-up, uncastable, permanently discounted)."""
+        game = _make_game()
+        rick, _ = game.players
+        game.active_player_index = 0
+        game.turn_number = 3
+        qb = _make_card("Quakebringer", type_line="Creature — Giant Berserker",
+                        oracle_text=QUAKEBRINGER, mana_cost="{3}{R}{R}",
+                        power="4", toughness="4")
+        rick.hand.append(qb)
+        _lands(rick, 4, "Mountain", "R")
+        engine = _engine(game)
+        foretell_card_from_hand(game, rick, qb)   # taps 2
+        game.turn_number = 4
+        for land in rick.battlefield:             # only 1 untapped: unpayable
+            land.tapped = True
+        rick.battlefield[0].tapped = False
+        result = _run(engine._execute_action(
+            game, 0, {"type": "cast", "card": "Quakebringer"}))
+        assert not result
+        assert _zone_of(qb, rick) == "exile", "must go back to exile"
+        assert qb._foretold and qb._face_down, "and stay foretold + hidden"
+        assert not qb._cast_via_foretell
+
+    def test_the_snapcaster_fallback_does_not_claim_a_declined_native_card(self):
+        """The native branches decline for real reasons — jump-start with an
+        empty hand has no card to discard. Branch 5 keyed on
+        playable_from_graveyard membership, which those branches themselves
+        populate on an earlier build, so the card came back offered at its
+        PRINTED cost under a FLASHBACK tag with its real cost unpaid."""
+        game = _make_game()
+        rick, _ = game.players
+        rf = _make_card("Risk Factor", type_line="Instant",
+                        oracle_text=RISK_FACTOR, mana_cost="{2}{R}")
+        rick.graveyard.append(rf)
+        rick.hand.append(_make_card("Pitchable", type_line="Creature"))
+        _lands(rick, 5, "Mountain", "R")
+        first = graveyard_castable_entries(rick, {"R": 5}, 0, 5)
+        assert any("JUMP-START" in o["label"] for o in first)
+        assert rf.id in rick.playable_from_graveyard
+        # Now the hand is empty, so jump-start legitimately declines.
+        rick.hand.clear()
+        second = graveyard_castable_entries(rick, {"R": 5}, 0, 5)
+        assert not any("FLASHBACK" in o["label"] for o in second), second
+
+    def test_the_executors_targeting_gate_reads_the_half_being_cast(self):
+        """_validate_cast was fixed to judge the half; fixing only that left
+        BOTH executors judging face 0, so an aftermath Memory was blocked by
+        Commit's targeting requirement."""
+        from mtg.helpers import spell_face_for_gates
+        cm = _commit_memory()
+        assert spell_face_for_gates(cm) is cm, "no half chosen → the card"
+        cm.cast_as_split_half = 1
+        face = spell_face_for_gates(cm)
+        assert face.name == "Memory" and "Aftermath" in face.oracle_text
+        import inspect
+
+        import mtg.autoplay as ap
+        import mtg.engine as eng
+        for src in (inspect.getsource(ap), inspect.getsource(eng)):
+            assert "_find_any_valid_target(game, _gate_card" in src, (
+                "the executor gate must evaluate the half, not the card")
+
+    def test_embalm_token_is_a_zombie_by_SUBTYPE(self):
+        """Zombie is a creature SUBTYPE (CR 205.3). extra_types PREPENDS,
+        giving "Zombie Creature — Angel" — Zombie in the supertype slot,
+        where the engine's subtype reader (which looks after the em-dash)
+        never sees it. The earlier pin asserted `"Zombie" in type_line`,
+        which the malformed string satisfies: a pin passing for the wrong
+        reason."""
+        game = _make_game()
+        rick, _ = game.players
+        angel = _make_card("Angel of Sanctions", type_line="Creature — Angel",
+                           oracle_text=ANGEL_OF_SANCTIONS,
+                           mana_cost="{3}{W}{W}", power="3", toughness="4")
+        rick.graveyard.append(angel)
+        _lands(rick, 8, "Plains", "W")
+        engine = _engine(game)
+        ok, _msg = activate_from_graveyard(engine, game, rick, angel)
+        assert ok
+        token = [c for c in rick.battlefield
+                 if getattr(c, "is_token", False)][0]
+        subtypes = token.type_line.split("—")[-1].lower()
+        assert "zombie" in subtypes, (
+            f"Zombie must be a SUBTYPE, got {token.type_line!r}")
+        assert "angel" in subtypes, "and the original subtypes are kept"
+        assert token.type_line.split("—")[0].strip().lower() == "creature"
+
+    def test_a_rejected_aftermath_half_does_not_stay_selected(self):
+        """cast_as_split_half is normally cleared by the split RESOLUTION,
+        which a rejected cast never reaches — so a refused half stayed
+        selected on the card object and every later cast of it, from any
+        zone, silently resolved that same half."""
+        game = _make_game()
+        rick, _ = game.players
+        cm = _commit_memory()
+        rick.hand.append(cm)
+        _lands(rick, 8, "Island", "U")
+        engine = _engine(game)
+        cm.cast_as_split_half = 1          # Memory, from HAND — illegal
+        ok, msg, _ = _run(engine.cast_spell_async(game, rick, cm))
+        assert not ok and "aftermath" in msg.lower()
+        assert cm.cast_as_split_half == -1, (
+            "the rejected half must not stay selected on the card")
+
+    def test_jump_start_is_refused_when_there_is_no_card_to_discard(self):
+        """CR 702.132a makes the discard an additional COST and CR 601.2g
+        forbids casting a spell whose costs can't be paid. It used to print
+        "cost unpaid" and cast anyway — a free recursion."""
+        game = _make_game()
+        rick, _ = game.players
+        rf = _make_card("Risk Factor", type_line="Instant",
+                        oracle_text=RISK_FACTOR, mana_cost="{2}{R}")
+        rf.cmc = 3
+        rick.graveyard.append(rf)
+        rick.playable_from_graveyard.append(rf.id)
+        _lands(rick, 5, "Mountain", "R")
+        assert not rick.hand, "fixture: empty hand"
+        engine = _engine(game)
+        result = _run(engine._execute_action(
+            game, 0, {"type": "cast", "card": "Risk Factor"}))
+        assert not result, "the cast must be refused"
+        assert _zone_of(rf, rick) == "graveyard", "and rolled back"
+
+    def test_escape_cost_is_all_or_nothing(self):
+        """The exile loop took "as many as it can", so a short graveyard paid
+        a partial cost and cast anyway (CR 601.2g)."""
+        game = _make_game()
+        rick, _ = game.players
+        cling = _make_card("Cling to Dust", type_line="Instant",
+                           oracle_text=CLING, mana_cost="{B}")
+        cling.cmc = 1
+        rick.graveyard.append(cling)
+        rick.graveyard.append(_make_card("Lonely", type_line="Creature"))
+        rick.playable_from_graveyard.append(cling.id)
+        _lands(rick, 6)
+        engine = _engine(game)
+        # Escape needs TWO other cards; only one is present.
+        result = _run(engine._execute_action(
+            game, 0, {"type": "cast", "card": "Cling to Dust",
+                      "target": "opponent"}))
+        assert not result, "the cast must be refused"
+        assert _zone_of(cling, rick) == "graveyard"
+        assert not rick.exile, "and no partial cost may be paid"
+
+    def test_the_opening_hand_is_not_counted_as_drawn_this_turn(self):
+        """Leaving it at 7 means no card drawn on turn 1 can ever be the
+        first one (CR 702.94a), and any future consumer of the counter
+        inherits the same off-by-seven.
+
+        Drives the REAL start_game — an earlier version of this pin zeroed
+        the counter itself and so performed the fix it was meant to test,
+        which mutation testing caught."""
+        game = _make_game()
+        engine = _engine(game)
+        for player in game.players:
+            for i in range(30):
+                player.library.append(_make_card(f"L{i}", type_line="Creature"))
+        engine.start_game(game)
+        assert all(len(p.hand) == 7 for p in game.players), "opening hands dealt"
+        assert all(p.cards_drawn_this_turn == 0 for p in game.players), (
+            "the opening hand is not 'cards you drew this turn'")
+
+    def test_an_aftermath_half_is_not_blocked_by_the_other_half_s_targets(self):
+        """BEHAVIORAL twin of the gate check above. The earlier version of
+        this pin grepped for `_find_any_valid_target(game, _gate_card` and
+        survived a mutant that set `_gate_card = card` — the grep string was
+        unchanged. A structural pin cannot see a changed VALUE."""
+        game = _make_game()
+        rick, _ = game.players
+        cm = _commit_memory()
+        cm.cmc = 10
+        rick.graveyard.append(cm)
+        rick.playable_from_graveyard.append(cm.id)
+        _lands(rick, 8, "Island", "U")
+        engine = _engine(game)
+        # Empty stack, no nonland permanents: Commit ("target spell or
+        # nonland permanent") has no legal target; Memory targets nothing.
+        assert not any(c for p in game.players for c in p.battlefield
+                       if not c.is_land()), "fixture must leave Commit targetless"
+        result = _run(engine._execute_action(
+            game, 0, {"type": "cast", "card": "Commit // Memory",
+                      "adventure": "Memory"}))
+        assert result, (
+            "Memory targets nothing — it must not be blocked by Commit's "
+            "targeting requirement (CR 601.2c applies to the half being cast)")
 
 
 if __name__ == "__main__":

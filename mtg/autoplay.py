@@ -51,7 +51,7 @@ import aiohttp, discord
 from mtg.constants import Phase, Zone, COMMAND_ZONE_FORMATS, PHASE_NAMES
 from mtg.helpers import (_normalize_pw_ability_idx,
                          _resolve_player_or_card_target, coerce_ai_string,
-                         exile_after_resolution_reason)
+                         exile_after_resolution_reason, spell_face_for_gates)
 from mtg.models import Card, Player, GameState
 from mtg.util import GameLogger
 
@@ -1545,6 +1545,7 @@ async def _autoplay_execute_action(cog, thread, game: GameState, player_idx: int
         # but the autoplay (Rick) path was missing it, so the AI's "FLASHBACK from
         # graveyard" castable list pointed at cards the cast resolver would never find.
         from_graveyard = False
+        _rollback_jump_start = False
         _gy_escape_exiled = []
         _gy_jumpstart_discarded = []
         if not card and player.playable_from_graveyard:
@@ -1565,6 +1566,10 @@ async def _autoplay_execute_action(cog, thread, game: GameState, player_idx: int
                     if _matched_half is None:
                         continue
                 card = c
+                if _matched_half is None:
+                    # Full-name graveyard cast — see the engine twin.
+                    from mtg.helpers import aftermath_half_index
+                    _matched_half = aftermath_half_index(c)
                 if _matched_half is not None:
                     c.cast_as_split_half = _matched_half
                 from_graveyard = True
@@ -1574,6 +1579,15 @@ async def _autoplay_execute_action(cog, thread, game: GameState, player_idx: int
                 if c.oracle_text:
                     from mtg.helpers import parse_escape_cost
                     _esc = parse_escape_cost(c.oracle_text)
+                    if _esc and len(player.graveyard) < _esc[1]:
+                        # CR 601.2g: costs are all-or-nothing. The loop below
+                        # exiles "as many as it can", so a short graveyard
+                        # paid a partial cost and cast anyway.
+                        print(f"[ESCAPE] {c.name}: only {len(player.graveyard)} "
+                              f"other card(s) in the graveyard, need {_esc[1]} "
+                              f"— cast refused")
+                        _rollback_jump_start = True   # reuse the refusal path
+                        break
                     if _esc:
                         _esc_cost, exile_count = _esc
                         c._escape_cost = _esc_cost
@@ -1592,6 +1606,9 @@ async def _autoplay_execute_action(cog, thread, game: GameState, player_idx: int
                 from mtg.helpers import pay_jump_start_discard
                 _gy_jumpstart_discarded = pay_jump_start_discard(
                     game, player, c)
+                if _gy_jumpstart_discarded is None:
+                    _gy_jumpstart_discarded = []
+                    _rollback_jump_start = True
                 break
 
         # Check command zone (like !play does)
@@ -1642,11 +1659,22 @@ async def _autoplay_execute_action(cog, thread, game: GameState, player_idx: int
             card._cast_from_graveyard = False
             card.cast_as_split_half = -1
 
+        if _rollback_jump_start:
+            _rollback_graveyard_cast()
+            game._last_cast_failure = (
+                game.turn_number, card.name,
+                "jump-start needs a card to discard — your hand is empty")
+            print(f"[JUMP-START] {card.name} cast refused — graveyard cast "
+                  f"rolled back")
+            return None
+
         # [TARGETING] Pre-cast target validation — block autoplay from casting
         # targeted spells when no legal target exists (CR 601.2c)
-        if HAS_TARGETING and _spell_requires_targets(card):
-            if not _find_any_valid_target(game, card, player.name):
-                print(f"[TARGETING] Autoplay tried to cast {card.name} with no valid targets")
+        # Aug 3: judge the split HALF being cast, not face 0 (engine twin).
+        _gate_card = spell_face_for_gates(card)
+        if HAS_TARGETING and _spell_requires_targets(_gate_card):
+            if not _find_any_valid_target(game, _gate_card, player.name):
+                print(f"[TARGETING] Autoplay tried to cast {_gate_card.name} with no valid targets")
                 # Aug 1 batch-12 (reviewer, pauper mirror): this gate blocks
                 # BEFORE cast_spell_async, so no _last_cast_failure was
                 # stashed and _get_action_error re-derived a reason — its
@@ -1684,19 +1712,32 @@ async def _autoplay_execute_action(cog, thread, game: GameState, player_idx: int
                     break
 
         # Handle exile/command zone movement (like !play does)
+        _was_foretold = False
         if from_exile:
+            if (getattr(card, '_foretold', False)
+                    and getattr(card, '_foretold_turn', None) == game.turn_number):
+                # CR 702.143b: not the turn you foretold it. The offer list
+                # gates this, but plan_turn emits a whole main phase at once,
+                # so one plan can foretell and then cast the same card.
+                print(f"[FORETELL] {card.name} was foretold this turn — can't "
+                      f"cast it until your next turn (CR 702.143b)")
+                game._last_cast_failure = (
+                    game.turn_number, card.name,
+                    "foretold this turn — castable from your next turn")
+                return None
             player.exile.remove(card)
             player.hand.append(card)
             if card.id in player.playable_from_exile:
                 player.playable_from_exile.remove(card.id)
             card._adventure_exiled = False
             if getattr(card, '_foretold', False):
-                # CR 702.143b: cast for the foretell cost. The stamp is what
-                # tells the cost stage to use it; _face_down clears because
-                # the card is no longer hidden once it's cast.
+                # Cast for the foretell cost. The stamp is what tells the cost
+                # stage to use it; _face_down clears because the card is no
+                # longer hidden once it's cast.
                 card._foretold = False
                 card._face_down = False
                 card._cast_via_foretell = True
+                _was_foretold = True
 
         # Graveyard cast (flashback/escape): mirror engine.py — cast_spell_async
         # gates on zone membership FIRST (July 20), so a card pulled out of the
@@ -1781,9 +1822,14 @@ async def _autoplay_execute_action(cog, thread, game: GameState, player_idx: int
                     player.exile.append(card)
                     print(f"[EXILE-ON-RESOLVE] {card.name} exiled after casting "
                           f"from graveyard ({_why})")
-            # Per-cast stamp; resolution has read it by now (see engine twin).
+            # Per-cast stamps; resolution has read them by now (engine twin).
             if from_graveyard:
                 card._cast_from_graveyard = False
+            # Without this, _cast_via_foretell becomes a PERMANENT "charge me
+            # the foretell cost" marker on the card object — every later cast
+            # from any zone is discounted, and can_cast_spell advertises it a
+            # mana early. Same stickiness class as _cast_from_graveyard.
+            card._cast_via_foretell = False
 
             for em in (effect_msgs or []):
                 await cog._autoplay_send(thread, em)
@@ -1804,7 +1850,16 @@ async def _autoplay_execute_action(cog, thread, game: GameState, player_idx: int
             if from_exile and card in player.hand:
                 player.hand.remove(card)
                 player.exile.append(card)
-                player.playable_from_exile.append(card.id)
+                # A failed cast must not change what the card IS. Restoring
+                # the foretell markers matters more than the playable list:
+                # without them the card sits in exile face-up and uncastable
+                # forever, having also lost its hidden-information status.
+                if _was_foretold:
+                    card._foretold = True
+                    card._face_down = True
+                    card._cast_via_foretell = False
+                else:
+                    player.playable_from_exile.append(card.id)
             if from_command_zone and card in player.hand:
                 player.hand.remove(card)
                 player.command_zone.append(card)
