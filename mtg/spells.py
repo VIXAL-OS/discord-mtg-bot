@@ -320,6 +320,9 @@ def _validate_cast(engine, game: GameState, player: Player, card: Card,
     # Buyback is chosen per cast too (CR 702.26a); a spell that was bought
     # back and re-cast without paying it again must not return to hand twice.
     card._buyback_paid = False
+    # Splice is chosen per cast (CR 702.46a). Stale entries here would replay
+    # the previous cast's spliced effects for free on the next one.
+    card._spliced_cards = []
 
     # June 11 audit: flashback/escape casts arrive here with the card in the
     # GRAVEYARD (marked playable by the castable-list generator), but this
@@ -888,6 +891,68 @@ def _compute_alt_costs(engine, game: GameState, player: Player, card: Card,
                       f"{_mk_cost} each (total {effective_mana_cost}, "
                       f"CMC {effective_cmc})")
 
+    # Splice (CR 702.46, Aug 3 2026) — an additive optional cost like the four
+    # above, with one structural difference that shapes the whole branch: the
+    # cost is printed on a card IN HAND, not on the card being cast. Those
+    # cards are revealed (public information — the Discord line names them)
+    # and STAY IN HAND; nothing below removes them, which is the entirety of
+    # CR 702.46c's "the spliced card remains in the player's hand".
+    #
+    # Greedy cheapest-first while the running total stays payable, so spare
+    # mana buys as many effects as it can reach. Splice is unusually safe to
+    # take whenever affordable: you keep the card either way, so the only cost
+    # is mana — unlike buyback, where the v1 gate has to protect the hand.
+    if pay_mana and not getattr(card, '_cast_via_madness', False):
+        _spliced = []
+        _sp_candidates = helpers.splice_candidates(game, player, card)
+        # The affordability probe has to see any cost INCREASE, which is
+        # computed further down (CR 601.2f orders the total as mana cost +
+        # additional costs + increases, then reductions). Without this the
+        # gate commits to the splice against the un-taxed cost and the tap
+        # then fails, turning an advertised-castable spell unpayable — the
+        # doomed-gate asymmetry, pointing the wrong way. Reductions are
+        # deliberately NOT subtracted here: ignoring them can only make the
+        # probe pessimistic (an affordable splice occasionally declined),
+        # which is the safe direction, whereas ignoring increases breaks
+        # casts.
+        if _sp_candidates:
+            from mtg.helpers import compute_cost_increase
+            _sp_inc, _ = compute_cost_increase(game, player, card)
+            # additional_cost carries commander tax and any caller-supplied
+            # extra generic, which the tap will charge just as surely.
+            _sp_tax = _sp_inc + max(additional_cost or 0, 0)
+        else:
+            _sp_tax = 0
+        for _sp_card, _sp_cost in _sp_candidates:
+            _sp_string = (effective_mana_cost or "") + _sp_cost
+            _probe = _sp_string + (("{%d}" % _sp_tax) if _sp_tax else "")
+            _sp_ok, _ = player.can_pay_mana_cost(_probe)
+            if not _sp_ok:
+                print(f"[SPLICE] {_sp_card.name} declined onto {card.name} — "
+                      f"{_sp_cost} unaffordable on top of {effective_mana_cost}"
+                      + (f" (+{_sp_tax} tax)" if _sp_tax else ""))
+                continue
+            effective_mana_cost = _sp_string
+            effective_cmc = helpers.cmc_of_cost_string(_sp_string)
+            _spliced.append(_sp_card)
+            print(f"[SPLICE] {_sp_card.name} spliced onto {card.name} for "
+                  f"{_sp_cost} (total {effective_mana_cost}, "
+                  f"CMC {effective_cmc})")
+            # v1 policy: at most ONE splice per cast. CR 702.46 allows any
+            # number, and the candidate list and _spliced_cards are both
+            # plural so lifting this is a one-line change — but greedy
+            # multi-splice is unbounded in a way its cost-family siblings are
+            # not (kicker/entwine/buyback each append ONE increment printed on
+            # the card being cast; splice appends N increments printed on
+            # OTHER cards), and every extra increment widens the gap between
+            # what _validate_plan_mana simulated and what the cast actually
+            # spends. Same shape as dredge's "at most one replaced draw per
+            # turn". No deck currently holds two different splice cards, so
+            # this changes nothing observable today; it bounds the blast
+            # radius if one ever does.
+            break
+        card._spliced_cards = _spliced
+
     if not effective_mana_cost and card.oracle_text:
         oracle_lower = card.oracle_text.lower()
         if re.search(r'suspend\s+\d', oracle_lower) and card in player.hand:
@@ -1214,6 +1279,21 @@ def _compute_alt_costs(engine, game: GameState, player: Player, card: Card,
 
     total_alt_reduction = (convoke_reduction + delve_reduction
                            + improvise_reduction + cost_reduction)
+    # CR 601.2h: "without paying its mana cost" does NOT waive additional
+    # costs, and CR 702.46a makes the splice cost one. Several branches above
+    # (free cast, printed alternate costs) flip pay_mana to False AFTER the
+    # splice branch has already committed, which would hand over the spliced
+    # effects for nothing. v1 declines the splice instead of charging it
+    # separately — the same scope the kicker branch documents for free casts,
+    # and the safe direction: the spell still resolves, just without the
+    # text it did not pay for. Checked at the single return so every
+    # pay_mana=False site is covered, present and future.
+    if not pay_mana and getattr(card, '_spliced_cards', None):
+        print(f"[SPLICE] {card.name} is being cast without paying its mana "
+              f"cost — declining the splice rather than granting it free "
+              f"(CR 601.2h)")
+        card._spliced_cards = []
+
     return None, {
         'effective_mana_cost': effective_mana_cost,
         'effective_cmc': effective_cmc,
@@ -3520,6 +3600,125 @@ async def _dispatch_resolution(engine, game: GameState, player: Player,
     return True, f"Cast {card.name}", effect_messages
 
 
+async def _resolve_spliced_effects(engine, game: GameState, player: Player,
+                                   card: Card, target: Any = None) -> List[str]:
+    """Resolve the text spliced onto `card` (CR 702.46), newest text last.
+
+    Each spliced card's effects run through the full Tier 1 -> 1.5 -> 2 -> 3
+    cascade, on a synthetic Card carrying the spliced text MINUS its own
+    splice line (that line is a static ability and does nothing once copied;
+    leaving it in feeds the resolver a casting-flavoured reminder, the shape
+    that has misfired generic patterns before).
+
+    Tier 2 is in that list because the first draft omitted it — copying the
+    split-half branch, which skips it. The pin caught it immediately: Glacial
+    Ray spliced onto Lava Spike charged its {1}{R} and dealt nothing, because
+    "deals 2 damage to any target" is precisely a SpellResolver shape and
+    neither Tier 1 nor the template library claims it. Paying a cost for no
+    effect is the failure this codebase keeps re-finding; the cheapest tier
+    that can resolve a spliced effect must be reachable from here.
+
+    Two deliberate choices, both documented rather than silent:
+
+    * The effects are APPENDED after the spell's own. CR 702.46 adds the
+      spliced text to the spell; sequencing it after the printed effect is
+      the reading the reminder text implies ("add this card's effects to that
+      spell") and is what a player would expect from Glacial Ray spliced onto
+      Lava Spike.
+    * Targets. CR 601.2c has the caster choose targets for EVERY instruction
+      as the spell is cast, spliced ones included, so the declared target is
+      forwarded — but only to spliced text that says "any target", which
+      accepts anything the caster could have declared. Anything narrower
+      ("target creature" against a declared player) would be the wrong TYPE,
+      so those fall back to the cascade's own per-effect auto-targeting.
+      Without the forward, Lava Spike aimed at the opponent's face spliced a
+      Glacial Ray that auto-picked a CREATURE instead — damage the caster
+      never chose, and the wrong half of a burn deck's plan.
+
+    The spliced cards are never removed from hand here or anywhere else;
+    that absence IS the CR 702.46c behaviour.
+    """
+    spliced = list(getattr(card, '_spliced_cards', None) or [])
+    if not spliced:
+        return []
+    messages: List[str] = []
+    player_idx = game.players.index(player) if player in game.players else 0
+    opponent = game.players[1 - player_idx]
+    for source in spliced:
+        text = helpers.strip_splice_line(getattr(source, 'oracle_text', '') or '')
+        if not text:
+            continue
+        synthetic = Card(
+            name=source.name,
+            mana_cost=getattr(source, 'mana_cost', '') or '',
+            type_line=getattr(source, 'type_line', '') or '',
+            oracle_text=text,
+        )
+        # CR 601.2c: the caster chose this target as the spell was cast, and
+        # the spliced instruction is part of that spell. Forward it only to
+        # "any target" text, which can legally take a player, creature or
+        # planeswalker alike; narrower phrasing gets the cascade's own
+        # per-effect auto-targeting instead of a type-mismatched hand-me-down.
+        spliced_target = target if 'any target' in text.lower() else None
+        produced: List[str] = []
+        try:
+            produced = engine.resolve_special_effects(
+                game, player, synthetic, spliced_target) or []
+            if not produced and HAS_EFFECT_TEMPLATES:
+                ctx = build_game_context(game, player, opponent,
+                                         card=synthetic,
+                                         explicit_target=spliced_target)
+                actions, _explanation = get_effect_library().resolve_spell(
+                    card_name=source.name, oracle_text=text,
+                    controller=player.name, opponent=opponent.name,
+                    game_context=ctx,
+                )
+                for action in (actions or []):
+                    if action.get("action") == "no_action":
+                        continue
+                    msg = engine.rules._execute_action_on_state(game, action)
+                    if msg:
+                        produced.append(msg)
+            if not produced and HAS_SPELL_RESOLVER and engine.spell_resolver:
+                result = await engine.spell_resolver.cast_spell(
+                    game, player, synthetic, target=spliced_target,
+                    target_mode=TargetMode.AUTO)
+                # Drop SpellResolver's "I could not parse this" marker so Tier
+                # 3 still gets its turn. Without this the marker counts as a
+                # result and the cascade stops one tier early, leaving a
+                # splice that was already PAID FOR with a placeholder and no
+                # effect — the cost-paid-effect-lost failure that putting
+                # Tier 2 in this cascade fixed, one tier further down.
+                #
+                # Only the "complex effect" marker is filtered, deliberately.
+                # SpellResolver's other no-parse output, the cosmetic
+                # "resolves (effects not automated)" line, needs
+                # parse_card_effects to return EMPTY — and rules/effects.py
+                # parse_effects always appends a COMPLEX effect for any text
+                # that strips non-empty, while strip_splice_line above already
+                # returns stripped text and empty text is skipped. So that
+                # branch is unreachable from here and filtering it would be
+                # dead code. (The sibling ETB path at the Tier-2 block below
+                # filters both; whether its second clause is live there is a
+                # question for whoever next touches it, not a drive-by fix.)
+                produced = [m for m in (result.messages or [])
+                            if "complex effect" not in m.lower()]
+            if not produced and engine.rules.client:
+                resolved, _ = await engine.rules.resolve_effect(
+                    game, text, source.name, player.name)
+                if resolved:
+                    produced.extend(resolved)
+        except Exception as e:  # noqa: BLE001 - crash barrier; strict re-raises
+            print(f"[SPLICE] Resolution error for {source.name}: {e}")
+            from mtg.util import maybe_reraise
+            maybe_reraise(e)
+        messages.append(f"🧵 **{source.name}** spliced onto {card.name}")
+        messages.extend(produced)
+        print(f"[SPLICE] Resolved spliced {source.name} "
+              f"({len(produced)} effect message(s)); it stays in hand")
+    return messages
+
+
 async def cast_spell_async(engine, game: GameState, player: Player, card: Card, pay_mana: bool = True, target: Any = None, additional_cost: int = 0) -> Tuple[bool, str, List[str]]:
     """Cast a spell with full effect resolution (async version).
 
@@ -3622,9 +3821,24 @@ async def cast_spell_async(engine, game: GameState, player: Player, card: Card, 
     if _final is not None:
         return _final
 
-    return await _dispatch_resolution(engine, game, player, card, target,
-                                      effect_messages, cast_trigger_msgs,
-                                      player_idx)
+    _success, _message, _effects = await _dispatch_resolution(
+        engine, game, player, card, target, effect_messages,
+        cast_trigger_msgs, player_idx)
+
+    # Spliced text resolves as part of the spell (CR 702.46), so it belongs
+    # AFTER resolution and nowhere else. This one site covers every path
+    # _dispatch_resolution can take — and, just as importantly, it is not
+    # reached when the spell was countered or fizzled, because
+    # _await_stack_window returns early in both cases. That is correct: a
+    # countered spell's spliced effects never happen, while the splice cost
+    # stays paid and the revealed cards stay in hand.
+    if getattr(card, '_spliced_cards', None):
+        _splice_msgs = await _resolve_spliced_effects(engine, game, player,
+                                                      card, target)
+        if _splice_msgs:
+            _effects = list(_effects) + _splice_msgs
+        card._spliced_cards = []
+    return _success, _message, _effects
 
 # =========================================================================
 # PENDING ASYNC TRIGGER QUEUE

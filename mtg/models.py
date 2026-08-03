@@ -467,6 +467,15 @@ class Card:
     # cast (CR 702.33c). Registry-gated auto-kick (helpers.MULTIKICKER_
     # MODELED); templates read it as ctx['kicked_times']. Reset per cast.
     _kicked_times: int = field(default=0, repr=False, compare=False)
+    # Aug 3 2026: the cards spliced onto THIS spell for this cast (CR 702.46).
+    # Unlike its four siblings above, which are flags read off the card being
+    # cast, this holds live Card references to cards that stay in the caster's
+    # HAND (CR 702.46c) — so it is declared for the same reason the others are
+    # (visible to to_dict / !undo carry-over, and to the next reader) and
+    # additionally so the countered/fizzled paths, which return before the
+    # post-resolution clear, do not leave an undeclared hard reference from a
+    # graveyard card to a hand card. Reset per cast alongside _kicked.
+    _spliced_cards: list = field(default_factory=list, repr=False, compare=False)
     # Animate-land duration (Aug 1 2026): player index whose NEXT turn ends
     # the animation ("Until your next turn, all lands you control become
     # 2/2..." — Sylvan Awakening). _animated_until_eot stays SET alongside

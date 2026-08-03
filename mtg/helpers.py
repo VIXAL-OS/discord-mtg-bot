@@ -1515,6 +1515,191 @@ def colors_spent_count(card) -> int:
                 if c in _REAL_COLORS])
 
 
+# ---------------------------------------------------------------------------
+# Aug 3, 2026 — SPLICE (CR 702.46), the last non-tail mechanic on the
+# missing-mechanics backlog.
+#
+# Splice is NOT a cost adjustment, despite having been filed next to affinity
+# and converge. It is a static ability that functions FROM YOUR HAND: as you
+# cast a spell of the named subtype, you may reveal the splice card, pay its
+# splice cost as an additional cost, and add its effects to that spell. The
+# revealed card never leaves your hand (CR 702.46c) — that is what makes it
+# unlike every other alternate/additional cost in this file, all of which
+# read the card BEING CAST.
+#
+# The sweep over Scryfall bulk (33 splice cards, 97 Arcane cards) found three
+# printed subtype phrases and one whole family the parser must DECLINE:
+#
+#   accept  "Splice onto Arcane {1}{R}"              — Glacial Ray, 27 cards
+#   accept  "Splice onto instant or sorcery {2}{U}"  — Kamigawa: Neon Dynasty
+#                                                      (note the LOWERCASE
+#                                                      subtype phrase)
+#   decline "Splice onto Arcane—Sacrifice two Mountains."  and the four other
+#           em-dash non-mana forms (Torrent of Stone, Roar of Jukai, Reweave's
+#           cousins). Same call as buyback's life/sacrifice forms: an unmodeled
+#           cost paid for free is strictly worse than not splicing.
+#   decline "Splice onto Anything {1}{R}" — falls out for free rather than
+#           being special-cased: "anything" matches no type line, so the
+#           subtype test fails and the card simply never splices.
+#   decline Minamo's Meddling's rules text, "...each card with the same name
+#           as a card spliced onto that spell" — `\bsplice\b` does not match
+#           "spliced", so no line is even considered.
+# ---------------------------------------------------------------------------
+
+# The subtype phrase is letters and spaces only, and the cost must close the
+# line. Both restrictions are what reject the em-dash forms: "Arcane—Exile
+# four cards from your graveyard." has a character outside [A-Za-z ] and no
+# trailing brace group, so it cannot match under any reading.
+_SPLICE_RE = re.compile(r"^\s*onto\s+([A-Za-z][A-Za-z ]*?)\s*"
+                        r"((?:\{[^}]+\})+)\s*$")
+
+
+def parse_splice(oracle_text):
+    """(subtype_phrase, mana_cost) for a card's own printed Splice, else None.
+
+    The subtype phrase is returned lowercased and verbatim ("arcane",
+    "instant or sorcery"); `splice_matches_spell` is what turns it into a
+    test against a spell's type line.
+
+    Uses the shared own-keyword guard for family consistency. No card in the
+    pool currently GRANTS splice, but every other parser in this file learned
+    the grant lesson the expensive way and a future set is one printing away.
+    """
+    clause = _own_keyword_clause(oracle_text, 'splice')
+    if clause is None:
+        return None
+    match = _SPLICE_RE.match(clause)
+    if not match:
+        return None
+    return match.group(1).strip().lower(), match.group(2).upper()
+
+
+def splice_matches_spell(subtype_phrase: str, type_line: str) -> bool:
+    """Can a card with "Splice onto <subtype_phrase>" splice onto this spell?
+
+    The phrase is split on " or " so the two real forms need no special
+    casing: "arcane" tests one token, "instant or sorcery" tests either. A
+    phrase naming something no type line contains ("anything") matches
+    nothing, which is the safe direction.
+    """
+    if not subtype_phrase or not type_line:
+        return False
+    lowered = type_line.lower()
+    return any(part.strip() in lowered
+               for part in subtype_phrase.lower().split(' or ')
+               if part.strip())
+
+
+def strip_splice_line(oracle_text: str) -> str:
+    """`oracle_text` without its "Splice onto ..." line.
+
+    Splice is a static ability that does nothing once the text has been
+    copied onto the spell, so the spliced effects must resolve WITHOUT it —
+    leaving it in hands the effect resolver a line whose reminder text
+    describes casting, which is exactly the kind of text that has misfired
+    generic patterns before (extort, the suspend reminder on Mox Tantalite).
+    """
+    if not oracle_text:
+        return oracle_text or ""
+    kept = [line for line in oracle_text.split('\n')
+            if not re.sub(r'\([^)]*\)', '', line).strip().lower()
+            .startswith('splice onto')]
+    return '\n'.join(kept).strip()
+
+
+def _splice_choices_are_makeable(game, spliced_text: str) -> bool:
+    """CR 702.46b — you may not splice a card whose required choices can't
+    be made.
+
+    Narrow BY DESIGN, and the scope is stated exactly rather than overclaimed
+    (an earlier draft of this docstring said the creature case was "the only
+    shape that can actually arise", which is false — Soulless Revival wants a
+    creature card in a GRAVEYARD, Wear Away an artifact or enchantment). The
+    three zone-and-type shapes below are the ones real printed splice cards
+    use; anything else is allowed through and, if it turns out to have no
+    legal target, fizzles at resolution having charged its cost. That is a
+    known gap, not a claim of completeness — full CR 702.46b enforcement needs
+    the targeting engine, which is a larger seam than this mechanic.
+
+    "Any target" is never restricted here: a player is always legal, so the
+    only card the shipped decks can splice (Glacial Ray) never trips this.
+    """
+    lowered = (spliced_text or '').lower()
+
+    def _battlefield(pred):
+        return any(pred(c)
+                   for p in getattr(game, 'players', []) or []
+                   for c in getattr(p, 'battlefield', []) or [])
+
+    if 'target creature card' in lowered and 'graveyard' in lowered:
+        # Soulless Revival — the target lives in a GRAVEYARD, so scanning the
+        # battlefield would answer a different question entirely.
+        return any(c.is_creature(game)
+                   for p in getattr(game, 'players', []) or []
+                   for c in getattr(p, 'graveyard', []) or [])
+    if 'target creature' in lowered:
+        # is_creature(game) and not is_creature(): a devotion-gated god below
+        # its threshold is NOT a creature (CR 207.4), and the bare call would
+        # count it as one — the June-10 D4 class.
+        return _battlefield(lambda c: c.is_creature(game))
+    if 'target artifact or enchantment' in lowered:
+        # Wear Away.
+        return _battlefield(
+            lambda c: 'artifact' in (getattr(c, 'type_line', '') or '').lower()
+            or 'enchantment' in (getattr(c, 'type_line', '') or '').lower())
+    return True
+
+
+def splice_candidates(game, player, spell_card):
+    """Cards in `player`'s hand that may be spliced onto `spell_card`.
+
+    Returns [(splice_card, cost_string)] cheapest-first (name breaks ties, so
+    the order is fully deterministic). Affordability is the CALLER's call —
+    it alone knows the running effective cost the splice cost is added to.
+
+    The identity exclusion is the load-bearing line. `_compute_alt_costs`
+    runs BEFORE the card leaves hand, so the spell being cast is still sitting
+    in `player.hand`; without `c is not spell_card`, Through the Breach would
+    splice onto ITSELF. It is deliberately an identity test and not a name
+    test: with two copies in hand (any 4-of format) splicing copy B onto
+    copy A is perfectly legal, and a name test would forbid it.
+    """
+    # CR 702.46a names the subtype of the SPELL, and for a split card the
+    # spell is the HALF being cast. spell_face_for_gates is the canonical
+    # answer ("Every CR 601.2c gate must evaluate the half").
+    #
+    # Honest scope: it covers split halves only. An ADVENTURE card's cached
+    # type_line is already the creature face alone ("Creature — Giant", not a
+    # combined string), so casting the adventure half reads the creature's
+    # type line and an "instant or sorcery" splice would DECLINE where the
+    # rules allow it. That is the safe direction, and no deck currently pairs
+    # an "instant or sorcery" splice card with anything at all — all four are
+    # absent from every deck JSON.
+    #
+    # Only the TYPE LINE comes from the face. The identity exclusion below
+    # still compares against the ORIGINAL spell_card: the face is a freshly
+    # built synthetic Card, so `c is not face` would be true for every card in
+    # hand and self-splice would come straight back.
+    type_line = getattr(spell_face_for_gates(spell_card), 'type_line', '') or ''
+    out = []
+    for c in list(getattr(player, 'hand', []) or []):
+        if c is spell_card:
+            continue
+        parsed = parse_splice(getattr(c, 'oracle_text', '') or '')
+        if not parsed:
+            continue
+        subtype, cost = parsed
+        if not splice_matches_spell(subtype, type_line):
+            continue
+        if not _splice_choices_are_makeable(
+                game, strip_splice_line(getattr(c, 'oracle_text', '') or '')):
+            continue
+        out.append((c, cost))
+    out.sort(key=lambda pair: (cmc_of_cost_string(pair[1]),
+                               getattr(pair[0], 'name', '')))
+    return out
+
+
 def spell_face_for_gates(card):
     """The card, or a synthetic Card for the split HALF being cast.
 

@@ -116,7 +116,12 @@ EXCEPT_BASELINE = {
     # twins of the madness pair above (same drain shape, same reasons) — a
     # miracle resolution crash must leave the card in hand in production
     # rather than corrupt the drain; both carry maybe_reraise.
-    "spells.py": 34,
+    # Aug 3 (+1): _resolve_spliced_effects' single per-spliced-card barrier
+    # (CR 702.46). One spliced card's cascade failing must not abort the
+    # SPELL that already resolved and was already paid for — the spliced
+    # text is an addition to it, not a precondition. Carries maybe_reraise,
+    # so strict batches and pytest still see the failure.
+    "spells.py": 35,
     # Aug 1 deferred slate: +1 for the opponent-cast trigger window's
     # crash barrier around the LLM response evaluation — carries
     # maybe_reraise so strict batches see it; the sibling own-cast
