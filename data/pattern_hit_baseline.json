@@ -41,6 +41,7 @@
  "ninjutsu \\{": 49,
  "put all creatures on the bottom of their owners.? librar": 2,
  "return target (?:nonland )?(?:creature|permanent) (?:an opponent controls )?to (?:its|their) owner'?s? hand": 176,
+ "reveal the top card of your library\\W+if it'?s a land card, put it onto the battlefield tapped\\W+otherwise,? draw a card": 1,
  "scry (\\d+|one|two|three|four|five)": 433,
  "search your library for (?:a |an? )?(basic )?(?:land|plains|island|swamp|mountain|forest)\\b.*?(?:put (?:it|that card) onto the battlefield)": 207,
  "search your library for (?:a|an)\\s+([\\w\\- ]+? card)[^.]*?(?:put it (into your hand|onto the battlefield|into your graveyard)|put it (on top of (?:your|its owner's) library)|reveal it[^.]*?put it (into your hand))": 529,

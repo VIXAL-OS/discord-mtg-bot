@@ -1935,18 +1935,52 @@ class EffectTemplateLibrary:
             action_generator=self._gen_archmages_charm,
         ))
 
-        # --- Prismatic Ending: exile nonland permanent with MV ≤ X (colors spent) ---
+        def _gen_prismatic_ending(ctrl, opp, ctx):
+            """Converge (CR 702.100a): exile a nonland permanent whose mana
+            value is <= the number of COLORS of mana spent to cast this.
+
+            The bound is colors SPENT, not the printed {X}: Prismatic Ending
+            is {X}{W}, and paying {2}{W} off two Plains and an Island spends
+            two colors, not three.
+            """
+            bound = int(ctx.get('colors_spent') or 0)
+            name = (ctx.get('explicit_target_name')
+                    or ctx.get('best_opponent_nonland') or '')
+            if not name:
+                return [{"action": "no_action",
+                         "reason": "No valid nonland permanent to exile with "
+                                   "Prismatic Ending"}]
+            # Verify the chosen target is actually within the bound. The
+            # target's mana value is on the ctx snapshot when available;
+            # without it, decline rather than exile something too big.
+            mv = ctx.get('explicit_target_mv')
+            if mv is None:
+                for _p in (ctx.get('opponent_battlefield') or []):
+                    _n = _p.get('name') if isinstance(_p, dict) else getattr(_p, 'name', '')
+                    if _n and _n.lower() == name.lower():
+                        mv = (_p.get('cmc') if isinstance(_p, dict)
+                              else getattr(_p, 'cmc', None))
+                        break
+            if mv is not None and int(mv or 0) > bound:
+                return [{"action": "no_action",
+                         "reason": (f"Prismatic Ending exiles mana value "
+                                    f"{bound} or less ({bound} color(s) of "
+                                    f"mana spent) — {name} is mana value "
+                                    f"{int(mv or 0)}")}]
+            return [{"action": "move_card", "card": name,
+                     "from_zone": "battlefield", "to_zone": "exile",
+                     "player": ctx.get('explicit_target_owner') or opp}]
+
+        # --- Prismatic Ending: exile nonland permanent with MV <= colors spent ---
+        # Aug 3: the converge CONDITION was ignored entirely — the template
+        # exiled any nonland permanent whatever its mana value, so a
+        # one-color Prismatic Ending answered a 6-drop. CR 702.100a: the
+        # bound is the number of COLORS of mana actually spent, which
+        # ctx['colors_spent'] now carries.
         self._add_card("prismatic ending", EffectTemplate(
             name="Prismatic Ending",
             description="Exile target nonland permanent with mana value X or less",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "move_card",
-                 "card": ctx.get('explicit_target_name') or ctx.get('best_opponent_nonland', ''),
-                 "from_zone": "battlefield", "to_zone": "exile",
-                 "player": ctx.get('explicit_target_owner') or opp},
-            ] if (ctx.get('explicit_target_name') or ctx.get('best_opponent_nonland')) else [
-                {"action": "no_action", "reason": "No valid nonland permanent to exile with Prismatic Ending"}
-            ],
+            action_generator=_gen_prismatic_ending,
             needs_target=True,
         ))
 
@@ -10747,6 +10781,13 @@ def build_game_context(game, player, opponent, card=None, entering_creature=None
         ctx['entwined'] = bool(getattr(card, '_entwined', False))
         # Multikicker truth (Aug 2): same contract — 0 when never kicked.
         ctx['kicked_times'] = int(getattr(card, '_kicked_times', 0) or 0)
+        # Converge truth (Aug 3, CR 702.100a): how many distinct COLORS of
+        # mana the engine actually committed for this cast. Same contract as
+        # 'kicked' — always present, so a converge template never has to
+        # guess from the printed cost (which says nothing about what was
+        # actually spent when generic mana came off duals).
+        from mtg.helpers import colors_spent_count as _csc
+        ctx['colors_spent'] = _csc(card)
 
     # Escape: "sacrifice it unless it escaped" (Kroxa). This key was READ in two
     # places and written NOWHERE in production — the two tests that exercised it

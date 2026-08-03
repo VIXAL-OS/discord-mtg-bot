@@ -318,6 +318,16 @@ class RulesEngine:
                 mana_cost_to_check = _taxed
             _red, _red_src = compute_cost_reduction(player, card,
                                                     from_graveyard=_from_gy)
+            # Affinity (CR 702.41a) reduces the same generic portion, and the
+            # gap it closes is the widest of any reducer: Icebreaker Kraken is
+            # printed {10}{U}{U} and costs {U}{U} on a ten-snow-land board.
+            # Without the pre-gate knowing that, the payment stage would
+            # happily pay it and the AI would never be offered the card.
+            from mtg.helpers import compute_affinity_reduction
+            _aff, _aff_phrase = compute_affinity_reduction(player, card)
+            if _aff > 0:
+                _red += _aff
+                _red_src = list(_red_src) + [f"affinity for {_aff_phrase}"]
             if _red > 0:
                 reduced = re.sub(
                     r'\{(\d+)\}',

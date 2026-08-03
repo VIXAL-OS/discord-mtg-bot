@@ -813,6 +813,73 @@ class TestPlanPathReachability:
         kept = {a.get("type") for a in _validate_plan_mana(engine, game, 0, plan)}
         assert {"graveyard_activate", "foretell"} <= kept, kept
 
+    def test_plan_validate_charges_mana_for_the_new_action_types(self):
+        """They fall through validation untouched — that part was fine — but
+        their mana was never simulated. Embalm is {5}{W}; a later cast in the
+        same plan validated against mana that was already spent and then
+        failed for real at the executor."""
+        from mtg.ai_turn import _validate_plan_mana
+        game = _make_game()
+        rick, _ = game.players
+        engine = GameEngine(None)
+        game._rules_engine = engine.rules
+        angel = _make_card("Angel of Sanctions", type_line="Creature — Angel",
+                           oracle_text=ANGEL_OF_SANCTIONS,
+                           mana_cost="{3}{W}{W}", power="3", toughness="4")
+        rick.graveyard.append(angel)
+        big = _make_card("Big Thing", type_line="Creature", mana_cost="{4}{W}")
+        big.cmc = 5
+        rick.hand.append(big)
+        _lands(rick, 7, "Plains", "W")   # embalm {5}{W} = 6, leaving 1
+        kept = _validate_plan_mana(engine, game, 0, [
+            {"type": "graveyard_activate", "card": "Angel of Sanctions",
+             "mechanic": "embalm"},
+            {"type": "cast", "card": "Big Thing"},
+        ])
+        types = [a.get("type") for a in kept]
+        assert "graveyard_activate" in types, "the activation is affordable"
+        assert not any(a.get("card") == "Big Thing" for a in kept), (
+            "the 5-drop must be rejected — embalm already spent 6 of 7")
+
+    def test_get_action_error_reports_the_new_action_types(self):
+        """Without a branch the AI's rejection-feedback loop gets None — the
+        Rhys-the-Redeemed failure mode, 8 failed activations feeding back
+        nothing for 24 turns."""
+        from mtg.ai_turn import _get_action_error
+        game = _make_game()
+        engine = GameEngine(None)
+        game._rules_engine = engine.rules
+        game._last_activation_failure = (
+            game.turn_number, "Angel of Sanctions",
+            "Embalm only as a sorcery (not your turn)")
+        msg = _get_action_error(
+            engine, game, 0,
+            {"type": "graveyard_activate", "card": "Angel of Sanctions"})
+        assert "sorcery" in (msg or "").lower(), msg
+        # And a generic reason when nothing was stashed.
+        game._last_activation_failure = None
+        msg2 = _get_action_error(
+            engine, game, 0, {"type": "foretell", "card": "Quakebringer"})
+        assert msg2 and "foretell" in msg2.lower(), msg2
+
+    def test_the_human_play_path_got_the_wave_mechanics(self):
+        """The third executor. `!play` had the exile-on-resolve change but
+        none of wave 3a: jump-start's discard was free, aftermath halves were
+        unmatchable, foretold cards uncastable — and its exile pre-move
+        called playable_from_exile.remove() UNGUARDED, which raises for any
+        card castable from exile without being on that list."""
+        import inspect
+
+        import mtg.cog as cog
+        src = inspect.getsource(cog)
+        assert "pay_jump_start_discard" in src, "jump-start's cost"
+        assert "aftermath_half_index" in src, "aftermath half resolution"
+        assert "_cast_via_foretell = True" in src, "foretell cost selection"
+        # The unguarded remove must be gone from the spell branch too.
+        assert "\n                player.playable_from_exile.remove(card.id)\n" not in src, (
+            "the spell branch's exile remove must be guarded like the land "
+            "branch's")
+
     def test_both_action_grammar_blocks_document_the_new_types(self):
         """The model cannot emit JSON it was never shown. There are TWO
         grammar blocks (decide_action and plan_turn) and they have drifted

@@ -894,6 +894,39 @@ def _validate_plan_mana(engine, game: GameState, player_idx: int, plan: list) ->
                         _prev_cast_had_template = True
                 except Exception:
                     pass
+        elif a_type in ("graveyard_activate", "foretell"):
+            # Aug 3: these two DO fall through plan validation untouched (the
+            # terminal else appends), but their mana was never simulated —
+            # embalm/eternalize cost {5}{W} / {5}{G}{G} and foretell {2}, so a
+            # later cast in the same plan validated against mana already
+            # spent and then failed for real at the executor.
+            if a_type == "foretell":
+                _new_cost = "{2}"
+            else:
+                _gy_card = next(
+                    (c for c in player.graveyard
+                     if c.name.lower() == str(card_name or '').lower()), None)
+                _parsed = None
+                if _gy_card is not None:
+                    from mtg.helpers import parse_graveyard_activation
+                    _parsed = parse_graveyard_activation(_gy_card.oracle_text or '')
+                _new_cost = _parsed[1] if _parsed else None
+            if _new_cost:
+                from mtg.helpers import cmc_of_cost_string as _cmc_of
+                _cost_n = _cmc_of(_new_cost)
+                if _cost_n > mana_remaining:
+                    print(f"[PLAN-VALIDATE] Rejected {a_type} {card_name} "
+                          f"(cost {_cost_n}) — only {mana_remaining} mana left")
+                    continue
+                _ok, mana_by_color, any_color_mana = _simulate_cast_spend(
+                    _new_cost, mana_by_color, any_color_mana)
+                if not _ok:
+                    print(f"[PLAN-VALIDATE] Rejected {a_type} {card_name} — "
+                          f"colored mana mismatch for {_new_cost}")
+                    continue
+                mana_remaining -= _cost_n
+            validated.append(action)
+
         elif a_type == "activate":
             # Reject second activation of the same planeswalker in one turn
             perm_name = action.get("permanent", "").lower()
@@ -2249,6 +2282,24 @@ def _get_action_error(engine, game: GameState, player_index: int, action: Dict) 
                 game._last_activation_failure = None
                 return _lsf_msg
         return f"Could not suspend {action.get('card', '?')}"
+
+    elif action_type in ("graveyard_activate", "foretell", "suspend_only_marker"):
+        # Aug 3: both new action types stash their real reason on
+        # _last_activation_failure (the July-30 pattern). Without a branch
+        # here the re-derivation below never runs for them and the AI's
+        # rejection-feedback loop gets None — the Rhys-the-Redeemed failure
+        # mode, where 8 failed activations fed back nothing for 24 turns.
+        _laf = getattr(game, '_last_activation_failure', None)
+        if _laf:
+            _laf_turn, _laf_name, _laf_msg = _laf
+            _want = str(action.get("card", "")).lower()
+            if (_laf_turn == game.turn_number and _want
+                    and _laf_name.lower() == _want):
+                game._last_activation_failure = None
+                return _laf_msg
+        _verb = ("foretell" if action_type == "foretell"
+                 else f"{action.get('mechanic', 'activate')} from the graveyard")
+        return f"Could not {_verb} {action.get('card', '?')}"
 
     elif action_type == "activate":
         perm_name = action.get("permanent")

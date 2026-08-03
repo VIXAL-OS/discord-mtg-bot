@@ -1426,7 +1426,16 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
         if not card:
             exile_card = player.find_card(actual_card_name, Zone.EXILE)
             if exile_card and (exile_card.id in player.playable_from_exile
-                               or getattr(exile_card, '_adventure_exiled', False)):
+                               or getattr(exile_card, '_adventure_exiled', False)
+                               or getattr(exile_card, '_foretold', False)):
+                # Aug 3: the human path is the THIRD executor and got none of
+                # the wave-3a mechanics — the documented two-paths divergence.
+                if (getattr(exile_card, '_foretold', False)
+                        and getattr(exile_card, '_foretold_turn', None) == game.turn_number):
+                    await ctx.send(f"❌ **{exile_card.name}** was foretold this "
+                                   f"turn — you can cast it from your next turn "
+                                   f"(CR 702.143b)")
+                    return
                 card = exile_card
                 from_exile = True
 
@@ -1434,34 +1443,67 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
         from_graveyard = False
         if not card and player.playable_from_graveyard:
             for c in player.graveyard:
-                if c.id in player.playable_from_graveyard and c.name.lower() == actual_card_name.lower():
-                    card = c
-                    from_graveyard = True
-                    player.graveyard.remove(c)
-                    player.playable_from_graveyard.remove(c.id)
-                    # Pay escape exile cost if applicable
-                    if c.oracle_text:
-                        from mtg.helpers import parse_escape_cost
-                        _esc = parse_escape_cost(c.oracle_text)
-                        if _esc:
-                            _esc_cost, exile_count = _esc
-                            # Charge the escape cost, and let the ETB see that
-                            # it WAS escaped (Kroxa's "sacrifice it unless it
-                            # escaped" had no producer for this at all).
-                            c._escape_cost = _esc_cost
-                            c._was_escaped = True
-                            exiled_names = []
-                            for _ in range(exile_count):
-                                if player.graveyard:
-                                    exiled = player.graveyard.pop()
-                                    player.exile.append(exiled)
-                                    exiled_names.append(exiled.name)
-                            print(f"[ESCAPE] Casting {c.name} from graveyard, exiling {exile_count}: {', '.join(exiled_names)}")
-                        else:
-                            print(f"[FLASHBACK] Casting {c.name} from graveyard via flashback")
-                    else:
-                        print(f"[FLASHBACK] Casting {c.name} from graveyard via flashback")
-                    break
+                if c.id not in player.playable_from_graveyard:
+                    continue
+                # Match a SPLIT HALF name too (an aftermath half is offered
+                # and cast under the half's name), and resolve a full-name
+                # graveyard cast to the aftermath half — the only half
+                # castable from there. Mirrors both AI executors.
+                _matched_half = None
+                if c.name.lower() != actual_card_name.lower():
+                    for _i, _sname in enumerate(getattr(c, 'split_names', []) or []):
+                        if _sname.lower() == actual_card_name.lower():
+                            _matched_half = _i
+                            break
+                    if _matched_half is None:
+                        continue
+                from mtg.helpers import (aftermath_half_index,
+                                         parse_escape_cost,
+                                         pay_jump_start_discard)
+                if _matched_half is None:
+                    _matched_half = aftermath_half_index(c)
+                # CR 601.2g: costs are all-or-nothing — refuse before paying
+                # anything if the graveyard is too short for escape, or the
+                # hand too empty for jump-start.
+                _esc_pre = parse_escape_cost(c.oracle_text or '')
+                if _esc_pre and len(player.graveyard) - 1 < _esc_pre[1]:
+                    await ctx.send(f"❌ **{c.name}** needs {_esc_pre[1]} other "
+                                   f"cards in your graveyard to escape — you "
+                                   f"have {len(player.graveyard) - 1}")
+                    return
+                from mtg.helpers import has_jump_start as _has_js
+                if _has_js(c.oracle_text or '') and not any(
+                        x is not c for x in player.hand):
+                    await ctx.send(f"❌ **{c.name}** needs a card to discard "
+                                   f"for jump-start — your hand is empty")
+                    return
+                card = c
+                if _matched_half is not None:
+                    c.cast_as_split_half = _matched_half
+                from_graveyard = True
+                player.graveyard.remove(c)
+                player.playable_from_graveyard.remove(c.id)
+                # Jump-start's additional discard (CR 702.132a).
+                pay_jump_start_discard(game, player, c)
+                _esc = parse_escape_cost(c.oracle_text or '')
+                if _esc:
+                    _esc_cost, exile_count = _esc
+                    # Charge the escape cost, and let the ETB see that it WAS
+                    # escaped (Kroxa's "sacrifice it unless it escaped" had no
+                    # producer for this at all).
+                    c._escape_cost = _esc_cost
+                    c._was_escaped = True
+                    exiled_names = []
+                    for _ in range(exile_count):
+                        if player.graveyard:
+                            exiled = player.graveyard.pop()
+                            player.exile.append(exiled)
+                            exiled_names.append(exiled.name)
+                    print(f"[ESCAPE] Casting {c.name} from graveyard, exiling "
+                          f"{exile_count}: {', '.join(exiled_names)}")
+                else:
+                    print(f"[GRAVEYARD-CAST] Casting {c.name} from graveyard")
+                break
 
         # If not in hand/exile, check command zone (commander / signature spell)
         if not card and game.format in COMMAND_ZONE_FORMATS:
@@ -1549,7 +1591,19 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
             if from_exile:
                 player.exile.remove(card)
                 player.hand.append(card)
-                player.playable_from_exile.remove(card.id)
+                # GUARDED, like the land branch above says it must be: a card
+                # castable from exile need not be on this list at all — an
+                # adventure half never is, and neither is a foretold card —
+                # so the bare remove() raised ValueError on the human path.
+                if card.id in player.playable_from_exile:
+                    player.playable_from_exile.remove(card.id)
+                card._adventure_exiled = False
+                if getattr(card, '_foretold', False):
+                    # CR 702.143b: cast for the foretell cost (the timing gate
+                    # ran at the exile scan above).
+                    card._foretold = False
+                    card._face_down = False
+                    card._cast_via_foretell = True
 
             # If from graveyard (flashback/escape), move to hand for cast_spell_async
             if from_graveyard and card not in player.hand:

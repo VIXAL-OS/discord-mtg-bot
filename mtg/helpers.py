@@ -1433,6 +1433,88 @@ def pay_jump_start_discard(game, player, card):
     return [worst]
 
 
+# ---------------------------------------------------------------------------
+# Aug 3, 2026 — COST MODIFICATION: affinity (CR 702.41) and converge
+# (CR 702.100). Both live on the SPELL being cast rather than on some other
+# permanent, which is why neither fits compute_cost_reduction (that scans the
+# battlefield for permanents saying "spells you cast cost less").
+# ---------------------------------------------------------------------------
+
+# "Affinity for X" — the printed forms across all of Scryfall are a card type
+# ("artifacts"), a supertype+type ("snow lands"), a subtype ("Equipment",
+# "Elves", "Gates", "Foods"), or a basic land type ("Forests"). The reminder
+# text always spells out the same rule: "This spell costs {1} less to cast for
+# each <X> you control."
+_AFFINITY_RE = re.compile(r'\baffinity for ([a-z][a-z\' ]*)', re.IGNORECASE)
+
+
+def parse_affinity(oracle_text):
+    """The "for X" phrase of a printed Affinity keyword, lowercased, or None.
+
+    Uses the shared own-keyword guard, so a card that GRANTS affinity —
+    "The next spell you cast this turn has affinity for artifacts" (Urza's
+    +1) — does not report affinity for itself.
+    """
+    clause = _own_keyword_clause(oracle_text, 'affinity')
+    if clause is None:
+        return None
+    match = re.match(r"\s*for\s+([a-z][a-z' ]*)", clause, re.IGNORECASE)
+    return match.group(1).strip().lower() if match else None
+
+
+def _affinity_matches(permanent, phrase: str) -> bool:
+    """Does `permanent` count toward "affinity for <phrase>"?
+
+    Matches the whole phrase against the type line, singularising the plural
+    the keyword always prints ("snow lands" -> "snow land", "artifacts" ->
+    "artifact"). Every word must appear, which is what makes the compound
+    forms work: "snow lands" needs BOTH the snow supertype and the land type,
+    so a snow artifact and a non-snow land each correctly fail.
+    """
+    type_line = (getattr(permanent, 'type_line', '') or '').lower()
+    if not type_line:
+        return False
+    words = [w[:-1] if len(w) > 3 and w.endswith('s') else w
+             for w in phrase.split()]
+    return all(w in type_line for w in words if w)
+
+
+def compute_affinity_reduction(player, card):
+    """(amount, phrase) for a card with Affinity, else (0, None).
+
+    CR 702.41a — "this spell costs {1} less to cast for each <X> you
+    control". The caller must still clamp to the generic portion present
+    (CR 601.2f); like every other reduction it can never eat a colored pip,
+    which is what stops Icebreaker Kraken ({10}{U}{U}) from ever costing less
+    than {U}{U}.
+    """
+    phrase = parse_affinity(getattr(card, 'oracle_text', '') or '')
+    if not phrase:
+        return 0, None
+    battlefield = (player.active_battlefield()
+                   if hasattr(player, 'active_battlefield')
+                   else getattr(player, 'battlefield', []) or [])
+    return sum(1 for p in battlefield
+               if p is not card and _affinity_matches(p, phrase)), phrase
+
+
+# Converge counts COLORS of mana spent (CR 702.100a). Colorless is not a
+# color, so {C} and generic mana paid by a colorless source never count.
+_REAL_COLORS = ('W', 'U', 'B', 'R', 'G')
+
+
+def colors_spent_count(card) -> int:
+    """How many distinct colors of mana were spent casting `card`.
+
+    The mana engine already resolves each tapped source to ONE committed
+    color (the June-10 OR-dual fix); this reads the set it recorded. Returns
+    0 when nothing was recorded, which is the safe direction — a converge
+    spell then does the least it can rather than inventing colors.
+    """
+    return len([c for c in (getattr(card, '_colors_spent', None) or ())
+                if c in _REAL_COLORS])
+
+
 def spell_face_for_gates(card):
     """The card, or a synthetic Card for the split HALF being cast.
 

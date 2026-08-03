@@ -516,6 +516,11 @@ class Card:
     # pipeline reads _cast_via_miracle exactly as it reads _cast_via_madness.
     _miracle_cost: str = field(default="", repr=False, compare=False)
     _cast_via_miracle: bool = field(default=False, repr=False, compare=False)
+    # Converge (CR 702.100a): the distinct COLORS of mana actually spent
+    # casting this spell, recorded by the mana engine at payment time. The
+    # engine already resolves each tapped source to one committed color, so
+    # this is that set — not the colors the cost merely asked for.
+    _colors_spent: tuple = field(default=(), repr=False, compare=False)
     _declared_graveyard_target_id: Optional[str] = field(default=None, repr=False, compare=False)
     _declared_graveyard_target_owner: str = field(default="", repr=False, compare=False)
     _imprinted_card_id: Optional[str] = field(default=None, repr=False, compare=False)
@@ -1802,6 +1807,10 @@ class Player:
     # GameEngine.draw_cards (the draw choke point) and reset with the other
     # per-turn counters at turn advance.
     cards_drawn_this_turn: int = 0
+    # Converge (CR 702.100a): colors committed by the most recent successful
+    # tap_sources_for_cost. Read once by the cost stage and stamped onto the
+    # spell as Card._colors_spent.
+    _last_colors_spent: tuple = field(default=(), repr=False, compare=False)
 
     # ---- Transient runtime state (reset/derived during play; NOT serialized) ----
     # Same convention as Card: declare runtime flags, don't staple
@@ -3053,6 +3062,14 @@ class Player:
             self._pending_tap_damage_msgs.append(
                 f"🩸 {self.name} pays {phyrexian_life_cost} life for Phyrexian "
                 f"mana (life: {max(0, self.life)})")
+
+        # Converge (CR 702.100a) needs the COLORS actually spent — the engine
+        # has already resolved each tapped source to exactly one committed
+        # color, so record that set (plus any colors taken from the floating
+        # pool) for the cost stage to stamp onto the spell.
+        _spent = {c for c in committed_color.values() if c in 'WUBRG'}
+        _spent |= {c for c in (pool_spent or {}) if c in 'WUBRG'}
+        self._last_colors_spent = tuple(sorted(_spent))
 
         _pool_note = (f" (+{sum(pool_spent.values())} from floating pool)"
                       if pool_spent else '')

@@ -903,7 +903,8 @@ def _compute_alt_costs(engine, game: GameState, player: Player, card: Card,
     raw_reduction = 0
     _red_sources: List[str] = []
     if pay_mana:
-        from mtg.helpers import compute_cost_increase, compute_cost_reduction
+        from mtg.helpers import (compute_affinity_reduction,
+                                 compute_cost_increase, compute_cost_reduction)
         _from_gy = card.id in (getattr(player, 'playable_from_graveyard', None) or [])
         cost_increase, _inc_sources = compute_cost_increase(game, player, card)
         if cost_increase:
@@ -911,6 +912,17 @@ def _compute_alt_costs(engine, game: GameState, player: Player, card: Card,
                   f"{', '.join(_inc_sources)}")
         raw_reduction, _red_sources = compute_cost_reduction(
             player, card, from_graveyard=_from_gy)
+        # Affinity (CR 702.41a) is a reduction printed on the SPELL rather
+        # than on another permanent, so it is computed separately and then
+        # joins the same budget — including the CR 601.2f clamp below, which
+        # is what stops Icebreaker Kraken ({10}{U}{U}) ever costing less than
+        # its two blue pips however many snow lands are out.
+        _aff_amt, _aff_phrase = compute_affinity_reduction(player, card)
+        if _aff_amt:
+            raw_reduction += _aff_amt
+            _red_sources.append(f"affinity for {_aff_phrase} (x{_aff_amt})")
+            print(f"[AFFINITY] {card.name}: -{_aff_amt} generic "
+                  f"({_aff_amt} {_aff_phrase} you control)")
 
     total_cost = effective_cmc + additional_cost + cost_increase
     x_value_chosen = 0
@@ -1261,6 +1273,12 @@ def _pay_costs(engine, game: GameState, player: Player, card: Card,
             return False, f"Not enough mana to cast {cast_name} (needs {effective_cmc}{tax_note} = {total_cost} total)", []
         # Track mana paid for X spell calculations
         card._mana_paid = total_cost
+        # Converge (CR 702.100a): hand the colors the engine actually
+        # committed to the spell, for its template to count.
+        card._colors_spent = tuple(getattr(player, '_last_colors_spent', ()) or ())
+        if card._colors_spent:
+            print(f"[CONVERGE] {card.name}: colors spent = "
+                  f"{'/'.join(card._colors_spent)}")
 
     # Buyback's non-mana form (CR 702.26a — Forbid's "Discard two cards"),
     # paid HERE rather than in the cost stage so a cast that dies at the mana
