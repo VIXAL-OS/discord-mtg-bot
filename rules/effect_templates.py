@@ -5060,6 +5060,105 @@ class EffectTemplateLibrary:
                          "playable this turn"),
             action_generator=self._gen_stromkirk_occultist,
         ))
+        def _gen_mycoloth_etb(ctrl, opp, ctx):
+            """Devour 2 (CR 702.81): "As this creature enters, you may
+            sacrifice any number of creatures. It enters with twice that many
+            +1/+1 counters on it."
+
+            Devour did not exist, so Mycoloth entered with ZERO counters — and
+            his whole payoff is "create a Saproling for EACH +1/+1 counter",
+            which a generic token pattern was resolving as a flat ONE token
+            forever. He was very nearly a dead card in the deck built around
+            him.
+
+            v1 choice, deliberately conservative: devour only TOKENS. Eating
+            real cards for counters is a genuine cost and a strategic call
+            this engine has no model for, but feeding spare tokens to Mycoloth
+            IS the card's line — and he converts each one into a permanent
+            Saproling engine, so it is close to pure profit.
+            """
+            fodder = [c for c in (ctx.get('controller_battlefield') or [])
+                      if getattr(c, 'is_token', False)
+                      and c is not ctx.get('_source_card')
+                      and 'creature' in (getattr(c, 'type_line', '') or '').lower()]
+            if not fodder:
+                return [{"action": "no_action",
+                         "reason": "Devour 2 — no expendable tokens to sacrifice"}]
+            actions = []
+            for token in fodder:
+                actions.append({"action": "sacrifice_permanent", "player": ctrl,
+                                "preferred_card": token.name,
+                                "only_preferred": True,
+                                "source": "Mycoloth (devour 2)",
+                                "reason": "devoured"})
+            actions.append({"action": "add_counters", "card": "self",
+                            "counter_type": "+1/+1",
+                            "amount": 2 * len(fodder)})
+            return actions
+
+        def _gen_mycoloth_upkeep(ctrl, opp, ctx):
+            """"At the beginning of your upkeep, create a 1/1 green Saproling
+            creature token for each +1/+1 counter on Mycoloth." A generic
+            token pattern was making exactly ONE regardless."""
+            source = ctx.get('_source_card')
+            counters = 0
+            if source is not None:
+                try:
+                    counters = int((getattr(source, 'counters', {}) or {})
+                                   .get('+1/+1', 0) or 0)
+                except (TypeError, ValueError, AttributeError):
+                    counters = 0
+            if counters <= 0:
+                return [{"action": "no_action",
+                         "reason": "Mycoloth has no +1/+1 counters — no Saprolings"}]
+            return [{"action": "create_token", "player": ctrl,
+                     "name": "Saproling", "power": 1, "toughness": 1,
+                     "types": "Creature — Saproling", "colors": ["G"],
+                     "count": counters}]
+
+        self._add_card("mycoloth", EffectTemplate(
+            name="Mycoloth",
+            description="Devour 2 — sacrifice spare tokens for twice that many +1/+1 counters",
+            action_generator=_gen_mycoloth_etb,
+        ))
+        self._add_card("mycoloth upkeep", EffectTemplate(
+            name="Mycoloth",
+            description="At the beginning of your upkeep, create a Saproling for each +1/+1 counter",
+            action_generator=_gen_mycoloth_upkeep,
+        ))
+
+        def _gen_werewolf_pack_leader(ctrl, opp, ctx):
+            """Pack tactics (CR 207.2c ability word): "Whenever this creature
+            attacks, IF you attacked with creatures with total power 6 or
+            greater this combat, draw a card."
+
+            The condition was ignored — a generic "whenever this attacks,
+            draw a card" pattern matched and drew EVERY combat, which is free
+            card advantage the card does not have. Same shape as the wave-2
+            ability-word conditions (delirium, morbid, metalcraft), and the
+            reason ability words need a consumer rather than a pattern.
+            """
+            total = 0
+            for perm in (ctx.get('controller_battlefield') or []):
+                if not getattr(perm, 'attacking', False):
+                    continue
+                try:
+                    total += int(getattr(perm, 'power', 0) or 0)
+                except (TypeError, ValueError):
+                    pass
+            if total < 6:
+                return [{"action": "no_action",
+                         "reason": (f"Pack tactics not met — attacking total "
+                                    f"power {total}, needs 6")}]
+            return [{"action": "draw_cards", "player": ctrl, "amount": 1}]
+
+        self._add_attack_card("werewolf pack leader", EffectTemplate(
+            name="Werewolf Pack Leader",
+            description=("Pack tactics — draw a card if you attacked with "
+                         "creatures of total power 6 or greater"),
+            action_generator=_gen_werewolf_pack_leader,
+        ))
+
         self._add_attack_card("drana, liberator of malakir", EffectTemplate(
             name="Drana, Liberator of Malakir",
             description=("Drana deals combat damage to a player: put a +1/+1 "
