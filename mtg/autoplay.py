@@ -239,6 +239,7 @@ async def _resolve_combat(cog, ctx, game: GameState):
                                "— extra combats in live games are a known "
                                "engine gap)_")
                 game._additional_combats = 0
+                game._extra_combat_untaps = 0
             post_combat = await cog.engine.continue_claude_post_combat(game)
             post_combat = cog._sanitize_action_bullets(post_combat)
             if post_combat:
@@ -554,6 +555,24 @@ async def _claude_extra_combats(cog, thread, game: GameState) -> None:
         game._in_extra_combat = True
         await cog._autoplay_send(
             thread, f"⚔️ **Additional Combat Phase #{combat_round}!**")
+        # CR 603.7 (Aug 2 batch-14, R-M3): apply any "at the beginning of
+        # that combat, untap all creatures you control" rider Moraug
+        # scheduled when it granted this phase. Running it at landfall
+        # time (the old behavior) untapped nothing, because land drops
+        # happen before the turn's real combat.
+        if getattr(game, '_extra_combat_untaps', 0) > 0:
+            game._extra_combat_untaps -= 1
+            _untapped = [c.name for c in claude_p.battlefield
+                         if c.is_creature(game=game) and c.tapped]
+            for _c in claude_p.battlefield:
+                if _c.is_creature(game=game) and _c.tapped:
+                    _c.tapped = False
+            print(f"[EXTRA-COMBAT] Untapped {len(_untapped)} creature(s) at "
+                  f"the start of the additional combat: {_untapped}")
+            if _untapped:
+                await cog._autoplay_send(
+                    thread, f"↪️ Untapped {len(_untapped)} creature(s) for "
+                    f"the additional combat.")
         game.set_phase(Phase.DECLARE_ATTACKERS,
                        via="autoplay:claude_extra_combat")
         game.attackers = []
@@ -655,6 +674,7 @@ async def _claude_extra_combats(cog, thread, game: GameState) -> None:
               f"granted mid-extra-combat (loop-protection cap — one "
               f"consumption pass per turn)")
     game._additional_combats = 0
+    game._extra_combat_untaps = 0
 
 
 async def _advance_phase_with_display(cog, thread, game: GameState):
@@ -1115,6 +1135,24 @@ async def _autoplay_human_turn(cog, thread, game: GameState, player_idx: int):
         # turn", CR 603.4) reads this flag to decline in extra combats.
         game._in_extra_combat = True
         await cog._autoplay_send(thread, f"⚔️ **Additional Combat Phase #{combat_round}!**")
+        # CR 603.7 (Aug 2 batch-14, R-M3): apply any "at the beginning of
+        # that combat, untap all creatures you control" rider Moraug
+        # scheduled when it granted this phase. Running it at landfall
+        # time (the old behavior) untapped nothing, because land drops
+        # happen before the turn's real combat.
+        if getattr(game, '_extra_combat_untaps', 0) > 0:
+            game._extra_combat_untaps -= 1
+            _untapped = [c.name for c in player.battlefield
+                         if c.is_creature(game=game) and c.tapped]
+            for _c in player.battlefield:
+                if _c.is_creature(game=game) and _c.tapped:
+                    _c.tapped = False
+            print(f"[EXTRA-COMBAT] Untapped {len(_untapped)} creature(s) at "
+                  f"the start of the additional combat: {_untapped}")
+            if _untapped:
+                await cog._autoplay_send(
+                    thread, f"↪️ Untapped {len(_untapped)} creature(s) for "
+                    f"the additional combat.")
 
         # Reset to declare attackers (fresh list — same staleness class as
         # the main declare site above)
@@ -1203,6 +1241,7 @@ async def _autoplay_human_turn(cog, thread, game: GameState, player_idx: int):
               f"granted mid-extra-combat (loop-protection cap — one consumption "
               f"pass per turn)")
     game._additional_combats = 0
+    game._extra_combat_untaps = 0
 
     # Advance to MAIN2 if we're stuck in combat phases
     if game.phase not in [Phase.MAIN2, Phase.END, Phase.CLEANUP] and not game.ended:

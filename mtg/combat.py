@@ -428,19 +428,29 @@ def resolve_combat_damage(rules, game: GameState) -> List[str]:
     damaged_entries = getattr(game, '_combat_damage_to_creature', [])
     if damaged_entries and not game.ended:
         from mtg.triggers import scan_damaged_creature
-        for source_card, damaged, dmg_amount in damaged_entries:
-            _damaged_owner = next(
-                (p for p in game.players if damaged in p.battlefield), None)
-            _src_owner = next(
-                (p for p in game.players
-                 if any(c.id == getattr(source_card, 'id', None)
-                        for c in p.battlefield)),
-                None)
-            if _src_owner is None and _damaged_owner is not None:
-                # The source died mid-combat (FS trades) — in 2-player
-                # combat the dealer's controller is the other player.
-                _src_owner = next(p for p in game.players
-                                  if p is not _damaged_owner)
+        for entry in damaged_entries:
+            # Aug 2 batch-14 audit (I-1): entries carry the source's
+            # controller resolved at ACCUMULATION time (the subscriber),
+            # because at drain time both the source and the damaged creature
+            # can already be dead — the old drain-time lookups both failed
+            # for Obliterator-vs-four-blockers and the deterministic edict
+            # never ran. Drain-time resolution kept only as the fallback.
+            source_card, damaged, dmg_amount = entry[0], entry[1], entry[2]
+            _src_owner = entry[3] if len(entry) > 3 else None
+            if _src_owner is None:
+                _damaged_owner = next(
+                    (p for p in game.players if damaged in p.battlefield),
+                    None)
+                _src_owner = next(
+                    (p for p in game.players
+                     if any(c.id == getattr(source_card, 'id', None)
+                            for c in p.battlefield)),
+                    None)
+                if _src_owner is None and _damaged_owner is not None:
+                    # The source died mid-combat (FS trades) — in 2-player
+                    # combat the dealer's controller is the other player.
+                    _src_owner = next(p for p in game.players
+                                      if p is not _damaged_owner)
             messages.extend(scan_damaged_creature(
                 rules, game, damaged, dmg_amount, _src_owner))
         game._combat_damage_to_creature = []

@@ -3728,6 +3728,15 @@ class GameState:
     # never grant the NEXT player a phantom extra combat (the stale-value
     # leak the sweep exists for).
     _additional_combats: int = field(default=0, repr=False, compare=False)
+    # Aug 2 2026 (batch-14 audit, R-M3): pending "at the beginning of that
+    # combat, untap all creatures you control" riders on granted extra
+    # combats (Moraug, Fury of Akoum). CR 603.7 — the untap belongs to the
+    # START of the granted combat, not to the landfall trigger that granted
+    # it; running it inline untapped 0 creatures every time (land drops
+    # happen in a main phase, before anything has attacked) and the extra
+    # combat then had no eligible attackers. Consumed one-per-phase by the
+    # extra-combat loops; reset alongside _additional_combats.
+    _extra_combat_untaps: int = field(default=0, repr=False, compare=False)
     # Aug 2 2026 (batch-13 audit): True while the Moraug consumption loop is
     # running an ADDITIONAL combat phase. Karlach, Fury of Avernus's trigger
     # carries an intervening-if ("if it's the first combat phase of the

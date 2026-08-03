@@ -95,10 +95,33 @@ class TestEmissionSpine:
         """The second async funnel — structural, it needs a real cascade to run."""
         import mtg.triggers
         src = inspect.getsource(mtg.triggers)
-        anchor = src.index("_check_cast_triggers(engine, game, caster, found_card)")
-        window = src[max(0, anchor - 800):anchor]
-        assert "events.emit(events.CARD_CAST" in window, (
+        anchor = src.index("_check_cast_triggers(\n                        engine, game, caster, found_card)")
+        window = src[max(0, anchor - 900):anchor]
+        assert 'events.emit(events.CARD_CAST' in window and 'via="cascade"' in window, (
             "the cascade free-cast lost its CARD_CAST emit")
+
+    def test_cascade_fires_cast_triggers_before_resolving(self):
+        """CR 601.2i / 603.3 — Aug 2 batch-14 (R-L1, CRITICAL).
+
+        The cascaded card is CAST, so "whenever a player casts" triggers go
+        on the stack above it and resolve FIRST. The fire used to sit after
+        the whole resolution block, and the opponent-cast scan walks a LIVE
+        battlefield: a cascaded Assassin's Trophy destroyed the Eidolon of
+        the Great Revel that should have triggered on it, the scan then
+        found nothing, and the dropped 2 damage flipped the winner of
+        game_1533407568360112128 (the caster was at 1 life).
+        """
+        import mtg.triggers
+        src = inspect.getsource(mtg.triggers)
+        fire = src.index("_check_cast_triggers(\n                        engine, game, caster, found_card)")
+        resolve = src.index('[CASCADE-SPELL] Tier 1.5 resolved')
+        enters = src.index('→ **{found_card.name}** enters the battlefield')
+        assert fire < resolve, (
+            "cascade must fire cast-triggers BEFORE resolving the spell's "
+            "own effect, or the effect can remove the triggering permanent")
+        assert fire < enters, (
+            "same for the creature branch — the permanent must not be on "
+            "the battlefield before its own cast triggers are collected")
 
     def test_sync_bridge_emits(self):
         """suspend / Etali / free-cast moves / legacy sync cast (7ba7ad6)."""

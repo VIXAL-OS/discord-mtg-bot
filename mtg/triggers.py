@@ -852,8 +852,39 @@ def _spell_matches_cast_trigger(engine, sentence_lower: str, card: Card,
     return True
 
 
+# Aug 2 batch-14 audit (I-4): a battlefield permanent's SUSPEND reminder text
+# ("At the beginning of your upkeep, remove a time counter") describes the
+# card while it is EXILED — the suspend machinery in advance_phase owns that,
+# not the battlefield upkeep scan. Mox Tantalite is a plain mana rock once it
+# resolves, and it queued a Tier-3 drain every single upkeep, each one
+# reporting "no state change" (15 wasted calls in batch 15334 — the #3
+# escalation of the batch).
+#
+# Strip ONLY the suspend clause. Cumulative upkeep, echo, vanishing and
+# fading also state their triggers in reminder text and are REAL for a
+# battlefield permanent, so a blanket paren-strip would silently delete four
+# working mechanics. Anchoring on the literal keyword keeps them safe.
+#
+# Module-level so the predicate is SHARED with its tests rather than mirrored
+# by them (a mirrored copy passes regardless of what production does).
+_SUSPEND_REMINDER_RE = re.compile(
+    r'suspend\s*\d*\s*[—\-–]?\s*(?:\{[^}]*\})*\s*\([^)]*\)')
+
+
+def has_battlefield_upkeep_trigger(oracle_text: str) -> bool:
+    """Whether a permanent ON THE BATTLEFIELD has an upkeep trigger."""
+    lowered = (oracle_text or "").lower()
+    if "upkeep" not in lowered:
+        return False
+    scan = _SUSPEND_REMINDER_RE.sub(' ', lowered)
+    return ("at the beginning of your upkeep" in scan
+            or "at the beginning of each upkeep" in scan
+            or "at the beginning of each player's upkeep" in scan)
+
+
 def queue_unhandled_combat_damage(game: GameState, attacker: Card,
-                                  attacker_owner: Player, damage_amount: int) -> None:
+                                  attacker_owner: Player, damage_amount: int,
+                                  sentence: str = "") -> None:
     """Queue an unmatched "deals combat damage to a player" trigger for the
     async Tier-3 drain.
 
@@ -876,11 +907,16 @@ def queue_unhandled_combat_damage(game: GameState, attacker: Card,
     # July 30 batch-9 audit: split on newlines too — a keyword line ends with
     # a newline, not a period, so the old period-only split glued "Flying,
     # trample" onto the front of every extracted trigger sentence.
-    sentence = next(
-        (s.strip() for para in oracle.split('\n') for s in para.split('.')
-         if 'combat damage to a player' in s.lower()
-         or 'combat damage to an opponent' in s.lower()),
-        oracle.strip())
+    # Aug 2 batch-14 audit (I-1): a caller with a DIFFERENT trigger shape
+    # (scan_damaged_creature's "deals damage to this creature") passes its own
+    # sentence — the extraction below only knows the damage-to-a-player shape,
+    # so its fallback was the raw oracle, printing "Trample" as the trigger.
+    if not sentence:
+        sentence = next(
+            (s.strip() for para in oracle.split('\n') for s in para.split('.')
+             if 'combat damage to a player' in s.lower()
+             or 'combat damage to an opponent' in s.lower()),
+            oracle.strip())
     print(f"[COMBAT-TRIGGER-UNHANDLED] {attacker.name}: {sentence[:120]}")
     engine = getattr(game, '_rules_engine', None)
     engine = getattr(engine, 'engine_ref', None) if engine is not None else None
@@ -889,7 +925,7 @@ def queue_unhandled_combat_damage(game: GameState, attacker: Card,
         return
     engine._queue_async_trigger(
         game, attacker, sentence, "combat_damage", attacker_owner.name,
-        context=(f"{attacker.name} dealt {damage_amount} combat damage to a player"),
+        context=(f"{attacker.name} dealt {damage_amount} damage"),
     )
 
 
@@ -940,8 +976,12 @@ def scan_damaged_creature(rules, game: GameState, damaged: Card,
     else:
         print(f"[DAMAGED-TRIGGER-UNHANDLED] {damaged.name}: "
               f"{_deffect[:100]}")
+        # Aug 2 batch-14 audit (I-1): pass the matched trigger sentence — the
+        # queue's own extraction only knows the damage-to-a-player shape and
+        # fell back to the raw oracle ("Trample" printed as the trigger).
         queue_unhandled_combat_damage(
-            game, damaged, _damaged_owner or game.players[0], dmg_amount)
+            game, damaged, _damaged_owner or game.players[0], dmg_amount,
+            sentence=f"Whenever a source deals damage to this creature, {_deffect}")
     return msgs
 
 
@@ -1149,6 +1189,34 @@ async def _check_cast_triggers(engine, game: GameState, caster: Player, card: Ca
                 )
                 print(f"[CASCADE-SPELL] {card.name} cascade found {found_card.name} (CMC {found_card.cmc}, type: {found_card.type_line})")
 
+                # CR 702.85a — cascade puts the card on the stack AS A CAST
+                # SPELL, so "whenever a player casts" triggers fire NOW, above
+                # it, and resolve BEFORE it (CR 601.2i / 603.3).
+                #
+                # Aug 2 batch-14 audit (R-L1, CRITICAL): this fire used to sit
+                # AFTER the whole resolution block below, so the cascaded
+                # spell's own effect had already mutated the battlefield by
+                # the time the opponent-cast scan ran — and that scan walks a
+                # LIVE battlefield list. In game_1533407568360112128 a
+                # cascaded Assassin's Trophy destroyed the Eidolon of the
+                # Great Revel that should have triggered on it; the scan then
+                # found nothing and the 2 damage never happened. The caster
+                # was at 1 life, so the dropped trigger flipped the winner.
+                # The main cast path has always had this ordering
+                # (mtg/spells.py — cast triggers, then _dispatch_resolution);
+                # only cascade's free-cast mini-pipeline was inverted.
+                events.emit(events.CARD_CAST, game, card=found_card,
+                            caster=caster, via="cascade", engine=engine)
+                try:
+                    cascade_cast_msgs = await _check_cast_triggers(
+                        engine, game, caster, found_card)
+                    if cascade_cast_msgs:
+                        messages.extend(cascade_cast_msgs)
+                except Exception as e:
+                    print(f"[CASCADE-CAST-TRIGGER] Error firing cast-triggers "
+                          f"for {found_card.name}: {e}")
+                    maybe_reraise(e)
+
                 # "Cast" the found card for free
                 if found_card.is_creature():
                     # Put creature onto battlefield
@@ -1342,19 +1410,11 @@ async def _check_cast_triggers(engine, game: GameState, caster: Player, card: Ca
                         if _should_emit_resolve_hint(game, f"cascade:{found_card.name}"):
                             messages.append(f"  (use `!judge resolve {found_card.name}` if effect needed)")
 
-                # CR 702.85a — cascade puts the spell on the stack as if cast.
-                # Fire cast-triggers (Eidolon, Rhystic Study, Esper Sentinel, prowess,
-                # magecraft, recursive cascade) for the cascaded-into card.
-                # Pub/sub slice 4a: CARD_CAST shadow emit for the cascade
-                # free-cast (the second of the two live cast funnels).
-                events.emit(events.CARD_CAST, game, card=found_card,
-                            caster=caster, via="cascade", engine=engine)
-                try:
-                    cascade_cast_msgs = await _check_cast_triggers(engine, game, caster, found_card)
-                    if cascade_cast_msgs:
-                        messages.extend(cascade_cast_msgs)
-                except Exception as e:
-                    print(f"[CASCADE-CAST-TRIGGER] Error firing cast-triggers for {found_card.name}: {e}")
+                # (The CARD_CAST emit + cast-trigger fire that used to live
+                # here moved ABOVE the resolution block — see the CR 601.2i
+                # note at the cascade announcement. Firing it here let the
+                # cascaded spell's own effect remove the triggering permanent
+                # before the scan ever saw it.)
             else:
                 messages.append(f"🌀 **Cascade {cascade_num + 1}/{cascade_count}** — no valid card found (exiled {len(exiled_cards)} cards)")
 
@@ -3528,12 +3588,7 @@ def _check_upkeep_triggers_sync(engine, game: GameState) -> Tuple[List[str], Lis
         if "upkeep" not in oracle_lower:
             continue
 
-        has_upkeep_trigger = (
-            "at the beginning of your upkeep" in oracle_lower or
-            "at the beginning of each upkeep" in oracle_lower or
-            "at the beginning of each player's upkeep" in oracle_lower
-        )
-        if not has_upkeep_trigger:
+        if not has_battlefield_upkeep_trigger(card.oracle_text):
             continue
 
         handled = False
@@ -4630,14 +4685,24 @@ def _handle_land_etb(engine, game: GameState, player: Player, card: Card) -> Lis
             if not hasattr(game, '_additional_combats'):
                 game._additional_combats = 0
             game._additional_combats += 1
-            # Moraug also untaps each creature you control (they get +X/+0)
-            untapped_count = 0
-            for c in player.battlefield:
-                if c.is_creature() and c.tapped:
-                    c.tapped = False
-                    untapped_count += 1
-            messages.append(f"⚔️ {perm.name}: Landfall! Additional combat phase #{game._additional_combats} this turn. Untapped {untapped_count} creatures.")
-            print(f"[LANDFALL] {perm.name}: additional combat #{game._additional_combats}, untapped {untapped_count} creatures")
+            # Aug 2 batch-14 audit (R-M3, CRITICAL): Moraug's untap is a
+            # DELAYED effect — "At the beginning of THAT combat, untap all
+            # creatures you control" (CR 603.7). It used to run inline here,
+            # at landfall-resolution time, which is during a MAIN phase
+            # BEFORE anything has attacked: it untapped 0 creatures every
+            # single time (twice in game_1533396690713968842, and the extra
+            # combats it granted then found "No attackers" because the
+            # turn's real attackers were still tapped). The consumption
+            # loops now apply this at the start of each extra combat, which
+            # is the whole point of the card.
+            game._extra_combat_untaps += 1
+            messages.append(
+                f"⚔️ {perm.name}: Landfall! Additional combat phase "
+                f"#{game._additional_combats} this turn "
+                f"(creatures untap when it begins).")
+            print(f"[LANDFALL] {perm.name}: additional combat "
+                  f"#{game._additional_combats}, untap scheduled for the "
+                  f"start of that combat")
 
         # Roil Elemental: landfall → gain control of target creature
         elif "roil elemental" in perm.name.lower() or (
@@ -5237,7 +5302,28 @@ def _accumulate_combat_damage_subscriber(game, source=None, target=None,
             return
         game._combat_damage_to_player.append((source, src_owner, amount))
     elif target_kind == "creature":
-        game._combat_damage_to_creature.append((source, target, amount))
+        # Aug 2 batch-14 audit (I-1): resolve the SOURCE's controller at
+        # ACCUMULATION time, exactly like the player branch above — at drain
+        # time both the source AND the damaged creature can be dead (Phyrexian
+        # Obliterator blocked by four creatures died alongside his blockers;
+        # the drain's died-mid-combat fallback keys off the damaged creature's
+        # battlefield presence, so every lookup failed, the deterministic
+        # edict branch was skipped, and Rick sacrificed 3 of an owed 6 via a
+        # lossy Tier-3 queue). At damage time both objects are still on the
+        # battlefield, so this lookup is reliable.
+        src_owner = next(
+            (p for p in game.players
+             if any(c.id == getattr(source, 'id', None)
+                    for c in p.battlefield)),
+            None)
+        if src_owner is None:
+            _dmg_owner = next(
+                (p for p in game.players if target in p.battlefield), None)
+            if _dmg_owner is not None:
+                src_owner = next(
+                    (p for p in game.players if p is not _dmg_owner), None)
+        game._combat_damage_to_creature.append(
+            (source, target, amount, src_owner))
 
 
 events.subscribe(events.COMBAT_DAMAGE_DEALT, _accumulate_combat_damage_subscriber)

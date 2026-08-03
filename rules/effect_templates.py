@@ -1709,15 +1709,32 @@ class EffectTemplateLibrary:
         # indestructible, damage prevention) but covers the common case.
         # Default toughness=99 (unknown) so we do NOT assume lethal when context is missing.
         def _searing_blood_gen(ctrl, opp, ctx):
-            target = ctx.get('best_opponent_creature')
-            # No opposing creature — Searing Blood requires a creature target,
-            # so the spell fizzles and deals NO damage to the player.
-            # (Without this guard, the template emitted a creature-damage
-            # action with sentinel "target" name, then the second clause
-            # incorrectly delivered 3 damage to the player.)
+            # Aug 2 batch-14 audit (R-L2): "target creature" is UNRESTRICTED —
+            # the caster's own creatures are legal targets (CR 601.2c), so
+            # reporting "no legal target" while the caster had two Monastery
+            # Swiftspears out (game_1533407568360112128) was wrong, and it
+            # burned the card and {R}{R} for nothing. A DECLARED target is
+            # honored wherever it lives; the auto-pick deliberately stays
+            # opponent-only, because blind-targeting your own creature with
+            # this card is self-harm (2 damage to it, then 3 to YOU when it
+            # dies) — declining is the strategically correct default, and
+            # the plan-validate hold is what should stop the cast upstream.
+            target = ctx.get('explicit_target_name') or ctx.get('best_opponent_creature')
             if not target:
                 return [{"action": "no_action",
                          "reason": "Searing Blood: requires a creature target — no legal target"}]
+            # A declared own-creature target flips the second clause's victim
+            # to the caster, so resolve the controller from the board rather
+            # than assuming the opponent.
+            _tgt_ctrl = opp
+            _game = ctx.get('_game')
+            _ctrl_player = ctx.get('_controller_player')
+            if _game is not None and _ctrl_player is not None:
+                from mtg.helpers import names_match
+                if any(names_match(c.name, target)
+                       for c in getattr(_ctrl_player, 'battlefield', []) or []):
+                    _tgt_ctrl = ctrl
+            opp = _tgt_ctrl
             target_toughness = ctx.get('target_toughness', 99)
             target_damage = ctx.get('target_damage_marked', 0)
             remaining_toughness = target_toughness - target_damage
@@ -8457,8 +8474,19 @@ class EffectTemplateLibrary:
             return [{"action": "no_action",
                      "reason": "Battalion: fewer than three attackers"}]
         name = ctx.get('attacking_name') or "Boros Elite"
-        return [{"action": "pump_all_creatures", "player": ctrl,
-                 "card": name, "power": 2, "toughness": 2}]
+        # Aug 2 batch-14 audit (I-3): pump THE ATTACKING INSTANCE, not every
+        # copy of the name — in 4-of formats a second non-attacking Boros
+        # Elite on the battlefield also got +2/+2 (game_1533407519135764574:
+        # [LAYERS-PT] showed #6138 AND #5616 modified with one Elite
+        # declared). The handler honors include_id when provided; name-only
+        # stays as the fallback for callers with no card object in ctx.
+        _atk_obj = ctx.get('_attacking_creature')
+        _action = {"action": "pump_all_creatures", "player": ctrl,
+                   "card": name, "power": 2, "toughness": 2}
+        _atk_id = getattr(_atk_obj, 'id', '') if _atk_obj is not None else ''
+        if _atk_id:
+            _action["include_id"] = _atk_id
+        return [_action]
 
     def _gen_underworld_sentinel_attack(self, ctrl, opp, ctx) -> List[Dict]:
         """Underworld Sentinel attacks: exile target creature card from your

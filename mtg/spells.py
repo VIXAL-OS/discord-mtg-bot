@@ -496,15 +496,35 @@ def _validate_cast(engine, game: GameState, player: Player, card: Card,
     # fallback then illegally countered the spell (Stifle beat a Scroll Rack
     # SPELL, game_1529988360263827656). CR 601.2c: no legal target, no cast.
     # Voidslime/Disallow/Tale's End name spells in their text and skip this.
+    # Aug 2 batch-14 audit (R-B2): Tale's End counters abilities OR a
+    # "legendary spell" — its text CONTAINS "spell", so the bare
+    # `'spell' not in oracle_lower` test skipped the gate entirely and it
+    # was castable at any spell at all (game_1533396649471246497 targeted a
+    # non-legendary Apex Devastator). The resolution-time legendary check in
+    # mtg/actions.py caught it and fizzled, so the card + mana were burned
+    # for nothing — CR 601.2c says there was no legal target to begin with.
+    # Voidslime/Disallow really do counter "target spell" unrestricted and
+    # must keep skipping this gate.
     if ('counter target' in oracle_lower
             and ('activated' in oracle_lower or 'triggered' in oracle_lower)
-            and 'spell' not in oracle_lower):
+            and ('spell' not in oracle_lower
+                 or 'legendary spell' in oracle_lower)):
         stack_has_ability = any(
             not getattr(entry, 'is_spell', True)
             for entry in getattr(game, 'stack', []))
-        if not stack_has_ability and not card.is_creature():
-            return ((False, f"{card.name} requires a target activated or "
-                            f"triggered ability on the stack", []),
+        stack_has_legal_spell = False
+        if 'legendary spell' in oracle_lower:
+            stack_has_legal_spell = any(
+                getattr(entry, 'is_spell', True)
+                and 'legendary' in (getattr(getattr(entry, 'card', None),
+                                            'type_line', '') or '').lower()
+                for entry in getattr(game, 'stack', []))
+        if (not stack_has_ability and not stack_has_legal_spell
+                and not card.is_creature()):
+            _need = ("a target activated or triggered ability"
+                     if 'legendary spell' not in oracle_lower
+                     else "a target ability or LEGENDARY spell")
+            return ((False, f"{card.name} requires {_need} on the stack", []),
                     _cast_from_graveyard, target)
 
     # July 20 audit (Diabolic Intent): "As an additional cost to cast this
@@ -1683,6 +1703,18 @@ async def _await_stack_window(engine, game: GameState, player: Player,
                 player.library.insert(0, card)
                 print(f"[STACK] {card.name} was countered — put on top of its owner's library")
                 effect_messages.append(f"❌ **{card.name}** is put on top of its owner's library!")
+            elif _countered_to == "hand":
+                # Aug 2 batch-14 audit (R-B1): Remand — "put it into its
+                # owner's hand instead of into that player's graveyard".
+                # There was no "hand" branch at all, so even a template that
+                # asked for it could not have routed here; Remand had no
+                # template either and fell through to the generic counter,
+                # sending the spell to the graveyard (its sibling Memory
+                # Lapse, which redirects to library_top, has worked for
+                # months — this is the same shape, one destination over).
+                player.hand.append(card)
+                print(f"[STACK] {card.name} was countered — returned to its owner's hand")
+                effect_messages.append(f"❌ **{card.name}** is returned to its owner's hand!")
             elif _countered_to == "exile":
                 # July 23 audit (#8): Force of Negation — "exile it instead of
                 # putting it into its owner's graveyard" (CR 614 zone-change
@@ -2806,6 +2838,41 @@ async def _dispatch_resolution(engine, game: GameState, player: Player,
                 effect_messages.append(f"🛡️ {card.name} enters with {_n} shield counter(s)")
                 print(f"[SHIELD-COUNTER] {card.name} enters with {_n} shield counter(s)")
 
+        # Aug 2 batch-14 audit (I-2): "enters with a <type> counter on it for
+        # each time it was kicked" (Everflowing Chalice). This is a STATIC
+        # "enters with" clause, not a trigger — _is_self_etb_trigger_paragraph
+        # correctly refuses it, so the ETB-template block never runs and the
+        # corners-pass name-keyed template was unreachable from the cast
+        # funnel: all four Chalice casts in batch 15334 paid their multikicker
+        # ({0}{2}{2}{2}{2}{2} in one game) and entered with ZERO counters.
+        # Same funnel convention as the X-counter / shield-counter parses
+        # above — but deliberately OUTSIDE their `is_creature()` gate, since
+        # the whole multikicker-counter family is artifacts (Chalice) and
+        # creatures (Apex Hawks) alike. Reads the _kicked_times truth stamped
+        # by _compute_alt_costs when the cost was actually PAID.
+        if card.oracle_text:
+            _mk_m = re.search(
+                r'enters (?:the battlefield )?with (?:a|an|one) ([\w+/]+) '
+                r'counter on it for each time it was kicked',
+                card.oracle_text.lower())
+            if _mk_m:
+                _k = int(getattr(card, '_kicked_times', 0) or 0)
+                if _k > 0:
+                    _ctype = _mk_m.group(1)
+                    card.counters[_ctype] = card.counters.get(_ctype, 0) + _k
+                    effect_messages.append(
+                        f"⭕ {card.name} enters with {_k} {_ctype} counter(s)")
+                    print(f"[MULTIKICKER] {card.name} enters with {_k} "
+                          f"{_ctype} counter(s)")
+                # Consume the stamp either way: a flicker re-entry is a NEW
+                # object that was never kicked (CR 400.7), and the noncast
+                # funnel's name-keyed template reads ctx['kicked_times'], so
+                # a stale stamp would resurrect the counters. A re-cast
+                # re-stamps in _compute_alt_costs. (reset_battlefield_state
+                # can't clear it for us — the CAST path calls that at entry,
+                # upstream of this read.)
+                card._kicked_times = 0
+
         # Initialize planeswalker loyalty
         if card.is_planeswalker():
             base_loyalty = 0
@@ -2952,6 +3019,26 @@ async def _dispatch_resolution(engine, game: GameState, player: Player,
                                         _any_action_executed = True
                                         if msg:
                                             effect_messages.append(msg)
+                                        # Aug 2 batch-14 audit (R-M1, CRITICAL):
+                                        # Phyrexian Processor was charged TWICE
+                                        # (26 → 16 → 6 in game_1533396690713968842).
+                                        # The "pay any amount of life" prompt above
+                                        # queues a pending_action unconditionally,
+                                        # and the name-keyed template ALSO pays via
+                                        # lose_life — then autoplay drained the
+                                        # still-pending prompt and paid the same
+                                        # auto-computed amount again (its
+                                        # _processor_paid guard is written nowhere
+                                        # but inside that drain, so it never saw
+                                        # the template's payment). The template IS
+                                        # the payment; retire the prompt.
+                                        if (action.get("action") == "lose_life"
+                                                and isinstance(getattr(game, 'pending_action', None), dict)
+                                                and game.pending_action.get('type') == 'pay_life_etb'
+                                                and game.pending_action.get('card_id') == card.id):
+                                            print(f"[ETB] {card.name}: life payment resolved by "
+                                                  f"template — clearing the pending prompt")
+                                            game.pending_action = None
                                     except Exception as e:
                                         print(f"[TEMPLATE] Action failed for {card.name}: {action} — {e}")
 

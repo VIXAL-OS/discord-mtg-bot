@@ -79,6 +79,90 @@ def _record_strategy_memo_result(game: GameState, accepted: bool) -> None:
 # file use it directly.
 from mtg.legal_actions import _check_color_castable, castable_labels  # noqa: E402
 
+# Aug 2 batch-14: module-level so the density gate is testable — the
+# nested _sanitize_memo closure reads this tuple; tests import it and
+# run the same >=2-hit rule against observed leak samples.
+_MEMO_SCAFFOLDING_MARKERS = (
+    'concrete board observation',
+    '500 characters',
+    'tight prose',
+    'do not narrate',
+    'hard limit',
+    'hard cap',
+    'maximum 500',
+    'naming specific cards',
+    'stable strategy reference',
+    'win conditions by archetype',
+    'prioritize in this order',
+    'threat evaluation',
+    'interaction rules',
+    'combat math:',
+    'control deck play',
+    # May 25 audit (F12): V4-Pro pattern caught in 1100/1501 memos —
+    # "Win condition: We need to output exactly four labeled lines.
+    # Let's assess the current board state to fill each line."
+    # The prefill guarantees `has_win`, so the positive-validator
+    # was useless against this. These markers catch the scaffolding
+    # paraphrase shape so density-check trips first.
+    'we need to output',
+    'we need to produce',
+    'we need to generate',
+    'we need to fill',
+    "let's assess",
+    "let's parse",
+    "let's fill",
+    "let's evaluate",
+    'labeled lines',
+    'labeled format',
+    'four labeled',
+    'fill each line',
+    'fill each label',
+    'to fill each',
+    # June 10 audit: 238 of 543 ACCEPTED memos carried
+    # scaffolding hidden BEHIND the required label — "Win
+    # condition: We need to produce exactly 4 lines as
+    # instructed: …" passed positive-validation (has the
+    # label) and density (those phrases weren't markers).
+    'we need to produce',
+    'we need to output',
+    'we must produce',
+    'as instructed',
+    'exactly 4 lines',
+    'exactly four lines',
+    'four lines as',
+    'the format is',
+    'per the format',
+    'the required format',
+    # Aug 2 batch-14 (strategist A/B): V4-Flash thinking mode
+    # leaks its format meta-reasoning in TELEGRAPHIC style —
+    # "We need produce exactly four lines. Need obey labels.
+    # Need analyze board." — the "to"-less variants matched
+    # NO existing marker, so 113/365 accepted memos were this
+    # garbage (each displacing the previous GOOD memo, which
+    # a nuke would have kept). All variants observed live in
+    # batch 15334.
+    'we need produce',
+    'we need output',
+    'we need answer',
+    'we need respond',
+    'we need craft',
+    'we need write',
+    'need obey',
+    'need craft',
+    'need analyze',
+    'need assess',
+    'need be specific',
+    'need exact',
+    'need output',
+    'need produce',
+    'four lines',
+    'under 800',
+    '800 chars',
+    'exact format',
+    'we are claude',
+    'we have game context',
+)
+
 
 # May 7 audit: helper for surfacing legality context to the actor's prompt.
 # The AI repeatedly planned Counterspell/Mana Leak/Dovin's Veto when the
@@ -1096,58 +1180,7 @@ RULES (apply to your output, not your reasoning):
                 # other passes — if it trips, nuke the memo entirely and let
                 # the caller fall back to the previous turn's memo.
                 lowered = (raw or '').lower()
-                scaffolding_markers = (
-                    'concrete board observation',
-                    '500 characters',
-                    'tight prose',
-                    'do not narrate',
-                    'hard limit',
-                    'hard cap',
-                    'maximum 500',
-                    'naming specific cards',
-                    'stable strategy reference',
-                    'win conditions by archetype',
-                    'prioritize in this order',
-                    'threat evaluation',
-                    'interaction rules',
-                    'combat math:',
-                    'control deck play',
-                    # May 25 audit (F12): V4-Pro pattern caught in 1100/1501 memos —
-                    # "Win condition: We need to output exactly four labeled lines.
-                    # Let's assess the current board state to fill each line."
-                    # The prefill guarantees `has_win`, so the positive-validator
-                    # was useless against this. These markers catch the scaffolding
-                    # paraphrase shape so density-check trips first.
-                    'we need to output',
-                    'we need to produce',
-                    'we need to generate',
-                    'we need to fill',
-                    "let's assess",
-                    "let's parse",
-                    "let's fill",
-                    "let's evaluate",
-                    'labeled lines',
-                    'labeled format',
-                    'four labeled',
-                    'fill each line',
-                    'fill each label',
-                    'to fill each',
-                    # June 10 audit: 238 of 543 ACCEPTED memos carried
-                    # scaffolding hidden BEHIND the required label — "Win
-                    # condition: We need to produce exactly 4 lines as
-                    # instructed: …" passed positive-validation (has the
-                    # label) and density (those phrases weren't markers).
-                    'we need to produce',
-                    'we need to output',
-                    'we must produce',
-                    'as instructed',
-                    'exactly 4 lines',
-                    'exactly four lines',
-                    'four lines as',
-                    'the format is',
-                    'per the format',
-                    'the required format',
-                )
+                scaffolding_markers = _MEMO_SCAFFOLDING_MARKERS
                 hits = sum(1 for m in scaffolding_markers if m in lowered)
                 if hits >= 2:
                     print(f"[STRATEGIST] Density-check nuke: {hits} scaffolding "

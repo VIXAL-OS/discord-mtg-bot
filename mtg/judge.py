@@ -51,6 +51,49 @@ from mtg.helpers import response_text
 from mtg.models import Card, Player, GameState
 
 
+# May 20 audit: the AI sometimes attaches a synthetic combat description to a
+# `resolve` action after a cast — game_1506604518098342018 planned
+# ["resolve: Craterhoof enters, pump team for +10/+10 trample. Attack for
+# lethal."], which fired in MAIN1 as a sorcery-speed -999 life event and
+# violated CR 510.1 (combat damage happens only in the combat damage step).
+#
+# Aug 2 batch-14 audit (R-M2, CRITICAL): the guard used to match the
+# SUBSTRING "combat damage" anywhere, including text that merely REFERENCES
+# combat damage as the CONDITION of a future replacement effect. Jeska,
+# Thrice Reborn's [0] — "Choose target creature. Until your next turn, if
+# that creature would deal combat damage to one of your opponents, it deals
+# triple that damage to that player instead" — is a legal sorcery-speed
+# loyalty ability (CR 606.3) that deals nothing at all when it resolves, so
+# it was refused on EVERY activation in every game and the card was
+# permanently non-functional. A conditional/future framing sets damage up;
+# it does not deal it now.
+#
+# Module-level (not inline in resolve_effect) so the predicate is shared with
+# its tests rather than mirrored by them — a mirrored copy passes no matter
+# what production does, which is how the first version of this pin survived
+# its own mutant.
+_SETS_UP_FUTURE_DAMAGE_RE = re.compile(
+    r'\b(?:if|whenever|when)\b[^.]*\bwould deal\b|\buntil your next turn\b')
+_COMBAT_SHAPED_RE = re.compile(
+    r'\b(attack(?:s|ing|ed)?|combat damage|deals? lethal|'
+    r'deal lethal damage|for lethal)\b')
+
+
+def is_combat_shaped_resolve(effect_description: str) -> bool:
+    """Whether a free-text resolve claims to deal combat damage RIGHT NOW.
+
+    True  -> refuse it (CR 510.1): "Attack for lethal", "deals combat damage
+             to each opponent".
+    False -> allow it: text that merely sets up or references future combat
+             damage ("until your next turn, if that creature would deal
+             combat damage ... instead").
+    """
+    lowered = (effect_description or "").lower()
+    if _SETS_UP_FUTURE_DAMAGE_RE.search(lowered):
+        return False
+    return bool(_COMBAT_SHAPED_RE.search(lowered))
+
+
 async def ask_judge(rules, game: GameState, question: str, context: str = "") -> str:
     """
     Ask Claude to rule on a complex interaction.
@@ -510,9 +553,7 @@ async def resolve_effect(rules, game: GameState, effect_description: str,
     # lethal."] that fired in MAIN1 as a sorcery-speed -999 life event,
     # violating CR 510.1 (combat damage only in the combat damage step).
     # Same pattern killed Rick in game_1506604605327282176:741-749.
-    effect_lower_guard = (effect_description or "").lower()
-    if re.search(r'\b(attack(?:s|ing|ed)?|combat damage|deals? lethal|deal lethal damage|for lethal)\b',
-                 effect_lower_guard):
+    if is_combat_shaped_resolve(effect_description):
         print(f"[RESOLVE-REFUSED] Combat-shaped resolve rejected: '{effect_description[:80]}' — "
               f"combat damage must happen in the combat damage step (CR 510.1)")
         # June 10 audit: emit the player-facing hint once per source per game.

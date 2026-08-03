@@ -1302,6 +1302,25 @@
       ]
     },
     {
+      "key": "remand",
+      "name": "Remand",
+      "event": "etb",
+      "description": "Counter target spell; return it to its owner's hand, then draw a card",
+      "actions": [
+        {
+          "action": "counter_spell",
+          "player": "$controller",
+          "target": "stack_top",
+          "countered_to": "hand"
+        },
+        {
+          "action": "draw_cards",
+          "player": "$controller",
+          "amount": 1
+        }
+      ]
+    },
+    {
       "key": "mesmeric glare",
       "name": "Mesmeric Glare",
       "event": "etb",
