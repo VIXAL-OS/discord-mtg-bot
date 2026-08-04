@@ -2341,6 +2341,148 @@ def has_metalcraft(player) -> bool:
     ) >= 3
 
 
+# "You may cast <types> spells from the top of your library" (Augur of
+# Autumn's coven half, Vizier of the Menagerie, Elven Chorus, ...).
+#
+# The phrase must be CONTIGUOUS. Every cascade card in the game contains both
+# "from the top of your library" (in its exile clause) and "You may cast" (in
+# its free-cast clause), so a two-substring test grants library casting to 32
+# cards that have no such ability. Requiring "cast ... spells from the top of
+# your library" as one phrase matches 27 cards across all of Scryfall and
+# ZERO cascade cards (swept 2026-08-03).
+LIBRARY_TOP_CAST_RE = re.compile(
+    r'you may cast ([a-z, \-]*?)spells? from the top of your library',
+    re.IGNORECASE)
+
+# Grant clauses this cannot honour, and therefore declines outright rather
+# than granting a free version of (the `damage_source_colors` convention —
+# an unmodelled rider is a reason to decline, not to guess).
+_LIBRARY_TOP_UNMODELED = (
+    'by removing',          # Falco Spara — additional cost
+    'by sacrificing',       # Into the Pit — additional cost
+    'in addition to paying',
+    'once each turn',       # Cemetery Illuminator, Johann — per-turn limit
+)
+
+# Class levels (CR 716.2) are not modelled anywhere in this engine, so a
+# level-gated grant would read as unconditional and active from the moment
+# the Class hits the battlefield. Ranger Class puts "You may cast creature
+# spells from the top of your library" under "{3}{G}: Level 3" — a separate
+# LINE, so neither the ability-word stripper nor the "as long as" check can
+# see the gate. A Class is therefore declined outright: the condition is
+# real and we cannot evaluate it.
+_CLASS_LEVEL_TYPE = 'class'
+
+
+def library_top_cast_types(player, game=None) -> set:
+    """Card types this player may cast off the TOP of their library.
+
+    v1 recognises the `creature` grant only — the family the live inventory
+    needs (Augur of Autumn) — while parsing the type phrase generically so
+    widening to the subtype grants (Goblin, Dragon, Merfolk...) is a change
+    to one comparison rather than a new parser.
+
+    A CONDITIONAL grant is honoured only when the condition is one we model.
+    Augur's is coven, which `has_coven` computes; anything else (Summoning
+    Materia's "as long as this Equipment is attached to a creature") declines,
+    so an unmodelled condition can never read as permanently satisfied.
+    """
+    types = set()
+    for perm in (getattr(player, 'battlefield', []) or []):
+        if getattr(perm, '_phased_out', False):
+            continue
+        if _CLASS_LEVEL_TYPE in (getattr(perm, 'type_line', '') or '').lower():
+            continue  # level-gated (CR 716.2) — see _CLASS_LEVEL_TYPE
+        for line in ((getattr(perm, 'oracle_text', '') or '')
+                     .split('\n')):
+            m = LIBRARY_TOP_CAST_RE.search(line)
+            if not m:
+                continue
+            low = line.lower()
+            if any(marker in low for marker in _LIBRARY_TOP_UNMODELED):
+                continue
+            # Ability words ("Coven — ", "Solved — ") are flavour, CR 207.2c.
+            body = re.sub(r'^\s*[A-Za-z\' ]+\s*[—–-]\s*', '', line).strip()
+            if body.lower().startswith('as long as'):
+                if 'creatures with different powers' in low:
+                    if not has_coven(player, game):
+                        continue
+                else:
+                    continue  # condition we do not model — decline
+            phrase = (m.group(1) or '').strip().lower()
+            if phrase == 'creature':
+                types.add('creature')
+    return types
+
+
+# The Vivid MANA ability (Bloom Tender, Faeburrow Elder). Matched on the
+# phrase rather than a card name — the `_all_lands_are_all_basic_types`
+# convention, since a name substring is how the Coldsteel-Heart-vs-Painter's-
+# Servant misfire happened.
+#
+# BOTH halves are required, ON THE SAME LINE. "for each color among permanents
+# you control" alone is a COUNTING phrase that nine cards share, and seven of
+# them have no mana ability at all: Soul of Ravnica and Mondo Gecko draw cards
+# with it, Conqueror's Flail pumps with it, Wildvine Pummeler and Rime Chill
+# reduce a cost with it. The first version of this predicate tested the count
+# alone and turned an EQUIPMENT into a mana source producing one mana of every
+# colour — mana from nothing (CR 106.1), and an underpaid cast (CR 601.2g).
+# Same-line scoping is what makes it the two cards this exists for; Chromatic
+# Orrery is the case that proves per-line matters, since it has a real mana
+# ability AND the counting phrase, on different lines.
+VIVID_COUNT_PHRASE = 'for each color among permanents you control'
+VIVID_ADD_PHRASE = 'add one mana of that color'
+
+
+def is_vivid_mana_line(oracle_text: str) -> bool:
+    """Does this card have the Vivid MANA ability (not merely the count)?"""
+    for line in (oracle_text or '').split('\n'):
+        low = line.lower()
+        if VIVID_COUNT_PHRASE in low and VIVID_ADD_PHRASE in low:
+            return True
+    return False
+
+
+def colors_among_permanents(player) -> set:
+    """The distinct colors among permanents this player controls (CR 202.2).
+
+    Never `color_identity` — identity also absorbs colors from oracle text,
+    which would make a colorless artifact with a {B} activated ability count
+    as a black permanent (the same reason `spell_colors_from_cost` exists).
+
+    Which of the two branches runs, stated accurately because it is easy to
+    get backwards: `deck_loader` stamps `card.colors` from Scryfall on EVERY
+    loaded card, so in production the `colors` branch handles essentially
+    everything and the mana-cost fallback only catches permanents Scryfall
+    calls colorless. Scryfall's `colors` IS the CR 202.2 colour including
+    colour indicators, so it is strictly better than the cost where the two
+    differ (Dryad Arbor is green with no mana cost). The fallback is what
+    tests and hand-built Cards hit, and what covers a token created without
+    an explicit colour list.
+
+    Consequence worth stating because it looks like a bug and is not: BASIC
+    LANDS ARE COLORLESS and contribute nothing. Bloom Tender alongside four
+    basics sees only its own {1}{G} and taps for a single {G} — which is the
+    printed, correct behavior.
+
+    Painter's Servant-style color-ADDING effects (rules/layers.py Layer 5)
+    are not consulted; there is no effective-colors accessor reachable from
+    Player, and over-counting here would over-advertise mana. Under-counting
+    is the safe direction (see `one_tap_mana_total`).
+    """
+    out = set()
+    for perm in (getattr(player, 'battlefield', []) or []):
+        if getattr(perm, '_phased_out', False):
+            continue
+        tok_colors = getattr(perm, 'colors', None)
+        if tok_colors:
+            out.update(str(c).upper() for c in tok_colors
+                       if str(c).upper() in ('W', 'U', 'B', 'R', 'G'))
+            continue
+        out |= spell_colors_from_cost(getattr(perm, 'mana_cost', '') or '')
+    return out
+
+
 def has_morbid(game) -> bool:
     """A creature died this turn.
 
@@ -2353,9 +2495,16 @@ def has_morbid(game) -> bool:
 
 
 def has_coven(player, game=None) -> bool:
-    """You control three or more creatures with DIFFERENT powers."""
+    """You control three or more creatures with DIFFERENT powers.
+
+    CR 702.26b: a phased-out permanent is treated as though it does not
+    exist, so it cannot contribute a power. The skip was missing while this
+    predicate had no consumer; the coven grant made it load-bearing.
+    """
     powers = set()
     for c in (getattr(player, 'battlefield', []) or []):
+        if getattr(c, '_phased_out', False):
+            continue
         try:
             if not c.is_creature(game=game) if game is not None else not c.is_creature():
                 continue

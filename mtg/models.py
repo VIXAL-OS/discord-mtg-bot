@@ -33,7 +33,8 @@ from mtg.constants import (
     _KEYWORD_LIST,
 )
 
-from mtg.helpers import get_mdfc_info
+from mtg.helpers import (get_mdfc_info, colors_among_permanents,
+                         is_vivid_mana_line)
 
 # Optional: structured mana cost parser (rules/mana.py)
 try:
@@ -2090,8 +2091,55 @@ class Player:
                 return True
             if 'add {' in text_lower and ('mana' in text_lower or '}' in text_lower):
                 return True
-        
+            # Vivid (Bloom Tender, Faeburrow Elder): "{T}: For each color
+            # among permanents you control, add one mana of that color."
+            # None of the checks above see it — the ability names no mana
+            # SYMBOL, so there is no "add {" and no "{t}: add". Bloom Tender
+            # was therefore absent from untapped_mana_sources entirely and
+            # contributed ZERO mana, in the four-colour deck it ships in.
+            if self._produces_all_colors_at_once(card):
+                return True
+
         return False
+
+    def _produces_all_colors_at_once(self, card) -> bool:
+        """Is this a Vivid-style source whose ONE tap yields every colour it
+        lists SIMULTANEOUSLY, rather than a choice between them?
+
+        This is the distinction the production dict cannot express on its
+        own: `{'W': 1, 'U': 1}` means "two mana, one of each" for an Azorius
+        Signet and "one mana, W or U" for a dual land. Everything downstream
+        assumes the exclusive (dual) reading, which is the conservative one.
+        This predicate is the ONLY thing that flips it, so it must be exact:
+        see `is_vivid_mana_line` for why both halves of the ability are
+        required on one line, and what testing the count alone did.
+        """
+        return is_vivid_mana_line(getattr(card, 'oracle_text', '') or '')
+
+    def _one_tap_output(self, production: Dict[str, int], card=None) -> int:
+        """How much mana ONE tap of this source actually yields.
+
+        June 10 deep-dive (dual-land underpay): a source's one-tap output is
+        the MAX over its colour options, not the sum — "Add {W} or {U}" duals
+        were counted as 2 available mana and the commitment accounting
+        credited both colours from one tap, so spells resolved UNDERPAID by
+        (colours-1) per dual (CR 601.2g). Single-key sources (basics, Sol
+        Ring {'C': 2}) are unchanged.
+
+        The `card` argument is optional and defaults to the old behaviour, so
+        callers that only hold a production dict are bit-identical. Passing
+        the card lets a Vivid source (see `_produces_all_colors_at_once`) sum
+        instead — its colours genuinely arrive together. Both-at-once
+        multi-colour producers WITHOUT that wording ("Add {B}{R}") remain
+        indistinguishable in this model and still under-count by design.
+        """
+        if not production:
+            return 0
+        if len(production) == 1:
+            return next(iter(production.values()))
+        if card is not None and self._produces_all_colors_at_once(card):
+            return sum(production.values())
+        return max(production.values())
     
     def _is_fetch_land(self, card: Card) -> bool:
         """Check if a card is a fetch land (sacrifice to search for a land).
@@ -2302,12 +2350,32 @@ class Player:
             _ch = card.counters.get('charge', 0) if hasattr(card, 'counters') else 0
             return {'C': max(_ch, 0)}
         # === MANA DORKS ===
+        # Vivid (Bloom Tender, Faeburrow Elder): "{T}: For each color among
+        # permanents you control, add one mana of that color." Phrase-matched
+        # so both cards — and any reprint that drops the "Vivid —" ability
+        # word, as Faeburrow Elder's printing does — are covered.
+        #
+        # The old entry here was `name_lower == 'bloom tender' -> {'any': 1}`,
+        # which was DEAD (the card never reached untapped_mana_sources, so
+        # this branch was unreachable) and would have been wrong if it had
+        # run: 'any' claims a colour the card cannot make, and a mono-green
+        # board would have advertised blue mana that the tap then fabricated.
+        # The true set is the colours actually present, which is also why
+        # basics contribute nothing — they are colourless (CR 202.2).
+        #
+        # `is_vivid_mana_line`, not the bare colour-count phrase: this branch
+        # sits ABOVE the oracle-text Add-line scan below, so a loose match
+        # here INTERCEPTS cards that scan already handled correctly. Chromatic
+        # Orrery is the case that proves it — a real {T}: Add {C}{C}{C}{C}{C}
+        # rock that also happens to count colours on another line.
+        if is_vivid_mana_line(card.oracle_text or ''):
+            _vivid = colors_among_permanents(self)
+            return {c: 1 for c in sorted(_vivid)} if _vivid else {'C': 0}
         if name_lower in ('llanowar elves', 'elvish mystic', 'fyndhorn elves'): return {'G': 1}
         if name_lower == 'birds of paradise': return {'any': 1}
         if name_lower == 'noble hierarch': return {'any': 1}
         if name_lower == 'elves of deep shadow': return {'B': 1}
         if name_lower == "avacyn's pilgrim": return {'W': 1}
-        if name_lower == 'bloom tender': return {'any': 1}
         if name_lower == 'deathrite shaman': return {'any': 1}
         if name_lower == 'priest of titania':
             _ec = len([c for c in self.creatures() if 'elf' in (c.type_line or '').lower()])
@@ -2422,7 +2490,10 @@ class Player:
         for src in self.untapped_mana_sources():
             prod = self._get_mana_production(src)
             if prod:
-                total += max(prod.values())
+                # Shared with the payment engine's own accounting — a
+                # re-expressed copy of this rule here is how the ceiling and
+                # the tap could silently disagree.
+                total += self._one_tap_output(prod, src)
         return total
 
     def available_mana_detailed(self) -> Dict[str, int]:
@@ -2860,15 +2931,14 @@ class Player:
         # both-at-once multi-color producers ("Add {B}{R}") are
         # indistinguishable in this production model and now under-count by 1
         # (a slight over-tap — the safe direction).
-        def _one_tap_output(production):
-            if not production:
-                return 0
-            if len(production) == 1:
-                return next(iter(production.values()))
-            return max(production.values())
+        # Extracted to Player._one_tap_output so `one_tap_mana_total` (the
+        # advertisement ceiling) and this (the payment arbiter) can never
+        # drift apart. Callers below that hold no card keep the old
+        # card-less behaviour by omitting the argument.
+        _one_tap_output = self._one_tap_output
 
         # Calculate total available mana
-        total_available = sum(_one_tap_output(p) for _, p in sources)
+        total_available = sum(_one_tap_output(p, c) for c, p in sources)
         total_cost = sum(color_needs.values()) + generic_needed + hybrid_count
         if total_available < total_cost:
             return False
@@ -2908,6 +2978,39 @@ class Player:
             if not remaining_needs:
                 break
             produces = {k: v for k, v in production.items() if v > 0 and k not in ('any', 'C')}
+            # Vivid: one tap yields EVERY listed colour at once, so it can
+            # satisfy several colored pips by itself (Bloom Tender alone pays
+            # {W}{U} on a four-colour board — that is the whole card). Only
+            # tap it if it actually helps; the sort above already puts it
+            # last, so basics are spent first.
+            #
+            # committed_color is deliberately left UNSET: Phase 4 narrows a
+            # committed source to that one colour (the June 10 OR-dual fix),
+            # which for a simultaneous source would throw away the rest.
+            # Leaving it unset keeps the full production, and the Phase 4
+            # settle then floats whatever the cost did not consume.
+            if self._produces_all_colors_at_once(card):
+                _useful = {c: a for c, a in produces.items()
+                           if c in remaining_needs}
+                if not _useful:
+                    continue
+                tapped_cards.add(id(card))
+                # Credit ONLY the colours this cost actually needs.
+                # `mana_produced` is the PAYMENT LEDGER, and the colour check
+                # further down forgives a shortfall whenever total production
+                # exceeds total cost (an 'any'-mana escape hatch). Crediting
+                # every colour inflates that surplus with mana of the WRONG
+                # colours: Bloom Tender alone would have paid {W}{W}, because
+                # its unused {B} and {G} looked like flexible excess. The
+                # unneeded colours are still produced — Phase 4 keeps the full
+                # production dict and floats them.
+                for _c, _amt in _useful.items():
+                    _take = min(_amt, remaining_needs[_c])
+                    mana_produced[_c] = mana_produced.get(_c, 0) + _take
+                    remaining_needs[_c] -= _take
+                    if remaining_needs[_c] <= 0:
+                        del remaining_needs[_c]
+                continue
             # Check if this source produces a color we need
             for color in list(remaining_needs.keys()):
                 if color in produces and remaining_needs[color] > 0:
@@ -3068,6 +3171,26 @@ class Player:
                 if generic_still_needed <= 0:
                     break
                 tapped_cards.add(id(card))
+                # Vivid tapped for generic: every colour arrives, so credit
+                # them all and leave committed_color unset (same reasoning as
+                # the Phase 1 branch — narrowing would discard the rest).
+                if self._produces_all_colors_at_once(card):
+                    # Same ledger discipline as the Phase 1 branch: generic
+                    # accepts any colour, so credit up to the shortfall and
+                    # no further. Over-crediting here would re-open the same
+                    # wrong-colour-surplus hole in the colour check below.
+                    _left = min(_one_tap_output(production, card),
+                                generic_still_needed)
+                    generic_still_needed -= _left
+                    for _c, _amt in sorted(production.items()):
+                        if _left <= 0:
+                            break
+                        if _c == 'any' or _amt <= 0:
+                            continue
+                        _take = min(_amt, _left)
+                        mana_produced[_c] = mana_produced.get(_c, 0) + _take
+                        _left -= _take
+                    continue
                 # June 10: a dual tapped for generic contributes ONE mana of
                 # one color, not one of each (was over-crediting and
                 # under-tapping the rest of the generic requirement).
@@ -3176,6 +3299,20 @@ class Player:
         # pool) for the cost stage to stamp onto the spell.
         _spent = {c for c in committed_color.values() if c in 'WUBRG'}
         _spent |= {c for c in (pool_spent or {}) if c in 'WUBRG'}
+        # A Vivid source has no committed colour by design (it contributes
+        # every colour at once), so it would otherwise be invisible to
+        # converge. Add whatever the settle actually consumed.
+        #
+        # This is NOT purely a no-op elsewhere, despite how it reads. Any
+        # source tapped WITHOUT a committed colour is also newly visible —
+        # in practice the 'any' sources, whose two tap sites never set one.
+        # The Lorwyn Vivid lands (Vivid Grove and friends, no relation to the
+        # ability word) produce {'G': 1, 'any': 1} and previously reported NO
+        # colours spent at all; they now report the one they paid with, which
+        # is the more correct answer for CR 702.100a. Recorded because the
+        # invariant matters to anything that later consumes _last_colors_spent.
+        _spent |= {c for c, v in produced_by_color.items()
+                   if c in 'WUBRG' and v > _excess.get(c, 0)}
         self._last_colors_spent = tuple(sorted(_spent))
 
         _pool_note = (f" (+{sum(pool_spent.values())} from floating pool)"

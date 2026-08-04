@@ -32,7 +32,7 @@ import asyncio, json, random, re
 from typing import Any, Dict, List, Optional, Tuple
 
 from mtg.constants import Phase, Zone, COMMAND_ZONE_FORMATS
-from mtg.helpers import _normalize_pw_ability_idx
+from mtg.helpers import _normalize_pw_ability_idx, library_top_cast_types
 from mtg.models import Card, Player, GameState
 
 # June 10 audit (V31c): failure-indicator phrases for the "Action succeeded:"
@@ -257,6 +257,31 @@ def _validate_plan_mana(engine, game: GameState, player_idx: int, plan: list) ->
                 or getattr(c, '_foretold', False)):
             hand_names.add(c.name.lower())
             _alt_zone_cards[c.name.lower()] = c
+    # The TOP CARD of the library, when something grants casting from there
+    # (Augur of Autumn's coven half). Without this the castable list offers
+    # the card and the plan validator immediately drops it as "not in hand"
+    # — the exact gap that made the alternate-cost mechanics decorative
+    # until July 28.
+    try:
+        _top_types = library_top_cast_types(player, game)
+    except (AttributeError, TypeError):
+        _top_types = set()
+    if _top_types and getattr(player, 'library', None):
+        _top_card = player.library[0]
+        # `not is_land()` matches the offer and all three executors. It is
+        # NOT cosmetic here: hand_names also admits `play_land`, so without
+        # it a Dryad Arbor on top would let a planned land-drop pass
+        # validation, consume the turn's land drop and credit a mana that
+        # never arrives, while every executor still refuses the action.
+        if ('creature' in _top_types
+                and 'creature' in (getattr(_top_card, 'type_line', '') or '').lower()
+                and not _top_card.is_land()):
+            hand_names.add(_top_card.name.lower())
+            # setdefault, not assignment: a graveyard/exile copy of the same
+            # name was registered above and carries the escape/flashback cost
+            # this one does not. Overwriting it would price an alternative-cost
+            # cast at the printed cost in any 4-of format.
+            _alt_zone_cards.setdefault(_top_card.name.lower(), _top_card)
     land_played = player.lands_played_this_turn >= player.max_lands_per_turn
 
     validated = []

@@ -31,6 +31,7 @@ import re
 from typing import Dict, List
 
 from mtg.constants import COMMAND_ZONE_FORMATS
+from mtg.helpers import library_top_cast_types
 
 try:
     from rules.mana import ManaCost
@@ -544,6 +545,30 @@ def castable_entries(game, player, mana_by_color: Dict, any_color_mana: int,
                             add(_entry(label, card.name, "hand",
                                        {"type": "cast", "card": card.name},
                                        ["free_cast"]))
+
+    # Cast from the TOP OF LIBRARY (Augur of Autumn's coven half, Vizier of
+    # the Menagerie, ...). Computed live and never cached: the top card
+    # changes on every draw, mill and scry, so a stale offer would name a
+    # card that is no longer there.
+    #
+    # This lives in castable_entries rather than graveyard_castable_entries
+    # because the coven condition needs `game` for effective power, and that
+    # function takes no game.
+    try:
+        _top_types = library_top_cast_types(player, game)
+    except (AttributeError, TypeError):
+        _top_types = set()
+    if _top_types and getattr(player, 'library', None):
+        _top = player.library[0]
+        _is_creature = 'creature' in (getattr(_top, 'type_line', '') or '').lower()
+        if _is_creature and 'creature' in _top_types and not _top.is_land():
+            _cost = _top.mana_cost or ""
+            if _check_color_castable(_cost, mana_by_color, any_color_mana,
+                                     total_mana):
+                add(_entry(f"{_top.name} ({_cost}) [TOP OF LIBRARY]",
+                           _top.name, "library",
+                           {"type": "cast", "card": _top.name},
+                           ["TOP OF LIBRARY"]))
 
     # Graveyard casts + graveyard activations + adventure/foretold/impulse
     # cards waiting in exile.

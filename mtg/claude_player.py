@@ -1832,8 +1832,14 @@ What is your best play? Respond with a JSON action."""
                     mana_by_color[color] += amt
 
         # Also check mana rocks and other sources
+        # CR 302.6: a summoning-sick creature's {T} mana ability is not
+        # available. untapped_mana_sources() is the authority (it also drops
+        # tapped and non-producing permanents); re-expressing the rule here
+        # is how this loop came to advertise mana the payment engine then
+        # refuses. Lands are excluded because the loop above counted them.
+        _usable_sources = {id(c) for c in player.untapped_mana_sources()}
         for perm in player.battlefield:
-            if not perm.is_land() and not perm.tapped and player._can_produce_mana(perm):
+            if not perm.is_land() and id(perm) in _usable_sources:
                 mana = player._get_mana_production(perm)
                 for color, amt in mana.items():
                     if color == 'any':
@@ -1932,13 +1938,15 @@ What is your best play? Respond with a JSON action."""
         # Apr 30 audit fix #25: AI repeatedly hallucinated graveyard-zone cards
         # as if they were in hand (Momentary Blink 7+ times in one game).
         gy_or_exile_castable = [c for c in castable_cards
-                                if 'FLASHBACK' in c or 'ESCAPE' in c or 'COMPANION' in c]
+                                if 'FLASHBACK' in c or 'ESCAPE' in c or 'COMPANION' in c
+                                or 'TOP OF LIBRARY' in c]
         if gy_or_exile_castable:
             castable_section += (
-                "\nNOTE: cards tagged [FLASHBACK from graveyard], [ESCAPE], or "
-                "[COMPANION] are NOT in your hand. Each can be cast at most ONCE "
-                "this turn (then they move to exile or hand). Don't plan multiple "
-                "casts of the same flashback/escape card."
+                "\nNOTE: cards tagged [FLASHBACK from graveyard], [ESCAPE], "
+                "[COMPANION], or [TOP OF LIBRARY] are NOT in your hand — they "
+                "are castable anyway, so the hand-only rule above does not "
+                "forbid them. Each can be cast at most ONCE this turn (then "
+                "they change zones). Don't plan multiple casts of the same one."
             )
 
         # Bug fix: explicit land-drop-used warning. Deepseek ignores subtle hints like "Lands: 1/1".
@@ -2260,8 +2268,14 @@ Based on this game state, what is your best play?
                     any_color_mana += amt
                 elif color in mana_by_color:
                     mana_by_color[color] += amt
+        # CR 302.6: a summoning-sick creature's {T} mana ability is not
+        # available. untapped_mana_sources() is the authority (it also drops
+        # tapped and non-producing permanents); re-expressing the rule here
+        # is how this loop came to advertise mana the payment engine then
+        # refuses. Lands are excluded because the loop above counted them.
+        _usable_sources = {id(c) for c in player.untapped_mana_sources()}
         for perm in player.battlefield:
-            if not perm.is_land() and not perm.tapped and player._can_produce_mana(perm):
+            if not perm.is_land() and id(perm) in _usable_sources:
                 mana = player._get_mana_production(perm)
                 for color, amt in mana.items():
                     if color == 'any':
@@ -2338,11 +2352,14 @@ Based on this game state, what is your best play?
 
         # Apr 30 audit fix #25: graveyard / exile zone reminder (mirrors decide_action).
         gy_or_exile_castable = [c for c in castable_cards
-                                if 'FLASHBACK' in c or 'ESCAPE' in c or 'COMPANION' in c]
+                                if 'FLASHBACK' in c or 'ESCAPE' in c or 'COMPANION' in c
+                                or 'TOP OF LIBRARY' in c]
         if gy_or_exile_castable:
             castable_section += (
-                "\nNOTE: cards tagged [FLASHBACK from graveyard], [ESCAPE], or "
-                "[COMPANION] are NOT in your hand. Cast each at most ONCE per turn."
+                "\nNOTE: cards tagged [FLASHBACK from graveyard], [ESCAPE], "
+                "[COMPANION], or [TOP OF LIBRARY] are NOT in your hand — they "
+                "are castable anyway, so the hand-only rule above does not "
+                "forbid them. Cast each at most ONCE per turn."
             )
 
         # Build state description (cached)

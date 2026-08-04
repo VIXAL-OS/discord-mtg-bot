@@ -51,7 +51,8 @@ import aiohttp, discord
 from mtg.constants import Phase, Zone, COMMAND_ZONE_FORMATS, PHASE_NAMES
 from mtg.helpers import (_normalize_pw_ability_idx,
                          _resolve_player_or_card_target, coerce_ai_string,
-                         exile_after_resolution_reason, spell_face_for_gates)
+                         exile_after_resolution_reason, library_top_cast_types,
+                         spell_face_for_gates)
 from mtg.models import Card, Player, GameState
 from mtg.util import GameLogger
 
@@ -1561,6 +1562,20 @@ async def _autoplay_execute_action(cog, thread, game: GameState, player_idx: int
                 card = exile_card
                 from_exile = True
 
+        # Cast from the TOP OF LIBRARY (Augur of Autumn's coven half).
+        # Detection only — this file moves a non-hand card into hand AFTER
+        # the pre-cast gates (the engine twin moves before them), so the
+        # actual pop happens further down alongside the exile move.
+        from_library_top = False
+        if not card and getattr(player, 'library', None) and card_name:
+            _top = player.library[0]
+            if (_top.name.lower() == card_name.lower()
+                    and 'creature' in library_top_cast_types(player, game)
+                    and 'creature' in (_top.type_line or '').lower()
+                    and not _top.is_land()):
+                card = _top
+                from_library_top = True
+
         # Apr 30 audit: check graveyard for Snapcaster-granted flashback / native
         # flashback / escape. The Claude AI fast-path checks here at engine.py:2153
         # but the autoplay (Rick) path was missing it, so the AI's "FLASHBACK from
@@ -1771,6 +1786,16 @@ async def _autoplay_execute_action(cog, thread, game: GameState, player_idx: int
                 player.hand.append(card)
             card._cast_from_graveyard = True
 
+        # Top-of-library cast: same zone-membership contract as the two
+        # branches above. The failure rollback below restores index 0.
+        if from_library_top:
+            if card in player.library:
+                player.library.remove(card)
+            if card not in player.hand:
+                player.hand.append(card)
+            print(f"[LIBRARY-TOP] {player.name} casts {card.name} from the "
+                  f"top of the library")
+
         commander_tax = 0
         if from_command_zone:
             commander_tax = card.times_cast_from_command_zone * 2
@@ -1886,6 +1911,15 @@ async def _autoplay_execute_action(cog, thread, game: GameState, player_idx: int
                 player.command_zone.append(card)
             if from_graveyard:
                 _rollback_graveyard_cast()
+            # Put a failed top-of-library cast back on TOP — index 0 is the
+            # card the next draw takes and the card the offer list re-reads.
+            if from_library_top:
+                if card in player.hand:
+                    player.hand.remove(card)
+                if card not in player.library:
+                    player.library.insert(0, card)
+                print(f"[LIBRARY-TOP] {card.name} cast failed — returned to "
+                      f"the top of the library")
             print(f"[AUTOPLAY] cast failed: {msg}")
             # July 20 batch-3 audit: same stash as engine.py's _execute_action
             # cast branch — the None return discards the real reason and

@@ -47,7 +47,8 @@ from mtg.display import GameDisplay
 from mtg.engine import GameEngine
 from mtg.helpers import (_normalize_pw_ability_idx,
                          _resolve_player_or_card_target,
-                         exile_after_resolution_reason)
+                         exile_after_resolution_reason,
+                         library_top_cast_types)
 from mtg.models import Card, Player, GameState, FormatValidator
 from mtg.rules_engine import RulesEngine
 from mtg.util import GameLogger, StdoutTee, StderrTee
@@ -1439,6 +1440,19 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
                 card = exile_card
                 from_exile = True
 
+        # Cast from the TOP OF LIBRARY (Augur of Autumn's coven half). The
+        # human path is the THIRD executor; leaving it out is the documented
+        # two-paths divergence, which this repo has paid for repeatedly.
+        from_library_top = False
+        if not card and getattr(player, 'library', None) and actual_card_name:
+            _top = player.library[0]
+            if (_top.name.lower() == actual_card_name.lower()
+                    and 'creature' in library_top_cast_types(player, game)
+                    and 'creature' in (_top.type_line or '').lower()
+                    and not _top.is_land()):
+                card = _top
+                from_library_top = True
+
         # Bug #28: Check if it's playable from graveyard (Snapcaster flashback, native flashback, escape)
         from_graveyard = False
         if not card and player.playable_from_graveyard:
@@ -1605,6 +1619,14 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
                     card._face_down = False
                     card._cast_via_foretell = True
 
+            # Top of library (Augur's coven half): same zone-membership
+            # contract — cast_spell_async gates on hand membership first.
+            if from_library_top:
+                if card in player.library:
+                    player.library.remove(card)
+                if card not in player.hand:
+                    player.hand.append(card)
+
             # If from graveyard (flashback/escape), move to hand for cast_spell_async
             if from_graveyard and card not in player.hand:
                 player.hand.append(card)
@@ -1696,6 +1718,12 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
                 if from_command_zone and card in player.hand:
                     player.hand.remove(card)
                     player.command_zone.append(card)
+                # Failed top-of-library cast goes back on TOP.
+                if from_library_top:
+                    if card in player.hand:
+                        player.hand.remove(card)
+                    if card not in player.library:
+                        player.library.insert(0, card)
                 await ctx.send(f"⚠️ {msg}")
                 return
         

@@ -44,8 +44,8 @@ from mtg.deck_loader import DeckLoader
 from mtg.helpers import (
     _collapse_repeated_life_gain, _should_emit_resolve_hint,
     _normalize_pw_ability_idx, _resolve_player_or_card_target,
-    exile_after_resolution_reason, get_mdfc_info, note_miracle_on_draw,
-    spell_face_for_gates, try_dredge,
+    exile_after_resolution_reason, get_mdfc_info, library_top_cast_types,
+    note_miracle_on_draw, spell_face_for_gates, try_dredge,
 )
 from mtg.models import Card, Player, GameState, StackEntry, FormatValidator
 from mtg import events
@@ -2917,6 +2917,25 @@ class GameEngine:
                         print(f"[IMPULSE-DRAW] AI casting {c.name} from exile")
                         break
 
+            # Cast from the TOP OF LIBRARY (Augur of Autumn's coven half).
+            # Same pre-move-to-hand contract as the exile branch above:
+            # cast_spell_async gates on zone membership first, so a card
+            # pulled off the library with no home is rejected as "Card not
+            # in hand". The rollback below restores it to library[0].
+            _from_library_top = False
+            if not card and getattr(player, 'library', None) and card_name:
+                _top = player.library[0]
+                if (_top.name.lower() == card_name.lower()
+                        and 'creature' in library_top_cast_types(player, game)
+                        and 'creature' in (_top.type_line or '').lower()
+                        and not _top.is_land()):
+                    card = _top
+                    _from_library_top = True
+                    player.library.pop(0)
+                    player.hand.append(_top)
+                    print(f"[LIBRARY-TOP] AI casting {_top.name} from the top "
+                          f"of the library")
+
             # Bug #28: Check if it's playable from graveyard (Snapcaster flashback, native flashback, escape)
             from_graveyard = False
             _rollback_jump_start = False
@@ -3026,6 +3045,20 @@ class GameEngine:
                 card._cast_from_graveyard = False
                 card.cast_as_split_half = -1
 
+            def _rollback_library_top_cast():
+                """Put a top-of-library cast that never happened back on top.
+
+                Every exit between the pop and a successful cast has to call
+                this or the card is stranded in NO zone — the failure mode
+                that hit escape twice (wave 3a, and again at a sibling exit
+                in batch-9 F4). Restoring to index 0 matters: it is the card
+                the next draw takes and the card the offer list re-reads.
+                """
+                if card in player.hand:
+                    player.hand.remove(card)
+                if card not in player.library:
+                    player.library.insert(0, card)
+
             if _rollback_jump_start:
                 _rollback_graveyard_cast()
                 game._last_cast_failure = (
@@ -3082,6 +3115,10 @@ class GameEngine:
                         _rollback_graveyard_cast()
                         print(f"[GRAVEYARD-CAST] {card.name} blocked pre-cast — "
                               f"rolled back (card + costs restored)")
+                    if _from_library_top:
+                        _rollback_library_top_cast()
+                        print(f"[LIBRARY-TOP] {card.name} blocked pre-cast — "
+                              f"returned to the top of the library")
                     return None
 
                 # [TARGETING] Pre-cast target validation — block AI from casting
@@ -3101,6 +3138,10 @@ class GameEngine:
                             _rollback_graveyard_cast()
                             print(f"[GRAVEYARD-CAST] {card.name} targeting failed "
                                   f"pre-cast — rolled back (card + costs restored)")
+                        if _from_library_top:
+                            _rollback_library_top_cast()
+                            print(f"[LIBRARY-TOP] {card.name} targeting failed "
+                                  f"pre-cast — returned to the top of the library")
                         return None
 
                 # Set X value if AI provided one (Blue Sun's Zenith, etc.)
@@ -3190,6 +3231,10 @@ class GameEngine:
                     elif card.id not in player.playable_from_exile:
                         player.playable_from_exile.append(card.id)
                     print(f"[EXILE-CAST] {card.name} cast failed — returned to exile")
+                if not success and _from_library_top:
+                    _rollback_library_top_cast()
+                    print(f"[LIBRARY-TOP] {card.name} cast failed — returned to "
+                          f"the top of the library")
                 if success:
                     if from_command_zone:
                         card.times_cast_from_command_zone += 1
@@ -4062,6 +4107,27 @@ class GameEngine:
                         "action": "isochron_copy", "player": player.name,
                         "source": perm.name, "target": target_name or ""})
                 if 'add' in effect_lower and ('mana' in effect_lower or '{' in effect_lower):
+                    # Vivid (Bloom Tender, Faeburrow Elder) FIRST: the ability
+                    # names no mana symbol, so the {WUBRGC} scan below finds
+                    # nothing and the card would fall through every branch to
+                    # a generic guess. One tap adds one mana of EACH colour
+                    # among permanents its controller controls.
+                    if player._produces_all_colors_at_once(perm):
+                        _vivid_prod = player._get_mana_production(perm)
+                        _vivid = [c for c, v in _vivid_prod.items()
+                                  if c in 'WUBRG' and v > 0]
+                        if not _vivid:
+                            return (f"{perm.name} produces no mana — "
+                                    f"{player.name} controls no coloured permanents")
+                        perm.tapped = True
+                        for _c in _vivid:
+                            player.mana_pool[_c] = player.mana_pool.get(_c, 0) + 1
+                        _vstr = ''.join(f"{{{c}}}" for c in _vivid)
+                        print(f"[ACTIVATE-MANA] {perm.name}: added {_vstr} "
+                              f"to {player.name}'s pool (Vivid — "
+                              f"{len(_vivid)} colour(s) among permanents)")
+                        return (f"{player.name} activates {perm.name}, "
+                                f"adds {_vstr}")
                     # Try to parse specific colors from oracle text
                     # Signets: "Add {R}{G}" / Talismans: "Add {C}{C}" / Sol Ring: "Add {C}{C}"
                     color_map = {'W': 'W', 'U': 'U', 'B': 'B', 'R': 'R', 'G': 'G', 'C': 'C'}
