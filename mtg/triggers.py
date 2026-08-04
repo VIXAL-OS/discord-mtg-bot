@@ -4112,6 +4112,31 @@ def _check_end_step_triggers_sync(engine, game: GameState) -> Tuple[List[str], L
     active_idx = game.active_player_index
     opponent = game.players[1 - active_idx]
 
+    # IMPENDING (CR 702.166a, Aug 3 2026): "At the beginning of YOUR end step,
+    # remove a time counter from it." Only the active player's, which is what
+    # makes the discount cost real time — a 4-counter Overlord is four of its
+    # controller's turns away from being able to attack. When the last counter
+    # comes off, is_creature stops returning False on its own (it is gated on
+    # counters remaining), so nothing has to un-suppress the type.
+    for perm in list(getattr(active, 'battlefield', []) or []):
+        if not getattr(perm, '_cast_via_impending', False):
+            continue
+        remaining = (perm.counters or {}).get('time', 0)
+        if remaining <= 0:
+            continue
+        perm.counters['time'] = remaining - 1
+        if perm.counters['time'] <= 0:
+            perm.counters.pop('time', None)
+            messages.append(f"⏳ **{perm.name}**'s last time counter is "
+                            f"removed — it becomes a creature")
+            print(f"[IMPENDING] {perm.name}: last time counter removed, "
+                  f"now a creature")
+        else:
+            messages.append(f"⏳ **{perm.name}**: time counter removed "
+                            f"({perm.counters['time']} left)")
+            print(f"[IMPENDING] {perm.name}: {perm.counters['time']} time "
+                  f"counter(s) left")
+
     # Scan ALL players' permanents for end step triggers
     # ("at the beginning of each end step" fires for all players, not just active)
     cards_to_sacrifice = []

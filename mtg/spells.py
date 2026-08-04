@@ -323,6 +323,10 @@ def _validate_cast(engine, game: GameState, player: Player, card: Card,
     # Splice is chosen per cast (CR 702.46a). Stale entries here would replay
     # the previous cast's spliced effects for free on the next one.
     card._spliced_cards = []
+    # Impending likewise (CR 702.166a) — a recast at full price must not
+    # inherit the previous cast's time counters or its type suppression.
+    card._cast_via_impending = False
+    card._impending_counters = 0
 
     # June 11 audit: flashback/escape casts arrive here with the card in the
     # GRAVEYARD (marked playable by the castable-list generator), but this
@@ -751,6 +755,33 @@ def _compute_alt_costs(engine, game: GameState, player: Player, card: Card,
                 print(f"[SPECTACLE] Using spectacle cost {_spec_cost} "
                       f"(CMC {effective_cmc}) instead of {card.mana_cost} "
                       f"(an opponent lost life this turn)")
+
+    # IMPENDING (CR 702.166, Aug 3 2026) — an ALTERNATIVE cost, so it belongs
+    # with the selectors above that REPLACE the mana cost, not with the
+    # kicker family that appends to it.
+    #
+    # v1 gate: take it whenever it is payable and cheaper than the printed
+    # cost. Unlike the other "cheaper is better" selectors this one has a real
+    # downside — the permanent is not a creature until its last time counter
+    # comes off — but the tempo is the point of the card, and a 6-drop you can
+    # deploy on turn 4 as a damage source is the line the card is designed
+    # around. Overlord of the Boilerbilges' "whenever this permanent enters or
+    # attacks" fires either way, because it says PERMANENT, not creature.
+    if pay_mana and not getattr(card, '_cast_via_madness', False):
+        _imp = helpers.parse_impending(card.oracle_text)
+        if _imp:
+            _imp_n, _imp_cost = _imp
+            _imp_ok, _ = player.can_pay_mana_cost(_imp_cost)
+            _printed_cmc = helpers.cmc_of_cost_string(effective_mana_cost or '')
+            if _imp_ok and helpers.cmc_of_cost_string(_imp_cost) < _printed_cmc:
+                effective_mana_cost = _imp_cost
+                effective_cmc = helpers.cmc_of_cost_string(_imp_cost)
+                card._cast_via_impending = True
+                card._impending_counters = _imp_n
+                print(f"[IMPENDING] Using impending cost {_imp_cost} "
+                      f"(CMC {effective_cmc}) instead of {card.mana_cost} — "
+                      f"enters with {_imp_n} time counters and is not a "
+                      f"creature until the last is removed")
     if getattr(card, 'cast_as_adventure', False) and card.adventure_cost:
         effective_mana_cost = card.adventure_cost
         # July 21 batch audit: was a digits + plain-single-pip count that gave
@@ -3143,6 +3174,21 @@ async def _dispatch_resolution(engine, game: GameState, player: Player,
                 card.counters['shield'] = card.counters.get('shield', 0) + _n
                 effect_messages.append(f"🛡️ {card.name} enters with {_n} shield counter(s)")
                 print(f"[SHIELD-COUNTER] {card.name} enters with {_n} shield counter(s)")
+
+            # IMPENDING (CR 702.166a): the counters half of the alternative
+            # cost taken in _compute_alt_costs. Sits beside the shield-counter
+            # parse because it is the same shape — an enters-with clause, not
+            # a trigger — but reads the STAMP rather than the oracle text,
+            # since the counters appear only when the impending cost was
+            # actually paid.
+            _imp_n = getattr(card, '_impending_counters', 0)
+            if getattr(card, '_cast_via_impending', False) and _imp_n:
+                card.counters['time'] = card.counters.get('time', 0) + _imp_n
+                effect_messages.append(
+                    f"⏳ {card.name} enters with {_imp_n} time counter(s) — "
+                    f"not a creature until the last is removed")
+                print(f"[IMPENDING] {card.name} enters with {_imp_n} time "
+                      f"counter(s); not a creature yet")
 
         # Aug 2 batch-14 audit (I-2): "enters with a <type> counter on it for
         # each time it was kicked" (Everflowing Chalice). This is a STATIC

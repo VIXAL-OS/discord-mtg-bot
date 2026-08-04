@@ -1317,6 +1317,15 @@ class Card:
     def is_creature(self, game=None) -> bool:
         if not self.type_line or "creature" not in self.type_line.lower():
             return False
+        # IMPENDING (CR 702.166a, Aug 3 2026): "if you cast this spell for its
+        # impending cost, it enters with N time counters and ISN'T A CREATURE
+        # until the last is removed". The second half is the whole downside of
+        # the discount, and without it the cheap cast was strictly better than
+        # the expensive one. Gated on the stamp AND on counters remaining, so a
+        # full-price cast is unaffected and the suppression ends by itself.
+        if getattr(self, '_cast_via_impending', False):
+            if (self.counters or {}).get('time', 0) > 0:
+                return False
         # Gods with devotion threshold: "As long as your devotion to X is less than N, ~ isn't a creature"
         if game and "God" in self.type_line and self.oracle_text and "devotion" in self.oracle_text.lower():
             oracle_lower = self.oracle_text.lower()

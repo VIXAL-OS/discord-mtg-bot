@@ -417,5 +417,158 @@ class TestStruckFromTheBacklog:
                    and a.get("counter_type") == "+1/+1" for a in actions), actions
 
 
+class TestImpending:
+    """CR 702.166 — "Impending N—[cost]": an ALTERNATIVE cost. Paying it makes
+    the permanent enter with N time counters and NOT be a creature until the
+    last is removed, one coming off at each of its controller's end steps.
+
+    Overlord of the Boilerbilges ({4}{R}{R}, impending 4—{2}{R}{R}) is the
+    only impending card in the deck inventory."""
+
+    OVERLORD = ("Impending 4—{2}{R}{R} (If you cast this spell for its "
+                "impending cost, it enters with four time counters and isn't "
+                "a creature until the last is removed. At the beginning of "
+                "your end step, remove a time counter from it.)\n"
+                "Whenever this permanent enters or attacks, it deals 4 damage "
+                "to any target.")
+
+    def _overlord(self):
+        card = _make_card("Overlord of the Boilerbilges",
+                          type_line="Enchantment Creature — Avatar Horror",
+                          oracle_text=self.OVERLORD, mana_cost="{4}{R}{R}",
+                          power="5", toughness="5")
+        card.cmc = 6
+        return card
+
+    def _game(self, lands):
+        game = _make_game()
+        rick, claude = game.players
+        card = self._overlord()
+        rick.hand.append(card)
+        for _ in range(lands):
+            rick.battlefield.append(_make_card(
+                "Mountain", type_line="Basic Land — Mountain",
+                oracle_text="{T}: Add {R}."))
+        return game, rick, claude, card
+
+    def test_the_parser_reads_count_and_cost(self):
+        from mtg.helpers import parse_impending
+        assert parse_impending(self.OVERLORD) == (4, "{2}{R}{R}")
+        assert parse_impending("Flying") is None
+
+    def test_the_pre_gate_knows_about_impending(self):
+        """Without this the payment stage would take the cheaper cost but the
+        pre-gate rejects first, so the AI is never OFFERED the card — the
+        doomed-gate asymmetry that convoke, Force of Will, affinity and the
+        static cost reductions each had to fix.
+
+        Decisive on exactly that awareness: four Mountains can pay {2}{R}{R}
+        and cannot pay {4}{R}{R}, so the gate's answer differs."""
+        game, rick, claude, card = self._game(4)
+        engine = _engine(game)
+        can, why = engine.rules.can_cast_spell(game, rick, card)
+        assert can, why
+
+    def test_it_is_cast_for_the_impending_cost_and_enters_suppressed(self):
+        import asyncio
+        game, rick, claude, card = self._game(4)
+        engine = _engine(game)
+        start = claude.life
+        ok, msg, _ = asyncio.new_event_loop().run_until_complete(
+            engine.cast_spell_async(game, rick, card))
+        assert ok, msg
+        assert sum(1 for c in rick.battlefield if c.tapped) == 4, "{2}{R}{R}"
+        assert card.counters.get('time') == 4
+        assert not card.is_creature(game), (
+            "CR 702.166a — not a creature until the last counter is removed")
+        assert claude.life == start - 4, (
+            "its trigger says PERMANENT, not creature, so the ETB still fires")
+
+    def test_the_counters_come_off_one_per_controller_end_step(self):
+        game = _make_game()
+        rick, _ = game.players
+        card = self._overlord()
+        card._cast_via_impending = True
+        card.counters['time'] = 2
+        rick.battlefield.append(card)
+        engine = _engine(game)
+        game.active_player_index = 0
+        engine._check_end_step_triggers_sync(game)
+        assert card.counters.get('time') == 1
+        assert not card.is_creature(game)
+        engine._check_end_step_triggers_sync(game)
+        assert not card.counters.get('time')
+        assert card.is_creature(game), (
+            "the suppression ends by itself once the counters are gone")
+
+    def test_only_the_controllers_own_end_step_removes_one(self):
+        """"At the beginning of YOUR end step" — which is what makes the
+        discount cost real time rather than half as much."""
+        game = _make_game()
+        rick, claude = game.players
+        card = self._overlord()
+        card._cast_via_impending = True
+        card.counters['time'] = 3
+        rick.battlefield.append(card)
+        engine = _engine(game)
+        game.active_player_index = 1          # the OPPONENT's end step
+        engine._check_end_step_triggers_sync(game)
+        assert card.counters.get('time') == 3, "not on the opponent's end step"
+
+    def test_an_impending_cost_that_is_not_cheaper_is_declined(self):
+        """v1 policy: take the alternative only when it is actually cheaper.
+        Without the comparison the branch would trade the printed cost for a
+        WORSE one and hand over the type suppression for nothing.
+
+        Synthetic by necessity — every printed impending cost is cheaper than
+        its card's mana cost, so the guard cannot be reached with a real card
+        and would otherwise be untested defence in depth."""
+        game = _make_game()
+        rick, _ = game.players
+        card = _make_card("Costly Overlord",
+                          type_line="Enchantment Creature — Avatar",
+                          oracle_text=("Impending 4—{6}{R}{R} (reminder)\n"
+                                       "Whenever this permanent enters or "
+                                       "attacks, it deals 4 damage to any "
+                                       "target."),
+                          mana_cost="{1}{R}", power="5", toughness="5")
+        card.cmc = 2
+        rick.hand.append(card)
+        for _ in range(8):
+            rick.battlefield.append(_make_card(
+                "Mountain", type_line="Basic Land — Mountain",
+                oracle_text="{T}: Add {R}."))
+        import asyncio
+        engine = _engine(game)
+        ok, msg, _ = asyncio.new_event_loop().run_until_complete(
+            engine.cast_spell_async(game, rick, card))
+        assert ok, msg
+        assert sum(1 for c in rick.battlefield if c.tapped) == 2, (
+            "the printed {1}{R}, not the pricier impending cost")
+        assert not card.counters.get('time')
+        assert card.is_creature(game)
+
+    def test_time_counters_alone_do_not_suppress_the_type(self):
+        """The suppression is gated on the impending STAMP as well as on the
+        counters, and that conjunction is load-bearing rather than belt-and-
+        braces: SUSPEND also puts time counters on a card (CR 702.62), and a
+        suspended creature that has reached the battlefield is an ordinary
+        creature. Keying only on 'time' counters would type-suppress it.
+
+        Decisive: identical counters, only the stamp differs."""
+        game = _make_game()
+        rick, _ = game.players
+        suspended = self._overlord()
+        suspended.counters['time'] = 2          # as suspend leaves them
+        rick.battlefield.append(suspended)
+        assert suspended.is_creature(game), "suspend is not impending"
+
+        impending = self._overlord()
+        impending._cast_via_impending = True
+        impending.counters['time'] = 2
+        rick.battlefield.append(impending)
+        assert not impending.is_creature(game)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

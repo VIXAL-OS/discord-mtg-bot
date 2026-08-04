@@ -1663,6 +1663,29 @@ def _splice_choices_are_makeable(game, spliced_text: str) -> bool:
     return True
 
 
+def parse_impending(oracle_text):
+    """(time_counters, mana_cost) for a printed Impending, else None.
+
+    CR 702.166a — "Impending N—[cost]": an ALTERNATIVE cost (it replaces the
+    mana cost rather than adding to it, unlike kicker's family). Paying it
+    makes the permanent enter with N time counters and NOT be a creature
+    until the last is removed; one comes off at the beginning of each of its
+    controller's end steps.
+
+    The separator is an EM DASH on every printing ("Impending 4—{2}{R}{R}"),
+    which is also how this is told apart from the ability word; a hyphen and
+    an en dash are accepted too so a reprint's typography cannot silently
+    turn the mechanic off.
+    """
+    clause = _own_keyword_clause(oracle_text, 'impending')
+    if clause is None:
+        return None
+    match = re.match(r'\s*(\d+)\s*[—–-]\s*((?:\{[^}]+\})+)', clause)
+    if not match:
+        return None
+    return int(match.group(1)), match.group(2).upper()
+
+
 def splice_legal_target_exists(game, splice_card) -> bool:
     """Does a spliced card's own instruction still have a legal target?
 

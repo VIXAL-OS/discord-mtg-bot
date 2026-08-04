@@ -365,6 +365,20 @@ class RulesEngine:
                     print(f"[CAST-GATE] {card.name}: spectacle cost {_spec} "
                           f"available — mana pre-gate passes")
                     return True, "OK (spectacle cost available)"
+            # Impending (CR 702.166, Aug 3): the same shape — an ALTERNATIVE
+            # cost that is cheaper than printed, which _compute_alt_costs will
+            # take. Without this waiver the pre-gate rejects first and the AI
+            # is never offered the card at its impending cost: Overlord of the
+            # Boilerbilges reported "only 4 untapped source(s) for 6 total
+            # mana" on a board that could pay its {2}{R}{R} four times over.
+            from mtg.helpers import parse_impending
+            _imp = parse_impending(card.oracle_text)
+            if _imp:
+                _imp_ok, _ = player.can_pay_mana_cost(_imp[1])
+                if _imp_ok:
+                    print(f"[CAST-GATE] {card.name}: impending cost {_imp[1]} "
+                          f"available — mana pre-gate passes")
+                    return True, "OK (impending cost available)"
             return False, reason
 
         return True, "OK"
