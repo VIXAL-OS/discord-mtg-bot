@@ -417,6 +417,202 @@ class TestStruckFromTheBacklog:
                    and a.get("counter_type") == "+1/+1" for a in actions), actions
 
 
+class TestCommanderPairLegality:
+    """CR 903.3 — a deck has ONE commander unless a card grants a second.
+
+    The identity UNION was applied to any number of commanders without ever
+    asking whether the pair was legal, so two arbitrary legends were accepted
+    and only their combined identity was questioned. Permissive rather than
+    corrupting, but decks are user-uploaded and 32 "Choose a Background"
+    commanders plus 31 Backgrounds are exactly the pair someone will hand in.
+    """
+
+    def _c(self, name):
+        from mtg.models import Card
+        e = CACHE[name.lower()]
+        card = Card(name=e["name"], type_line=e["type_line"],
+                    oracle_text=e.get("oracle_text") or "",
+                    mana_cost=e.get("mana_cost") or "")
+        card.color_identity = list(e.get("color_identity") or [])
+        return card
+
+    def _issues(self, *names):
+        from mtg.models import FormatValidator
+        return FormatValidator._commander_pair_issues(
+            [self._c(n) for n in names])
+
+    def test_one_commander_is_always_fine(self):
+        assert self._issues("Karlach, Fury of Avernus") == []
+
+    def test_partner_with_pairs_only_with_the_named_card(self):
+        """Brallin says "Partner with Shabraz". Anything else is illegal even
+        though the other card has plain Partner — which is what makes this
+        stricter than "somebody said partner"."""
+        assert self._issues("Brallin, Skyshark Rider",
+                            "Shabraz, the Skyshark") == []
+        bad = self._issues("Brallin, Skyshark Rider", "Thrasios, Triton Hero")
+        assert bad and "cannot partner with" in bad[0]
+        assert "Shabraz, the Skyshark" in bad[0], "the printed casing is kept"
+
+    def test_plain_partner_pairs_with_any_other_plain_partner(self):
+        assert self._issues("Thrasios, Triton Hero", "Tymna the Weaver") == []
+
+    def test_choose_a_background_requires_an_actual_background(self):
+        assert self._issues("Karlach, Fury of Avernus", "Raised by Giants") == []
+        bad = self._issues("Karlach, Fury of Avernus", "Tymna the Weaver")
+        assert bad and "is not a Background" in bad[0]
+
+    def test_two_arbitrary_legends_are_rejected(self):
+        bad = self._issues("Niv-Mizzet, the Firemind", "Tymna the Weaver")
+        assert bad, "neither grants a second commander"
+
+    def test_three_commanders_are_never_legal(self):
+        bad = self._issues("Thrasios, Triton Hero", "Tymna the Weaver",
+                           "Karlach, Fury of Avernus")
+        assert bad and "at most two" in bad[0]
+
+    def test_the_check_is_actually_wired_into_validate_deck(self):
+        """Every other pin here calls _commander_pair_issues DIRECTLY, so none
+        of them notices if the call site is removed from validate_deck — which
+        is the only place a user's uploaded deck ever goes through. Mutation
+        testing caught exactly that: the helper survived being orphaned.
+
+        Decisive: the deck itself is otherwise legal, so the ONLY thing that
+        can put an issue in this list is the pair check."""
+        from mtg.models import FormatValidator
+        cards = [self._c("Mountain")] * 100
+        _ok, issues = FormatValidator.validate_deck(
+            cards, "commander",
+            commander=[self._c("Brallin, Skyshark Rider"),
+                       self._c("Niv-Mizzet, the Firemind")])
+        assert any("cannot partner with" in i for i in issues), issues
+
+
+class TestPartnerDeck:
+    """The Aug 3 coverage deck. Built entirely from already-cached cards, so
+    it loads with no Scryfall fetch and no fuzzy-name roulette."""
+
+    DECK = "data/test_partner_brallin_shabraz.json"
+
+    def _deck(self):
+        return json.load(open(self.DECK, encoding="utf-8"))
+
+    def test_it_uses_the_established_commander_partner_schema(self):
+        """NOT a list. The loader reads `commander` as a string and takes the
+        second from a separate `partner` key (mtg/engine.py) — a list would
+        break it, which is why the existing partner deck uses this shape."""
+        deck = self._deck()
+        assert isinstance(deck["commander"], str)
+        assert deck["partner"] == "Shabraz, the Skyshark"
+
+    def test_it_is_a_legal_hundred_card_commander_deck(self):
+        from mtg.models import Card, FormatValidator
+        deck = self._deck()
+        cards = []
+        for entry in deck["cards"]:
+            e = CACHE.get(entry["name"].lower())
+            assert e, f"{entry['name']} is not cached — it would fuzzy-fetch"
+            card = Card(name=e["name"], type_line=e["type_line"],
+                        oracle_text=e.get("oracle_text") or "",
+                        mana_cost=e.get("mana_cost") or "")
+            card.color_identity = list(e.get("color_identity") or [])
+            cards.extend([card] * entry["quantity"])
+        assert len(cards) == 100, "commanders are IN the list, per convention"
+        cmdrs = [c for c in cards
+                 if c.name in (deck["commander"], deck["partner"])]
+        ok, issues = FormatValidator.validate_deck(cards, "commander",
+                                                   commander=cmdrs)
+        assert ok, issues
+
+    def test_it_is_registered_and_in_the_all_range(self):
+        from mtg.autoplay import AUTOPLAY_DECKS, AUTOPLAY_MATRIX, AUTOPLAY_PHASES
+        assert AUTOPLAY_DECKS["partner_brallin"] == "test_partner_brallin_shabraz"
+        nums = [m[0] for m in AUTOPLAY_MATRIX
+                if "partner_brallin" in (m[2], m[3])]
+        assert nums, "no matchups"
+        assert AUTOPLAY_PHASES["all"][1] >= max(nums), (
+            "the 'all' range must cover the new matchups — the Apr 6 bug class")
+
+
+class TestDrawTriggers:
+    """"Whenever YOU draw a card" watchers, found while building the partner
+    deck: Shabraz, the Skyshark grew on every draw and gained life, and
+    nothing fired at all. Sheoldred and Niv-Mizzet are the same shape."""
+
+    SHABRAZ = ("Partner with Brallin, Skyshark Rider\n"
+               "Flying\n"
+               "Whenever you draw a card, put a +1/+1 counter on Shabraz and "
+               "you gain 1 life.\n"
+               "{W/U}: Target Human gains flying until end of turn.")
+    SPHINX = ("Flying\n"
+              "Whenever an opponent draws a card, you may draw two cards.")
+
+    def test_a_you_draw_watcher_fires(self):
+        game = _make_game()
+        rick, _ = game.players
+        shabraz = _make_card("Shabraz, the Skyshark",
+                             type_line="Legendary Creature — Shark Bird",
+                             oracle_text=self.SHABRAZ, power="3", toughness="3")
+        rick.battlefield.append(shabraz)
+        rick.library.append(_make_card("Top", type_line="Instant"))
+        engine = _engine(game)
+        start = rick.life
+        engine.draw_cards(rick, 1, game)
+        assert shabraz.counters.get('+1/+1') == 1
+        assert rick.life == start + 1
+
+    def test_it_does_not_fire_on_the_opponents_draw(self):
+        game = _make_game()
+        rick, claude = game.players
+        shabraz = _make_card("Shabraz, the Skyshark",
+                             type_line="Legendary Creature — Shark Bird",
+                             oracle_text=self.SHABRAZ, power="3", toughness="3")
+        rick.battlefield.append(shabraz)
+        claude.library.append(_make_card("Top", type_line="Instant"))
+        engine = _engine(game)
+        start = rick.life
+        engine.draw_cards(claude, 1, game)
+        assert not shabraz.counters, '"whenever YOU draw"'
+        assert rick.life == start
+
+    def test_the_opponent_draw_family_is_not_double_fired(self):
+        """mtg/engine.py's post-draw block already handles Smothering Tithe
+        and Consecrated Sphinx. An unscoped watcher scan here fired ON TOP of
+        it, drawing FOUR cards off one Sphinx trigger instead of two.
+
+        Decisive: the count is the whole finding — the old behaviour still
+        produced a Sphinx message and still drew cards, just twice as many."""
+        game = _make_game()
+        rick, claude = game.players
+        rick.battlefield.append(_make_card(
+            "Consecrated Sphinx", type_line="Creature — Sphinx",
+            oracle_text=self.SPHINX, power="4", toughness="6"))
+        for i in range(6):
+            rick.library.append(_make_card("X%d" % i, type_line="Instant"))
+        claude.library.append(_make_card("Y", type_line="Instant"))
+        engine = _engine(game)
+        engine.draw_cards(claude, 1, game)
+        assert len(rick.hand) == 2, (
+            "exactly the existing handler's two cards, not four")
+
+    def test_a_watcher_that_draws_cannot_re_enter(self):
+        """The hook is per-draw, so a watcher whose effect draws would
+        re-enter it. No printed card in the inventory loops, but the
+        loop-protection convention here is to bound it anyway."""
+        game = _make_game()
+        rick, _ = game.players
+        rick.battlefield.append(_make_card(
+            "Loopy Oracle", type_line="Creature — Sphinx",
+            oracle_text="Whenever you draw a card, draw a card.",
+            power="1", toughness="1"))
+        for i in range(20):
+            rick.library.append(_make_card("X%d" % i, type_line="Instant"))
+        engine = _engine(game)
+        engine.draw_cards(rick, 1, game)
+        assert len(rick.hand) <= 3, (
+            f"the guard must bound the chain; drew {len(rick.hand)}")
+
+
 class TestImpending:
     """CR 702.166 — "Impending N—[cost]": an ALTERNATIVE cost. Paying it makes
     the permanent enter with N time counters and NOT be a creature until the

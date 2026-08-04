@@ -126,7 +126,12 @@ EXCEPT_BASELINE = {
     # crash barrier around the LLM response evaluation — carries
     # maybe_reraise so strict batches see it; the sibling own-cast
     # window barrier is already in this baseline.
-    "triggers.py": 52,
+    # Aug 3 (+1): fire_draw_triggers' per-action barrier, the exact twin of
+    # fire_discard_triggers' (already in this baseline). A watcher's action
+    # failing must not abort the DRAW that triggered it — the draw has already
+    # happened and the card is in hand. Carries maybe_reraise, so strict
+    # batches and pytest still see the failure.
+    "triggers.py": 53,
     "util.py": 6,
 }
 

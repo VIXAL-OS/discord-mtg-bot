@@ -1,0 +1,322 @@
+{
+  "name": "Brallin + Shabraz (Partner)",
+  "format": "commander",
+  "description": "100-card Jeskai partner deck: TWO commanders via \"Partner with\" (CR 702.124), so it tests the multi-commander path end to end — the CR 903.4 identity UNION (R from Brallin, W/U from Shabraz), the partner-with ETB tutor, and two command-zone objects at once. Also the live vehicle for the two watcher seams the pair is built on: Brallin fires on every DISCARD (counter + damage to each opponent) and Shabraz on every DRAW (counter + life), so the loot/wheel/rummage shell triggers both several times a game.",
+  "colors": [
+    "W",
+    "U",
+    "R"
+  ],
+  "commander": "Brallin, Skyshark Rider",
+  "partner": "Shabraz, the Skyshark",
+  "cards": [
+    {
+      "name": "Brallin, Skyshark Rider",
+      "quantity": 1
+    },
+    {
+      "name": "Shabraz, the Skyshark",
+      "quantity": 1
+    },
+    {
+      "name": "Conspiracy Theorist",
+      "quantity": 1
+    },
+    {
+      "name": "Glint-Horn Buccaneer",
+      "quantity": 1
+    },
+    {
+      "name": "Magus of the Wheel",
+      "quantity": 1
+    },
+    {
+      "name": "Nimble Obstructionist",
+      "quantity": 1
+    },
+    {
+      "name": "Containment Construct",
+      "quantity": 1
+    },
+    {
+      "name": "Niv-Mizzet, the Firemind",
+      "quantity": 1
+    },
+    {
+      "name": "Surly Badgersaur",
+      "quantity": 1
+    },
+    {
+      "name": "Ashling, Flame Dancer",
+      "quantity": 1
+    },
+    {
+      "name": "Baral, Chief of Compliance",
+      "quantity": 1
+    },
+    {
+      "name": "Cavalier of Flame",
+      "quantity": 1
+    },
+    {
+      "name": "Kozilek, the Great Distortion",
+      "quantity": 1
+    },
+    {
+      "name": "Neheb, Dreadhorde Champion",
+      "quantity": 1
+    },
+    {
+      "name": "Ox of Agonas",
+      "quantity": 1
+    },
+    {
+      "name": "Pilfering Hawk",
+      "quantity": 1
+    },
+    {
+      "name": "Agent of Treachery",
+      "quantity": 1
+    },
+    {
+      "name": "Archmage Emeritus",
+      "quantity": 1
+    },
+    {
+      "name": "Ascendant Spirit",
+      "quantity": 1
+    },
+    {
+      "name": "Blazing Rootwalla",
+      "quantity": 1
+    },
+    {
+      "name": "Bloodmad Vampire",
+      "quantity": 1
+    },
+    {
+      "name": "Cloudblazer",
+      "quantity": 1
+    },
+    {
+      "name": "Combustible Gearhulk",
+      "quantity": 1
+    },
+    {
+      "name": "Consecrated Sphinx",
+      "quantity": 1
+    },
+    {
+      "name": "Esper Sentinel",
+      "quantity": 1
+    },
+    {
+      "name": "Fae of Wishes",
+      "quantity": 1
+    },
+    {
+      "name": "Falkenrath Gorger",
+      "quantity": 1
+    },
+    {
+      "name": "Gadwick, the Wizened",
+      "quantity": 1
+    },
+    {
+      "name": "Incorrigible Youths",
+      "quantity": 1
+    },
+    {
+      "name": "Burning Inquiry",
+      "quantity": 1
+    },
+    {
+      "name": "Reforge the Soul",
+      "quantity": 1
+    },
+    {
+      "name": "Wheel of Fortune",
+      "quantity": 1
+    },
+    {
+      "name": "Wheel of Misfortune",
+      "quantity": 1
+    },
+    {
+      "name": "Decree of Justice",
+      "quantity": 1
+    },
+    {
+      "name": "Cathartic Reunion",
+      "quantity": 1
+    },
+    {
+      "name": "Chart a Course",
+      "quantity": 1
+    },
+    {
+      "name": "Faithless Looting",
+      "quantity": 1
+    },
+    {
+      "name": "Frantic Search",
+      "quantity": 1
+    },
+    {
+      "name": "Pull from Tomorrow",
+      "quantity": 1
+    },
+    {
+      "name": "Risk Factor",
+      "quantity": 1
+    },
+    {
+      "name": "Thrill of Possibility",
+      "quantity": 1
+    },
+    {
+      "name": "Tormenting Voice",
+      "quantity": 1
+    },
+    {
+      "name": "Arcane Denial",
+      "quantity": 1
+    },
+    {
+      "name": "Archmage's Charm",
+      "quantity": 1
+    },
+    {
+      "name": "Avacyn's Judgment",
+      "quantity": 1
+    },
+    {
+      "name": "Blue Sun's Zenith",
+      "quantity": 1
+    },
+    {
+      "name": "Brainstorm",
+      "quantity": 1
+    },
+    {
+      "name": "Consider",
+      "quantity": 1
+    },
+    {
+      "name": "Cryptic Command",
+      "quantity": 1
+    },
+    {
+      "name": "Divination",
+      "quantity": 1
+    },
+    {
+      "name": "Entreat the Angels",
+      "quantity": 1
+    },
+    {
+      "name": "Fiery Temper",
+      "quantity": 1
+    },
+    {
+      "name": "Shark Typhoon",
+      "quantity": 1
+    },
+    {
+      "name": "Teferi, Hero of Dominaria",
+      "quantity": 1
+    },
+    {
+      "name": "Chandra, Spark Hunter",
+      "quantity": 1
+    },
+    {
+      "name": "Daretti, Scrap Savant",
+      "quantity": 1
+    },
+    {
+      "name": "Jaya Ballard",
+      "quantity": 1
+    },
+    {
+      "name": "Mask of Memory",
+      "quantity": 1
+    },
+    {
+      "name": "Sarkhan, Fireblood",
+      "quantity": 1
+    },
+    {
+      "name": "Solitary Confinement",
+      "quantity": 1
+    },
+    {
+      "name": "The Restoration of Eiganjo",
+      "quantity": 1
+    },
+    {
+      "name": "Arcum's Astrolabe",
+      "quantity": 1
+    },
+    {
+      "name": "Chandra, Heart of Fire",
+      "quantity": 1
+    },
+    {
+      "name": "Chromatic Star",
+      "quantity": 1
+    },
+    {
+      "name": "Lonely Sandbar",
+      "quantity": 1
+    },
+    {
+      "name": "Remote Isle",
+      "quantity": 1
+    },
+    {
+      "name": "Secluded Steppe",
+      "quantity": 1
+    },
+    {
+      "name": "Eiganjo, Seat of the Empire",
+      "quantity": 1
+    },
+    {
+      "name": "Otawara, Soaring City",
+      "quantity": 1
+    },
+    {
+      "name": "Sokenzan, Crucible of Defiance",
+      "quantity": 1
+    },
+    {
+      "name": "Sunbaked Canyon",
+      "quantity": 1
+    },
+    {
+      "name": "Academy Ruins",
+      "quantity": 1
+    },
+    {
+      "name": "Adarkar Wastes",
+      "quantity": 1
+    },
+    {
+      "name": "Ancient Den",
+      "quantity": 1
+    },
+    {
+      "name": "Island",
+      "quantity": 8
+    },
+    {
+      "name": "Mountain",
+      "quantity": 8
+    },
+    {
+      "name": "Plains",
+      "quantity": 10
+    }
+  ]
+}

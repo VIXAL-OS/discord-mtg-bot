@@ -70,6 +70,85 @@ except ImportError:
 class FormatValidator:
     """Validates decks against format rules."""
     
+    # The five printed ways a card grants a SECOND commander (CR 702.124
+    # partner, 702.125 friends forever, 702.140 doctor's companion, plus the
+    # Background and Doctor/companion pairings). Matched against oracle text
+    # because that is where every one of them is printed.
+    _SECOND_COMMANDER_GRANTS = (
+        "partner",                 # covers plain Partner AND "Partner with X"
+        "friends forever",
+        "doctor's companion",
+        "choose a background",
+    )
+
+    @staticmethod
+    def _commander_pair_issues(commanders) -> List[str]:
+        """Issues with the SET of commanders (CR 903.3), not with the deck.
+
+        A single commander is always fine. Two are legal only when a printed
+        ability says so, and this checks the specific pairing rather than just
+        "somebody said partner":
+
+          * "Partner with <name>" pairs with THAT card and no other.
+          * plain Partner pairs with any other plain-Partner card.
+          * "Choose a Background" pairs with a Background, and the Background
+            is the one that has to be a Background — not a second legend.
+
+        Three or more is never legal.
+
+        Deliberately reports rather than strips, matching how the banned-list
+        and identity checks behave here (the July-20 call: swap the offending
+        card, do not auto-mutate someone's deck).
+        """
+        issues: List[str] = []
+        if len(commanders) <= 1:
+            return issues
+        if len(commanders) > 2:
+            issues.append(
+                f"{len(commanders)} commanders — a deck may have at most two, "
+                f"and only when a printed ability grants the second (CR 903.3)")
+            return issues
+
+        first, second = commanders
+        texts = [(getattr(c, 'oracle_text', '') or '').lower() for c in commanders]
+        types = [(getattr(c, 'type_line', '') or '').lower() for c in commanders]
+
+        # "Partner with <name>" — the named partner must be the other card.
+        # Matched against the ORIGINAL text (case-insensitively) so the name
+        # keeps its printed casing when it is quoted back to the player.
+        for i, cmdr in enumerate(commanders):
+            match = re.search(r'[Pp]artner with ([^\n(]+)',
+                              getattr(cmdr, 'oracle_text', '') or '')
+            if match:
+                named = match.group(1).strip().rstrip('.').lower()
+                other = (getattr(commanders[1 - i], 'name', '') or '').lower()
+                if named and named != other:
+                    issues.append(
+                        f"**{commanders[i].name}** has \"Partner with "
+                        f"{match.group(1).strip()}\" and cannot partner with "
+                        f"**{commanders[1 - i].name}**")
+                return issues
+
+        # Choose a Background — the OTHER card must actually be a Background.
+        for i, text in enumerate(texts):
+            if "choose a background" in text:
+                if "background" not in types[1 - i]:
+                    issues.append(
+                        f"**{commanders[i].name}** says \"Choose a "
+                        f"Background\", but **{commanders[1 - i].name}** is "
+                        f"not a Background")
+                return issues
+
+        # Otherwise both need a symmetric grant (Partner / Friends Forever /
+        # Doctor's Companion).
+        symmetric = ("partner", "friends forever", "doctor's companion")
+        for i, text in enumerate(texts):
+            if not any(g in text for g in symmetric):
+                issues.append(
+                    f"**{commanders[i].name}** has no ability allowing a "
+                    f"second commander (CR 903.3)")
+        return issues
+
     @staticmethod
     def get_color_identity(card) -> List[str]:
         """
@@ -185,6 +264,16 @@ class FormatValidator:
         # color identity (Partner, Friends Forever, Doctor's Companion,
         # Choose-a-Background — multi-commander mechanics).
         if format_name in COMMAND_ZONE_FORMATS and commanders:
+            # CR 903.3: a deck has ONE commander unless a card explicitly
+            # grants a second. Aug 3, 2026: the union below was applied to any
+            # number of commanders without ever asking whether the PAIR is
+            # legal, so two arbitrary legends were accepted and only their
+            # combined identity was ever questioned. Permissive rather than
+            # corrupting — it let an illegal deck through, it never broke a
+            # legal one — but decks are user-uploaded, and 32 "Choose a
+            # Background" commanders plus 31 Backgrounds are exactly the kind
+            # of pair someone will hand in.
+            issues.extend(FormatValidator._commander_pair_issues(commanders))
             commander_identity = set()
             for cmdr in commanders:
                 commander_identity.update(FormatValidator.get_color_identity(cmdr))

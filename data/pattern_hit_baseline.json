@@ -81,6 +81,7 @@
  "whenever (?:a|another) .*?creature.*?enters(?!.*each creature).*?put (?:a|\\d+) \\+1/\\+1 counter": 62,
  "whenever (?:a|another) .*?creature.*?enters.*?draw a card": 36,
  "whenever (?:a|another) .*?creature.*?enters.*?you gain (\\d+) life": 29,
+ "whenever (?:a|another)\\b[^.]*?\\bcreature\\b[^.]*?\\benters\\b[^.]*?\\bbolster (\\d+)": 1,
  "whenever .+? attacks.*?create (\\w+) (\\d+)/(\\d+) (\\w[\\w\\s]*?) (?:creature |artifact )?tokens?": 92,
  "whenever .+? attacks.*?deals? (\\d+) damage": 64,
  "whenever .+? attacks.*?draw (\\w+) cards?": 143,

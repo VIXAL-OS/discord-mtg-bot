@@ -5460,6 +5460,109 @@ def fire_discard_triggers(game, player, discarded):
     return msgs
 
 
+_DRAW_CLAUSE = re.compile(r'whenever you draw a card', re.IGNORECASE)
+
+
+def fire_draw_triggers(game, drawing_player, drawn_card=None):
+    """"Whenever YOU draw a card" watchers (CR 603.2). Returns messages.
+
+    Aug 3, 2026, found while building the partner deck: Shabraz, the Skyshark
+    grew on every draw and gained life, and nothing fired at all. Sheoldred,
+    the Apocalypse and Niv-Mizzet, the Firemind are the same shape.
+
+    SCOPED TO "you" ON PURPOSE. The OPPONENT-draw half of the family already
+    has a handler — mtg/engine.py's post-draw block covers Smothering Tithe
+    and Consecrated Sphinx — and an unscoped scan here double-fired it,
+    drawing four cards off one Sphinx trigger instead of two. That was caught
+    by tracing an anomalous count rather than by review, and it is exactly why
+    a new watcher must be grepped against the existing handlers first.
+
+    Scans every battlefield anyway (not just the drawer's), because a
+    permanent's controller is who "you" refers to, and the drawing player may
+    be either of them.
+    """
+    msgs = []
+    rules = getattr(game, '_rules_engine', None)
+    if rules is None:
+        return msgs
+    # Re-entrancy guard: a watcher whose effect draws cards would otherwise
+    # re-enter through the same hook. No printed card in the inventory loops,
+    # but the loop-protection convention here is to bound it anyway.
+    if getattr(game, '_in_draw_triggers', False):
+        return msgs
+    game._in_draw_triggers = True
+    try:
+        for owner in game.players:
+            if owner is not drawing_player:
+                continue          # "whenever YOU draw" — the controller drew
+            for perm in list(getattr(owner, 'battlefield', []) or []):
+                oracle = getattr(perm, 'oracle_text', '') or ''
+                for raw in oracle.split('\n'):
+                    line = re.sub(r'\([^)]*\)', '', raw).strip()
+                    match = _DRAW_CLAUSE.search(line)
+                    if not match:
+                        continue
+                    effect = line[match.end():].lower()
+                    if 'may pay' in effect:
+                        print(f"[DRAW-TRIGGER-SKIPPED] {perm.name}: "
+                              f"opponent-choice payment shape")
+                        continue
+                    actions = []
+                    if re.search(r'\+1/\+1 counter on', effect):
+                        actions.append({"action": "add_counters",
+                                        "card": perm.name,
+                                        "counter_type": "+1/+1", "amount": 1})
+                    gain = re.search(r'gain (\d+) life', effect)
+                    if gain:
+                        actions.append({"action": "gain_life",
+                                        "player": owner.name,
+                                        "amount": int(gain.group(1))})
+                    lose = re.search(r'loses? (\d+) life', effect)
+                    if lose:
+                        for p in game.players:
+                            if p is not owner:
+                                actions.append({"action": "lose_life",
+                                                "player": p.name,
+                                                "amount": int(lose.group(1))})
+                    dmg = re.search(r'deals (\d+) damage', effect)
+                    if dmg:
+                        for p in game.players:
+                            if p is not owner:
+                                actions.append({"action": "deal_damage",
+                                                "amount": int(dmg.group(1)),
+                                                "target_player": p.name,
+                                                "source": perm.name})
+                    drw = re.search(r'draw (a|one|two|\d+) cards?', effect)
+                    if drw:
+                        _n = {'a': 1, 'one': 1, 'two': 2}.get(
+                            drw.group(1), None)
+                        if _n is None:
+                            try:
+                                _n = int(drw.group(1))
+                            except ValueError:
+                                _n = 1
+                        actions.append({"action": "draw_cards",
+                                        "player": owner.name, "amount": _n})
+                    if not actions:
+                        print(f"[DRAW-TRIGGER-UNHANDLED] {perm.name}: {line}")
+                        continue
+                    for action in actions:
+                        try:
+                            out = rules._execute_action_on_state(game, action)
+                        except Exception as e:  # noqa: BLE001 - crash barrier
+                            print(f"[DRAW-TRIGGER] {perm.name} failed: {e}")
+                            from mtg.util import maybe_reraise
+                            maybe_reraise(e)
+                            continue
+                        if out:
+                            msgs.append(f"🃏 **{perm.name}**: {out}")
+                    print(f"[DRAW-TRIGGER] {perm.name} fired on "
+                          f"{drawing_player.name} drawing")
+    finally:
+        game._in_draw_triggers = False
+    return msgs
+
+
 def queue_cast_triggers_sync(engine, game, caster, card, via: str = "sync") -> int:
     """Sync-context cast-trigger bridge (July 24, 2026 — slice 4b groundwork).
 

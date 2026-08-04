@@ -1398,6 +1398,19 @@ def note_miracle_on_draw(game, player, card):
     draws are sync and casting is not — the same sync-gap bridge madness uses.
     Returns True when a miracle was recorded.
     """
+    # "Whenever ... draws a card" watchers fire on EVERY draw, so they hook
+    # ABOVE the miracle early-return below — the same placement lesson the
+    # discard watchers needed relative to the madness return. This function is
+    # called at all four draw-to-hand sites, which is what makes one hook here
+    # complete coverage. Messages ride game._pending_messages because this
+    # function's return value means "a miracle was recorded".
+    from mtg.triggers import fire_draw_triggers
+    _draw_msgs = fire_draw_triggers(game, player, card)
+    if _draw_msgs:
+        if getattr(game, '_pending_messages', None) is None:
+            game._pending_messages = []
+        game._pending_messages.extend(_draw_msgs)
+
     cost = parse_miracle(getattr(card, 'oracle_text', '') or '')
     if cost is None:
         return False

@@ -166730,5 +166730,308 @@
    "cardmarket": "https://www.cardmarket.com/en/Magic/Products?idProduct=262071&referrer=scryfall&utm_campaign=card_prices&utm_medium=text&utm_source=scryfall",
    "cardhoarder": "https://www.cardhoarder.com/cards/48984?affiliate_id=scryfall&ref=card-profile&utm_campaign=affiliate&utm_medium=card&utm_source=scryfall"
   }
+ },
+ "shabraz, the skyshark": {
+  "object": "card",
+  "id": "9955d172-0b24-4c61-9dee-c935a1f26da2",
+  "oracle_id": "7599fe9a-b6a5-491b-a308-aef3bf1e9daf",
+  "multiverse_ids": [
+   484721
+  ],
+  "mtgo_id": 80751,
+  "tcgplayer_id": 212157,
+  "cardmarket_id": 452123,
+  "name": "Shabraz, the Skyshark",
+  "lang": "en",
+  "released_at": "2020-04-17",
+  "uri": "https://api.scryfall.com/cards/9955d172-0b24-4c61-9dee-c935a1f26da2",
+  "scryfall_uri": "https://scryfall.com/card/c20/14/shabraz-the-skyshark?utm_source=api",
+  "layout": "normal",
+  "highres_image": true,
+  "image_status": "highres_scan",
+  "image_updated_at": "2026-07-13T08:27:09Z",
+  "image_uris": {
+   "small": "https://cards.scryfall.io/small/front/9/9/9955d172-0b24-4c61-9dee-c935a1f26da2.jpg?1783931229",
+   "normal": "https://cards.scryfall.io/normal/front/9/9/9955d172-0b24-4c61-9dee-c935a1f26da2.jpg?1783931229",
+   "large": "https://cards.scryfall.io/large/front/9/9/9955d172-0b24-4c61-9dee-c935a1f26da2.jpg?1783931229",
+   "png": "https://cards.scryfall.io/png/front/9/9/9955d172-0b24-4c61-9dee-c935a1f26da2.png?1783931229",
+   "art_crop": "https://cards.scryfall.io/art_crop/front/9/9/9955d172-0b24-4c61-9dee-c935a1f26da2.jpg?1783931229",
+   "border_crop": "https://cards.scryfall.io/border_crop/front/9/9/9955d172-0b24-4c61-9dee-c935a1f26da2.jpg?1783931229",
+   "thumb": "https://cards.scryfall.io/thumb/front/9/9/9955d172-0b24-4c61-9dee-c935a1f26da2.webp?1783931229",
+   "grid": "https://cards.scryfall.io/grid/front/9/9/9955d172-0b24-4c61-9dee-c935a1f26da2.webp?1783931229",
+   "display": "https://cards.scryfall.io/display/front/9/9/9955d172-0b24-4c61-9dee-c935a1f26da2.webp?1783931229",
+   "art": "https://cards.scryfall.io/art/front/9/9/9955d172-0b24-4c61-9dee-c935a1f26da2.webp?1783931229",
+   "crop": "https://cards.scryfall.io/crop/front/9/9/9955d172-0b24-4c61-9dee-c935a1f26da2.webp?1783931229"
+  },
+  "mana_cost": "{3}{W}{U}",
+  "cmc": 5.0,
+  "type_line": "Legendary Creature — Shark Bird",
+  "oracle_text": "Partner with Brallin, Skyshark Rider\nFlying\nWhenever you draw a card, put a +1/+1 counter on Shabraz and you gain 1 life.\n{W/U}: Target Human gains flying until end of turn.",
+  "power": "3",
+  "toughness": "3",
+  "colors": [
+   "U",
+   "W"
+  ],
+  "color_identity": [
+   "U",
+   "W"
+  ],
+  "keywords": [
+   "Flying",
+   "Partner with",
+   "Partner"
+  ],
+  "all_parts": [
+   {
+    "object": "related_card",
+    "id": "9b4fdcd5-5346-46a8-b1a4-84ddb74089e0",
+    "component": "combo_piece",
+    "name": "Brallin, Skyshark Rider",
+    "type_line": "Legendary Creature — Human Shaman",
+    "uri": "https://api.scryfall.com/cards/9b4fdcd5-5346-46a8-b1a4-84ddb74089e0"
+   },
+   {
+    "object": "related_card",
+    "id": "9955d172-0b24-4c61-9dee-c935a1f26da2",
+    "component": "combo_piece",
+    "name": "Shabraz, the Skyshark",
+    "type_line": "Legendary Creature — Shark Bird",
+    "uri": "https://api.scryfall.com/cards/9955d172-0b24-4c61-9dee-c935a1f26da2"
+   }
+  ],
+  "legalities": {
+   "standard": "not_legal",
+   "future": "not_legal",
+   "historic": "not_legal",
+   "timeless": "not_legal",
+   "gladiator": "not_legal",
+   "pioneer": "not_legal",
+   "modern": "not_legal",
+   "legacy": "legal",
+   "pauper": "not_legal",
+   "vintage": "legal",
+   "penny": "not_legal",
+   "commander": "legal",
+   "oathbreaker": "legal",
+   "standardbrawl": "not_legal",
+   "brawl": "not_legal",
+   "competitivebrawl": "not_legal",
+   "alchemy": "not_legal",
+   "paupercommander": "not_legal",
+   "duel": "legal",
+   "oldschool": "not_legal",
+   "premodern": "not_legal",
+   "predh": "not_legal",
+   "tlr": "not_legal"
+  },
+  "games": [
+   "paper",
+   "mtgo"
+  ],
+  "reserved": false,
+  "game_changer": false,
+  "foil": true,
+  "nonfoil": true,
+  "finishes": [
+   "nonfoil",
+   "foil"
+  ],
+  "oversized": false,
+  "promo": false,
+  "reprint": false,
+  "variation": false,
+  "set_id": "f60ec786-1f8d-42f7-9abc-0d880fe243f6",
+  "set": "c20",
+  "set_name": "Commander 2020",
+  "set_type": "commander",
+  "set_uri": "https://api.scryfall.com/sets/f60ec786-1f8d-42f7-9abc-0d880fe243f6",
+  "set_search_uri": "https://api.scryfall.com/cards/search?order=set&q=e%3Ac20&unique=prints",
+  "scryfall_set_uri": "https://scryfall.com/sets/c20?utm_source=api",
+  "rulings_uri": "https://api.scryfall.com/cards/9955d172-0b24-4c61-9dee-c935a1f26da2/rulings",
+  "prints_search_uri": "https://api.scryfall.com/cards/search?order=released&q=oracleid%3A7599fe9a-b6a5-491b-a308-aef3bf1e9daf&unique=prints",
+  "collector_number": "14",
+  "digital": false,
+  "rarity": "mythic",
+  "card_back_id": "0aeebaf5-8c7d-4636-9e82-8c27447861f7",
+  "artist": "Paul Scott Canavan",
+  "artist_ids": [
+   "c19bfb77-5099-4f7c-8585-6eaf367712c9"
+  ],
+  "illustration_id": "6410797d-1201-4723-a841-db384e789539",
+  "border_color": "black",
+  "frame": "2015",
+  "frame_effects": [
+   "legendary"
+  ],
+  "security_stamp": "oval",
+  "full_art": false,
+  "textless": false,
+  "booster": false,
+  "story_spotlight": false,
+  "edhrec_rank": 6558,
+  "preview": {
+   "source": "The Command Zone",
+   "source_uri": "https://www.youtube.com/watch?v=UgdCRi_g5ik",
+   "previewed_at": "2020-04-04"
+  },
+  "prices": {
+   "usd": "4.30",
+   "usd_foil": "3.11",
+   "usd_etched": null,
+   "eur": "1.80",
+   "eur_foil": "2.04",
+   "tix": "4.28"
+  },
+  "related_uris": {
+   "gatherer": "https://gatherer.wizards.com/Pages/Card/Details.aspx?multiverseid=484721&printed=false",
+   "tcgplayer_infinite_articles": "https://partner.tcgplayer.com/c/4931599/1830156/21018?subId1=api&trafcat=tcgplayer.com%2Fsearch%2Farticles&u=https%3A%2F%2Fwww.tcgplayer.com%2Fsearch%2Farticles%3FproductLineName%3Dmagic%26q%3DShabraz%252C%2Bthe%2BSkyshark",
+   "tcgplayer_infinite_decks": "https://partner.tcgplayer.com/c/4931599/1830156/21018?subId1=api&trafcat=tcgplayer.com%2Fsearch%2Fdecks&u=https%3A%2F%2Fwww.tcgplayer.com%2Fsearch%2Fdecks%3FproductLineName%3Dmagic%26q%3DShabraz%252C%2Bthe%2BSkyshark",
+   "edhrec": "https://edhrec.com/route/?cc=Shabraz%2C+the+Skyshark"
+  },
+  "purchase_uris": {
+   "tcgplayer": "https://partner.tcgplayer.com/c/4931599/1830156/21018?subId1=api&u=https%3A%2F%2Fwww.tcgplayer.com%2Fproduct%2F212157%3Fpage%3D1",
+   "cardmarket": "https://www.cardmarket.com/en/Magic/Products?idProduct=452123&referrer=scryfall&utm_campaign=card_prices&utm_medium=text&utm_source=scryfall",
+   "cardhoarder": "https://www.cardhoarder.com/cards/80751?affiliate_id=scryfall&ref=card-profile&utm_campaign=affiliate&utm_medium=card&utm_source=scryfall"
+  }
+ },
+ "raised by giants": {
+  "object": "card",
+  "id": "11c93414-935e-462b-ad89-27ca21d01bf9",
+  "oracle_id": "1682cf24-17a3-49ad-8b6f-9b7f13ebf53c",
+  "multiverse_ids": [
+   563133
+  ],
+  "mtgo_id": 100538,
+  "tcgplayer_id": 272638,
+  "cardmarket_id": 658482,
+  "name": "Raised by Giants",
+  "lang": "en",
+  "released_at": "2022-06-10",
+  "uri": "https://api.scryfall.com/cards/11c93414-935e-462b-ad89-27ca21d01bf9",
+  "scryfall_uri": "https://scryfall.com/card/clb/250/raised-by-giants?utm_source=api",
+  "layout": "normal",
+  "highres_image": true,
+  "image_status": "highres_scan",
+  "image_updated_at": "2026-07-13T06:05:04Z",
+  "image_uris": {
+   "small": "https://cards.scryfall.io/small/front/1/1/11c93414-935e-462b-ad89-27ca21d01bf9.jpg?1783922704",
+   "normal": "https://cards.scryfall.io/normal/front/1/1/11c93414-935e-462b-ad89-27ca21d01bf9.jpg?1783922704",
+   "large": "https://cards.scryfall.io/large/front/1/1/11c93414-935e-462b-ad89-27ca21d01bf9.jpg?1783922704",
+   "png": "https://cards.scryfall.io/png/front/1/1/11c93414-935e-462b-ad89-27ca21d01bf9.png?1783922704",
+   "art_crop": "https://cards.scryfall.io/art_crop/front/1/1/11c93414-935e-462b-ad89-27ca21d01bf9.jpg?1783922704",
+   "border_crop": "https://cards.scryfall.io/border_crop/front/1/1/11c93414-935e-462b-ad89-27ca21d01bf9.jpg?1783922704",
+   "thumb": "https://cards.scryfall.io/thumb/front/1/1/11c93414-935e-462b-ad89-27ca21d01bf9.webp?1783922704",
+   "grid": "https://cards.scryfall.io/grid/front/1/1/11c93414-935e-462b-ad89-27ca21d01bf9.webp?1783922704",
+   "display": "https://cards.scryfall.io/display/front/1/1/11c93414-935e-462b-ad89-27ca21d01bf9.webp?1783922704",
+   "art": "https://cards.scryfall.io/art/front/1/1/11c93414-935e-462b-ad89-27ca21d01bf9.webp?1783922704",
+   "crop": "https://cards.scryfall.io/crop/front/1/1/11c93414-935e-462b-ad89-27ca21d01bf9.webp?1783922704"
+  },
+  "mana_cost": "{5}{G}",
+  "cmc": 6.0,
+  "type_line": "Legendary Enchantment — Background",
+  "oracle_text": "Commander creatures you own have base power and toughness 10/10 and are Giants in addition to their other types.",
+  "colors": [
+   "G"
+  ],
+  "color_identity": [
+   "G"
+  ],
+  "keywords": [],
+  "legalities": {
+   "standard": "not_legal",
+   "future": "not_legal",
+   "historic": "not_legal",
+   "timeless": "not_legal",
+   "gladiator": "not_legal",
+   "pioneer": "not_legal",
+   "modern": "not_legal",
+   "legacy": "legal",
+   "pauper": "not_legal",
+   "vintage": "legal",
+   "penny": "not_legal",
+   "commander": "legal",
+   "oathbreaker": "legal",
+   "standardbrawl": "not_legal",
+   "brawl": "not_legal",
+   "competitivebrawl": "not_legal",
+   "alchemy": "not_legal",
+   "paupercommander": "not_legal",
+   "duel": "legal",
+   "oldschool": "not_legal",
+   "premodern": "not_legal",
+   "predh": "not_legal",
+   "tlr": "not_legal"
+  },
+  "games": [
+   "paper",
+   "mtgo"
+  ],
+  "reserved": false,
+  "game_changer": false,
+  "foil": true,
+  "nonfoil": true,
+  "finishes": [
+   "nonfoil",
+   "foil"
+  ],
+  "oversized": false,
+  "promo": false,
+  "reprint": false,
+  "variation": false,
+  "set_id": "5e4c3fe8-fd57-4b20-ad56-c03790a16cea",
+  "set": "clb",
+  "set_name": "Commander Legends: Battle for Baldur's Gate",
+  "set_type": "draft_innovation",
+  "set_uri": "https://api.scryfall.com/sets/5e4c3fe8-fd57-4b20-ad56-c03790a16cea",
+  "set_search_uri": "https://api.scryfall.com/cards/search?order=set&q=e%3Aclb&unique=prints",
+  "scryfall_set_uri": "https://scryfall.com/sets/clb?utm_source=api",
+  "rulings_uri": "https://api.scryfall.com/cards/11c93414-935e-462b-ad89-27ca21d01bf9/rulings",
+  "prints_search_uri": "https://api.scryfall.com/cards/search?order=released&q=oracleid%3A1682cf24-17a3-49ad-8b6f-9b7f13ebf53c&unique=prints",
+  "collector_number": "250",
+  "digital": false,
+  "rarity": "rare",
+  "flavor_text": "Your parents taught you that strength can be nurtured and honed, no matter one's size.",
+  "card_back_id": "0aeebaf5-8c7d-4636-9e82-8c27447861f7",
+  "artist": "Kai Carpenter",
+  "artist_ids": [
+   "dcd3cf0d-67b7-4b73-8e62-1d318bf6209c"
+  ],
+  "illustration_id": "43b61539-befd-4025-a16f-c3e958b93ada",
+  "border_color": "black",
+  "frame": "2015",
+  "frame_effects": [
+   "legendary"
+  ],
+  "security_stamp": "oval",
+  "full_art": false,
+  "textless": false,
+  "booster": true,
+  "story_spotlight": false,
+  "edhrec_rank": 5924,
+  "preview": {
+   "source": "Wizards of the Coast",
+   "source_uri": "https://www.twitch.tv/videos/1486418408",
+   "previewed_at": "2022-05-17"
+  },
+  "prices": {
+   "usd": "0.37",
+   "usd_foil": "0.40",
+   "usd_etched": null,
+   "eur": "0.16",
+   "eur_foil": "0.42",
+   "tix": "1.17"
+  },
+  "related_uris": {
+   "gatherer": "https://gatherer.wizards.com/Pages/Card/Details.aspx?multiverseid=563133&printed=false",
+   "tcgplayer_infinite_articles": "https://partner.tcgplayer.com/c/4931599/1830156/21018?subId1=api&trafcat=tcgplayer.com%2Fsearch%2Farticles&u=https%3A%2F%2Fwww.tcgplayer.com%2Fsearch%2Farticles%3FproductLineName%3Dmagic%26q%3DRaised%2Bby%2BGiants",
+   "tcgplayer_infinite_decks": "https://partner.tcgplayer.com/c/4931599/1830156/21018?subId1=api&trafcat=tcgplayer.com%2Fsearch%2Fdecks&u=https%3A%2F%2Fwww.tcgplayer.com%2Fsearch%2Fdecks%3FproductLineName%3Dmagic%26q%3DRaised%2Bby%2BGiants",
+   "edhrec": "https://edhrec.com/route/?cc=Raised+by+Giants"
+  },
+  "purchase_uris": {
+   "tcgplayer": "https://partner.tcgplayer.com/c/4931599/1830156/21018?subId1=api&u=https%3A%2F%2Fwww.tcgplayer.com%2Fproduct%2F272638%3Fpage%3D1",
+   "cardmarket": "https://www.cardmarket.com/en/Magic/Products?idProduct=658482&referrer=scryfall&utm_campaign=card_prices&utm_medium=text&utm_source=scryfall",
+   "cardhoarder": "https://www.cardhoarder.com/cards/100538?affiliate_id=scryfall&ref=card-profile&utm_campaign=affiliate&utm_medium=card&utm_source=scryfall"
+  }
  }
 }

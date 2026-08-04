@@ -292,6 +292,12 @@ AUTOPLAY_DECKS = {
     "escape": "test_escape_kroxa",
     "transform": "test_transform_werewolves",
     "partner": "test_partner_thrasios_tymna",
+    # Aug 3, 2026: the second partner deck, and the only one built around
+    # "Partner WITH <name>" (CR 702.124b) rather than plain Partner — so it is
+    # the live vehicle for the named-pair legality check. Also the coverage
+    # deck for the two watcher seams its commanders are made of: Brallin fires
+    # on every DISCARD, Shabraz on every DRAW.
+    "partner_brallin": "test_partner_brallin_shabraz",
     # Modern decks (60 cards, 4-of, 20 life)
     "burn": "test_burn_modern",
     "uw_control": "test_uw_control_modern",
@@ -506,6 +512,19 @@ AUTOPLAY_MATRIX = [
     (150, "commander", "aristocrats",       "replacement_chain", "Korvold sacrifice (human) vs Gisela + doublers (AI path) — reverse of 137"),
     (151, "commander", "layers",            "replacement_chain", "Humility (human) vs Gisela + doublers (AI path) — reverse of 139"),
     (152, "commander", "combat_keywords",   "layers",            "Glissa trample+deathtouch (human) vs Humility (AI path) — reverse of 138"),
+    # Aug 3, 2026 — Brallin + Shabraz, the "Partner WITH <name>" pair. Both
+    # seats against every opponent, per the coverage-deck rule. Opponents are
+    # chosen so the pair's own engine is under load: madness and escape are
+    # the discard decks (Brallin), rashmi and baral are the draw decks
+    # (Shabraz).
+    (153, "commander", "partner_brallin",   "madness",           "Partner-with + discard/draw watchers (human) vs madness discard (AI)"),
+    (154, "commander", "madness",           "partner_brallin",   "Madness (human) vs partner-with pair (AI path) — reverse of 153"),
+    (155, "commander", "partner_brallin",   "escape",            "Partner-with pair (human) vs Kroxa graveyard (AI)"),
+    (156, "commander", "escape",            "partner_brallin",   "Escape (human) vs partner-with pair (AI path) — reverse of 155"),
+    (157, "commander", "partner_brallin",   "rashmi",            "Partner-with pair (human) vs cast-trigger value (AI) — draw-heavy for Shabraz"),
+    (158, "commander", "rashmi",            "partner_brallin",   "Rashmi (human) vs partner-with pair (AI path) — reverse of 157"),
+    (159, "commander", "partner_brallin",   "baral",             "Partner-with pair (human) vs counters/draw (AI) — Consecrated Sphinx lives here"),
+    (160, "commander", "baral",             "partner_brallin",   "Baral (human) vs partner-with pair (AI path) — reverse of 159"),
 ]
 
 AUTOPLAY_PHASES = {
@@ -525,7 +544,9 @@ AUTOPLAY_PHASES = {
     "stifle": (140, 145),  # July 21: [CAST-TRIGGER-PRIORITY] window (Talrand + Stifle-shapes) + both-seat reverses
     "july21": (140, 145),  # Alias for the July 21 coverage deck
     "reverses": (144, 152),  # July 21 batch-4 follow-up: AI-path reverses for the coverage decks' specialty matchups
-    "all": (1, 152),
+    "partner_brallin": (153, 160),  # Aug 3: the "Partner with <name>" pair + its discard/draw watcher seams
+    "aug3": (153, 160),             # Alias for the Aug 3 coverage deck
+    "all": (1, 160),
 }
 
 

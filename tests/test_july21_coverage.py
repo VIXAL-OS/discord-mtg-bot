@@ -199,7 +199,12 @@ class TestStifleDeckRegistration:
         # aristocrats/layers, etc.), so every distinct opponent must now
         # appear in both orientations.
         from mtg.autoplay import AUTOPLAY_MATRIX
-        coverage = {"stifle", "devotion", "combat_keywords", "replacement_chain"}
+        coverage = {"stifle", "devotion", "combat_keywords", "replacement_chain",
+                    # Aug 3, 2026: the "Partner with <name>" pair. Its whole
+                    # point is a mechanic that only exists across two command
+                    # zone objects, so an asymmetric-path bug is exactly the
+                    # kind it would hide.
+                    "partner_brallin"}
         pairs = {(m[2], m[3]) for m in AUTOPLAY_MATRIX if m[1] == "commander"}
         missing = []
         for deck in coverage:
