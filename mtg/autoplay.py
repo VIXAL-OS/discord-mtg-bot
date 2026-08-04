@@ -2763,6 +2763,18 @@ async def _run_single_autoplay(cog, channel, game_format: str, deck1_name: str, 
         use_alt_adapter = _openrouter_adapter
         alt_model = openrouter_model
         alt_label = f"OpenRouter ({openrouter_model})"
+    elif not force_claude and getattr(cog, 'batch_actor_adapter', None) \
+            and cog.batch_actor_adapter():
+        # Aug 3: the provider is whatever the batch pre-flight probe picked
+        # (cog._active_provider), not a hardcoded DeepSeek. Model strings are
+        # read off the adapter rather than restated, so a slug change in one
+        # place cannot desync the cost accounting from what actually ran.
+        use_alt_adapter = cog.batch_actor_adapter()
+        # No fallback string: a wrong-but-plausible default is exactly how
+        # a Qwen-pinned batch silently ran DeepSeek. If an adapter cannot
+        # name its model we want the AttributeError, not a guess.
+        alt_model = use_alt_adapter.model
+        alt_label = getattr(cog, '_active_provider', 'deepseek').capitalize()
     elif cog._deepseek_adapter and not force_claude:
         use_alt_adapter = cog._deepseek_adapter
         alt_model = "deepseek-v4-flash"
@@ -2802,10 +2814,15 @@ async def _run_single_autoplay(cog, channel, game_format: str, deck1_name: str, 
         else:
             _game_start_stats = None
         _game_start_strat_stats = None
-        if (cog._deepseek_reasoner_adapter
-                and use_alt_adapter is cog._deepseek_adapter
-                and hasattr(cog._deepseek_reasoner_adapter, 'get_stats')):
-            _game_start_strat_stats = cog._deepseek_reasoner_adapter.get_stats().copy()
+        _batch_strategist = (cog.batch_strategist_adapter()
+                             if getattr(cog, 'batch_strategist_adapter', None)
+                             else cog._deepseek_reasoner_adapter)
+        _actor_is_batch_provider = (
+            getattr(cog, 'batch_actor_adapter', None)
+            and use_alt_adapter is cog.batch_actor_adapter())
+        if (_batch_strategist and _actor_is_batch_provider
+                and hasattr(_batch_strategist, 'get_stats')):
+            _game_start_strat_stats = _batch_strategist.get_stats().copy()
         cog.engine.claude_ai.client = use_alt_adapter
         cog.engine.claude_ai.model = alt_model
         cog.engine.rules.client = use_alt_adapter
@@ -2814,10 +2831,12 @@ async def _run_single_autoplay(cog, channel, game_format: str, deck1_name: str, 
         # Phase 3: wire reasoner as strategist when using DeepSeek actor.
         # OpenRouter games get the same model for both roles (OpenRouter has
         # its own reasoning models selectable via --openrouter).
-        if cog._deepseek_reasoner_adapter and use_alt_adapter is cog._deepseek_adapter:
-            cog.engine.claude_ai.strategist_client = cog._deepseek_reasoner_adapter
-            cog.engine.claude_ai.strategist_model = "deepseek-v4-flash"
-            print("[AUTOPLAY] Phase 3 split: actor=deepseek-v4-flash (non-thinking), strategist=deepseek-v4-flash THINKING (0731 A/B — was v4-pro, Aug 2)")
+        if _batch_strategist and _actor_is_batch_provider:
+            cog.engine.claude_ai.strategist_client = _batch_strategist
+            cog.engine.claude_ai.strategist_model = _batch_strategist.model
+            print(f"[AUTOPLAY] Phase 3 split: actor={alt_model} (non-thinking), "
+                  f"strategist={cog.engine.claude_ai.strategist_model} THINKING "
+                  f"[provider={getattr(cog, '_active_provider', 'deepseek')}]")
         else:
             # OpenRouter or single-model path: actor and strategist share one model
             cog.engine.claude_ai.strategist_client = None
@@ -2895,7 +2914,11 @@ async def _run_single_autoplay(cog, channel, game_format: str, deck1_name: str, 
             thread_id=thread.id,
             player1_name=p1_name,
             player1_id=99999,
-            player2_name="Claude",
+            # Aug 3: name the AI seat after whoever is actually playing it.
+            # Rick stays Rick — he is the pretend-HUMAN seat, and which model
+            # drives him is implied by his opponent.
+            player2_name=(cog.ai_player_name(force_claude, openrouter_model)
+                          if hasattr(cog, 'ai_player_name') else "Claude"),
             player2_id=None,
             format=game_format,
             player1_deck=deck1_data,
@@ -3259,19 +3282,20 @@ async def _run_single_autoplay(cog, channel, game_format: str, deck1_name: str, 
 
                 turn_had_actions = False
                 if game.active_player.is_claude:
+                    actor_name = game.active_player.name
                     actions = await cog.engine.execute_claude_turn(game)
                     actions = cog._sanitize_action_bullets(actions)
                     if actions:
                         turn_had_actions = True
-                        msg = f"**Claude's turn:**\n" + "\n".join(f"\u2022 {a}" for a in actions)
+                        msg = f"**{actor_name}'s turn:**\n" + "\n".join(f"\u2022 {a}" for a in actions)
                         if len(msg) > 1900:
-                            await cog._autoplay_send(thread, "**Claude's turn:**")
+                            await cog._autoplay_send(thread, f"**{actor_name}'s turn:**")
                             for a in actions:
                                 await cog._autoplay_send(thread, f"\u2022 {a[:1900]}")
                         else:
                             await cog._autoplay_send(thread, msg)
                     else:
-                        await cog._autoplay_send(thread, "*Claude thinks, then passes.*")
+                        await cog._autoplay_send(thread, f"*{actor_name} thinks, then passes.*")
 
                     await cog._autoplay_resolve_pending_action(thread, game)
 
@@ -3569,18 +3593,35 @@ async def _run_single_autoplay(cog, channel, game_format: str, deck1_name: str, 
             # of input tokens; output is also 2-4x lower than the old list rate.
             #   V4-Flash (actor):      hit $0.0028/M, miss $0.14/M,  out $0.28/M
             #   V4-Pro   (strategist): hit $0.0036/M, miss $0.435/M, out $0.87/M
-            ACTOR_INPUT_MISS_RATE = 0.14   / 1_000_000
-            ACTOR_INPUT_HIT_RATE  = 0.0028 / 1_000_000
-            ACTOR_OUTPUT_RATE     = 0.28   / 1_000_000
+            #
+            # Aug 3: these are no longer hardcoded per ROLE. Hardcoding
+            # assumed the provider, so the moment a batch ran on anything but
+            # DeepSeek every cost figure printed here was silently wrong —
+            # and the pre-flight probe can now switch providers at launch.
+            # Rates are looked up from the MODEL STRING that actually ran
+            # (rules.llm_adapter.MODEL_RATES), which also means the Aug 2
+            # strategist A/B reprices itself instead of needing an edit here.
+            from rules.llm_adapter import rates_for_model as _rates
+            # rate_key, not model: DashScope RESELLS deepseek-v4-flash under
+            # the identical name at its own rates (10x worse cache), so
+            # pricing by model string alone would bill an Alibaba-hosted
+            # DeepSeek at DeepSeek's own prices. rate_key defaults to model,
+            # so every existing adapter is unaffected.
+            _actor_model = (getattr(use_alt_adapter, 'rate_key', None)
+                            or use_alt_adapter.model)
+            _strat_model = ((getattr(_batch_strategist, 'rate_key', None)
+                             or _batch_strategist.model)
+                            if _batch_strategist else _actor_model)
+            (ACTOR_INPUT_HIT_RATE, ACTOR_INPUT_MISS_RATE,
+             ACTOR_OUTPUT_RATE) = _rates(_actor_model)
+            (STRAT_INPUT_HIT_RATE, STRAT_INPUT_MISS_RATE,
+             STRAT_OUTPUT_RATE) = _rates(_strat_model)
             # Aug 2 (the flash A/B): the strategist is V4-FLASH thinking mode
             # now, so it bills at Flash rates. Thinking tokens bill as OUTPUT
             # on DeepSeek, so expect strat completion_tokens to RISE while
             # the rate drops ~3x — net strat cost should still fall hard.
-            # (Revert with the llm_adapter factory: Pro rates were
-            # hit $0.0036 / miss $0.435 / out $0.87.)
-            STRAT_INPUT_MISS_RATE = 0.14   / 1_000_000
-            STRAT_INPUT_HIT_RATE  = 0.0028 / 1_000_000
-            STRAT_OUTPUT_RATE     = 0.28   / 1_000_000
+            # That A/B needs no edit here any more: the lookup above reads
+            # whichever model the strategist adapter is actually carrying.
             # PARALLEL-MODE CAVEAT: with real rates the CUMULATIVE
             # [STATS-CUMULATIVE] est_cost tracks the real bill. The per-game
             # [STATS-GAME] delta is UNRELIABLE under `!autoplay-parallel` — all
@@ -3630,10 +3671,18 @@ async def _run_single_autoplay(cog, channel, game_format: str, deck1_name: str, 
             # in the log instead of silently dropping the line — game
             # `1505386281578921984` showed this hole in the May 16 batch.
             try:
-                stats = cog._deepseek_adapter.get_stats()
+                # Aug 4: read the adapters that ACTUALLY RAN, not the DeepSeek
+                # ones. These were hardcoded, so the first Qwen batch reported
+                # `calls=0 est_cost=$0.0000` — the DeepSeek adapters sat idle
+                # while Qwen did all the work, and the cost line dutifully
+                # reported the idle ones. Silent zeroes, on the exact number
+                # the provider A/B exists to measure.
+                stats = (use_alt_adapter.get_stats()
+                         if hasattr(use_alt_adapter, 'get_stats')
+                         else cog._deepseek_adapter.get_stats())
                 strat_stats = None
-                if cog._deepseek_reasoner_adapter and hasattr(cog._deepseek_reasoner_adapter, 'get_stats'):
-                    strat_stats = cog._deepseek_reasoner_adapter.get_stats()
+                if _batch_strategist and hasattr(_batch_strategist, 'get_stats'):
+                    strat_stats = _batch_strategist.get_stats()
             except Exception as _stats_err:
                 print(f"[AUTOPLAY] STATS-GAME stats lookup failed: {_stats_err}")
                 stats = None

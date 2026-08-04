@@ -579,7 +579,7 @@ async def resolve_effect(rules, game: GameState, effect_description: str,
     # empty pool. If the effect hinges on an optional mana payment and no
     # mana is available at all, resolve it as a decline instead of letting
     # the model invent the payment.
-    if re.search(r'\byou may pay\b', effect_lower_guard) and controller:
+    if re.search(r'\byou may pay\b', _guard_desc.lower()) and controller:
         _ctrl_p = next((p for p in game.players if p.name == controller), None)
         if _ctrl_p is not None:
             _pool_total = sum((getattr(_ctrl_p, 'mana_pool', {}) or {}).values())

@@ -1545,7 +1545,7 @@ async def execute_claude_turn(engine, game: GameState) -> List[str]:
                     result_card = game.find_card_global(a_id)
                     if result_card:
                         declared_names.append(result_card[0].name)
-                actions_taken.append(f"⚔️ Claude attacks with {', '.join(declared_names)}")
+                actions_taken.append(f"⚔️ {player.name} attacks with {', '.join(declared_names)}")
                 print(f"[EXECUTE_CLAUDE] Declared {len(game.attackers)} attacker(s)")
         else:
             print(f"[EXECUTE_CLAUDE] Claude chose not to attack")

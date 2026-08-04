@@ -1995,8 +1995,16 @@ class CubeDraftCog(commands.Cog, name="Cube Draft"):
                 is_human=False, is_claude=False,
                 discord_user_id=99999,
             ))
+            # Aug 3: name the AI seat after whoever is actually playing it
+            # (the autodraft runs on the same provider as an autoplay batch).
+            # DraftSeat.is_claude is the identity flag; the name is display.
+            _game_cog_for_name = self.bot.get_cog("MTG Game")
+            _ai_name = (_game_cog_for_name.ai_player_name()
+                        if _game_cog_for_name
+                        and hasattr(_game_cog_for_name, 'ai_player_name')
+                        else "Claude")
             seats.append(DraftSeat(
-                seat_index=1, name="Claude",
+                seat_index=1, name=_ai_name,
                 is_claude=True,
             ))
             for i in range(2, POD_SIZE):
@@ -2100,7 +2108,8 @@ class CubeDraftCog(commands.Cog, name="Cube Draft"):
             claude_seat_obj.sideboard = claude_sb
 
             await self._autodraft_send(thread, self._format_deck_summary("Rick Deckard", rick_deck))
-            await self._autodraft_send(thread, self._format_deck_summary("Claude", claude_deck))
+            await self._autodraft_send(thread, self._format_deck_summary(
+                claude_seat_obj.name, claude_deck))
 
             print(f"[AUTO-DRAFT] Rick's deck: {len(rick_deck)} cards, "
                   f"Claude's deck: {len(claude_deck)} cards")
@@ -2117,7 +2126,7 @@ class CubeDraftCog(commands.Cog, name="Cube Draft"):
                 player1_name="Rick Deckard",
                 player1_id=99999,
                 player1_cards=list(rick_seat.deck),
-                player2_name="Claude",
+                player2_name=claude_seat_obj.name,
                 player2_id=None,
                 player2_cards=list(claude_seat_obj.deck),
                 format_name="limited",

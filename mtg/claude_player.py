@@ -2195,8 +2195,9 @@ Based on this game state, what is your best play?
                 else:
                     print(f"{self.provider_tag} Action missing 'type' key ({list(action.keys())}); defaulting to pass")
                     action = {"type": "pass"}
-            # Coerce list-valued target/card to first element (multi-target spells)
-            for _k in ("target", "card", "permanent"):
+            # Normalize singular identity fields emitted by some providers.
+            # ``target`` may be a legitimate cast target array.
+            for _k in ("card", "permanent"):
                 _v = action.get(_k)
                 if isinstance(_v, (list, tuple)):
                     action[_k] = _v[0] if _v else None
@@ -2784,8 +2785,8 @@ IMPORTANT: Always end with {"type": "pass"}. No text outside the JSON array."""
                 print(f"{self.provider_tag} [PLAN] Not a list, wrapping: {type(plan)}")
                 plan = [plan] if isinstance(plan, dict) else [{"type": "pass"}]
 
-            # Normalize each step: drop non-dicts, guarantee 'type' key, coerce
-            # list-valued 'target' to first element (multi-target spells).
+            # Normalize each step: drop non-dicts and guarantee a 'type' key.
+            # Cast target arrays remain intact for multi-target spells.
             normalized = []
             for step in plan:
                 if not isinstance(step, dict):
@@ -2799,9 +2800,6 @@ IMPORTANT: Always end with {"type": "pass"}. No text outside the JSON array."""
                           f"to hold {step.get('card') or step.get('permanent')}"
                           f" — dropping the step")
                     continue
-                tgt = step.get("target")
-                if isinstance(tgt, (list, tuple)):
-                    step["target"] = tgt[0] if tgt else None
                 normalized.append(step)
             plan = normalized or [{"type": "pass"}]
 

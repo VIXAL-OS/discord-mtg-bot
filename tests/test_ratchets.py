@@ -90,7 +90,13 @@ EXCEPT_BASELINE = {
     # July 30: +1 for the !coverage XMage-probe barrier (network/subprocess
     # crash barrier with its own [XMAGE] log line — the deliberately
     # swallow-only class, not a maybe_reraise candidate).
-    "cog.py": 31,
+    # Aug 4: +1 for the inter-wave provider re-probe. Same class and
+    # deliberately NOT a maybe_reraise candidate: the probe exists to keep a
+    # batch running when a provider degrades, so letting it re-raise under
+    # strict would hand it the power to END a 160-game batch — the exact
+    # failure it was built to prevent. It logs [PROVIDER-PROBE] and leaves
+    # the running provider selected.
+    "cog.py": 32,
     # July 30: _check_color_castable moved here from claude_player.py — its
     # ManaCost-parse fallback catch moved with it (claude_player's count
     # dropped by one under its unchanged ceiling).

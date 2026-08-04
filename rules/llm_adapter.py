@@ -528,12 +528,39 @@ class OpenAICompatibleAdapter:
                  model: str = "deepseek-v4-flash", log_tag: str = "DEEPSEEK",
                  extra_headers: dict = None,
                  thinking_enabled: bool = None,
-                 reasoning_effort: str = None):
+                 reasoning_effort: str = None,
+                 request_timeout: float = 90.0,
+                 max_retries: int = 1,
+                 rate_key: str = None):
         from openai import OpenAI
-        client_kwargs = dict(api_key=api_key, base_url=base_url)
+        # Aug 3, 2026 — THE HANG FIX. This client was constructed with no
+        # timeout at all, so it inherited the openai SDK's default: 600s per
+        # request with 2 retries, i.e. up to THIRTY MINUTES before a single
+        # call gives up. On Aug 3 that parked an entire 25-game batch: every
+        # game froze mid-`[PLAN] Planning main1` awaiting a DeepSeek actor
+        # call that never returned, and 53 minutes later not one game had
+        # finished a turn.
+        #
+        # The strategist has had a deadman since May (60s no-chunk / 120s
+        # hard cap) precisely because a 28-minute hang killed a game. The
+        # ACTOR never got one — it is non-streaming, so there was nothing to
+        # watch inter-chunk — and the actor is the call every game makes
+        # several times a turn. This bounds it at the transport instead,
+        # which covers every call site at once rather than needing a wrapper
+        # around each of the ~10 `asyncio.to_thread` invocations.
+        #
+        # Timing out is SAFE here: every call site already handles adapter
+        # exceptions (that is how 503s degrade today), so a timeout surfaces
+        # as the same recoverable error and the game moves on instead of
+        # blocking forever. Worst case per logical call is
+        # request_timeout * (max_retries + 1).
+        client_kwargs = dict(api_key=api_key, base_url=base_url,
+                             timeout=request_timeout, max_retries=max_retries)
         if extra_headers:
             client_kwargs['default_headers'] = extra_headers
         self._openai_client = OpenAI(**client_kwargs)
+        self._request_timeout = request_timeout
+        self._max_retries = max_retries
         self.messages = _MessagesNamespace(self._openai_client,
                                            default_model=model,
                                            log_tag=log_tag,
@@ -541,6 +568,13 @@ class OpenAICompatibleAdapter:
                                            reasoning_effort=reasoning_effort)
         self._model = model
         self._log_tag = log_tag
+        # Aug 4: the model STRING is not a unique price key. DashScope
+        # RESELLS deepseek-v4-flash under the identical name at its own
+        # rates (notably a 10x worse cache rate), so pricing by model alone
+        # would bill an Alibaba-hosted DeepSeek at DeepSeek's own prices.
+        # rate_key lets a factory disambiguate; it defaults to the model, so
+        # every existing adapter is unchanged.
+        self.rate_key = rate_key or model
         # Build a compact init log line summarizing thinking/reasoning config
         extras = []
         if thinking_enabled is False:
@@ -549,8 +583,27 @@ class OpenAICompatibleAdapter:
             extras.append("thinking=enabled")
         if reasoning_effort:
             extras.append(f"reasoning_effort={reasoning_effort}")
+        extras.append(f"timeout={request_timeout:g}s x{max_retries + 1}")
         extras_str = f", {', '.join(extras)}" if extras else ""
         print(f"[{log_tag}] Adapter initialized (model={model}, base_url={base_url}{extras_str})")
+
+    @property
+    def model(self) -> str:
+        """Public alias for the configured model.
+
+        Aug 4: the class only ever exposed `_model`, and the autoplay swap
+        block read `getattr(adapter, 'model', 'deepseek-v4-flash')` — so it
+        silently received the FALLBACK for every adapter ever built. A batch
+        pinned to Qwen therefore ran with claude_ai.model set to
+        'deepseek-v4-flash': the right adapter, the wrong model string, which
+        DashScope happily served because it hosts that model too. The pin
+        said qwen and the games ran DeepSeek.
+
+        The misleading default is gone from the call sites; this property
+        exists so `adapter.model` is simply correct for anyone who reaches
+        for the obvious name.
+        """
+        return self._model
 
     def get_stats(self) -> dict:
         """Return cumulative usage statistics for this adapter session."""
@@ -698,6 +751,13 @@ def create_deepseek_reasoner_adapter(api_key: str = None) -> 'OpenAICompatibleAd
             model="deepseek-v4-flash",
             log_tag="DEEPSEEK:REASONER",
             thinking_enabled=True,
+            # Longer than the actor's 90s: a thinking-mode memo legitimately
+            # runs long, and this role already has a streaming deadman (60s
+            # no-chunk / 120s hard cap) as its primary bound. The transport
+            # cap is the backstop for what the deadman CANNOT see — a request
+            # that never opens a stream at all, which is exactly how the Aug 3
+            # hang presented.
+            request_timeout=180.0,
         )
     except ImportError:
         print("[DEEPSEEK:REASONER] openai package not installed. Run: pip install openai>=1.40.0")
@@ -705,3 +765,359 @@ def create_deepseek_reasoner_adapter(api_key: str = None) -> 'OpenAICompatibleAd
     except Exception as e:
         print(f"[DEEPSEEK:REASONER] Failed to create adapter: {e}")
         return None
+
+
+# ===========================================================================
+# ALIBABA / DASHSCOPE (Qwen) — Aug 3, 2026
+# ===========================================================================
+# Added so a batch is not hostage to one provider's congestion. DeepSeek has
+# ANNOUNCED (not yet live) peak-hour pricing for Beijing 09:00-12:00 and
+# 14:00-18:00; those windows are 21:00-00:00 and 02:00-06:00 EDT, and an
+# overnight batch straddles both. The Aug 3 batch launched at Beijing 11:13
+# and took a burst of HTTP 503 "service is too busy" plus a latency tail of
+# 200-365s per call against a healthy median of ~8s.
+#
+# DashScope is OpenAI-compatible, so this is the same OpenAICompatibleAdapter
+# with a different base_url — and unlike the OpenRouter route it preserves the
+# actor/strategist split, because we hold two independent model slugs.
+
+def _dashscope_base_url() -> str:
+    """Resolve the DashScope endpoint for the configured region.
+
+    Regions are NOT interchangeable: "API Keys are independent across regions
+    and cannot be used across regions" — a Frankfurt key against the
+    Singapore host returns 401 with a message that reads like a bad key,
+    which is a genuinely misleading error and cost an hour on Aug 4.
+
+    Frankfurt and Tokyo additionally embed a WORKSPACE ID in the hostname,
+    a different shape from Singapore/Beijing. Set DASHSCOPE_WORKSPACE_ID for
+    those; the console shows it next to the API key.
+
+        DASHSCOPE_REGION=intl          -> Singapore  (default)
+        DASHSCOPE_REGION=cn            -> Beijing
+        DASHSCOPE_REGION=eu-central-1  -> Frankfurt  (needs workspace id)
+        DASHSCOPE_REGION=ap-northeast-1-> Tokyo      (needs workspace id)
+        DASHSCOPE_BASE_URL=...         -> full override, wins over all of it
+    """
+    explicit = os.getenv("DASHSCOPE_BASE_URL", "").strip()
+    if explicit:
+        return explicit
+    region = os.getenv("DASHSCOPE_REGION", "intl").strip().lower()
+    workspace = os.getenv("DASHSCOPE_WORKSPACE_ID", "").strip()
+    if region in ("intl", "singapore", "ap-southeast-1"):
+        return "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+    if region in ("cn", "beijing", "cn-beijing"):
+        return "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    if region in ("eu-central-1", "frankfurt", "ap-northeast-1", "tokyo",
+                  "us-east-1", "us-virginia", "virginia"):
+        canon = {"frankfurt": "eu-central-1",
+                 "tokyo": "ap-northeast-1",
+                 "us-virginia": "us-east-1",
+                 "virginia": "us-east-1"}.get(region, region)
+        if not workspace:
+            print(f"[DASHSCOPE] region={canon} needs DASHSCOPE_WORKSPACE_ID "
+                  f"(the hostname embeds it) — falling back to Singapore, "
+                  f"which will 401 if the key is not a Singapore key")
+            return "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+        return f"https://{workspace}.{canon}.maas.aliyuncs.com/compatible-mode/v1"
+    print(f"[DASHSCOPE] unknown DASHSCOPE_REGION={region!r} — using Singapore")
+    return "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+
+
+DASHSCOPE_BASE_URL = _dashscope_base_url()
+
+# Confirmed 2026-08-04 against Alibaba's per-model doc pages. qwen3.7-flash
+# is real, callable, and available in Beijing / Singapore / Frankfurt / Tokyo
+# / Hong Kong, with function calling, structured outputs and context caching
+# all supported — which is the whole feature set this workload needs.
+#
+# Alibaba publishes DATED snapshot ids too (qwen3.7-flash-2026-07-15). The
+# undated alias is deliberate: it tracks the current build the way
+# `deepseek-v4-flash` does, and pinning a date is what to do if a build
+# regresses, not before.
+#
+# Also worth knowing, from the same model list: DashScope HOSTS
+# `deepseek-v4-flash` and `deepseek-v4-pro` itself. If DeepSeek's own API is
+# congested, that is a route to the identical model on different
+# infrastructure — zero quality risk, unlike switching model families. Not
+# wired here (it needs its own rate entries, since Alibaba's resale price is
+# not DeepSeek's), but it is the lowest-risk failover available.
+QWEN_ACTOR_MODEL = os.getenv("QWEN_ACTOR_MODEL", "qwen3.7-flash")
+QWEN_STRATEGIST_MODEL = os.getenv("QWEN_STRATEGIST_MODEL", "qwen3.7-plus")
+
+
+def create_dashscope_adapter(model: str, api_key: str = None,
+                             log_tag: str = None,
+                             thinking_enabled: bool = None,
+                             request_timeout: float = 90.0,
+                             rate_key: str = None):
+    """Adapter for Alibaba Model Studio (DashScope), OpenAI-compatible.
+
+    Mirrors create_deepseek_adapter: returns None rather than raising when
+    the key or the openai package is missing, so callers can invoke it
+    unconditionally at startup and degrade to whatever else is configured.
+    """
+    key = api_key or os.getenv("DASHSCOPE_API_KEY") or os.getenv("ALIBABA_API_KEY")
+    if not key:
+        return None
+    try:
+        return OpenAICompatibleAdapter(
+            api_key=key,
+            base_url=DASHSCOPE_BASE_URL,
+            model=model,
+            log_tag=log_tag or f"DASHSCOPE:{model}",
+            thinking_enabled=thinking_enabled,
+            request_timeout=request_timeout,
+            rate_key=rate_key,
+        )
+    except ImportError:
+        print("[DASHSCOPE] openai package not installed. Run: pip install openai>=1.40.0")
+        return None
+    except Exception as e:
+        print(f"[DASHSCOPE] Failed to create adapter: {e}")
+        return None
+
+
+def create_qwen_actor_adapter(api_key: str = None):
+    """Actor role on Qwen: fast structured JSON, thinking OFF.
+
+    Mirrors the DeepSeek actor exactly — thinking is disabled EXPLICITLY
+    rather than left to the endpoint default, which is the lesson from
+    V4-Flash defaulting to thinking-enabled server-side and silently
+    billing chain-of-thought.
+    """
+    return create_dashscope_adapter(
+        QWEN_ACTOR_MODEL, api_key=api_key,
+        log_tag="QWEN:ACTOR", thinking_enabled=False)
+
+
+def create_qwen_strategist_adapter(api_key: str = None):
+    """Strategist role on Qwen: one deep-reasoning memo per turn.
+
+    Defaults to the PLUS tier, by operator choice. Worth stating the cost
+    consequence plainly: Plus is the quality tier, not a cost play — at the
+    verified Fireworks rate ($0.40/$1.60) it is dearer than the DeepSeek
+    strategist currently in place (V4-Flash thinking, $0.14/$0.28), which
+    the Aug 2 A/B adopted for a 61% saving. Set QWEN_STRATEGIST_MODEL to the
+    flash slug to mirror the DeepSeek arrangement instead.
+    """
+    return create_dashscope_adapter(
+        QWEN_STRATEGIST_MODEL, api_key=api_key,
+        log_tag="QWEN:STRATEGIST", thinking_enabled=True,
+        request_timeout=180.0)
+
+
+# ===========================================================================
+# PROVIDER RATE TABLE — the single source of truth for token pricing
+# ===========================================================================
+# Before this existed the rates were LOCAL constants inside the [STATS-GAME]
+# cost block in mtg/autoplay.py, hardcoded per ROLE (ACTOR_*/STRAT_*). That
+# silently assumed the provider, so the moment a batch runs on anything but
+# DeepSeek every cost figure it prints is wrong. Keying on the model string
+# instead means a provider swap reprices itself.
+#
+# Values are US DOLLARS PER MILLION TOKENS: (cache_hit_in, cache_miss_in, out).
+# The cache_hit column is the one that decides this workload's economics —
+# 66-84% of input tokens are hits here, so blended input is far below the
+# headline miss rate.
+MODEL_RATES = {
+    # DeepSeek — verified against the account's own usage export (reproduced
+    # a known monthly bill to the cent); the April 2026 price cut put the hit
+    # rate at 98% off, which is unusually aggressive (most providers do 90%).
+    "deepseek-v4-flash": (0.0028, 0.14, 0.28),
+    "deepseek-v4-pro": (0.0036, 0.435, 0.87),
+
+    # Qwen via DashScope — from Alibaba's PER-MODEL doc pages, which is the
+    # only source that has held up. Both an aggregator listing and a
+    # summarised read of the consolidated pricing table gave wrong answers
+    # tonight, the latter reporting qwen3.7-flash as absent when it has its
+    # own page with a full billing breakdown. If a Qwen rate needs checking,
+    # go to help/en/model-studio/<model-name>, not a table or a third party.
+    #
+    # qwen3.7-flash, Input<=32k tier (verified 2026-08-04). This workload's
+    # prompts are ~10K, so the lowest tier is the one that applies; the
+    # tiers step up above 32K and again above 256K.
+    #   input 0.028 | output 0.11 | IMPLICIT cache 0.006 | explicit read 0.003
+    # The implicit-cache rate is the one modelled: it needs no cache
+    # management, exactly like DeepSeek's. (Explicit caching is cheaper still
+    # at 0.003 but bills 0.034 for creation and has to be managed, so it is
+    # only worth it if a stable prefix is reused hard — which this workload's
+    # STABLE STRATEGY REFERENCE block arguably is. Worth revisiting.)
+    "qwen3.7-flash": (0.006, 0.028, 0.11),
+    # Plus: input corroborated by two independent sources (the promo page's
+    # "List Price $0.276" and the pricing table). Output from the table only.
+    "qwen3.7-plus": (0.0276, 0.276, 1.101),
+    "qwen3.7-max": (0.165, 1.65, 4.951),
+
+    # DeepSeek RESOLD BY DASHSCOPE — provider-scoped keys, because the model
+    # strings are identical to DeepSeek's own and would otherwise be priced
+    # at DeepSeek's rates. Verified 2026-08-04 from the Model Studio
+    # per-model page (deepseek-v4-flash: in 0.138 / out 0.275 / implicit
+    # cache 0.028; regions Beijing, Frankfurt, US-Virginia, Tokyo).
+    #
+    # The list prices essentially match DeepSeek's own, but the CACHE rate is
+    # 0.028 against DeepSeek's 0.0028 — 10x worse — so blended input runs
+    # ~1.45x DeepSeek direct. That is the honest price of this failover, and
+    # it buys the thing no model swap can: the IDENTICAL model on different
+    # infrastructure, so a congested-DeepSeek batch keeps its exact play
+    # quality instead of trading it for availability.
+    "dashscope:deepseek-v4-flash": (0.028, 0.138, 0.275),
+    "dashscope:deepseek-v4-pro": (0.028, 0.138, 0.275),
+
+    # Family catch-alls, so an unrecognised member still prices as its family
+    # rather than falling to the unknown-model rate. They also make the
+    # longest-first match below load-bearing rather than merely defensive,
+    # since every specific slug nests inside one of these.
+    #
+    # Both sit at the QUALITY tier of their family (Plus / V4-Pro), not the
+    # absolute top. Stated plainly because it is a compromise rather than a
+    # rule: an unrecognised Flash-class model over-reports ~1.7x, which is
+    # the safe direction, but an unrecognised MAX-class model would
+    # UNDER-report ~6x. Pricing the catch-all at Max instead would make every
+    # unknown Qwen read ~10x high, and a cost line nobody believes is worth
+    # no more than one that is wrong. The mitigation is the real one: add the
+    # slug to the table when a new tier starts being used.
+    "qwen": (0.0276, 0.276, 1.101),
+    "deepseek": (0.0036, 0.435, 0.87),
+}
+
+# What to charge a model we have no entry for. DeepSeek V4-Flash's MISS rate
+# is used for all three columns: it is the provider we actually run, and
+# pricing an unknown model at the no-discount rate over-reports rather than
+# under-reports. A cost line that reads high is a prompt to add a rate entry;
+# one that reads low is a silent lie.
+_UNKNOWN_MODEL_RATE = (0.14, 0.14, 0.28)
+
+
+def rates_for_model(model: str):
+    """(hit, miss, out) dollars-per-token for a model string.
+
+    Matching is substring-based and LONGEST-FIRST, because the slugs nest:
+    'qwen3.7-flash' contains 'qwen3.7', and a shortest-first match would
+    price Plus at Flash rates. Returns per-TOKEN rates (already divided by
+    a million) so call sites can multiply directly.
+    """
+    m = (model or "").lower()
+    # Provider-scoped keys ("dashscope:deepseek-v4-flash") are checked first
+    # and EXACTLY, so a resold model is never priced at its origin's rates
+    # by the substring pass below.
+    if m in MODEL_RATES:
+        hit, miss, out = MODEL_RATES[m]
+        return (hit / 1_000_000, miss / 1_000_000, out / 1_000_000)
+    for key in sorted(MODEL_RATES, key=len, reverse=True):
+        if key in m:
+            hit, miss, out = MODEL_RATES[key]
+            return (hit / 1_000_000, miss / 1_000_000, out / 1_000_000)
+    hit, miss, out = _UNKNOWN_MODEL_RATE
+    return (hit / 1_000_000, miss / 1_000_000, out / 1_000_000)
+
+
+# ===========================================================================
+# PROVIDER LATENCY PROBE — Aug 3, 2026
+# ===========================================================================
+
+async def probe_adapter_latency(adapter, samples: int = 2,
+                                timeout: float = 25.0) -> dict:
+    """Time a few trivial completions against one adapter.
+
+    `messages.create` is SYNCHRONOUS (callers wrap it in a thread), so each
+    sample goes through asyncio.to_thread and the whole probe stays awaitable.
+
+    ANY error disqualifies the provider. That is deliberate rather than
+    lenient: the failure this exists to dodge is HTTP 503 "service is too
+    busy", so an erroring provider is precisely the one not to pick — there
+    is no point averaging a 503 into a latency figure.
+
+    Also doubles as a slug validity check. An unknown model returns 4xx here
+    and the provider is skipped, which is what keeps the VERIFY-flagged Qwen
+    slugs from being able to kill a batch mid-run.
+    """
+    if adapter is None:
+        return {"ok": False, "median_ms": None, "errors": 0,
+                "detail": "not configured"}
+    lat = []
+    errors = 0
+    last_err = ""
+    for _ in range(max(1, samples)):
+        t0 = time.monotonic()
+        try:
+            await asyncio.wait_for(
+                asyncio.to_thread(
+                    lambda: adapter.messages.create(
+                        max_tokens=4,
+                        messages=[{"role": "user", "content": "ping"}])),
+                timeout=timeout)
+            lat.append((time.monotonic() - t0) * 1000.0)
+        except Exception as e:
+            errors += 1
+            last_err = str(e)[:160]
+    if not lat:
+        return {"ok": False, "median_ms": None, "errors": errors,
+                "detail": last_err or "all probes failed"}
+    lat.sort()
+    return {"ok": errors == 0, "median_ms": lat[len(lat) // 2],
+            "errors": errors, "detail": last_err}
+
+
+async def choose_fastest_provider(candidates: list, samples: int = 2,
+                                  timeout: float = 25.0):
+    """Pick the responsive provider with the lowest median latency.
+
+    `candidates` is [(name, probe_adapter), ...] — probe the ACTOR adapter of
+    each provider, since that is the high-volume role whose latency dominates
+    a batch.
+
+    Returns (winner_name_or_None, results_by_name). None means nothing was
+    usable and the caller should keep whatever default it already had; it
+    never means "pick arbitrarily".
+
+    All probes run CONCURRENTLY, so the pre-flight costs one round-trip of
+    wall clock rather than one per provider, and a few tokens in total.
+    """
+    named = [(n, a) for n, a in candidates if a is not None]
+    if not named:
+        return None, {}
+    results = await asyncio.gather(
+        *[probe_adapter_latency(a, samples, timeout) for _, a in named])
+    by_name = {n: r for (n, _), r in zip(named, results)}
+    healthy = {n: r for n, r in by_name.items() if r["ok"]}
+    for n, r in by_name.items():
+        if r["median_ms"] is None:
+            print(f"[PROVIDER-PROBE] {n}: UNUSABLE — {r['detail']}")
+        elif r["ok"]:
+            print(f"[PROVIDER-PROBE] {n}: median {r['median_ms']:.0f}ms")
+        else:
+            print(f"[PROVIDER-PROBE] {n}: median {r['median_ms']:.0f}ms "
+                  f"but {r['errors']} error(s) — disqualified: {r['detail']}")
+    if not healthy:
+        return None, by_name
+    winner = min(healthy, key=lambda n: healthy[n]["median_ms"])
+    return winner, by_name
+
+
+def create_dashscope_deepseek_actor_adapter(api_key: str = None):
+    """DeepSeek V4-Flash, served by Alibaba rather than DeepSeek.
+
+    The lowest-risk failover there is: when DeepSeek's own API is congested
+    this is the SAME MODEL on different infrastructure, so nothing about play
+    quality changes — unlike switching to Qwen, which is a real A/B. Costs
+    ~1.45x DeepSeek direct on blended input (the cache rate is 10x worse).
+
+    Availability note: NOT offered in Singapore. Regions are Beijing,
+    Frankfurt, US-Virginia and Tokyo, so this needs DASHSCOPE_REGION set to
+    one of those — on the default Singapore endpoint the call will simply
+    fail, and the pre-flight probe will skip it rather than break a batch.
+    """
+    return create_dashscope_adapter(
+        "deepseek-v4-flash", api_key=api_key,
+        log_tag="DASHSCOPE:DEEPSEEK-ACTOR", thinking_enabled=False,
+        rate_key="dashscope:deepseek-v4-flash")
+
+
+def create_dashscope_deepseek_strategist_adapter(api_key: str = None):
+    """Strategist twin of the above — flash in THINKING mode, mirroring the
+    Aug 2 A/B that this repo already validated on DeepSeek direct."""
+    return create_dashscope_adapter(
+        "deepseek-v4-flash", api_key=api_key,
+        log_tag="DASHSCOPE:DEEPSEEK-STRATEGIST", thinking_enabled=True,
+        rate_key="dashscope:deepseek-v4-flash", request_timeout=180.0)

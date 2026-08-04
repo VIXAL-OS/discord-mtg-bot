@@ -3442,6 +3442,13 @@ class Player:
         oracle_lower = (getattr(card, 'oracle_text', '') or '').lower()
         if not oracle_lower:
             return False
+        # Commander 2020 free-interaction cycle (Fierce Guardianship,
+        # Deflecting Swat, etc.).  Mirror the payment-stage predicate.
+        if (('control a commander' in oracle_lower
+             or 'a commander you control' in oracle_lower)
+                and 'without paying its mana cost' in oracle_lower):
+            return any(getattr(c, 'is_commander', False)
+                       for c in self.battlefield)
         # Force of Will family: "pay 1 life and exile a <color> card from
         # your hand rather than pay this spell's mana cost"
         if 'pay 1 life and exile a' in oracle_lower and 'from your hand' in oracle_lower:

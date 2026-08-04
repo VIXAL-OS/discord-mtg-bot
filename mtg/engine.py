@@ -194,16 +194,16 @@ def _collapse_repeated_life_gain(messages):
 
 
 def _normalize_action_target(action):
-    """Normalize the 'target' field of an AI action dict to a string or None.
+    """Normalize an AI target to a name, cast-name list, or ``None``.
 
     The AI sometimes packs structured data into the target field (e.g.
-    `{"X": 2}` for X-cost spells, or a list of targets). Downstream code
-    calls .lower() / find_card / etc. on the target value and crashes with
-    AttributeError when the value isn't a string.
+    `{"X": 2}` for X-cost spells).  Cast actions may legitimately carry a
+    list of named targets; other action types still collapse a list to one
+    name because their executors accept a single target.
 
     Side effects: if the dict contains an X-cost value and the action lacks
     one, hoist it onto the action under x_value. Mutates `action` in place
-    via assignment of normalized target. Returns the normalized string/None.
+    via assignment of the normalized target.
     """
     target_name = action.get("target")
     if isinstance(target_name, dict):
@@ -212,7 +212,11 @@ def _normalize_action_target(action):
         target_name = (target_name.get('card') or target_name.get('name')
                        or target_name.get('target') or None)
     elif isinstance(target_name, list):
-        target_name = next((t for t in target_name if isinstance(t, str)), None)
+        named_targets = [t for t in target_name if isinstance(t, str) and t]
+        if action.get('type') == 'cast' and len(named_targets) > 1:
+            target_name = named_targets
+        else:
+            target_name = named_targets[0] if named_targets else None
     elif target_name is not None and not isinstance(target_name, str):
         target_name = str(target_name) if target_name else None
     action['target'] = target_name
@@ -2811,7 +2815,10 @@ class GameEngine:
             game._last_exec_cast_like = {'turn': game.turn_number, 'type': 'cast',
                                          'card': card_name}
             target_name = _normalize_action_target(action)  # May be None
-            adventure_name = action.get("adventure")  # Adventure half name
+            adventure_name = action.get("adventure")  # Adventure/split half name
+            if not isinstance(adventure_name, str):
+                # Provider schema drift: Qwen emitted ``adventure: true``.
+                adventure_name = None
             card = player.find_card(card_name, Zone.HAND)
 
             # May 20 audit (Bug C): when the AI casts a detrimental targeted
@@ -3094,7 +3101,11 @@ class GameEngine:
 
                 # Find target if specified
                 target = None
-                if target_name:
+                if isinstance(target_name, list):
+                    # Multi-target templates (Ghostly Flicker et al.) resolve
+                    # the individual names; do not throw the second one away.
+                    target = target_name
+                elif target_name:
                     # Shared with the autoplay cast path (mtg/helpers.py) —
                     # stack -> battlefield -> graveyard -> player/pronoun.
                     # These were two divergent copies until the July 27 fanout;
@@ -3702,6 +3713,21 @@ class GameEngine:
                                   f"{ability_idx} → {_equip_idx} (equip intent: own-creature target)")
                             ability_idx = _equip_idx
                             ability = abilities[_equip_idx]
+
+                # A named target cannot belong to a mana ability.  This also
+                # prevents a hand-only Channel request from silently clamping
+                # to a same-name land's battlefield mana ability (Boseiju).
+                _ability_effect = (ability.get('effect') or '').strip().lower()
+                _is_mana_effect = bool(re.match(
+                    r'^add\s+(?:\{[wubrgc]\}|one mana|two mana|three mana|'
+                    r'x mana|an amount of mana)', _ability_effect))
+                if target_name and _is_mana_effect:
+                    reason = (f"{perm.name}'s mana ability does not take a "
+                              f"target; refusing targeted activation")
+                    print(f"[ACTIVATE-CLAUDE] {reason}")
+                    game._last_activation_failure = (
+                        game.turn_number, perm.name, reason)
+                    return None
 
                 # Check if can activate
                 if ability['needs_tap'] and perm.tapped:

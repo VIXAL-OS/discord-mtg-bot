@@ -1261,8 +1261,14 @@ async def _check_cast_triggers(engine, game: GameState, caster: Player, card: Ca
                             # module-level import and causes UnboundLocalError later in this function)
                             lib = get_effect_library()
                             etb_text = found_card.oracle_text
-                            opponent_name = game.players[1 - game.players.index(caster)].name if len(game.players) > 1 else "Opponent"
-                            cascade_actions, cascade_desc = lib.resolve_etb(found_card.name, etb_text, caster.name, opponent_name)
+                            opponent = (game.players[1 - game.players.index(caster)]
+                                        if len(game.players) > 1 else caster)
+                            cascade_ctx = build_game_context(
+                                game, caster, opponent, card=found_card,
+                                entering_creature=found_card, entering_player=caster)
+                            cascade_actions, cascade_desc = lib.resolve_etb(
+                                found_card.name, etb_text, caster.name,
+                                opponent.name, game_context=cascade_ctx)
                             if cascade_actions and not any(a.get('action') == 'no_action' for a in cascade_actions):
                                 print(f"[CASCADE-ETB] Tier 1.5 resolved {found_card.name}: {cascade_desc}")
                                 for action in cascade_actions:
@@ -1309,8 +1315,14 @@ async def _check_cast_triggers(engine, game: GameState, caster: Player, card: Ca
                         try:
                             lib = get_effect_library()
                             etb_text = found_card.oracle_text
-                            opponent_name = game.players[1 - game.players.index(caster)].name if len(game.players) > 1 else "Opponent"
-                            cascade_actions, cascade_desc = lib.resolve_etb(found_card.name, etb_text, caster.name, opponent_name)
+                            opponent = (game.players[1 - game.players.index(caster)]
+                                        if len(game.players) > 1 else caster)
+                            cascade_ctx = build_game_context(
+                                game, caster, opponent, card=found_card,
+                                entering_player=caster)
+                            cascade_actions, cascade_desc = lib.resolve_etb(
+                                found_card.name, etb_text, caster.name,
+                                opponent.name, game_context=cascade_ctx)
                             if cascade_actions and not any(a.get('action') == 'no_action' for a in cascade_actions):
                                 print(f"[CASCADE-ETB] Tier 1.5 resolved {found_card.name}: {cascade_desc}")
                                 for action in cascade_actions:

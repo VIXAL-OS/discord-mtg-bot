@@ -108,11 +108,21 @@ try:
         create_deepseek_adapter,
         create_openrouter_adapter,
         create_deepseek_reasoner_adapter,
+        create_qwen_actor_adapter,
+        create_qwen_strategist_adapter,
+        create_dashscope_deepseek_actor_adapter,
+        create_dashscope_deepseek_strategist_adapter,
+        choose_fastest_provider,
     )
 except ImportError:
     create_deepseek_adapter = None
     create_openrouter_adapter = None
     create_deepseek_reasoner_adapter = None
+    create_qwen_actor_adapter = None
+    create_qwen_strategist_adapter = None
+    create_dashscope_deepseek_actor_adapter = None
+    create_dashscope_deepseek_strategist_adapter = None
+    choose_fastest_provider = None
 
 
 # =============================================================================
@@ -164,6 +174,38 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
         )
         if self._deepseek_reasoner_adapter:
             print("[DEEPSEEK] Phase 3 split active: actor=deepseek-v4-flash, strategist=deepseek-v4-pro")
+
+        # Alibaba / DashScope (Qwen) — the second provider, so a batch is not
+        # hostage to one vendor's congestion. Same actor/strategist split.
+        # Both are None when DASHSCOPE_API_KEY is unset, which is the normal
+        # case today and costs nothing: the pre-flight probe simply has one
+        # candidate and DeepSeek stays selected.
+        self._qwen_adapter = (
+            create_qwen_actor_adapter() if create_qwen_actor_adapter else None)
+        self._qwen_reasoner_adapter = (
+            create_qwen_strategist_adapter()
+            if create_qwen_strategist_adapter else None)
+        if self._qwen_adapter:
+            print("[QWEN] Alibaba/DashScope available as an alternate provider")
+
+        # DeepSeek RESOLD by Alibaba — the same model on other infrastructure.
+        # Strictly the lowest-risk failover: switching to it changes nothing
+        # about play quality, where switching to Qwen is a real A/B. Costs
+        # ~1.45x DeepSeek direct (its cache rate is 10x worse) and is NOT
+        # offered in Singapore, so on the default endpoint the probe will
+        # simply find it unusable and skip it.
+        self._ds_via_dashscope_adapter = (
+            create_dashscope_deepseek_actor_adapter()
+            if create_dashscope_deepseek_actor_adapter else None)
+        self._ds_via_dashscope_reasoner_adapter = (
+            create_dashscope_deepseek_strategist_adapter()
+            if create_dashscope_deepseek_strategist_adapter else None)
+
+        # Which provider a batch actually runs on. Set by the pre-flight
+        # latency probe (_select_batch_provider) and read by the autoplay
+        # swap block. Defaults to deepseek so every path that never probes —
+        # single !autoplay games, tests — behaves exactly as before.
+        self._active_provider = "deepseek"
 
         # Wrap engine.delete_game so logging cleanup happens automatically
         _original_delete = self.engine.delete_game
@@ -5211,9 +5253,136 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
         if openrouter_model:
             short = openrouter_model.split("/")[-1] if "/" in openrouter_model else openrouter_model
             return f"OpenRouter ({short})"
+        if self._active_provider == "qwen" and self._qwen_adapter:
+            return "Qwen"
         if self._deepseek_adapter:
             return "Deepseek"
         return "Claude"
+
+    def ai_player_name(self, force_claude: bool = False,
+                       openrouter_model: str = None) -> str:
+        """What to CALL the AI player in game state and Discord.
+
+        Aug 3: the AI seat was hardcoded "Claude" no matter who was actually
+        playing, so every autoplay log and every Discord line said Claude
+        while DeepSeek made the decisions. Now it names the provider.
+
+        Safe to vary because nothing keys on this string: the AI is
+        identified by `Player.is_claude` (derived from a null user_id), not
+        by name — verified by grep, there is no `name == "Claude"` anywhere.
+
+        Deliberately a SINGLE TOKEN, unlike `_get_ai_label`, which returns
+        things like "OpenRouter (optimus-alpha)". This value becomes a player
+        name that lands in commander-damage keys, log lines and message
+        interpolation, so parentheses and spaces are a liability there.
+        """
+        if force_claude:
+            return "Claude"
+        if openrouter_model:
+            return "OpenRouter"
+        if self._active_provider == "qwen" and self._qwen_adapter:
+            return "Qwen"
+        if self._deepseek_adapter:
+            return "Deepseek"
+        return "Claude"
+
+    def batch_actor_adapter(self):
+        """The actor adapter for the provider this batch selected."""
+        if self._active_provider == "qwen" and self._qwen_adapter:
+            return self._qwen_adapter
+        if (self._active_provider == "deepseek-via-alibaba"
+                and self._ds_via_dashscope_adapter):
+            return self._ds_via_dashscope_adapter
+        return self._deepseek_adapter
+
+    def batch_strategist_adapter(self):
+        """The strategist adapter for the provider this batch selected.
+
+        Falls back to the same provider's actor adapter rather than crossing
+        providers: a split that ran the actor on one vendor and the
+        strategist on another would defeat the point of switching away from
+        a congested one.
+        """
+        if self._active_provider == "qwen":
+            return self._qwen_reasoner_adapter or self._qwen_adapter
+        if self._active_provider == "deepseek-via-alibaba":
+            return (self._ds_via_dashscope_reasoner_adapter
+                    or self._ds_via_dashscope_adapter)
+        return self._deepseek_reasoner_adapter
+
+    async def _select_batch_provider(self) -> str:
+        """Pre-flight: probe every configured provider, run on the fastest.
+
+        Aug 3, 2026. The Aug 3 batch launched into DeepSeek's Beijing
+        09:00-12:00 peak window and took a burst of HTTP 503 plus a latency
+        tail of 200-365s per call against a healthy ~8s median. Nothing
+        noticed, because provider choice was a startup constant.
+
+        Deliberately NOT time-based. Encoding "avoid Beijing 09:00-12:00 and
+        14:00-18:00" would bake in a schedule that is a guess about someone
+        else's infrastructure and goes stale silently; measuring the thing we
+        actually care about does not. It also handles the case the schedule
+        cannot: both providers busy, or a provider degraded off-peak.
+
+        Sets and returns self._active_provider. When only one provider is
+        configured this is a single cheap probe whose result cannot change
+        the outcome, so it stays informative rather than load-bearing.
+        """
+        # Operator override. The probe optimises for LATENCY, which is not
+        # always what you want: choosing a provider deliberately (an A/B, a
+        # cost experiment) must not be silently overruled because the other
+        # one answered a ping 200ms quicker. Health still gates it — a pinned
+        # provider that fails its probe is reported and NOT used, because
+        # pinning a broken provider should fail loudly rather than park a
+        # batch the way Aug 3 did.
+        _forced = os.getenv("MTG_FORCE_PROVIDER", "").strip().lower()
+        if _forced:
+            _adapters = {"deepseek": self._deepseek_adapter,
+                         "qwen": self._qwen_adapter,
+                         "deepseek-via-alibaba": self._ds_via_dashscope_adapter}
+            _pinned = _adapters.get(_forced)
+            if _pinned is None:
+                print(f"[PROVIDER-PROBE] MTG_FORCE_PROVIDER={_forced!r} is not "
+                      f"configured — ignoring the pin and probing normally")
+            else:
+                from rules.llm_adapter import probe_adapter_latency
+                r = await probe_adapter_latency(_pinned, samples=1, timeout=30.0)
+                if r["ok"]:
+                    print(f"[PROVIDER-PROBE] PINNED to {_forced} "
+                          f"(median {r['median_ms']:.0f}ms) — probe skipped")
+                    self._active_provider = _forced
+                    return _forced
+                print(f"[PROVIDER-PROBE] PINNED provider {_forced} failed its "
+                      f"health check ({r['detail']}) — falling back to the probe")
+
+        if choose_fastest_provider is None:
+            return self._active_provider
+        candidates = [("deepseek", self._deepseek_adapter),
+                      ("qwen", self._qwen_adapter),
+                      ("deepseek-via-alibaba", self._ds_via_dashscope_adapter)]
+        configured = [(n, a) for n, a in candidates if a is not None]
+        if len(configured) < 2:
+            # One provider (the normal case today): probe anyway so the log
+            # records whether it was healthy at launch, but never switch away
+            # from the only thing we have.
+            if configured:
+                name, adapter = configured[0]
+                from rules.llm_adapter import probe_adapter_latency
+                r = await probe_adapter_latency(adapter, samples=1, timeout=30.0)
+                state = ("healthy" if r["ok"]
+                         else f"DEGRADED ({r['detail']})")
+                ms = f"{r['median_ms']:.0f}ms" if r["median_ms"] else "n/a"
+                print(f"[PROVIDER-PROBE] only {name} configured — {state}, {ms}")
+            return self._active_provider
+        winner, results = await choose_fastest_provider(configured, samples=2)
+        if winner is None:
+            print(f"[PROVIDER-PROBE] no provider passed — keeping "
+                  f"{self._active_provider} (nothing better to switch to)")
+            return self._active_provider
+        if winner != self._active_provider:
+            print(f"[PROVIDER-PROBE] switching {self._active_provider} -> {winner}")
+        self._active_provider = winner
+        return winner
 
     async def _check_deepseek_balance(self) -> dict | None:
         """Delegates to mtg.autoplay._check_deepseek_balance (Phase 2F)."""
@@ -5330,6 +5499,10 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
                 if not balance_info["ok"]:
                     # Hard stop — don't burn a thread creation on a batch that will 402 immediately
                     return
+            _picked = await self._select_batch_provider()
+            if _picked != "deepseek":
+                await ctx.send(f"⚡ Running this batch on **{_picked}** "
+                               f"(lower measured latency at launch)")
 
         self._batch_running = True
         self._batch_stop_flag = False
@@ -5458,6 +5631,22 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
         if not matchups:
             await ctx.send(f"❌ No matchups in range {start_num}-{end_num}")
             return
+
+        # Pre-flight. The parallel path had NO balance check at all — only
+        # the sequential !autoplay-batch did — so the batch this repo
+        # actually runs was the one that could 402 on game 8 (it has, twice).
+        # The provider probe rides alongside it.
+        if not force_claude and not openrouter_model:
+            balance_info = await self._check_deepseek_balance()
+            if balance_info is not None:
+                await ctx.send(balance_info["message"])
+                if not balance_info["ok"]:
+                    return
+            _picked = await self._select_batch_provider()
+            if _picked != "deepseek":
+                await ctx.send(f"⚡ Running this batch on **{_picked}** "
+                               f"(lower measured latency at launch)")
+
         self._batch_running = True
         self._batch_stop_flag = False
         results = []
@@ -5526,6 +5715,34 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
                     await batch_thread.send(f"⏹️ **Stopped** after {len(results)} games.")
                     break
                 wave = matchups[wave_start:wave_start + n_concurrent]
+
+                # Aug 4: RE-PROBE BETWEEN WAVES. The launch probe alone is
+                # not enough — on Aug 3 DeepSeek measured healthy at 23:00
+                # and degraded minutes later, and because provider choice was
+                # fixed at launch the batch had no way to notice. A wave
+                # boundary is the natural place to reconsider: no game is
+                # in flight, so switching costs nothing and cannot corrupt a
+                # game mid-turn.
+                #
+                # Skipped for wave 1 (the launch probe just ran) and whenever
+                # only one provider is configured, so the common case pays
+                # nothing. Failure here must never take the batch down —
+                # a probe is a convenience, and the running provider stays
+                # selected if anything goes wrong.
+                if wave_start > 0 and not force_claude and not openrouter_model:
+                    try:
+                        _before = self._active_provider
+                        _now = await self._select_batch_provider()
+                        if _now != _before:
+                            await batch_thread.send(
+                                f"⚡ **Provider switched {_before} → {_now}** "
+                                f"before wave {wave_start // n_concurrent + 1} "
+                                f"— {_before} degraded mid-batch")
+                    except Exception as _probe_err:
+                        print(f"[PROVIDER-PROBE] inter-wave probe failed "
+                              f"({_probe_err}) — staying on "
+                              f"{self._active_provider}")
+
                 await batch_thread.send(
                     f"🚀 **Wave {wave_start // n_concurrent + 1}:** "
                     f"{', '.join(f'#{m[0]}' for m in wave)}")

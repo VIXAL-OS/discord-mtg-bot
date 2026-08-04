@@ -1138,8 +1138,19 @@ def _compute_alt_costs(engine, game: GameState, player: Player, card: Card,
     used_alternate_cost = False
     if pay_mana and (effective_mana_cost or additional_cost > 0):
         oracle_lower = (card.oracle_text or '').lower()
+        # Commander 2020 free-interaction cycle.  The condition replaces
+        # the printed mana cost, and remains legal even with no mana sources.
+        if (('control a commander' in oracle_lower
+             or 'a commander you control' in oracle_lower)
+                and 'without paying its mana cost' in oracle_lower
+                and any(getattr(c, 'is_commander', False)
+                        for c in player.battlefield)):
+            pay_mana = False
+            used_alternate_cost = True
+            print(f"[ALTERNATE-COST] {card.name}: commander controlled — "
+                  f"casting without paying its mana cost")
         # Force of Will: "You may pay 1 life and exile a blue card from your hand rather than pay this spell's mana cost"
-        if 'pay 1 life and exile a' in oracle_lower and 'from your hand' in oracle_lower:
+        elif 'pay 1 life and exile a' in oracle_lower and 'from your hand' in oracle_lower:
             # Check if player can't afford mana but can pay alternate cost
             available = player.available_mana()
             if available < total_cost:

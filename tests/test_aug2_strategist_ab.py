@@ -43,8 +43,40 @@ class TestStrategistFlashAB:
             "strategist (flash rejects the knob)")
 
     def test_swap_block_and_pricing_follow_the_model(self):
+        """Aug 3: this contract is now enforced by construction rather than
+        by two literals matching each other.
+
+        It used to assert `strategist_model = "deepseek-v4-flash"` and
+        `STRAT_INPUT_MISS_RATE = 0.14` appeared in autoplay.py — i.e. that
+        someone had hand-synced the hardcoded rate to the hardcoded model.
+        Both are gone: the swap block reads the model off the adapter and
+        the rate is looked up from that string. So the assertion moves from
+        "the text says Flash" to "the pricing genuinely follows whatever
+        model the adapter carries", which is what the A/B actually needs and
+        is what a provider switch would otherwise silently break.
+        """
+        pytest.importorskip("openai")
+        from rules.llm_adapter import (create_deepseek_reasoner_adapter,
+                                       rates_for_model)
         src = (REPO / "mtg" / "autoplay.py").read_text(encoding="utf-8")
-        assert 'strategist_model = "deepseek-v4-flash"' in src
-        assert "STRAT_INPUT_MISS_RATE = 0.14" in src, (
-            "strategist bills at Flash rates now — Pro rates would "
-            "over-report ~3x")
+        assert "rates_for_model" in src, (
+            "pricing must be derived from the model that actually ran")
+        assert "STRAT_INPUT_MISS_RATE = 0.14" not in src, (
+            "a hardcoded strategist rate re-assumes the provider")
+        assert 'strategist_model = "deepseek-v4-flash"' not in src, (
+            "the swap block must read the model off the adapter")
+
+        adapter = create_deepseek_reasoner_adapter(api_key="test-key-not-used")
+        hit, miss, out = rates_for_model(adapter._model)
+        assert (round(hit * 1e6, 4), round(miss * 1e6, 3),
+                round(out * 1e6, 2)) == (0.0028, 0.14, 0.28), (
+            "the strategist bills at Flash rates; Pro would over-report ~3x")
+
+    def test_a_pro_strategist_would_reprice_itself(self):
+        """The other half of "follows the model": if the revert path is ever
+        taken, the rate must move on its own. Pinning this is what makes the
+        indirection worth having rather than just longer."""
+        from rules.llm_adapter import rates_for_model
+        hit, miss, out = rates_for_model("deepseek-v4-pro")
+        assert (round(hit * 1e6, 4), round(miss * 1e6, 3),
+                round(out * 1e6, 2)) == (0.0036, 0.435, 0.87)

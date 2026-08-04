@@ -392,6 +392,37 @@ class MTGBot(commands.Bot):
             self.mtg_game_calls += 1
         self._save_persistent_costs()
 
+    def track_mtg_usage(self, usage, model: str) -> None:
+        """Usage callback for ClaudePlayer and RulesEngine provider calls."""
+        input_tokens = usage.input_tokens
+        output_tokens = usage.output_tokens
+        self.total_input_tokens += input_tokens
+        self.total_output_tokens += output_tokens
+        self.api_calls += 1
+        self.mtg_game_input_tokens += input_tokens
+        self.mtg_game_output_tokens += output_tokens
+        self.mtg_game_calls += 1
+
+        # DeepSeek and Qwen share the fork's cheap-provider accounting
+        # buckets. Per-model precision for batch stats lives in
+        # rules.llm_adapter.MODEL_RATES.
+        if 'deepseek' in model.lower() or 'qwen' in model.lower():
+            model_low = model.lower()
+            # Qwen Plus/Max are premium tiers; ``plus`` does not contain
+            # ``-pro``, so it must be named explicitly.
+            is_pro = ('v4-pro' in model_low or '-pro' in model_low or
+                      'reasoner' in model_low or
+                      'plus' in model_low or 'max' in model_low)
+            if is_pro:
+                self.deepseek_pro_input_tokens += input_tokens
+                self.deepseek_pro_output_tokens += output_tokens
+                self.deepseek_pro_calls += 1
+            else:
+                self.deepseek_input_tokens += input_tokens
+                self.deepseek_output_tokens += output_tokens
+                self.deepseek_calls += 1
+        self._save_persistent_costs()
+
     def get_cost_summary(self) -> str:
         """Return a human-readable lifetime cost summary."""
         chat_in = self.total_input_tokens - self.mtg_game_input_tokens
@@ -406,19 +437,24 @@ class MTGBot(commands.Bot):
             + self.deepseek_pro_input_tokens * CONFIG.deepseek_pro_input_cost_per_million / 1_000_000
             + self.deepseek_pro_output_tokens * CONFIG.deepseek_pro_output_cost_per_million / 1_000_000
         )
-        # MTG-game Sonnet portion (if any games went via Claude actor)
+        # MTG-game Claude portion excludes the cheap-provider counters; using
+        # the whole MTG total here double-bills every DeepSeek/Qwen call.
+        cheap_in = self.deepseek_input_tokens + self.deepseek_pro_input_tokens
+        cheap_out = self.deepseek_output_tokens + self.deepseek_pro_output_tokens
+        mtg_sonnet_in = max(0, self.mtg_game_input_tokens - cheap_in)
+        mtg_sonnet_out = max(0, self.mtg_game_output_tokens - cheap_out)
         mtg_sonnet_cost = (
-            self.mtg_game_input_tokens * CONFIG.sonnet_input_cost_per_million / 1_000_000
-            + self.mtg_game_output_tokens * CONFIG.sonnet_output_cost_per_million / 1_000_000
+            mtg_sonnet_in * CONFIG.sonnet_input_cost_per_million / 1_000_000
+            + mtg_sonnet_out * CONFIG.sonnet_output_cost_per_million / 1_000_000
         )
         lines = [
             "💰 **Lifetime API Usage**",
             f"Total API calls: {self.api_calls:,}",
             "",
             f"**Chat (Sonnet)**: {chat_in:,} in / {chat_out:,} out → ${chat_cost:.4f}",
-            f"**MTG games (Sonnet portion)**: {self.mtg_game_input_tokens:,} in / "
-            f"{self.mtg_game_output_tokens:,} out → ${mtg_sonnet_cost:.4f}",
-            f"**MTG games (DeepSeek)**: {self.deepseek_input_tokens + self.deepseek_pro_input_tokens:,} in / "
+            f"**MTG games (Sonnet portion)**: {mtg_sonnet_in:,} in / "
+            f"{mtg_sonnet_out:,} out → ${mtg_sonnet_cost:.4f}",
+            f"**MTG games (DeepSeek/Qwen)**: {self.deepseek_input_tokens + self.deepseek_pro_input_tokens:,} in / "
             f"{self.deepseek_output_tokens + self.deepseek_pro_output_tokens:,} out → ${ds_cost:.4f}",
             "",
             f"**Total**: ${chat_cost + mtg_sonnet_cost + ds_cost:.4f}",
