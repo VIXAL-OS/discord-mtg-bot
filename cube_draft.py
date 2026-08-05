@@ -49,6 +49,26 @@ from mtg_game import (
 POD_SIZE = 8
 PACK_SIZE = 15
 NUM_ROUNDS = 3
+
+
+def _format_ai_turn_message(player_name: str, actions: List[str]) -> str:
+    """Format a drafted-game action summary for the actual AI seat name."""
+    return (f"**{player_name}'s turn:**\n"
+            + "\n".join(f"• {action}" for action in actions))
+
+
+def _format_post_combat_message(player_name: str, actions: List[str]) -> str:
+    """Format a drafted-game post-combat summary for the actual AI seat."""
+    return (f"**{player_name} (post-combat):**\n"
+            + "\n".join(f"• {action}" for action in actions))
+
+
+def _format_autodraft_pick_summary(round_num: int, pick_num: int,
+                                   rick_card: str, ai_name: str,
+                                   ai_card: str) -> str:
+    """Format a public draft-pick row without assuming an AI provider."""
+    return (f"R{round_num}P{pick_num}: Rick → **{rick_card}** | "
+            f"{ai_name} → **{ai_card}**")
 DEFAULT_DECK_SIZE = 40
 DEFAULT_STARTING_LIFE = 20
 
@@ -2007,6 +2027,7 @@ class CubeDraftCog(commands.Cog, name="Cube Draft"):
                 seat_index=1, name=_ai_name,
                 is_claude=True,
             ))
+            result["deck2"] = f"{_ai_name} (drafted)"
             for i in range(2, POD_SIZE):
                 seats.append(DraftSeat(
                     seat_index=i, name=bot_names[i - 2],
@@ -2038,7 +2059,7 @@ class CubeDraftCog(commands.Cog, name="Cube Draft"):
                 f"{NUM_ROUNDS} rounds of {PACK_SIZE}-card packs — {POD_SIZE}-seat pod\n\n"
                 f"{seat_list}\n\n"
                 f"Rick Deckard 🎲 = heuristic picks (human game paths)\n"
-                f"Claude 🤖 = AI picks via API")
+                f"{_ai_name} 🤖 = AI picks via API")
 
             # ================================================================
             # PHASE 4: Draft picks (3 rounds × 15 picks)
@@ -2075,10 +2096,11 @@ class CubeDraftCog(commands.Cog, name="Cube Draft"):
                     # Post pick summary every 5 picks, plus first and last
                     if pick_num % 5 == 0 or pick_num == 1 or pick_num == PACK_SIZE:
                         rick_latest = seats[0].pool[-1].name if seats[0].pool else "?"
-                        claude_latest = seats[1].pool[-1].name if seats[1].pool else "?"
+                        ai_latest = seats[1].pool[-1].name if seats[1].pool else "?"
                         await self._autodraft_send(thread,
-                            f"R{round_num}P{pick_num}: "
-                            f"Rick → **{rick_latest}** | Claude → **{claude_latest}**")
+                            _format_autodraft_pick_summary(
+                                round_num, pick_num, rick_latest,
+                                seats[1].name, ai_latest))
 
                     # Pass packs to next seat
                     new_packs = {}
@@ -2247,15 +2269,20 @@ class CubeDraftCog(commands.Cog, name="Cube Draft"):
                         actions = await self.engine.execute_claude_turn(game)
                         if actions:
                             turn_had_actions = True
-                            msg = f"**Claude's turn:**\n" + "\n".join(f"• {a}" for a in actions)
+                            msg = _format_ai_turn_message(
+                                game.active_player.name, actions)
                             if len(msg) > 1900:
-                                await self._autodraft_send(thread, "**Claude's turn:**")
+                                await self._autodraft_send(
+                                    thread,
+                                    f"**{game.active_player.name}'s turn:**")
                                 for a in actions:
                                     await self._autodraft_send(thread, f"• {a[:1900]}")
                             else:
                                 await self._autodraft_send(thread, msg)
                         else:
-                            await self._autodraft_send(thread, "*Claude thinks, then passes.*")
+                            await self._autodraft_send(
+                                thread,
+                                f"*{game.active_player.name} thinks, then passes.*")
 
                         # Resolve any pending actions (ETBs, targets, etc.)
                         await self.game_cog._autoplay_resolve_pending_action(thread, game)
@@ -2316,8 +2343,8 @@ class CubeDraftCog(commands.Cog, name="Cube Draft"):
                             if game.phase == Phase.MAIN2 and not game.ended:
                                 post_combat = await self.engine.continue_claude_post_combat(game)
                                 if post_combat:
-                                    msg = ("**Claude (post-combat):**\n"
-                                           + "\n".join(f"• {a}" for a in post_combat))
+                                    msg = _format_post_combat_message(
+                                        game.active_player.name, post_combat)
                                     await self._autodraft_send(thread, msg)
                     else:
                         # Rick's turn — use autoplay human turn (human code paths)

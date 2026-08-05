@@ -61,6 +61,12 @@ from mtg.util import GameLogger
 # these let the [STATS-GAME] emit label itself unreliable when that happened.
 _ACTIVE_AUTOPLAY_GAMES = 0
 _AUTOPLAY_GAMES_STARTED = 0
+
+
+def _format_post_combat_message(player_name: str, actions: List[str]) -> str:
+    """Format a user-visible post-combat summary for the actual AI seat."""
+    return (f"**{player_name} (post-combat):**\n"
+            + "\n".join(f"• {action}" for action in actions))
 _THREAD_CREATE_LOCK = None
 _THREAD_CREATE_LAST = 0.0
 
@@ -246,7 +252,8 @@ async def _resolve_combat(cog, ctx, game: GameState):
             post_combat = await cog.engine.continue_claude_post_combat(game)
             post_combat = cog._sanitize_action_bullets(post_combat)
             if post_combat:
-                msg = "**Claude (post-combat):**\n" + "\n".join(f"• {a}" for a in post_combat)
+                msg = _format_post_combat_message(
+                    game.active_player.name, post_combat)
                 if len(msg) > 1900:
                     for action in post_combat:
                         await ctx.send(f"• {action[:1900]}")
@@ -3399,7 +3406,8 @@ async def _run_single_autoplay(cog, channel, game_format: str, deck1_name: str, 
                             post_combat = await cog.engine.continue_claude_post_combat(game)
                             post_combat = cog._sanitize_action_bullets(post_combat)
                             if post_combat:
-                                msg = "**Claude (post-combat):**\n" + "\n".join(f"\u2022 {a}" for a in post_combat)
+                                msg = _format_post_combat_message(
+                                    game.active_player.name, post_combat)
                                 await cog._autoplay_send(thread, msg)
 
                     # Aug 2: the INTERNAL-resolution flow (execute_claude_turn
