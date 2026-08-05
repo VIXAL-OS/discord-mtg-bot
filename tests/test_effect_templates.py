@@ -167,7 +167,8 @@ class TestMoreBurnedCards:
             "with mana value 4 or less until Spell Queller leaves the battlefield.",
             "Rick", "Claude"))
         assert actions == [{"action": "exile_from_stack",
-                            "controller": "Rick", "max_mv": 4}]
+                            "controller": "Rick", "max_mv": 4,
+                            "silent_on_no_result": True}]
 
     def test_bitterblossom_upkeep_fires_both_halves(self, lib):
         # Bug B (May 16): the outer event-type gate bypassed name-keyed

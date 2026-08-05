@@ -1163,6 +1163,14 @@ async def execute_claude_turn(engine, game: GameState) -> List[str]:
         return []
     
     actions_taken = []
+    # The stack path announces casts immediately so responses cannot race
+    # ahead. Expose earlier buffered actions so it can flush them first.
+    game._active_turn_narration = {
+        "turn": game.turn_number,
+        "player": game.players[claude_index].name,
+        "actions": actions_taken,
+        "flushed": False,
+    }
     max_actions = 20  # Safety limit
     max_retries = 3   # Retries per failed action
     retry_count = 0
@@ -1791,6 +1799,12 @@ async def continue_claude_post_combat(engine, game: GameState) -> List[str]:
     """
     claude_index = 0 if game.players[0].is_claude else 1
     actions_taken = []
+    game._active_turn_narration = {
+        "turn": game.turn_number,
+        "player": game.players[claude_index].name,
+        "actions": actions_taken,
+        "flushed": False,
+    }
     max_actions = 15
     max_retries = 3
 

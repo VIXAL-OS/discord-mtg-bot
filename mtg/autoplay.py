@@ -310,14 +310,19 @@ AUTOPLAY_DECKS = {
     "burn": "test_burn_modern",
     "uw_control": "test_uw_control_modern",
     "jund": "test_jund_modern",
-    "companion_lurrus": "test_companion_lurrus",
+    "companion_lurrus_vintage": "test_companion_lurrus",
+    # Format-specific spot-check decks (legality pinned to cache fields).
+    "burn_standard": "test_burn_standard",
+    "uw_control_standard": "test_uw_control_standard",
+    "burn_legacy": "test_burn_legacy",
+    "jund_legacy": "test_jund_legacy",
     # Pauper deck (60 cards, 4-of, 20 life, commons-only)
     "burn_pauper": "test_burn_pauper",
     # Limited decks (40 cards, 20 life)
     "limited_aggro": "test_limited_aggro",
     "limited_control": "test_limited_control",
     # Brawl (60 cards, singleton, 25 life)
-    "brawl_omnath": "test_brawl_omnath",
+    "brawl_tatyova": "test_brawl_tatyova",
     # Oathbreaker (60 cards, singleton, 20 life, signature spell)
     "oathbreaker_chandra": "test_oathbreaker_chandra",
     # Mechanic stress test decks
@@ -423,12 +428,12 @@ AUTOPLAY_MATRIX = [
     # Phase 5: Limited (79)
     (79, "limited", "limited_aggro", "limited_control", "40-card decks, draw-to-empty SBA"),
     # Phase 6: Brawl + Oathbreaker (80-81)
-    (80, "brawl",      "brawl_omnath",       "brawl_omnath",       "25 life, 60 singleton, landfall mirror"),
+    (80, "brawl",      "brawl_tatyova",      "brawl_tatyova",      "25 life, 60 singleton, Standard Brawl-legal landfall mirror"),
     (81, "oathbreaker", "oathbreaker_chandra", "oathbreaker_chandra", "Signature spell, PW commander"),
     # Phase 7: Format Spot-Checks (82-85)
     (82, "edh",      "surrak", "rashmi", "EDH alias = commander"),
-    (83, "standard", "burn",       "uw_control", "20 life, 60 cards, no command zone"),
-    (84, "legacy",   "burn",       "jund",       "Legacy format string works"),
+    (83, "standard", "burn_standard", "uw_control_standard", "20 life, 60 cards, cache-verified Standard legality"),
+    (84, "legacy",   "burn_legacy", "jund_legacy", "Legacy-specific fixtures without banned Ragavan/Wrenn"),
     (85, "pauper",   "burn_pauper", "burn_pauper", "Pauper: 20 life, commons-only, suspend/landfall/alt sac costs (Fireblast, Shard Volley)"),
     # Phase 8: Mechanic-Specific Tests (86-99)
     (86,  "commander", "adventure",       "surrak",  "Adventure (human) vs stompy (AI)"),
@@ -444,7 +449,7 @@ AUTOPLAY_MATRIX = [
     (96,  "commander", "adventure",       "madness",     "Adventure (human) vs madness (AI) — alternate casting"),
     (97,  "commander", "madness",         "escape",      "Madness (human) vs escape (AI) — discard fuels graveyard"),
     (98,  "commander", "transform",       "adventure",   "Transform (human) vs adventure (AI)"),
-    (99,  "modern",    "companion_lurrus", "burn",       "Companion Lurrus (human) vs burn (AI)"),
+    (99,  "vintage",   "companion_lurrus_vintage", "burn_legacy", "Vintage-legal Companion Lurrus vs burn"),
     # Phase 9: Cube Draft — full pipeline test (100)
     (100, "draft",   "test",       "",           "Full cube draft pipeline: load → pick → build → play"),
 
@@ -1404,13 +1409,17 @@ async def _autoplay_execute_action(cog, thread, game: GameState, player_idx: int
     requiring a Discord ctx object.
     """
     player = game.players[player_idx]
-    # The LLM occasionally emits structured values (dict/list/int) in fields
-    # the schema types as strings; every downstream consumer assumes str
-    # (.strip()/.lower()), so coerce once here rather than at each use site.
-    for _sfield in ("card", "permanent", "target", "description"):
+    # The LLM occasionally emits structured values where scalar fields are
+    # expected. Coerce scalar fields here, while preserving real target arrays
+    # for multi-target spells.
+    for _sfield in ("card", "permanent", "tutor_card", "description"):
         if _sfield in action and not isinstance(action[_sfield], str):
             action[_sfield] = coerce_ai_string(action[_sfield])
     # June 10 audit (C3/V28): positional cast→resolve pairing. Capture the
+    if ("target" in action
+            and not isinstance(action["target"], (str, list, tuple))):
+        action["target"] = coerce_ai_string(action["target"])
+
     # previous action's cast/activate stamp, then clear; the cast/activate
     # branches below re-stamp on entry. A `resolve` that IMMEDIATELY follows
     # a cast/activate is always dropped — on success the cascade already
@@ -1520,11 +1529,15 @@ async def _autoplay_execute_action(cog, thread, game: GameState, player_idx: int
             except Exception as e:
                 print(f"[AUTOPLAY] cycle action failed: {e}")
                 return None
-        # Defensive: AI sometimes returns target as a list or dict instead of string
+        # Preserve real multi-target choices (Ghostly Flicker et al.). A
+        # one-item list is still the common malformed single-target shape.
         if isinstance(target_name, list):
-            target_name = target_name[0] if target_name else None
-            if isinstance(target_name, dict):
-                target_name = target_name.get('target') or target_name.get('name') or str(target_name)
+            if len(target_name) > 1:
+                target_name = [coerce_ai_string(item) for item in target_name]
+                target_name = [name for name in target_name if name]
+            else:
+                target_name = (coerce_ai_string(target_name[0])
+                               if target_name else None)
         elif isinstance(target_name, dict):
             target_name = target_name.get('target') or target_name.get('name') or str(target_name)
         # AI sometimes packs X-value into target for X-cost spells (Finale of Devastation, Devil's Play)
@@ -1815,9 +1828,38 @@ async def _autoplay_execute_action(cog, thread, game: GameState, player_idx: int
         # meant every graveyard-targeting spell a human would cast lost its
         # declared target, and "opponent" never resolved to a player at all.
         target = None
-        if target_name:
+        if isinstance(target_name, (list, tuple)):
+            target = list(target_name)
+        elif target_name:
             from mtg.helpers import resolve_cast_target
             target = resolve_cast_target(game, player, card, target_name)
+        if (target_name and target is None and HAS_TARGETING
+                and _spell_requires_targets(spell_face_for_gates(card))):
+            _stash_name = (card.adventure_name
+                           if getattr(card, 'cast_as_adventure', False)
+                           and getattr(card, 'adventure_name', None)
+                           else card.name)
+            reason = (f"declared target '{target_name}' is not a legal target "
+                      f"for {_stash_name} (CR 601.2c)")
+            print(f"[TARGETING] {reason}")
+            game._last_cast_failure = (game.turn_number, _stash_name, reason)
+            if from_command_zone and card in player.hand:
+                player.hand.remove(card)
+                player.command_zone.append(card)
+            if from_graveyard:
+                _rollback_graveyard_cast()
+            if from_library_top:
+                _rollback_library_top_cast()
+            if from_exile and card in player.hand:
+                player.hand.remove(card)
+                player.exile.append(card)
+                if _was_foretold:
+                    card._foretold = True
+                    card._face_down = True
+                    card._cast_via_foretell = False
+                elif card.id not in player.playable_from_exile:
+                    player.playable_from_exile.append(card.id)
+            card.cast_as_adventure = False
 
         # Pass explicit X value from batch plan (Walking Ballista, Hangarback Walker, etc.)
         if action.get("X") is not None:
@@ -1829,10 +1871,20 @@ async def _autoplay_execute_action(cog, thread, game: GameState, player_idx: int
         if modes:
             card._modes_chosen = modes if isinstance(modes, list) else [modes]
 
+        tutor_choice = action.get("tutor_card")
+        if isinstance(tutor_choice, list):
+            tutor_choice = tutor_choice[0] if tutor_choice else None
+        card._tutor_card = (
+            str(tutor_choice).strip() if tutor_choice is not None else None
+        )
+
+        card._cast_from_command_zone = from_command_zone
         success, msg, effect_msgs = await cog.engine.cast_spell_async(
             game, player, card, target=target,
             additional_cost=commander_tax
         )
+        card._cast_from_command_zone = False
+        card._tutor_card = None
 
         # May 23 audit (CRITICAL #4): even when cast_spell_async returns
         # success=True, the spell may have been countered on the stack. Record
@@ -2821,12 +2873,15 @@ async def _run_single_autoplay(cog, channel, game_format: str, deck1_name: str, 
         else:
             _game_start_stats = None
         _game_start_strat_stats = None
-        _batch_strategist = (cog.batch_strategist_adapter()
-                             if getattr(cog, 'batch_strategist_adapter', None)
-                             else cog._deepseek_reasoner_adapter)
-        _actor_is_batch_provider = (
-            getattr(cog, 'batch_actor_adapter', None)
-            and use_alt_adapter is cog.batch_actor_adapter())
+        if getattr(cog, 'batch_stats_adapters', None):
+            (_stats_provider, _batch_actor,
+             _batch_strategist) = cog.batch_stats_adapters()
+        else:
+            _stats_provider = getattr(cog, '_active_provider', 'deepseek')
+            _batch_actor = use_alt_adapter
+            _batch_strategist = getattr(
+                cog, '_deepseek_reasoner_adapter', None)
+        _actor_is_batch_provider = use_alt_adapter is _batch_actor
         if (_batch_strategist and _actor_is_batch_provider
                 and hasattr(_batch_strategist, 'get_stats')):
             _game_start_strat_stats = _batch_strategist.get_stats().copy()
@@ -3073,7 +3128,12 @@ async def _run_single_autoplay(cog, channel, game_format: str, deck1_name: str, 
                 # partner / friends-forever / background pairs validate
                 # against their combined color identity.
                 cmdrs = cmd_zone if cmd_zone else None
-                ok, issues = FormatValidator.validate_deck(full_deck, game_format, commander=cmdrs)
+                companions = list(
+                    getattr(p, 'companion_zone', []) or [])
+                companion = companions[0] if len(companions) == 1 else None
+                ok, issues = FormatValidator.validate_deck(
+                    full_deck, game_format, commander=cmdrs,
+                    companion=companion)
                 if ok:
                     print(f"[DECK-VALIDATE] {dname} ({game_format}): legal")
                 else:
@@ -3301,8 +3361,12 @@ async def _run_single_autoplay(cog, channel, game_format: str, deck1_name: str, 
                                 await cog._autoplay_send(thread, f"\u2022 {a[:1900]}")
                         else:
                             await cog._autoplay_send(thread, msg)
-                    else:
-                        await cog._autoplay_send(thread, f"*{actor_name} thinks, then passes.*")
+                    elif not (
+                            isinstance(getattr(game, '_active_turn_narration', None), dict)
+                            and game._active_turn_narration.get('flushed')
+                    ):
+                        await cog._autoplay_send(
+                            thread, f"*{actor_name} thinks, then passes.*")
 
                     await cog._autoplay_resolve_pending_action(thread, game)
 
@@ -3804,15 +3868,31 @@ async def _run_single_autoplay(cog, channel, game_format: str, deck1_name: str, 
                     hit_tokens = stats.get('cache_hit_tokens', 0)
                     miss_tokens = stats.get('cache_miss_tokens', 0)
                     cache_seen = hit_tokens + miss_tokens
-                    cache_hit_pct = (100.0 * hit_tokens / cache_seen) if cache_seen else 0.0
+                    cache_hit_pct = (
+                        100.0 * hit_tokens / cache_seen
+                        if cache_seen else 0.0)
+                    strat_hit_tokens = (
+                        strat_stats.get('cache_hit_tokens', 0)
+                        if strat_stats else 0)
+                    strat_miss_tokens = (
+                        strat_stats.get('cache_miss_tokens', 0)
+                        if strat_stats else 0)
+                    strat_cache_seen = (
+                        strat_hit_tokens + strat_miss_tokens)
+                    strat_cache_hit_pct = (
+                        100.0 * strat_hit_tokens / strat_cache_seen
+                        if strat_cache_seen else 0.0)
                     print(f"[AUTOPLAY] [STATS-CUMULATIVE] calls={stats['calls'] + strat_total_calls} "
                           f"(actor={stats['calls']}, strat={strat_total_calls}) "
                           f"prompt_tokens={stats['prompt_tokens'] + strat_total_prompt} "
                           f"completion_tokens={stats['completion_tokens'] + strat_total_completion} "
                           f"est_cost=${total_cost:.4f} "
                           f"(actor=${actor_total_cost:.4f}, strat=${strat_total_cost:.4f}) "
-                          f"cache_hit={cache_hit_pct:.1f}% "
-                          f"({hit_tokens}/{cache_seen} prompt tokens)")
+                          f"actor_cache_hit={cache_hit_pct:.1f}% "
+                          f"({hit_tokens}/{cache_seen} actor prompt tokens) "
+                          f"strat_cache_hit={strat_cache_hit_pct:.1f}% "
+                          f"({strat_hit_tokens}/{strat_cache_seen} "
+                          f"strategist prompt tokens)")
                     # May 17 audit: always emit per-purpose breakdown at
                     # game-end, not just every 200th call. ~60% of games
                     # in the May 16 batch never crossed the 200-call mark

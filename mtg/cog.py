@@ -214,21 +214,8 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
             _original_delete(thread_id)
         self.engine.delete_game = _delete_with_logging
 
-        # Set up integrated engine for enhanced features
-        self._setup_integrated_engine()
-
         # Try to auto-load the default deck
         self._load_default_deck()
-    
-    def _setup_integrated_engine(self):
-        """Set up the integrated engine with priority system.
-
-        Note: mtg_enhanced_integration.py is deprecated (Apr 2026).
-        Integration is now done directly in GameEngine. This method
-        is kept for backward compatibility but no longer loads the module.
-        """
-        self.integrated = None
-    
     async def cog_load(self):
         """Called when the cog is loaded - start async components."""
         # Install stdout tee so engine print() calls get routed to game logs
@@ -261,52 +248,25 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
             root_logger.setLevel(logging.WARNING)
         root_logger.addHandler(self._stderr_log_handler)
 
-        # `self.integrated` has been hardwired to None since the Apr 2026
-        # integrated-engine deprecation, so this branch never executes.
-        # The corresponding `_on_message_priority` listener was deleted in the
-        # May 17 deprecation-rot pass. Kept the conditional as a no-op marker
-        # in case someone re-introduces an integrated engine later.
-
-        # Reuse XMage bridge from integrated engine (already started above)
-        # instead of spawning a second Java subprocess.
-        #
-        # Apr 30 audit: capture the bridge state and (if it failed) the reason,
-        # then stash both on the engine so per-game logs can emit a definitive
-        # [XMAGE-INIT] line. Without this, "XMage didn't fire" is invisible
-        # in per-game audits — you can't tell if it was a Java-not-installed
-        # error, a JAR-build mismatch, or an init bug.
+        # The retired integrated-engine wrapper no longer owns XMage.
+        # Start the bridge directly; failure remains graceful.
         self.engine._xmage_init_reason = ""
         if not HAS_XMAGE_BRIDGE:
-            self.engine._xmage_init_reason = "HAS_XMAGE_BRIDGE=False (rules.xmage_bridge import failed at module load)"
-        elif self.integrated and self.integrated.enhanced:
-            # Legacy path: integrated engine ran — reuse its bridge.
-            effects_mgr = self.integrated.enhanced.effects
-            if not effects_mgr.xmage:
-                self.engine._xmage_init_reason = "CardEffectsManager.xmage is None (HybridRulesEngine wasn't constructed)"
-            elif effects_mgr.xmage._xmage_available:
-                self.engine.xmage_bridge = effects_mgr.xmage._xmage
-                self.engine._xmage_available = True
-                print("[XMAGE] Bridge available (shared from integrated engine)")
-            else:
-                err = effects_mgr.xmage._last_init_error or "unknown (no exception captured)"
-                self.engine._xmage_init_reason = f"HybridRulesEngine.start failed: {err}"
-                print(f"[XMAGE] Integrated engine bridge not available — running without XMage ({err})")
+            self.engine._xmage_init_reason = (
+                "HAS_XMAGE_BRIDGE=False "
+                "(rules.xmage_bridge import failed at module load)")
         else:
-            # May 14 audit: the integrated engine was deprecated (Apr 2026) and
-            # self.integrated is now always None, so the XMage bridge was
-            # permanently inactive across the May 14 batch. Try a direct
-            # spawn here as a fallback. Failure stays graceful — the engine
-            # works without XMage, just at slightly higher Tier 3 cost.
             try:
                 from rules.xmage_bridge import XMageBridge
                 bridge = XMageBridge()
                 await bridge.start()
                 self.engine.xmage_bridge = bridge
                 self.engine._xmage_available = True
-                print("[XMAGE] Bridge spawned directly (no integrated-engine wrapper)")
+                print("[XMAGE] Bridge spawned directly")
             except Exception as e:
-                self.engine._xmage_init_reason = f"direct-spawn failed: {type(e).__name__}: {e}"
-                print(f"[XMAGE] Direct spawn failed: {e} — Tier 2.5 inactive")
+                self.engine._xmage_init_reason = (
+                    f"direct-spawn failed: {type(e).__name__}: {e}")
+                print(f"[XMAGE] Direct spawn failed: {e} \u2014 Tier 2.5 inactive")
 
     async def cog_unload(self):
         """Called when the cog is unloaded - clean up."""
@@ -326,16 +286,8 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
             sys.stdout = self._stdout_tee.original
             self._stdout_tee = None
 
-        # See cog_load: self.integrated has been None since Apr 2026, so this
-        # branch is dead. The `_on_message_priority` listener was also deleted.
-
-        # May 14 audit: when the integrated engine was deprecated the bridge
-        # lifecycle moved to direct-spawn in cog_load, but the unload path
-        # still assumed "integrated engine owns lifecycle" — which would
-        # leave the Java subprocess running on cog reload. Stop the bridge
-        # explicitly when we spawned it ourselves. Has-attr guarded for
-        # extra safety (bridge may have failed to spawn).
-        if not self.integrated and getattr(self.engine, 'xmage_bridge', None):
+        # Direct bridge lifecycle: stop it on cog unload when present.
+        if getattr(self.engine, 'xmage_bridge', None):
             try:
                 await self.engine.xmage_bridge.stop()
             except Exception as e:
@@ -367,7 +319,7 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
             self._stdout_tee.active_thread = None
 
     # _on_message_priority listener removed May 17, 2026.
-    # The body was gated by `self.integrated` which is hardwired to None since
+    # The body was gated by a retired engine bridge that was always disabled;
     # the Apr 2026 integrated-engine deprecation, and the listener was never
     # actually registered (the add_listener call was gated by the same flag).
     # Both branches were dead code per the May 17 deprecation-rot audit.
@@ -395,45 +347,9 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
 
     @staticmethod
     def _sanitize_action_bullets(actions):
-        """Strip engine-internal debug strings from player-facing action bullets.
-
-        The `actions_taken` list gathers messages from many sources (human
-        path `_execute_action`, combat/block/trigger messages, SBA messages).
-        Defense-in-depth: any bracketed log tag or raw Python exception
-        fragment that slips through gets filtered here before it reaches
-        Discord.
-        """
-        if not actions:
-            return actions
-        debug_prefixes = (
-            "[PLAN-VALIDATE]", "[EXECUTE]", "[RESOLVE]", "[DEBUG]",
-            "[ETB-", "[TRIGGER-", "[XMAGE", "[SPELL_RESOLVER]",
-            "[SEMANTIC]", "[ACCUMULATOR]", "[OPP-CAST-TRIGGER]",
-            "[LANDFALL]", "[COMBAT]", "[DAMAGE-PREVENTED]",
-            "[AUTO-DRAFT]", "[DRAFT-CLAUDE]", "[AI-RESOLVE]",
-            "[AUTOPLAY-JUDGE]", "[AUTOPLAY]", "[STRIP]", "[JUDGE-FIX]",
-            # May 7 audit fix #1: filter the success sentinel that the
-            # early-cast-announcement path returns from _execute_action.
-            "[EARLY-CAST]",
-        )
-        exception_markers = (
-            "Traceback (most recent", " at 0x",
-            "KeyError:", "AttributeError:", "TypeError:", "ValueError:",
-            "IndexError:", "NameError:", "RuntimeError:", "AssertionError:",
-        )
-        cleaned = []
-        for a in actions:
-            if not a:
-                continue
-            s = str(a).strip()
-            if not s:
-                continue
-            if any(s.startswith(p) for p in debug_prefixes):
-                continue
-            if any(m in s for m in exception_markers):
-                continue
-            cleaned.append(a)
-        return cleaned
+        # Compatibility delegate for the shared narration sanitizer.
+        from mtg.helpers import sanitize_action_bullets
+        return sanitize_action_bullets(actions)
 
     def _cleanup_game_logging(self, thread_id: int):
         """Remove game logger and unregister from stdout tee."""
@@ -600,16 +516,6 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
             f"Use `!state` to see the board.",
             embed=embed
         )
-        
-        # Set up priority system for this game
-        if self.integrated:
-            async def on_priority_change(player_name):
-                await self._thread_send(thread, f"⏳ **{player_name}** has priority")
-            
-            self.integrated.setup_priority(
-                thread.id, game,
-                on_priority_change=on_priority_change
-            )
         
         # If Claude goes first, take turn
         if game.players[first_player].is_claude:
@@ -1692,10 +1598,12 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
             # Set X value for X-cost spells
             if x_value_override is not None:
                 card._x_value = x_value_override
+            card._cast_from_command_zone = from_command_zone
             success, msg, effect_msgs = await self.engine.cast_spell_async(
                 game, player, card, target=target,
                 additional_cost=commander_tax
             )
+            card._cast_from_command_zone = False
             if success:
                 # Graveyard casts: exile after resolution only for the
                 # mechanics that print an exile clause (mirror of the engine
@@ -3266,20 +3174,44 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
             await ctx.send("No active game in this thread!")
             return
         
-        if self.integrated:
-            display = self.integrated.get_priority_display(ctx.channel.id)
-            await ctx.send(display)
+        priority_system = getattr(game, '_priority_system', None)
+        current = game.players[game.active_player_index].name
+        if game.stack_enabled and priority_system is not None:
+            state = priority_system.get_state()
+            lines = [
+                f"**Turn {state['turn']}** - {state['phase']}",
+                f"Active player: {state['active_player']}",
+                f"Priority: {state['priority_holder'] or 'none'}",
+            ]
+            if state['stack']:
+                lines.append("**Stack (top first):**")
+                for item in state['stack']:
+                    kind = "spell" if item['is_spell'] else "ability"
+                    lines.append(
+                        f"\u2022 **{item['name']}** ({kind}, "
+                        f"controller: {item['controller']})")
+            else:
+                lines.append("*Stack is empty*")
+            await ctx.send(chr(10).join(lines))
         else:
-            # Fallback display
-            current = game.players[game.active_player_index].name
-            await ctx.send(f"**Turn {game.turn_number}** - {PHASE_NAMES[game.phase]}\n"
-                          f"Active player: {current}\n"
-                          f"*Stack is empty*")
+            entries = list(reversed(getattr(game, 'stack', []) or []))
+            lines = [
+                f"**Turn {game.turn_number}** - {PHASE_NAMES[game.phase]}",
+                f"Active player: {current}",
+            ]
+            if entries:
+                lines.append("**Stack (top first):**")
+                lines.extend(
+                    f"\u2022 **{getattr(getattr(entry, 'card', None), 'name', 'Ability')}**"
+                    for entry in entries)
+            else:
+                lines.append("*Stack is empty*")
+            await ctx.send(chr(10).join(lines))
 
     # !legend command removed May 17, 2026. The legend rule now runs through
     # SBA (rules/sba_adapter.py — see Bug 3 fix); the controller's "keep one,
     # sacrifice the rest" choice is handled by the SBA dispatch heuristic
-    # (keep most-recently-added). The old command depended on self.integrated
+    # (keep most-recently-added). The old command depended on a retired bridge
     # which has been hardwired to None since the Apr 2026 integrated-engine
     # deprecation — every invocation returned "requires the integrated engine"
     # and did nothing.
@@ -3313,12 +3245,6 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
                 await ctx.send(f"⏩ **{player_name}** yields until end of turn (F6)")
             else:
                 await ctx.send(f"⚠️ {result.get('message', 'Could not set auto-pass')}")
-        elif self.integrated:
-            result = await self.integrated.handle_priority_message(
-                ctx.channel.id, player_name, "f6", game
-            )
-            if result.handled:
-                await ctx.send(f"⏩ **{player_name}** yields until end of turn")
         else:
             await ctx.send("⏩ Priority yield noted (stack system not active this game).")
 
@@ -5286,29 +5212,27 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
             return "Deepseek"
         return "Claude"
 
+    def batch_stats_adapters(self):
+        # One provider-aware resolver for gameplay and cumulative stats.
+        if self._active_provider == "qwen":
+            actor = self._qwen_adapter
+            strategist = self._qwen_reasoner_adapter or actor
+            return "qwen", actor, strategist
+        if self._active_provider == "deepseek-via-alibaba":
+            actor = self._ds_via_dashscope_adapter
+            strategist = self._ds_via_dashscope_reasoner_adapter or actor
+            return "deepseek-via-alibaba", actor, strategist
+        actor = self._deepseek_adapter
+        strategist = self._deepseek_reasoner_adapter
+        return "deepseek", actor, strategist
+
     def batch_actor_adapter(self):
-        """The actor adapter for the provider this batch selected."""
-        if self._active_provider == "qwen" and self._qwen_adapter:
-            return self._qwen_adapter
-        if (self._active_provider == "deepseek-via-alibaba"
-                and self._ds_via_dashscope_adapter):
-            return self._ds_via_dashscope_adapter
-        return self._deepseek_adapter
+        # The actor adapter for the provider this batch selected.
+        return self.batch_stats_adapters()[1]
 
     def batch_strategist_adapter(self):
-        """The strategist adapter for the provider this batch selected.
-
-        Falls back to the same provider's actor adapter rather than crossing
-        providers: a split that ran the actor on one vendor and the
-        strategist on another would defeat the point of switching away from
-        a congested one.
-        """
-        if self._active_provider == "qwen":
-            return self._qwen_reasoner_adapter or self._qwen_adapter
-        if self._active_provider == "deepseek-via-alibaba":
-            return (self._ds_via_dashscope_reasoner_adapter
-                    or self._ds_via_dashscope_adapter)
-        return self._deepseek_reasoner_adapter
+        # The strategist adapter for the provider this batch selected.
+        return self.batch_stats_adapters()[2]
 
     async def _select_batch_provider(self) -> str:
         """Pre-flight: probe every configured provider, run on the fastest.

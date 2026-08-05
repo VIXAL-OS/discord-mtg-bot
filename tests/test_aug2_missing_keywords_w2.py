@@ -148,19 +148,39 @@ class TestPuresteelPaladin:
             game_context=_ctx(game))[0]
         assert a == [{"action": "draw_cards", "player": "Rick", "amount": 1}]
 
-    def test_metalcraft_sets_equip_to_zero(self):
-        """A SET-TO-ZERO, which the subtractive equip-cost reducer could not
-        express — so this half had no implementation path at all."""
-        import inspect
-        import mtg.engine
-        src = inspect.getsource(mtg.engine)
-        i = src.index("METALCRAFT (CR 702.60)")
-        window = src[i:i + 900]
-        assert "has_metalcraft(player)" in window, (
-            "the equip path must consult the predicate")
-        assert 'cost_str = "{0}"' in window, (
-            "equip {0} is a set-to-zero, not a reduction")
+    def test_metalcraft_sets_equip_to_zero(self, make_game, make_card):
+        """Puresteel's global ability sets another Equipment's cost to zero."""
+        import asyncio
+        from mtg.engine import GameEngine
 
+        game = make_game()
+        rick = game.players[0]
+        paladin = make_card(
+            "Puresteel Paladin", type_line="Creature - Human Knight",
+            oracle_text=("Whenever an Equipment enters the battlefield under "
+                         "your control, you may draw a card.\nMetalcraft - "
+                         "Equipment you control have equip {0} as long as you "
+                         "control three or more artifacts."))
+        equipment = make_card(
+            "Trailblazer's Boots", type_line="Artifact - Equipment",
+            oracle_text=("Equipped creature has nonbasic landwalk.\n"
+                         "Equip {2} (Activate only as a sorcery.)"),
+            power="0", toughness="0")
+        creature = make_card("Bear")
+        rick.battlefield.extend([
+            paladin, equipment, creature,
+            make_card("Artifact One", type_line="Artifact"),
+            make_card("Artifact Two", type_line="Artifact"),
+        ])
+
+        result = asyncio.run(GameEngine(None)._execute_action(game, 0, {
+            "type": "activate", "permanent": equipment.name,
+            "ability": 0, "target": creature.name,
+        }))
+
+        assert equipment.attached_to == creature.id
+        assert equipment.id in creature.attachments
+        assert "equips" in result
     def test_the_predicate_gates_it(self, game, make_card):
         rick = game.players[0]
         for i in range(2):

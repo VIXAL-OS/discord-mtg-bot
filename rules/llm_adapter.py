@@ -87,9 +87,10 @@ class _AdaptedResponse:
         text = content or reasoning
         self.content = [_ContentBlock(text)]
         self.reasoning_content = reasoning
+        usage = getattr(openai_response, 'usage', None)
         self.usage = _Usage(
-            prompt_tokens=openai_response.usage.prompt_tokens,
-            completion_tokens=openai_response.usage.completion_tokens,
+            prompt_tokens=getattr(usage, 'prompt_tokens', 0) or 0,
+            completion_tokens=getattr(usage, 'completion_tokens', 0) or 0,
         )
 
 
@@ -396,8 +397,11 @@ class _MessagesNamespace:
                     raise
 
             self._call_count += 1
-            self._total_prompt_tokens += openai_response.usage.prompt_tokens
-            self._total_completion_tokens += openai_response.usage.completion_tokens
+            _usage = getattr(openai_response, 'usage', None)
+            self._total_prompt_tokens += (
+                getattr(_usage, 'prompt_tokens', 0) or 0)
+            self._total_completion_tokens += (
+                getattr(_usage, 'completion_tokens', 0) or 0)
             self._purpose_counts[purpose] = self._purpose_counts.get(purpose, 0) + 1
             # Periodic breakdown so you can grep [CALL-BREAKDOWN] post-batch.
             if self._call_count % 200 == 0:

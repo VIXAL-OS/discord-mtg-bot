@@ -444,10 +444,6 @@ class GameEngine:
                 oldest_key = next(iter(self.ended_games))
                 del self.ended_games[oldest_key]
         
-        # Clean up priority system if using integrated engine
-        if hasattr(self, 'integrated') and self.integrated:
-            self.integrated.cleanup_priority(thread_id)
-        
         # Delete the save file
         filepath = os.path.join(self.GAMES_DIR, f"{thread_id}.json")
         if os.path.exists(filepath):
@@ -754,6 +750,15 @@ class GameEngine:
                     top_stack = game.stack[-1]
                     spell_name = top_stack.card.name if top_stack.card else "Unknown"
                     caster_name = top_stack.controller_name
+
+                    # Countered entries remain briefly while their cast
+                    # coroutines unwind, but are no longer legal targets.
+                    if getattr(top_stack, 'countered', False):
+                        print(f"[STACK-AI] {player_name} auto-pass on already "
+                              f"countered entry: {spell_name}")
+                        await ps.player_action(
+                            player_name, PriorityAction.pass_priority())
+                        return
 
                     # Auto-pass on triggered abilities (non-spell stack entries)
                     # unless player has Stifle-type effects that can counter the ability
@@ -1194,7 +1199,8 @@ class GameEngine:
         self.rules.log_event(f"Game started. {game.players[first_player_index].name} goes first.")
         self.save_game(game)  # Persist to disk
     
-    def draw_cards(self, player: Player, count: int = 1, game: GameState = None) -> List[Card]:
+    def draw_cards(self, player: Player, count: int = 1, game: GameState = None,
+                   suppress_opponent_draw_triggers: bool = False) -> List[Card]:
         """Draw cards from library to hand. Each draw is a separate event for replacement effects."""
         drawn = []
         for _ in range(count):
@@ -1270,7 +1276,7 @@ class GameEngine:
 
         # Check "whenever an opponent draws" triggers (Smothering Tithe, Consecrated Sphinx, etc.)
         # Messages are pushed to game._pending_messages so callers can flush them to Discord.
-        if game and drawn:
+        if game and drawn and not suppress_opponent_draw_triggers:
             player_idx = game.players.index(player) if player in game.players else 0
             for opp_idx, opp in enumerate(game.players):
                 if opp_idx == player_idx:
@@ -1304,7 +1310,10 @@ class GameEngine:
                         'whenever an opponent draws' in oracle_lower and 'draw two' in oracle_lower
                     ):
                         sphinx_count = len(drawn) * 2
-                        sphinx_drawn = self.draw_cards(opp, sphinx_count, game=None)  # game=None prevents recursive triggers
+                        sphinx_drawn = self.draw_cards(
+                            opp, sphinx_count, game=game,
+                            suppress_opponent_draw_triggers=True,
+                        )
                         if sphinx_drawn:
                             msg = f"🦋 **Consecrated Sphinx** — {opp.name} draws {len(sphinx_drawn)} card(s)"
                             print(f"[DRAW-TRIGGER] {msg}")
@@ -1359,7 +1368,8 @@ class GameEngine:
         # Pay mana cost — color-aware tapping when mana engine is available
         if pay_mana and (card.mana_cost or card.cmc > 0):
             if HAS_MANA_ENGINE and card.mana_cost:
-                tapped_ok = player.tap_sources_for_cost(card.mana_cost, game=game)
+                tapped_ok = player.tap_sources_for_cost(
+                    card.mana_cost, game=game, spending_card=card)
             else:
                 tapped_ok = player.tap_lands_for_mana(card.cmc, game=game)
             if not tapped_ok:
@@ -3115,6 +3125,24 @@ class GameEngine:
 
                 # Guard: don't cast counterspells when there's nothing on the stack
                 # Exception 1: modal spells (Mystic Confluence, Cryptic Command) have other modes
+                if (target_name and target is None and HAS_TARGETING
+                        and _spell_requires_targets(spell_face_for_gates(card))):
+                    _stash_name = (card.adventure_name
+                                   if getattr(card, 'cast_as_adventure', False)
+                                   and getattr(card, 'adventure_name', None)
+                                   else card.name)
+                    reason = (f"declared target '{target_name}' is not a legal "
+                              f"target for {_stash_name} (CR 601.2c)")
+                    print(f"[TARGETING] {reason}")
+                    game._last_cast_failure = (game.turn_number, _stash_name, reason)
+                    if from_graveyard:
+                        _rollback_graveyard_cast()
+                    if _from_library_top:
+                        _rollback_library_top_cast()
+                    if getattr(card, 'cast_as_adventure', False):
+                        card.cast_as_adventure = False
+                    return None
+
                 # Exception 2: creatures with counter ETBs (Frilled Mystic, Draining Whelk) — the
                 # creature is legal to cast; the ETB will just fizzle if there's no target
                 oracle_lower = (card.oracle_text or '').lower()
@@ -3188,9 +3216,17 @@ class GameEngine:
                 modes = action.get("modes") or action.get("mode")
                 if modes:
                     card._modes_chosen = modes if isinstance(modes, list) else [modes]
+                tutor_choice = action.get("tutor_card")
+                if isinstance(tutor_choice, (list, tuple)):
+                    tutor_choice = tutor_choice[0] if tutor_choice else None
+                card._tutor_card = (
+                    str(tutor_choice).strip() if tutor_choice else None)
 
                 # Use async version with spell resolution
+                card._cast_from_command_zone = from_command_zone
                 success, msg, effect_msgs = await self.cast_spell_async(game, player, card, target=target, additional_cost=commander_tax)
+                card._tutor_card = None
+                card._cast_from_command_zone = False
                 print(f"[EXECUTE] cast {card_name}: success={success}, msg={msg}")
                 # July 20 batch-3 audit: keep the REAL failure reason for
                 # _get_action_error — returning None below discards it, and
@@ -3205,6 +3241,11 @@ class GameEngine:
                                    and getattr(card, 'adventure_name', None)
                                    else card.name)
                     game._last_cast_failure = (game.turn_number, _stash_name, msg)
+                if not success and getattr(card, 'cast_as_adventure', False):
+                    card.cast_as_adventure = False
+                    print(f"[ADVENTURE] {card.name} cast failed ? cleared "
+                          f"adventure-face routing flag")
+
                 if effect_msgs:
                     for em in effect_msgs:
                         print(f"[EXECUTE] effect: {em}")
@@ -3717,6 +3758,44 @@ class GameEngine:
                 # A named target cannot belong to a mana ability.  This also
                 # prevents a hand-only Channel request from silently clamping
                 # to a same-name land's battlefield mana ability (Boseiju).
+                _tortured_target = None
+                _tortured_discard = None
+                _activation_effect_lower = (ability.get('effect') or '').lower()
+                _activation_cost_lower = (ability.get('cost') or '').lower()
+                if (
+                    'return target creature card from your graveyard' in _activation_effect_lower
+                    and 'discard a creature card' in _activation_cost_lower
+                ):
+                    _gy_targets = [c for c in player.graveyard
+                                   if c.is_creature()]
+                    _hand_costs = [c for c in player.hand if c.is_creature()]
+                    if target_name:
+                        _wanted = str(target_name).strip().lower()
+                        for _candidate in _gy_targets:
+                            if _candidate.name.lower() == _wanted:
+                                _tortured_target = _candidate
+                                break
+                    if _tortured_target is None and _gy_targets:
+                        _tortured_target = max(
+                            _gy_targets, key=lambda c: int(c.cmc or 0))
+                    _cost_name = (action.get('discard')
+                                  or action.get('cost_card'))
+                    if _cost_name:
+                        for _candidate in _hand_costs:
+                            if _candidate.name.lower() == str(_cost_name).lower():
+                                _tortured_discard = _candidate
+                                break
+                    if _tortured_discard is None and _hand_costs:
+                        _tortured_discard = min(
+                            _hand_costs, key=lambda c: int(c.cmc or 0))
+                    if _tortured_target is None or _tortured_discard is None:
+                        reason = (f"{perm.name} needs both a creature card in "
+                                  f"hand to discard and one in graveyard to target")
+                        print(f"[ACTIVATE-CLAUDE] {reason}")
+                        game._last_activation_failure = (
+                            game.turn_number, perm.name, reason)
+                        return None
+
                 _ability_effect = (ability.get('effect') or '').strip().lower()
                 _is_mana_effect = bool(re.match(
                     r'^add\s+(?:\{[wubrgc]\}|one mana|two mana|three mana|'
@@ -3786,7 +3865,8 @@ class GameEngine:
                     # before (it probed as resolving NOTHING at any event).
                     from mtg.helpers import has_metalcraft
                     _equip_free = any(
-                        'equip {0}' in (_s.oracle_text or '').lower()
+                        re.search(r'equipment you control have equip \{0\}',
+                                  (_s.oracle_text or '').lower())
                         and has_metalcraft(player)
                         for _s in player.battlefield)
                     if _equip_free:
@@ -3893,12 +3973,13 @@ class GameEngine:
                                 _st_msgs = _fire_sacrifice_triggers(self.rules, game, player, perm) or []
                                 from mtg.triggers import queue_death
                                 queue_death(game, perm, player)
-                                dies_msgs, _unh = self._check_dies_triggers_sync(game, perm, player)
-                                self.queue_unhandled_dies(game, perm, player, _unh)
-                                _all = _st_msgs + (dies_msgs or [])
-                                if _all:
-                                    game._pending_messages.extend(_all)
-                                    print(f"[ACTIVATE-CLAUDE] Fired {len(_all)} trigger(s) for self-sac of {perm.name}")
+                                # Dies triggers drain once through the queued
+                                # SBA choke point; only sacrifice watchers are
+                                # immediate here.
+                                if _st_msgs:
+                                    game._pending_messages.extend(_st_msgs)
+                                    print(f"[ACTIVATE-CLAUDE] Fired {len(_st_msgs)} "
+                                          f"sacrifice trigger(s) for {perm.name}")
                             except Exception as e:
                                 print(f"[ACTIVATE-CLAUDE] self-sac trigger dispatch failed: {e}")
                                 from mtg.util import maybe_reraise
@@ -4009,11 +4090,8 @@ class GameEngine:
                             if sac_target.is_creature():
                                 from mtg.triggers import queue_death
                                 queue_death(game, sac_target, player)
-                                dies_msgs, _unh = self._check_dies_triggers_sync(game, sac_target, player)
-                                self.queue_unhandled_dies(game, sac_target, player, _unh)
-                                if dies_msgs:
-                                    game._pending_messages.extend(dies_msgs)
-                                    print(f"[ACTIVATE-CLAUDE] Fired {len(dies_msgs)} dies-trigger(s) for {sac_target.name} (sac cost)")
+                                # The queued SBA drain is authoritative for
+                                # dies triggers; do not scan them inline too.
                         except Exception as e:
                             print(f"[SAC-TRIGGER] sac-cost trigger scan failed: {e}")
                             from mtg.util import maybe_reraise
@@ -4055,7 +4133,20 @@ class GameEngine:
                 # trigger could never fire either.
                 _discard_match = _re.search(
                     r'discard (a|one|two|three|\d+) cards?', cost_lower)
-                if _discard_match or 'discard your hand' in cost_lower:
+                if _tortured_discard is not None:
+                    player.hand.remove(_tortured_discard)
+                    from mtg.helpers import madness_discard_to_exile
+                    _dm = madness_discard_to_exile(
+                        game, player, _tortured_discard)
+                    if _dm is None:
+                        player.graveyard.append(_tortured_discard)
+                        _dm = (f"??? **{player.name}** discards "
+                               f"**{_tortured_discard.name}**")
+                    if getattr(game, '_pending_messages', None) is None:
+                        game._pending_messages = []
+                    game._pending_messages.append(_dm)
+                    print(f"[ACTIVATE-COST] {player.name} discards {_tortured_discard.name} for {perm.name}")
+                elif _discard_match or 'discard your hand' in cost_lower:
                     if not player.hand:
                         print(f"[ACTIVATE-COST] {player.name} can't discard for "
                               f"{perm.name} — hand is empty")
@@ -4320,6 +4411,18 @@ class GameEngine:
                     print(f"[ACTIVATE-CLAUDE] {perm.name} artifact search resolved: {found_artifact.name if found_artifact else 'nothing'}")
                     return "\n".join(messages)
 
+                if _tortured_target is not None:
+                    if _tortured_target in player.graveyard:
+                        player.graveyard.remove(_tortured_target)
+                        player.hand.append(_tortured_target)
+                        print(f"[ACTIVATE-CLAUDE-INLINE] {perm.name}: returned "
+                              f"{_tortured_target.name} from graveyard")
+                        return (f"?? **{_tortured_target.name}** ? hand "
+                                f"({perm.name})")
+                    reason = f"{perm.name}'s target left the graveyard"
+                    game._last_activation_failure = (
+                        game.turn_number, perm.name, reason)
+                    return None
                 effect_text = ability['effect'].lower()
 
                 # === STONEFORGE STYLE: Put Equipment from hand onto battlefield ===
@@ -4543,6 +4646,14 @@ class GameEngine:
                                 tmpl_msgs.append(f"💀 **{sacrificed_cost_card.name}** sacrificed "
                                                  f"(cost for {perm.name})")
                             for act in tmpl_actions:
+                                # Activated-template damage and other actions
+                                # need their originating permanent for
+                                # replacement/prevention/source attribution.
+                                act.setdefault("_source_card_name", perm.name)
+                                act.setdefault("_source_controller", player.name)
+                                act.setdefault("_source_oracle",
+                                               perm.oracle_text or "")
+                                act.setdefault("source", perm.name)
                                 if act.get("action") != "no_action":
                                     try:
                                         m = self.rules._execute_action_on_state(game, act)

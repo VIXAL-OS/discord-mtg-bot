@@ -1,0 +1,19 @@
+{
+  "name": "Blue-White Standard Control Stress Test",
+  "format": "standard",
+  "description": "Current-cache Standard spot-check: creature and noncreature counters, sweepers, bounce, card draw, ETB value, and exile removal.",
+  "colors": ["W", "U"],
+  "cards": [
+    {"name": "Opt", "quantity": 4},
+    {"name": "Negate", "quantity": 4},
+    {"name": "Essence Scatter", "quantity": 4},
+    {"name": "Banishing Light", "quantity": 4},
+    {"name": "Day of Judgment", "quantity": 4},
+    {"name": "Think Twice", "quantity": 4},
+    {"name": "Cloudblazer", "quantity": 4},
+    {"name": "Into the Roil", "quantity": 4},
+    {"name": "Authority of the Consuls", "quantity": 4},
+    {"name": "Island", "quantity": 12},
+    {"name": "Plains", "quantity": 12}
+  ]
+}

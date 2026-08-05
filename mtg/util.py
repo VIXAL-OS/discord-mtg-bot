@@ -11,6 +11,7 @@ Originally lived at lines 266-394 of the monolith.
 
 import contextvars
 import os
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional
@@ -124,6 +125,7 @@ class StdoutTee:
     def __init__(self, original_stdout):
         self.original = original_stdout
         self.log_files: Dict[int, Path] = {}  # thread_id -> console log path
+        self._write_stats: Dict[int, Dict[str, float]] = {}
         self._active_thread_var: contextvars.ContextVar[Optional[int]] = contextvars.ContextVar(
             'stdout_tee_active_thread', default=None
         )
@@ -140,11 +142,24 @@ class StdoutTee:
         self.original.write(text)
         active = self._active_thread_var.get()
         if active and active in self.log_files:
+            started = time.perf_counter()
             try:
                 with open(self.log_files[active], "a", encoding="utf-8") as f:
                     f.write(text)
             except Exception:
                 pass  # Don't let logging errors break the bot
+            finally:
+                elapsed_ms = (time.perf_counter() - started) * 1000.0
+                stats = self._write_stats.setdefault(active, {
+                    "writes": 0, "bytes": 0, "total_ms": 0.0,
+                    "max_ms": 0.0, "slow_writes": 0,
+                })
+                stats["writes"] += 1
+                stats["bytes"] += len(str(text).encode("utf-8"))
+                stats["total_ms"] += elapsed_ms
+                stats["max_ms"] = max(stats["max_ms"], elapsed_ms)
+                if elapsed_ms >= 10.0:
+                    stats["slow_writes"] += 1
 
     def flush(self):
         self.original.flush()
@@ -154,6 +169,16 @@ class StdoutTee:
 
     def remove_game(self, thread_id: int):
         self.log_files.pop(thread_id, None)
+        stats = self._write_stats.pop(thread_id, None)
+        if stats:
+            average_ms = stats["total_ms"] / max(stats["writes"], 1)
+            self.original.write(
+                f"[STDOUT-TEE-STATS] game={thread_id} "
+                f"writes={int(stats['writes'])} bytes={int(stats['bytes'])} "
+                f"total_ms={stats['total_ms']:.2f} "
+                f"avg_ms={average_ms:.3f} max_ms={stats['max_ms']:.2f} "
+                f"slow_ge_10ms={int(stats['slow_writes'])}\n"
+            )
 
     def __getattr__(self, name):
         return getattr(self.original, name)

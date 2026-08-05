@@ -1,0 +1,18 @@
+{
+  "name": "Mono-Red Standard Stress Test",
+  "format": "standard",
+  "description": "Current-cache Standard spot-check: burn, cast triggers, ETB damage, draw-discard costs, and large Dragon finishers.",
+  "colors": ["R"],
+  "cards": [
+    {"name": "Shock", "quantity": 4},
+    {"name": "Lightning Strike", "quantity": 4},
+    {"name": "Viashino Pyromancer", "quantity": 4},
+    {"name": "Guttersnipe", "quantity": 4},
+    {"name": "Dragonmaster Outcast", "quantity": 4},
+    {"name": "Thrill of Possibility", "quantity": 4},
+    {"name": "Impact Tremors", "quantity": 4},
+    {"name": "Terror of the Peaks", "quantity": 4},
+    {"name": "Twinflame Tyrant", "quantity": 4},
+    {"name": "Mountain", "quantity": 24}
+  ]
+}

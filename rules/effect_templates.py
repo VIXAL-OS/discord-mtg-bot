@@ -275,6 +275,7 @@ class EffectTemplateLibrary:
         self._card_templates: Dict[str, EffectTemplate] = {}
         self._pattern_templates: List[Tuple[str, EffectTemplate]] = []
         self._attack_templates: Dict[str, EffectTemplate] = {}
+        self._upkeep_templates: Dict[str, EffectTemplate] = {}
         # Dies/LTB templates need their own registry so cards with BOTH an ETB
         # AND a dies trigger (Solemn Simulacrum, Mulldrifter, etc.) don't have
         # one registration silently overwriting the other when keyed by name.
@@ -320,6 +321,8 @@ class EffectTemplateLibrary:
         if card_key in self._dies_templates:
             return "template"
         if card_key in self._attack_templates:
+            return "template"
+        if card_key in self._upkeep_templates:
             return "template"
         if oracle_text:
             oracle_lower = oracle_text.lower()
@@ -690,6 +693,16 @@ class EffectTemplateLibrary:
         Try to resolve an 'at the beginning of your upkeep' trigger.
         """
         ctx = game_context or {}
+        card_key = (trigger_card_name or "").lower().strip()
+        if card_key in self._upkeep_templates:
+            template = self._upkeep_templates[card_key]
+            ctx['_event_type'] = 'upkeep'
+            try:
+                actions = template.action_generator(controller, opponent, ctx)
+                return actions, template.description
+            except Exception as exc:
+                print(f"[UPKEEP-TEMPLATE] Error executing upkeep template "
+                      f"for {trigger_card_name}: {exc}")
         return self.resolve_etb(
             card_name=trigger_card_name,
             oracle_text=trigger_oracle,
@@ -921,28 +934,24 @@ class EffectTemplateLibrary:
                 action_generator=lambda ctrl, opp, ctx: [],
             ))
 
-        # --- DIES DRAIN: {card_name: (opponent_loses, you_gain)} ---
-        DIES_DRAIN = {
-            "blood artist":             (1, 1),
-            "zulaport cutthroat":       (1, 1),
-            "bastion of remembrance":   (1, 1),
-        }
-        for name, (drain, gain) in DIES_DRAIN.items():
-            self._add_card(name, EffectTemplate(
-                name=name.title(),
-                description=f"Each opponent loses {drain} life and you gain {gain} life",
-                action_generator=lambda ctrl, opp, ctx, d=drain, g=gain: [
-                    {"action": "lose_life", "player": opp, "amount": d},
-                    {"action": "gain_life", "player": ctrl, "amount": g},
-                ]))
-        # July 31 batch-11 (cube reviewer): Kokusho was in the DIES_DRAIN
-        # _add_card block above, but his drain is his OWN death trigger —
-        # the self-death dispatch checks _dies_templates, and the
-        # _card_templates fallback is (correctly) blocked by the May-23
-        # dies-words positive-scoping guard, so every Kokusho death was a
-        # real Tier 3 call (game_1532532179492536430). The watchers above
-        # (Blood Artist family) resolve through the watcher path and stay
-        # put; a SELF-dies trigger belongs in the dies registry.
+        # Blood Artist, Zulaport Cutthroat, and Bastion of Remembrance are
+        # battlefield death WATCHERS, not own-ETB effects. The authoritative
+        # dies scanner in mtg.triggers handles them. Registering those words
+        # as name-keyed ETB templates caused a false drain as each permanent
+        # entered, and duplicated later deaths through a second route.
+        # Bastion's actual ETB is the Soldier token below.
+        self._add_card("bastion of remembrance", EffectTemplate(
+            name="Bastion of Remembrance",
+            description="Create a 1/1 white Human Soldier creature token",
+            action_generator=lambda ctrl, opp, ctx: [
+                {"action": "create_token", "player": ctrl,
+                 "name": "Human Soldier", "power": 1, "toughness": 1,
+                 "types": "Creature - Human Soldier", "count": 1},
+            ],
+        ))
+
+        # Kokusho's drain is his OWN death trigger, so it belongs in the
+        # dedicated dies registry.
         self._add_dies_card("kokusho, the evening star", EffectTemplate(
             name="Kokusho, the Evening Star",
             description="Kokusho dies: each opponent loses 5 life, you gain "
@@ -1395,19 +1404,23 @@ class EffectTemplateLibrary:
 
         # --- Apr 28 audit: top template-backlog cards (silent "X resolves") ---
 
-        # Diabolic Intent: sacrifice a creature, search your library for a card
+        # Diabolic Intent's sacrifice is paid during CR 601.2h in mtg.spells;
+        # resolution performs only the search.
         self._add_card("diabolic intent", EffectTemplate(
             name="Diabolic Intent",
-            description="Sacrifice a creature, search your library for a card",
+            description="Search your library for a card",
             action_generator=lambda ctrl, opp, ctx: [
-                {"action": "sacrifice_permanent", "player": ctrl,
-                 "type_filter": "creature", "reason": "Diabolic Intent additional cost"},
                 {"action": "search_library", "player": ctrl, "count": 1,
                  "reason": "Diabolic Intent: tutor any card to hand"},
-            ] if any(c.is_creature() for c in ctx.get('controller_battlefield', [])) else [
-                {"action": "no_action", "reason": "Diabolic Intent: no creature to sacrifice"}
             ],
         ))
+        self._add_card("primal command", EffectTemplate(
+            name="Primal Command",
+            description="Choose two: gain 7; put a noncreature permanent on top; recycle a graveyard; tutor a creature",
+            action_generator=self._gen_primal_command,
+            needs_target=True,
+        ))
+
 
         # Abrupt Decay: destroy target nonland permanent with mana value 3 or less.
         # June 10 deep-dive (B10b): honor the named target when LEGAL, and
@@ -1999,12 +2012,11 @@ class EffectTemplateLibrary:
             needs_target=True,
         ))
 
-        # --- Shard Volley: deals 3 damage to any target, sacrifice a land as additional cost ---
+        # --- Shard Volley: its land sacrifice is paid while casting ---
         self._add_card("shard volley", EffectTemplate(
             name="Shard Volley",
             description="Shard Volley deals 3 damage to any target (sacrifice a land as additional cost)",
             action_generator=lambda ctrl, opp, ctx: [
-                {"action": "sacrifice_land", "player": ctrl},
                 {"action": "deal_damage", "amount": 3,
                  "target_player": ctx.get('explicit_target_name') or opp},
             ],
@@ -2629,6 +2641,55 @@ class EffectTemplateLibrary:
             name="Marit Lage's Slumber",
             description="At the beginning of your upkeep, if you control ten or more snow permanents, sacrifice this enchantment and create Marit Lage, a legendary 20/20 black Avatar creature token with flying and indestructible",
             action_generator=_gen_marit_lage_slumber,
+        ))
+        # Supported intervening-if upkeep triggers that previously fell into
+        # the generic token guard or Tier 3. Keep them event-scoped: Hellkite
+        # also has a combat-damage trigger and must not run this check on ETB.
+        def _dragonmaster_outcast_upkeep(ctrl, opp, ctx):
+            player = ctx.get('_controller_player')
+            land_count = sum(1 for card in getattr(player, 'battlefield', [])
+                             if card.is_land()) if player is not None else 0
+            if land_count < 6:
+                return [{"action": "no_action",
+                         "reason": f"Dragonmaster Outcast: {land_count} of 6 lands"}]
+            return [make_token_action(ctrl, "dragon_5_5", 1)]
+
+        self._add_upkeep_card("dragonmaster outcast", EffectTemplate(
+            name="Dragonmaster Outcast",
+            description="At upkeep with six or more lands, create a 5/5 red Dragon token with flying",
+            action_generator=_dragonmaster_outcast_upkeep,
+        ))
+
+        def _damia_upkeep(ctrl, opp, ctx):
+            player = ctx.get('_controller_player')
+            hand_size = len(getattr(player, 'hand', [])) if player is not None else 0
+            if hand_size >= 7:
+                return [{"action": "no_action",
+                         "reason": f"Damia: hand already has {hand_size} cards"}]
+            return [{"action": "draw_cards", "player": ctrl,
+                     "amount": 7 - hand_size}]
+
+        self._add_upkeep_card("damia, sage of stone", EffectTemplate(
+            name="Damia, Sage of Stone",
+            description="At upkeep with fewer than seven cards, draw the difference",
+            action_generator=_damia_upkeep,
+        ))
+
+        def _hellkite_tyrant_upkeep(ctrl, opp, ctx):
+            player = ctx.get('_controller_player')
+            artifact_count = sum(
+                1 for card in getattr(player, 'battlefield', [])
+                if card.is_artifact()) if player is not None else 0
+            if artifact_count < 20:
+                return [{"action": "no_action",
+                         "reason": f"Hellkite Tyrant: {artifact_count} of 20 artifacts"}]
+            return [{"action": "win_game", "player": ctrl,
+                     "reason": "controls twenty or more artifacts at upkeep"}]
+
+        self._add_upkeep_card("hellkite tyrant", EffectTemplate(
+            name="Hellkite Tyrant",
+            description="At upkeep with twenty or more artifacts, win the game",
+            action_generator=_hellkite_tyrant_upkeep,
         ))
 
         # Mana Vault — "At the beginning of your upkeep, if Mana Vault is
@@ -4365,7 +4426,7 @@ class EffectTemplateLibrary:
             EffectTemplate(
                 name="Werewolf Transform Check",
                 description="Day/night upkeep transform check (uses spells_cast_prev_turn)",
-                action_generator=lambda ctrl, opp, ctx: self._gen_werewolf_transform(ctrl, opp, ctx),
+                action_generator=lambda ctrl, opp, ctx: [],
             )
         )
 
@@ -4525,20 +4586,50 @@ class EffectTemplateLibrary:
             )
         )
 
-        # Amass: "amass [Zombies/Orcs] N"
-        # Simplified: creates a 0/0 Army token + N +1/+1 counters
-        # TODO: Full amass should check if an Army token exists and just add counters
+        # Amass: grow an Army you already control; create one only when none
+        # exists (CR 701.44). The old template created a second Army on every
+        # resolution and then put all counters on the first same-name token.
+        def _gen_amass_amount(ctrl, ctx, amount):
+            battlefield = ctx.get('controller_battlefield', []) or []
+            army = next((
+                card for card in battlefield
+                if card.is_creature(ctx.get('_game'))
+                and 'army' in (card.type_line or '').lower().split()
+            ), None)
+            if army is not None:
+                return [{"action": "add_counters", "card": army.name,
+                         "counter_type": "+1/+1", "amount": amount}]
+            oracle = (ctx.get('_oracle') or '').lower()
+            tribe = "Orc" if "amass orcs" in oracle else "Zombie"
+            token_name = f"{tribe} Army"
+            return [
+                {"action": "create_token", "player": ctrl, "name": token_name,
+                 "power": 0, "toughness": 0,
+                 "types": f"Creature - {tribe} Army", "count": 1},
+                {"action": "add_counters", "card": token_name,
+                 "counter_type": "+1/+1", "amount": amount},
+            ]
+
+        def _gen_amass(ctrl, opp, ctx):
+            return _gen_amass_amount(ctrl, ctx, int(ctx['_match'].group(1)))
+
+        # Dreadhorde Invasion's upkeep paragraph contains both effects. The
+        # generic lose-life regex otherwise wins first and silently drops Amass.
+        self._add_upkeep_card("dreadhorde invasion", EffectTemplate(
+            name="Dreadhorde Invasion",
+            description="Lose 1 life, then amass Zombies 1",
+            action_generator=lambda ctrl, opp, ctx: [
+                {"action": "lose_life", "player": ctrl, "amount": 1},
+                *_gen_amass_amount(ctrl, ctx, 1),
+            ],
+        ))
+
         self._add_pattern(
             r"amass (?:\w+ )?(\d+)",
             EffectTemplate(
                 name="Amass",
                 description="Amass: create or grow Army token with +1/+1 counters",
-                action_generator=lambda ctrl, opp, ctx: [
-                    {"action": "create_token", "player": ctrl, "name": "Zombie Army",
-                     "power": 0, "toughness": 0, "types": "Creature - Zombie Army", "count": 1},
-                    {"action": "add_counters", "card": "Zombie Army", "counter_type": "+1/+1",
-                     "amount": int(ctx['_match'].group(1))}
-                ]
+                action_generator=_gen_amass,
             )
         )
 
@@ -5551,21 +5642,11 @@ class EffectTemplateLibrary:
                 ],
             ))
 
-        # --- Shard Volley: sacrifice a land, deal 3 damage to any target ---
+        # --- Shard Volley: sacrifice was already paid as an additional cost ---
         def _shard_volley(ctrl, opp, ctx):
-            # Find a land to sacrifice (prefer non-fetch, cheapest)
-            ctrl_lands = []
-            for c in ctx.get('_controller_creatures', []):
-                pass  # Not relevant
-            # We need to look at the battlefield directly via game context
-            # Since we don't have game object, use controller_land_count as a check
-            # and emit a move_card action for "worst_land" (the engine will find it)
-            if ctx.get('controller_land_count', 0) > 0:
-                return [
-                    {"action": "sacrifice_land", "player": ctrl},
-                    {"action": "deal_damage", "amount": 3, "target_player": opp},
-                ]
-            return [{"action": "no_action", "reason": "No land to sacrifice for Shard Volley"}]
+            return [
+                {"action": "deal_damage", "amount": 3, "target_player": opp},
+            ]
         self._add_card("shard volley", EffectTemplate(
             name="Shard Volley",
             description="Sacrifice a land. Deal 3 damage to any target.",
@@ -5706,11 +5787,11 @@ class EffectTemplateLibrary:
 
         # Endrek Sahr, Master Breeder: cast trigger creates X 1/1 Thrull tokens
         # (X = cast creature's MV). NOT an ETB — the cast trigger is handled elsewhere.
-        # Register as no-ETB so templates don't fall through to Tier 3.
-        # Also has "sacrifice when you control 7+ Thrulls" — needs SBA handling, not template.
+        # Register as no-ETB so templates don't fall through to Tier 3. Its
+        # seven-Thrull state trigger is handled by the PERMANENT_ENTERED subscriber.
         self._add_card("endrek sahr, master breeder", EffectTemplate(
             name="Endrek Sahr, Master Breeder",
-            description="No ETB action (cast trigger creates Thrull tokens; 7+ Thrull check needs SBA)",
+            description="No ETB action (cast trigger and seven-Thrull state trigger are handled mechanically)",
             action_generator=lambda ctrl, opp, ctx: [],
         ))
 
@@ -7294,7 +7375,7 @@ class EffectTemplateLibrary:
             opp_player = ctx.get('_opponent_player')
             explicit = (ctx.get('explicit_target_name') or '').strip().lower()
             chosen = None
-            for _want_explicit in ((True, False) if explicit else (False,)):
+            for _want_explicit in ((True,) if explicit else (False,)):
                 for pl in (ctrl_player, opp_player):
                     if pl is None:
                         continue
@@ -7312,6 +7393,11 @@ class EffectTemplateLibrary:
                         break
                 if chosen is not None:
                     break
+            if explicit and chosen is None:
+                return [{"action": "no_action",
+                         "reason": ("Reanimate: declared target is not a "
+                                    "creature card in a graveyard")}]
+
             if chosen is None:
                 _name_fallback = ctx.get('best_graveyard_creature', '')
                 if _name_fallback:
@@ -7691,6 +7777,7 @@ class EffectTemplateLibrary:
             "etb": self._card_templates,
             "dies": self._dies_templates,
             "attack": self._attack_templates,
+            "upkeep": self._upkeep_templates,
         }
         entries = data.get("templates")
         if not isinstance(entries, list):
@@ -7743,6 +7830,10 @@ class EffectTemplateLibrary:
     def _add_attack_card(self, name_lower: str, template: EffectTemplate):
         """Register an attack-trigger-specific template (checked before ETB templates)."""
         self._attack_templates[name_lower] = template
+
+    def _add_upkeep_card(self, name_lower: str, template: EffectTemplate):
+        """Register an upkeep-only template, checked before general templates."""
+        self._upkeep_templates[name_lower] = template
 
     def _add_dies_card(self, name_lower: str, template: EffectTemplate):
         """Register a dies-trigger template (checked when event_type='dies').
@@ -8975,6 +9066,31 @@ class EffectTemplateLibrary:
     def _gen_upkeep_token_from_match(self, ctrl, opp, ctx) -> List[Dict]:
         """Generic upkeep token creation from oracle text pattern."""
         oracle = ctx.get('_oracle', '')
+        token_count = 1
+        if 'for each equipment attached to' in oracle.lower():
+            source = ctx.get('_source_card')
+            controller = ctx.get('_controller_player')
+            if source is None or controller is None:
+                return []
+            attachment_ids = set(getattr(source, 'attachments', []) or [])
+            token_count = sum(
+                1 for permanent in controller.battlefield
+                if 'equipment' in (permanent.type_line or '').lower()
+                and (getattr(permanent, 'attached_to', None) == source.id
+                     or permanent.id in attachment_ids)
+            )
+            if token_count <= 0:
+                return []
+            token_match = re.search(
+                r'(\d+)/(\d+)\s+(\w[\w\s]*?)(?:\s+creature)?\s+tokens?',
+                oracle)
+            if token_match:
+                power = int(token_match.group(1))
+                toughness = int(token_match.group(2))
+                name = token_match.group(3).strip().title()
+                return [{"action": "create_token", "player": ctrl,
+                         "name": name, "power": power, "toughness": toughness,
+                         "types": f"Creature - {name}", "count": token_count}]
         # June 10 deep-dive (CRITICAL — Marit Lage's Slumber): the generic
         # upkeep-token pattern regexed straight across an intervening-if
         # condition (CR 603.4) — "if you control ten or more snow permanents,
@@ -8985,7 +9101,7 @@ class EffectTemplateLibrary:
         # the generic generator refuses them.
         if re.search(r'at the beginning of (?:your|each) upkeep,\s*if\b', oracle.lower()):
             return [{"action": "no_action",
-                     "reason": "conditional upkeep trigger (intervening if, CR 603.4) — needs a dedicated template"}]
+                     "reason": "unsupported conditional upkeep trigger (named template absent; CR 603.4)"}]
         # Try to extract token stats from oracle text
         token_match = re.search(r'(\d+)/(\d+)\s+(\w[\w\s]*?)(?:\s+creature)?\s+tokens?', oracle)
         if token_match:
@@ -9956,6 +10072,105 @@ class EffectTemplateLibrary:
                 # Put non-land into hand (same as drawing)
                 return [{"action": "draw_cards", "player": ctrl, "amount": 1}]
         return [{"action": "draw_cards", "player": ctrl, "amount": 1}]
+
+    def _gen_primal_command(self, ctrl, opp, ctx) -> List[Dict]:
+        """Resolve the two modes actually chosen for Primal Command."""
+        aliases = {
+            "1": 1, "life": 1, "gain life": 1,
+            "2": 2, "top": 2, "noncreature": 2, "put on top": 2,
+            "3": 3, "graveyard": 3, "shuffle": 3,
+            "4": 4, "creature": 4, "search": 4, "tutor": 4,
+        }
+
+        def _mode_number(value):
+            if isinstance(value, int) and 1 <= value <= 4:
+                return value
+            text = str(value or "").strip().lower()
+            if text in aliases:
+                return aliases[text]
+            for key, number in aliases.items():
+                if len(key) > 1 and key in text:
+                    return number
+            return None
+
+        raw_modes = ctx.get('_modes') or []
+        if not isinstance(raw_modes, (list, tuple)):
+            raw_modes = [raw_modes]
+        modes = []
+        for raw in raw_modes:
+            number = _mode_number(raw)
+            if number and number not in modes:
+                modes.append(number)
+            if len(modes) == 2:
+                break
+
+        ctrl_player = ctx.get('_controller_player')
+        opp_player = ctx.get('_opponent_player')
+        game = ctx.get('_game')
+        players = [p for p in (ctrl_player, opp_player) if p is not None]
+        explicit = [str(name).strip() for name in
+                    (ctx.get('explicit_target_names') or []) if str(name).strip()]
+        if not explicit and ctx.get('explicit_target_name'):
+            explicit = [str(ctx['explicit_target_name']).strip()]
+
+        def _named_player(default):
+            for name in explicit:
+                for candidate in players:
+                    if candidate.name.lower() == name.lower():
+                        return candidate
+            return default
+
+        def _noncreature_target():
+            for name in explicit:
+                for owner in players:
+                    for permanent in owner.battlefield:
+                        if (permanent.name.lower() == name.lower()
+                                and not permanent.is_creature(game)):
+                            return owner, permanent
+            for owner in (opp_player, ctrl_player):
+                if owner is None:
+                    continue
+                legal = [c for c in owner.battlefield
+                         if not c.is_creature(game)]
+                if legal:
+                    return owner, max(legal, key=lambda c: int(c.cmc or 0))
+            return None, None
+
+        if not modes:
+            target_owner, target_card = _noncreature_target()
+            modes = [2, 4] if target_card is not None else [1, 4]
+        for fallback in (4, 1, 3, 2):
+            if len(modes) == 2:
+                break
+            if fallback not in modes:
+                modes.append(fallback)
+
+        actions = []
+        for mode in modes[:2]:
+            if mode == 1:
+                recipient = _named_player(ctrl_player)
+                actions.append({"action": "gain_life", "player": recipient.name,
+                                "amount": 7, "source": "Primal Command"})
+            elif mode == 2:
+                owner, permanent = _noncreature_target()
+                if permanent is None:
+                    actions.append({"action": "no_action",
+                                    "reason": "Primal Command: no legal noncreature permanent target"})
+                else:
+                    actions.append({"action": "move_card", "card": permanent.name,
+                                    "from_zone": "battlefield", "to_zone": "library",
+                                    "position": "top", "player": owner.name,
+                                    "reason": "Primal Command mode 2"})
+            elif mode == 3:
+                recipient = _named_player(opp_player or ctrl_player)
+                actions.append({"action": "shuffle_graveyard_into_library",
+                                "player": recipient.name,
+                                "reason": "Primal Command mode 3"})
+            elif mode == 4:
+                actions.append({"action": "search_library", "player": ctrl,
+                                "card_type": "Creature", "count": 1,
+                                "to_zone": "hand", "reason": "Primal Command mode 4"})
+        return actions
 
     def _gen_ghostly_flicker(self, ctrl, opp, ctx) -> List[Dict]:
         """Ghostly Flicker: exile TWO target artifacts, creatures, or lands you control, return them.

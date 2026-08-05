@@ -164,6 +164,22 @@ _MEMO_SCAFFOLDING_MARKERS = (
 )
 
 
+_MEMO_LABEL_TASK_REFERENCE_RE = re.compile(
+    r'(?i)(?:^|[^a-z])(?:win condition|this turn|'
+    r'opp threats(?:[ \t]*&[ \t]*answers)?|hold for opp turn)'
+    r'[ \t]*:[ \t]*(?:'
+    r'(?:the[ \t]+)?(?:user|prompt|task|request|instruction)s?'
+    r'|(?:we|i)[ \t]+(?:need|must|should)[ \t]+(?:to[ \t]+)?'
+    r'(?:answer|output|respond|provide|produce|follow))'
+    r'(?=$|[^a-z])'
+)
+
+
+def _memo_has_labeled_task_reference(cleaned: str) -> bool:
+    # Labels are not strategic evidence when their content describes the task.
+    return bool(_MEMO_LABEL_TASK_REFERENCE_RE.search(cleaned or ""))
+
+
 # May 7 audit: helper for surfacing legality context to the actor's prompt.
 # The AI repeatedly planned Counterspell/Mana Leak/Dovin's Veto when the
 # stack was empty and targeted removal when the opponent had 0 creatures —
@@ -186,6 +202,16 @@ def _card_legality_note(card, game, opp_player) -> str:
     oracle = (card.oracle_text or '').lower()
     type_line = (getattr(card, 'type_line', '') or '').lower()
     is_instant_or_sorcery = 'instant' in type_line or 'sorcery' in type_line
+
+    if ('aura' in type_line
+            and ('enchant creature' in oracle or 'enchant permanent' in oracle)):
+        caster = next((p for p in game.players if p is not opp_player), None)
+        if caster is not None:
+            from rules.targeting_helpers import aura_has_legal_target
+            if not aura_has_legal_target(game, card, caster):
+                zone = ("in any graveyard" if 'in a graveyard' in oracle
+                        else "on the battlefield")
+                return f"no legal Aura targets {zone}"
 
     # June 11 audit: the prompt advertised untapped Chainer as a target for
     # Murderous Compulsion ("target tapped creature"), inducing repeated
@@ -394,7 +420,7 @@ class ClaudePlayer:
         self.model = "claude-sonnet-5"  # Game decisions use Sonnet (Opus reserved for emotional support)
         self.last_error = None  # Track errors for debugging
         self.usage_callback = usage_callback  # Callback for token tracking
-        self.engine_ref = None  # Set by IntegratedGameEngine after init (for plan_turn PW access)
+        self.engine_ref = None  # Set by the active GameEngine (for plan_turn PW access)
         # Circuit breaker: track consecutive API failures to detect credit exhaustion
         self._consecutive_failures = 0
         self._api_disabled = False  # Set True after too many consecutive failures
@@ -408,7 +434,7 @@ class ClaudePlayer:
         self._strategy_task = None  # asyncio.Task for background strategist call
         # Phase 3: split Actor (self.client) from Strategist (strategist_client).
         # None = fall back to self.client / self.model (Anthropic or single-model DeepSeek).
-        # Set by IntegratedGameEngine when DEEPSEEK_API_KEY is available.
+        # Set by autoplay when a separate strategist provider is available.
         self.strategist_client = None   # the deep-reasoning strategist (v4-flash THINKING since the Aug 2 A/B; was v4-pro)
         self.strategist_model = None    # model name string for the strategist client
 
@@ -1334,6 +1360,10 @@ RULES (apply to your output, not your reasoning):
                         continue
                     filtered_sentences.append(s)
                 cleaned = ' '.join(filtered_sentences).strip()
+                if _memo_has_labeled_task_reference(cleaned):
+                    print("[STRATEGIST] Labeled task-reference nuke \u2014 "
+                          f"discarding {len(cleaned)}-char memo")
+                    return ""
                 # May 20 audit (#12) — POSITIVE validation. Previous code only
                 # rejected long essay-mode memos (>600 chars) without labels.
                 # The May 20 batch showed 30% of memos still lacked the labeled
@@ -1603,7 +1633,7 @@ DECISION QUALITY — AVOID COMMON MISTAKES:
 - X-COST SPELLS (Walking Ballista, Hydroid Krasis, Blue Sun's Zenith): set X to a meaningful value. Casting X=0 wastes the card. If you can only afford X=1 and the effect needs more to matter, hold it.
 - DISCARD (Liliana of the Veil, Smallpox, end-step discard): when forced to discard, drop your highest-CMC unplayable card or a redundant land — never discard your only win condition or a card you can cast next turn.
 - LIFE AS A RESOURCE: at low life (≤5) treat your life total like cards in hand. Skip optional life payments (fetchlands, shocklands' 2-life option, Dark Confidant flips, Phyrexian mana) unless the payoff is decisive.
-- TUTORS (Demonic Tutor, Vampiric, Mystical): name a card that wins or stabilizes immediately, not a generic ramp piece you'd draw normally.
+- TUTORS (Demonic Tutor, Vampiric, Mystical): include `"tutor_card": "<exact card name>"`; name a card that wins or stabilizes immediately, not generic ramp.
 - FLASHBACK GRANTERS (Snapcaster Mage, Lurrus, Past in Flames, Mizzix's Mastery): when you grant flashback to an instant/sorcery in your graveyard, follow through THIS TURN — include the flashback cast in the same plan if you have mana for both. Snapcaster {1}{U} + flashback Lightning Bolt {R} = 3 mana for 3 damage and a body. Skipping the flashback wastes the Snapcaster's whole reason to exist (granted ability ends at end of turn, the spell stays in your graveyard but unused). If you can't afford both, hold the granter for a turn you can. Same logic for Lurrus's once-per-turn permanent recursion — recur a value piece, don't waste the slot.
 - DON'T SANDBAG WHEN YOU'RE DYING (control decks especially): if your life is ≤5 and you have a body that can BLOCK in hand (Snapcaster Mage, Spell Queller, Solitude evoke, Watcher in the Mist, Reflector Mage — any flash creature, any 0-mana evoke), DEPLOY IT. Holding "for value" while taking lethal next turn is a known control-deck losing pattern. Evoke costs are FREE alternative casts — Solitude evokes for {0} and exiles a creature; Endurance evokes to shuffle graveyards; Grief evokes to discard. At 2 life vs a 4-power attacker, evoking Solitude to exile the attacker IS the play. Free spells (Force of Negation, Foil, alt-cost counterspells) are also free chumpings if cast on creatures, and free protection on your turn.
 - WHEN HOLDING REMOVAL: ask "what gets worse if I wait one turn?" If opp has lethal damage on board or a snowballing anthem (Cathar's Crusade, Sword of Feast and Famine), removal NOW is correct. If opp is empty-handed and tapped out, holding can be fine. Default to action-now over inaction.
@@ -1639,6 +1669,8 @@ Respond with a JSON action. Examples:
 {"type": "cast", "card": "Lightning Bolt", "target": "opponent"}
 {"type": "cast", "card": "Counterspell", "target": "stack_top"}
 {"type": "cast", "card": "Beanstalk Giant", "adventure": "Fertile Footsteps"}
+{"type": "cast", "card": "Demonic Tutor", "tutor_card": "Craterhoof Behemoth"}
+{"type": "cast", "card": "Primal Command", "modes": [2, 4], "target": ["Sol Ring"], "tutor_card": "Craterhoof Behemoth"}
 {"type": "suspend", "card": "Rift Bolt"}
 {"type": "foretell", "card": "Quakebringer"}
 {"type": "graveyard_activate", "card": "Angel of Sanctions", "mechanic": "embalm"}
@@ -1661,7 +1693,7 @@ NOTE: For adventure cards, use the "adventure" key to cast the adventure half (s
 RESPONSE FORMAT — a single JSON object with the action keys only (no "reasoning" field — keep output minimal):
 {"type": "play_land", "card": "Forest"}
 
-ONLY output cards that are listed in YOUR HAND above. Do NOT invent card names.
+ONLY output cast/play cards that are listed in YOUR HAND above. A `tutor_card` is the explicit exception: it must name a real card you intend to find in your library. Do NOT invent card names.
 
 CRITICAL: You MUST end your response with a valid JSON object. If you are uncertain what to do, output {"type": "pass"} — never output prose without JSON. A response with no JSON action will be treated as a pass automatically, wasting your turn.
 
@@ -2594,6 +2626,8 @@ CRITICAL: After each cast, subtract its mana cost from your available mana. Do N
 ACTION GRAMMAR:
 - {"type": "play_land", "card": "Forest"}
 - {"type": "cast", "card": "Arcane Signet"}
+- {"type": "cast", "card": "Demonic Tutor", "tutor_card": "Craterhoof Behemoth"}
+- {"type": "cast", "card": "Primal Command", "modes": [2, 4], "target": ["Sol Ring"], "tutor_card": "Craterhoof Behemoth"}
 - {"type": "suspend", "card": "Rift Bolt"} — pay the Suspend cost, exile with time counters, casts free later (the ⏳ hint lists candidates)
 - {"type": "crew", "vehicle": "Smuggler's Copter"} — tap creatures with total power ≥ the crew cost; the Vehicle becomes an artifact creature until end of turn (the 🚗 hint lists candidates; crew BEFORE attacking)
 - {"type": "foretell", "card": "Quakebringer"} — pay {2} to exile it face down; cast it on a LATER turn for its (cheaper) foretell cost. The castable list marks these [FORETELL ...] and, once foretold, [FORETOLD — cast from exile]
@@ -2621,7 +2655,7 @@ WHEN TO USE `activate` INSTEAD OF `resolve`:
 WHEN TO USE `cast` INSTEAD OF `resolve`:
 - Reanimate spells (Animate Dead, Reanimate, Victimize, Stitch Together): `{"type": "cast", "card": "Animate Dead", "target": "<creature in graveyard>"}`
   NOT `{"type": "resolve", "description": "Return Blood Artist from graveyard"}`
-- Tutor spells: `{"type": "cast", "card": "Demonic Tutor"}` — engine picks/tutors
+- Tutor spells: `{"type": "cast", "card": "Demonic Tutor", "tutor_card": "Craterhoof Behemoth"}` — always name the exact card to find
 - Spell-from-graveyard effects (Yawgmoth's Will, Past in Flames): `cast` the spell
 
 `resolve` description field rules (only when truly needed): ≤80 chars, imperative

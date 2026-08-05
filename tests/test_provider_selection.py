@@ -24,6 +24,7 @@ a wrong slug fails pre-flight and the batch falls back, rather than dying
 mid-run.
 """
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
@@ -214,24 +215,69 @@ class TestDashScopeFactories:
                 f"{model} is selectable but has no MODEL_RATES entry")
 
 
+def _cost_tracker():
+    from bot import MTGBot
+    counters = (
+        "total_input_tokens", "total_output_tokens", "api_calls",
+        "mtg_game_input_tokens", "mtg_game_output_tokens", "mtg_game_calls",
+        "qwen_input_tokens", "qwen_output_tokens", "qwen_calls",
+        "qwen_plus_input_tokens", "qwen_plus_output_tokens",
+        "qwen_plus_calls", "qwen_max_input_tokens",
+        "qwen_max_output_tokens", "qwen_max_calls",
+        "mtg_game_qwen_input_tokens",
+        "mtg_game_qwen_output_tokens", "mtg_game_qwen_plus_input_tokens",
+        "mtg_game_qwen_plus_output_tokens", "mtg_game_qwen_max_input_tokens",
+        "mtg_game_qwen_max_output_tokens", "sonnet_input_tokens",
+        "sonnet_output_tokens", "mtg_game_sonnet_input_tokens",
+        "mtg_game_sonnet_output_tokens", "deepseek_input_tokens",
+        "deepseek_output_tokens", "deepseek_calls",
+        "deepseek_pro_input_tokens", "deepseek_pro_output_tokens",
+        "deepseek_pro_calls", "mtg_game_deepseek_input_tokens",
+        "mtg_game_deepseek_output_tokens",
+        "mtg_game_deepseek_pro_input_tokens",
+        "mtg_game_deepseek_pro_output_tokens",
+    )
+    tracker = SimpleNamespace(**{name: 0 for name in counters})
+    tracker._save_persistent_costs = lambda: None
+    return MTGBot, tracker
+
+
 class TestCostRoutingInBot:
     def test_qwen_does_not_fall_into_the_sonnet_bucket(self):
         """_track_usage routed on 'deepseek' in model. A Qwen string failed
         that and fell through to the ELSE branch — the Sonnet bucket —
         pricing $0.03/M tokens at Sonnet rates, ~36x high."""
-        from pathlib import Path
-        src = (Path(__file__).resolve().parent.parent
-               / "bot.py").read_text(encoding="utf-8")
-        assert "'deepseek' in model.lower() or 'qwen' in model.lower()" in src
+        MTGBot, tracker = _cost_tracker()
+        usage = SimpleNamespace(input_tokens=11, output_tokens=7)
+        MTGBot.track_mtg_usage(tracker, usage, "qwen3.7-flash")
+        assert (tracker.qwen_input_tokens, tracker.qwen_output_tokens,
+                tracker.qwen_calls) == (11, 7, 1)
+        assert tracker.sonnet_input_tokens == 0
+        assert tracker.deepseek_input_tokens == 0
+        assert tracker.deepseek_pro_input_tokens == 0
 
     def test_qwen_premium_tier_is_recognised(self):
         """'plus' does NOT contain '-pro', so without naming it a Qwen
         strategist bills at actor rates — the quiet direction of wrong."""
-        from pathlib import Path
-        src = (Path(__file__).resolve().parent.parent
-               / "bot.py").read_text(encoding="utf-8")
-        i = src.index("is_pro = (")
-        assert "'plus' in model_low" in src[i:i + 400]
+        MTGBot, tracker = _cost_tracker()
+        usage = SimpleNamespace(input_tokens=13, output_tokens=5)
+        MTGBot.track_mtg_usage(tracker, usage, "qwen3.7-plus")
+        assert (tracker.qwen_plus_input_tokens,
+                tracker.qwen_plus_output_tokens,
+                tracker.qwen_plus_calls) == (13, 5, 1)
+        assert tracker.qwen_input_tokens == 0
+        assert tracker.sonnet_input_tokens == 0
+        assert tracker.deepseek_pro_input_tokens == 0
+
+    def test_qwen_max_has_its_own_rate_bucket(self):
+        MTGBot, tracker = _cost_tracker()
+        usage = SimpleNamespace(input_tokens=17, output_tokens=9)
+        MTGBot.track_mtg_usage(tracker, usage, "qwen3.7-max")
+        assert (tracker.qwen_max_input_tokens,
+                tracker.qwen_max_output_tokens,
+                tracker.qwen_max_calls) == (17, 9, 1)
+        assert tracker.qwen_plus_input_tokens == 0
+        assert tracker.mtg_game_qwen_max_input_tokens == 17
 
 
 class TestResoldModelPricing:

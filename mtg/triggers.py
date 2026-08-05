@@ -374,7 +374,13 @@ def _check_creature_etb_triggers_sync(engine, game: GameState, entering_player: 
             oracle_lower = card.oracle_text.lower()
 
             # Skip if no creature-enters trigger
+            _is_scourge_dragon_trigger = (
+                card.name.lower() == "scourge of valkas"
+                and entering_creature.is_creature(game)
+                and 'dragon' in (entering_creature.type_line or '').lower()
+            )
             has_creature_enters = (
+                _is_scourge_dragon_trigger or
                 ("whenever another creature" in oracle_lower and "enters" in oracle_lower) or
                 ("whenever a creature" in oracle_lower and "enters" in oracle_lower) or
                 ("whenever a nontoken creature" in oracle_lower and "enters" in oracle_lower) or
@@ -448,8 +454,11 @@ def _check_creature_etb_triggers_sync(engine, game: GameState, entering_player: 
         _tinfos = []
         for card, _cp, _ci in _etb_collected:
             _tt = ""
-            for paragraph in card.oracle_text.split('\n'):
-                if "whenever" in paragraph.lower() and "creature" in paragraph.lower() and "enters" in paragraph.lower():
+            for paragraph in card.oracle_text.splitlines():
+                if ("whenever" in paragraph.lower()
+                        and "enters" in paragraph.lower()
+                        and ("creature" in paragraph.lower()
+                             or card.name.lower() == "scourge of valkas")):
                     _tt = paragraph.strip()
                     break
             if _tt:
@@ -478,8 +487,27 @@ def _check_creature_etb_triggers_sync(engine, game: GameState, entering_player: 
         
         # ---- HARDCODED HANDLERS (fast, no API) ----
         
+        # Scourge of Valkas is mandatory and its current oracle wording
+        # says "Scourge ... or another Dragon", not "creature".
+        if (card.name.lower() == "scourge of valkas"
+                and 'dragon' in (entering_creature.type_line or '').lower()):
+            dragon_count = sum(
+                1 for permanent in _ctrl_player.battlefield
+                if permanent.is_creature(game)
+                and 'dragon' in (permanent.type_line or '').lower()
+            )
+            actual_dmg = engine.rules._apply_noncombat_damage_to_player(
+                game, opponent, dragon_count, card.name)
+            messages.append(
+                f"\U0001F525 {card.name} deals {actual_dmg} damage to {opponent.name}!")
+            if actual_dmg > 0 and opponent.life <= 0:
+                game.ended = True
+                game.winner = player_idx
+                messages.append(f"\U0001F480 {opponent.name} loses the game!")
+            handled = True
+
         # Terror of the Peaks / Warstorm Surge: deals damage equal to entering creature's power
-        if "deals damage equal to that creature's power" in oracle_lower or (
+        elif "deals damage equal to that creature's power" in oracle_lower or (
             "deals damage equal to" in oracle_lower and "power" in oracle_lower and "any target" in oracle_lower
         ):
             try:
@@ -740,7 +768,36 @@ def _spell_matches_cast_trigger(engine, sentence_lower: str, card: Card,
     # When cast as adventure, the spell type is the adventure's type (instant/sorcery),
     # not the card's creature type. This prevents Chulane/Beast Whisperer from triggering.
     is_adventure_cast = getattr(card, 'cast_as_adventure', False)
-    is_creature_spell = card.is_creature() and not is_adventure_cast
+    try:
+        _card_is_creature = card.is_creature(game=game)
+    except TypeError:  # lightweight test doubles / legacy adapters
+        _card_is_creature = card.is_creature()
+    is_creature_spell = _card_is_creature and not is_adventure_cast
+
+    # Color-qualified cast triggers (Gadwick: "cast a blue spell"). Card
+    # color is determined by the face being cast, not color identity; identity
+    # also includes off-color rules text and is a deck-construction property.
+    _color_words = {
+        'white': 'W', 'blue': 'U', 'black': 'B', 'red': 'R', 'green': 'G',
+    }
+    _required_colors = {
+        symbol for word, symbol in _color_words.items()
+        if re.search(rf'\b{word} spell\b', sentence_lower)
+    }
+    if _required_colors:
+        if 'devoid' in (card.oracle_text or '').lower():
+            _spell_colors = set()
+        else:
+            from mtg.helpers import spell_colors_from_cost
+            _spell_cost = card.mana_cost or ''
+            if is_adventure_cast and getattr(card, 'adventure_cost', None):
+                _spell_cost = card.adventure_cost
+            elif (getattr(card, 'cast_as_split_half', -1) >= 0
+                  and getattr(card, 'split_costs', None)):
+                _spell_cost = card.split_costs[card.cast_as_split_half]
+            _spell_colors = spell_colors_from_cost(_spell_cost)
+        if not (_required_colors & _spell_colors):
+            return False
 
     # --- Spell subtype/type filters ---
     # "noncreature spell" — skip creatures (but adventure half IS noncreature)
@@ -835,7 +892,12 @@ def _spell_matches_cast_trigger(engine, sentence_lower: str, card: Card,
     # graveyard") isn't wrongly gated.
     _cond_clause = sentence_lower.split(',', 1)[0]
     if re.search(r'from (?:a|your|their) graveyard', _cond_clause):
-        if not getattr(card, '_cast_from_graveyard', False):
+        _origin = getattr(card, '_cast_origin', '')
+        _is_graveyard_cast = (
+            _origin == 'graveyard' if _origin
+            else getattr(card, '_cast_from_graveyard', False)
+        )
+        if not _is_graveyard_cast:
             return False
 
     # --- "no mana was spent" / "without paying" (Roiling Vortex) ---
@@ -1788,6 +1850,23 @@ async def _check_cast_triggers(engine, game: GameState, caster: Player, card: Ca
                         messages.append(f"⚡ {bf_card.name} deals {actual} damage to {target_player.name}")
                         executed_trigger = True
 
+
+                # Bontu's Monument-class triggers contain two independent
+                # effects. The old parser silently omitted the opponent loss.
+                _opp_loss = re.search(
+                    r'each opponent loses (\d+) life', sentence_lower)
+                if _opp_loss:
+                    _loss_amt = int(_opp_loss.group(1))
+                    for _victim in game.players:
+                        if _victim is caster:
+                            continue
+                        _msg = engine.rules._execute_action_on_state(game, {
+                            "action": "lose_life", "player": _victim.name,
+                            "amount": _loss_amt, "source": bf_card.name,
+                        })
+                        if _msg:
+                            messages.append(_msg)
+                    executed_trigger = True
                 # Gain life: "gain N life" (trigger)
                 # No `if not executed_trigger` guard here — life gain and draw are distinct
                 # effects that can both appear in the same sentence (Sythis, Harvest's Hand)
@@ -1801,6 +1880,17 @@ async def _check_cast_triggers(engine, game: GameState, caster: Player, card: Ca
                     # directly and one Sythis gain logged nothing at all.
                     _log_life_change(caster, life_amt, f"cast trigger: {bf_card.name}")
                     messages.append(f"⚡ {bf_card.name} — {caster.name} gains {life_amt} life")
+                    executed_trigger = True
+
+                # Deterministic "untap this creature" cast triggers
+                # (Thermo-Alchemist) resolve before the triggering spell.
+                if (not executed_trigger
+                        and 'untap this creature' in sentence_lower):
+                    bf_card.tapped = False
+                    messages.append(
+                        f"\u26A1 **{bf_card.name}** untaps from casting {card.name}")
+                    print(f"[CAST-TRIGGER] {bf_card.name} untaps from "
+                          f"casting {card.name}")
                     executed_trigger = True
 
                 # June 10 audit (V21): self-pump cast triggers (Kiln Fiend
@@ -2260,15 +2350,45 @@ def _creature_entered_subscriber(game, card=None, controller=None, via=None,
     """
     if card is None or controller is None:
         return
-    engine = getattr(rules, 'engine_ref', None) if rules is not None else None
-    if engine is None or not hasattr(engine, '_check_creature_etb_triggers_sync'):
-        print(f"[ETB-BUS] {card.name} entered (via={via or '?'}) with no "
-              f"usable engine in payload — creature watcher dispatch skipped")
-        return
     try:
         if not card.is_creature(game):
             return
     except Exception:
+        return
+
+    # Aug 5 targeted closure: Endrek's seven-Thrull ability is a
+    # state-triggered ability (CR 603.8), not a state-based action. Every
+    # physical Thrull entry comes through this subscriber, including token
+    # creation and reanimation, so check the condition before requiring an
+    # engine reference for the broader creature-entered watcher dispatch.
+    type_line = (getattr(card, 'type_line', '') or '').lower()
+    if re.search(r'\bthrull\b', type_line) and rules is not None:
+        endrek = next((permanent for permanent in controller.battlefield
+                       if permanent.name.lower() ==
+                       'endrek sahr, master breeder'), None)
+        if endrek is not None:
+            thrulls = sum(
+                1 for permanent in controller.battlefield
+                if re.search(r'\bthrull\b',
+                             (getattr(permanent, 'type_line', '') or '').lower())
+                and permanent.is_creature(game)
+            )
+            if thrulls >= 7 and hasattr(rules, '_execute_action_on_state'):
+                msg = rules._execute_action_on_state(game, {
+                    "action": "sacrifice_permanent", "player": controller.name,
+                    "preferred_card": "Endrek Sahr, Master Breeder",
+                    "only_preferred": True, "allow_commander": True,
+                    "reason": "Endrek Sahr state trigger (seven or more Thrulls)",
+                })
+                if msg:
+                    game._pending_messages = (
+                        getattr(game, '_pending_messages', []) or [])
+                    game._pending_messages.append(msg)
+
+    engine = getattr(rules, 'engine_ref', None) if rules is not None else None
+    if engine is None or not hasattr(engine, '_check_creature_etb_triggers_sync'):
+        print(f"[ETB-BUS] {card.name} entered (via={via or '?'}) with no "
+              f"usable engine in payload — creature watcher dispatch skipped")
         return
     msgs = _dispatch_creature_entered(engine, game, controller, card)
     if msgs:
@@ -3715,6 +3835,13 @@ def _check_upkeep_triggers_sync(engine, game: GameState) -> Tuple[List[str], Lis
         if not card.oracle_text:
             continue
         oracle_lower = card.oracle_text.lower()
+        # advance_phase owns Solitary Confinement's upkeep choice immediately
+        # before this scan. Letting the generic scanner see it again queues a
+        # second copy that can sacrifice the permanent after its controller
+        # already discarded to keep it.
+        if card.name.lower() == "solitary confinement":
+            continue
+
         if "upkeep" not in oracle_lower:
             continue
 
@@ -5415,6 +5542,13 @@ def fire_discard_triggers(game, player, discarded):
             if not _discard_filter_matches(match.group(1), discarded):
                 continue
             effect = line[match.end():].lower()
+            # This family needs the discarded card's post-discard graveyard
+            # state. madness_discard_to_exile owns that zone handoff and
+            # resolves Containment Construct there; do not emit a false
+            # unhandled marker before the card reaches its destination.
+            if ('may exile that card from your graveyard' in effect
+                    and 'may play that card this turn' in effect):
+                continue
             # Anje's untap clause is handled at the madness choke point,
             # which knows whether the discarded card actually had madness.
             if 'untap' in effect and 'madness' in effect:

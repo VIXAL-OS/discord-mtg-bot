@@ -61,6 +61,37 @@ def response_text(response) -> str:
     )
 
 
+def sanitize_action_bullets(actions):
+    # Strip engine-internal diagnostics from player-facing action bullets.
+    if not actions:
+        return actions
+    debug_prefixes = (
+        "[PLAN-VALIDATE]", "[EXECUTE]", "[RESOLVE]", "[DEBUG]",
+        "[ETB-", "[TRIGGER-", "[XMAGE", "[SPELL_RESOLVER]",
+        "[SEMANTIC]", "[ACCUMULATOR]", "[OPP-CAST-TRIGGER]",
+        "[LANDFALL]", "[COMBAT]", "[DAMAGE-PREVENTED]",
+        "[AUTO-DRAFT]", "[DRAFT-CLAUDE]", "[AI-RESOLVE]",
+        "[AUTOPLAY-JUDGE]", "[AUTOPLAY]", "[STRIP]", "[JUDGE-FIX]",
+        "[EARLY-CAST]",
+    )
+    exception_markers = (
+        "Traceback (most recent", " at 0x",
+        "KeyError:", "AttributeError:", "TypeError:", "ValueError:",
+        "IndexError:", "NameError:", "RuntimeError:", "AssertionError:",
+    )
+    cleaned = []
+    for action in actions:
+        if not action:
+            continue
+        text = str(action).strip()
+        if not text or any(text.startswith(p) for p in debug_prefixes):
+            continue
+        if any(marker in text for marker in exception_markers):
+            continue
+        cleaned.append(action)
+    return cleaned
+
+
 def names_match(a, b) -> bool:
     """Exact normalized card-name equality.
 
@@ -864,6 +895,28 @@ def madness_discard_to_exile(game, player, card):
 
     cost = parse_madness_cost(getattr(card, 'oracle_text', '') or '')
     if cost is None:
+        # Containment Construct / Conspiracy Theorist shape. The general
+        # discard watcher runs before callers append the discarded card to a
+        # graveyard, so this shared zone-handoff is the first authoritative
+        # point where the optional exile can resolve. Autoplay takes the
+        # strictly-upside option and grants the existing impulse permission.
+        _construct = next((
+            perm for perm in player.battlefield
+            if ('whenever you discard a card' in
+                (getattr(perm, 'oracle_text', '') or '').lower()
+                and 'may exile that card from your graveyard' in
+                (getattr(perm, 'oracle_text', '') or '').lower()
+                and 'may play that card this turn' in
+                (getattr(perm, 'oracle_text', '') or '').lower())
+        ), None)
+        if _construct is not None:
+            player.exile.append(card)
+            if card.id not in player.playable_from_exile:
+                player.playable_from_exile.append(card.id)
+            print(f"[DISCARD-TRIGGER] {_construct.name} exiles {card.name} "
+                  f"from graveyard; playable this turn")
+            return (f"?? **{_construct.name}** exiles **{card.name}** ? "
+                    f"{player.name} may play it this turn")
         return None
     card._madness_cost = cost
     player.exile.append(card)
@@ -2150,6 +2203,9 @@ def compute_cost_increase(game, player, card):
             if perm is card:
                 continue
             oracle = getattr(perm, 'oracle_text', '') or ''
+            # Saga chapter text is not a static ability of the permanent.
+            if 'saga' in (getattr(perm, 'type_line', '') or '').lower():
+                continue
             if 'more to cast' not in oracle.lower():
                 continue
             for m in _COST_INCREASE_RE.finditer(oracle):
@@ -2167,6 +2223,33 @@ def compute_cost_increase(game, player, card):
                 except (TypeError, ValueError):
                     continue
                 sources.append(perm.name)
+
+    # Chapter-created taxes persist independently of the Saga that created
+    # them and expire as the source controller's next turn begins.
+    _effects = getattr(game, '_temporary_cost_increases', []) or []
+    _active_effects = []
+    for _effect in _effects:
+        try:
+            _expires = int(_effect.get('expires_turn', 0))
+        except (TypeError, ValueError):
+            continue
+        if game.turn_number >= _expires:
+            continue
+        _active_effects.append(_effect)
+        if player.name == _effect.get('controller'):
+            continue
+        if (_effect.get('restriction') == 'noncreature'
+                and card.is_creature(game=game)):
+            continue
+        try:
+            _amount = int(_effect.get('amount', 0))
+        except (TypeError, ValueError):
+            continue
+        if _amount <= 0:
+            continue
+        total += _amount
+        sources.append(_effect.get('source', 'temporary effect'))
+    game._temporary_cost_increases = _active_effects
     return total, sources
 
 

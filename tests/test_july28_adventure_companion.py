@@ -168,13 +168,22 @@ class TestCompanionValidation:
         return [_card_from_cache(c["name"])
                 for c in deck["cards"] for _ in range(c.get("quantity", 1))]
 
-    def test_the_fixture_is_now_legal_under_its_own_companion(self):
+    def test_the_fixture_is_legal_in_its_declared_vintage_format(self):
         from mtg.models import FormatValidator
         cards = self._lurrus_deck()
         assert len(cards) == 60
         ok, issues = FormatValidator.validate_deck(
-            cards, "modern", companion=_card_from_cache("Lurrus of the Dream-Den"))
+            cards, "vintage", companion=_card_from_cache("Lurrus of the Dream-Den"))
         assert ok, f"the companion fixture still violates its own mechanic: {issues}"
+
+    def test_lurrus_is_not_presented_as_modern_legal(self):
+        from mtg.models import FormatValidator
+        ok, issues = FormatValidator.validate_deck(
+            self._lurrus_deck(), "modern",
+            companion=_card_from_cache("Lurrus of the Dream-Den"))
+        assert not ok
+        assert any("Lurrus of the Dream-Den" in issue
+                   and "modern-legal (banned)" in issue for issue in issues)
 
     def test_street_wraith_is_gone(self):
         raw = (_ROOT / "data" / "test_companion_lurrus.json").read_text(encoding="utf-8")

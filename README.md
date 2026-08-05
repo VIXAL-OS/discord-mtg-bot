@@ -9,7 +9,7 @@ Includes:
 - An **LLM-backed judge** for genuinely complex interactions
 - An **`!undo` snapshot stack** so bugs in obscure rules don't ruin your game
 - A **`!coverage`** command that classifies every card in a deck by how the engine will handle it
-- An **autoplay loop** for batch playtesting (Claude or DeepSeek as both players)
+- An **autoplay loop** for batch playtesting (Claude, DeepSeek, or Qwen as both players)
 - A **persona layer** for chat flavor in game threads
 
 For a Discord companion bot with distress support / memory / tarot / YouTube transcription, see the sibling [`discord-companion-bot`](https://github.com/VIXAL-OS/discord-companion-bot) repo. That bot can optionally import this MTG engine if you want both in one deployment.
@@ -184,10 +184,9 @@ docker compose logs -f
 
 You're waiting for the Discord ready line. Then sanity-check in Discord:
 `!card Lightning Bolt` (Scryfall works), `!game claude commander` +
-`!mydeck surrak` (deck loading works), `!state` (rendering works). If you set
-`DEEPSEEK_API_KEY`, a single `!autoplay commander surrak aminatou` exercises
-the engine, both LLM adapters, logging, and Discord rate limiting end-to-end
-for about a penny — it's the best one-shot integration test.
+`!mydeck surrak` (deck loading works), `!state` (rendering works). If you set `DEEPSEEK_API_KEY` or `DASHSCOPE_API_KEY`, a single
+`!autoplay commander surrak aminatou` exercises the engine, provider
+selection, logging, and Discord rate limiting end to end.
 
 State lives in host bind mounts (`data/`, `logs/`, `config.json`), so
 `docker compose down` and rebuilds don't lose your decks, saved games, or
@@ -211,7 +210,7 @@ Secrets are environment variables (the same ones `.env` holds), so they go in
 Fly's secret store rather than a file:
 
 ```bash
-fly secrets set DISCORD_TOKEN=xxx ANTHROPIC_API_KEY=xxx DEEPSEEK_API_KEY=xxx
+fly secrets set DISCORD_TOKEN=xxx ANTHROPIC_API_KEY=xxx DEEPSEEK_API_KEY=xxx DASHSCOPE_API_KEY=xxx
 ```
 
 Saved games need a volume — one gigabyte is plenty, and it must be in the same
@@ -288,7 +287,7 @@ the **whole bot except the XMage bridge**. That's the honest dividing line. If
 you want Tier 2.5, you want root — a VPS or their VPS tier.
 
 On a panel you skip Docker entirely: clone, `pip install -r requirements.txt`,
-set `DISCORD_TOKEN` / `ANTHROPIC_API_KEY` (and optionally `DEEPSEEK_API_KEY`)
+set `DISCORD_TOKEN` / `ANTHROPIC_API_KEY` (and optionally `DEEPSEEK_API_KEY` or `DASHSCOPE_API_KEY`)
 in the panel's environment-variable UI, and run `python bot.py`. Panels are
 genuinely *well* shaped for this — they're built around always-on processes
 with restart-on-crash, so you avoid the scale-to-zero trap that makes
@@ -297,9 +296,8 @@ serverless platforms awkward for a gateway client.
 #### Sizing for real use
 
 **Size for concurrent games, not for autoplay batches.** `!autoplay` is a
-development harness — the numbers in *Log growth* below (~286MB for a 143-game
-batch) describe testing the engine, not people playing on your server. Normal
-play produces a tiny fraction of that.
+development harness; batch log volume varies with game length and instrumentation.
+Normal play produces a tiny fraction of a full regression matrix.
 
 What production actually looks like: games are keyed by Discord thread, so any
 number can run at once across any number of servers. Concurrency is cheap on
@@ -319,10 +317,9 @@ APIs. Three things do scale, though:
   event loop, so a heavy `!state` render briefly pauses *every* game in the
   process. On a throttled shared-CPU plan that's the thing you'd notice first.
 
-**Multi-server caveat:** `mtg_channel_id` is a single global setting, not
-per-guild. The bot auto-responds without being mentioned in that one channel;
-everywhere else — including every other server — it needs an @-mention. That
-works fine, it's just worth knowing before you invite it to a second server.
+**Multi-server configuration:** `mtg_channel_id` accepts either one legacy
+channel ID for every guild or a `{guild_id: channel_id}` mapping, optionally
+with a `"*"` fallback. Unlisted guilds do not inherit another guild's channel.
 
 The practical ceiling is almost never the host. It's your LLM API spend and
 rate limits, which are identical wherever you run.
@@ -334,9 +331,9 @@ Two separate things grow, and they want different treatments.
 **The container's stdout** is capped in `docker-compose.yml` (`max-size: 10m`,
 `max-file: 5` → a 50MB ceiling). Nothing to do.
 
-**The bot's per-game logs** under `logs/` are not capped, and they add up fast
-if you run autoplay batches: two files per game, and one full 143-game batch is
-**~286MB**. They're plain text, so they compress about **10x**.
+**The bot's per-game logs** under `logs/` are not capped, and full autoplay
+matrices add up. They are plain text and compress well, so use rotation or the
+nightly gzip policy below if you run batches regularly.
 
 The simplest policy that keeps everything is a nightly job that gzips anything
 older than 30 days:
@@ -345,8 +342,8 @@ older than 30 days:
 (crontab -l 2>/dev/null; echo "0 4 * * * find ~/discord-mtg-bot/logs -name 'game_*.log' -mtime +30 -exec gzip {} +") | crontab -
 ```
 
-That turns a batch's 286MB into ~28MB while keeping every line greppable
-(`zgrep` reads them directly). Recent logs stay uncompressed so the audit
+Compressed archives keep old logs inexpensive while preserving every line for
+`zgrep`. Recent logs stay uncompressed so the audit
 workflow's normal `grep` still works on them.
 
 **Archiving whole batches compresses better and matters more than it looks.**
@@ -393,7 +390,7 @@ want one policy everywhere — a `logs/*.log` glob with `copytruncate` works.
 4. Generate an OAuth2 invite URL with the `bot` + `applications.commands` scopes, plus permissions: `Send Messages`, `Read Message History`, `Attach Files`, `Embed Links`, `Add Reactions`, `Use Slash Commands`, `Manage Threads`, `Create Public Threads`, `Send Messages in Threads`.
 5. Invite the bot to your server.
 6. Get your Anthropic API key from <https://console.anthropic.com>, put it in `.env` as `ANTHROPIC_API_KEY`.
-7. (Optional) For autoplay batches, also set `DEEPSEEK_API_KEY` — gives a much cheaper actor model (V4-Flash) while keeping Claude for the strategist. Without DeepSeek configured, autoplay falls back to Claude on both sides (more expensive).
+7. (Optional) For autoplay batches, set `DEEPSEEK_API_KEY` and/or `DASHSCOPE_API_KEY`. The preflight probe selects a healthy provider; without either, autoplay falls back to Claude on both sides.
 8. Run `python bot.py`.
 
 ## Picking and writing personas
@@ -410,27 +407,30 @@ Roughly per usage pattern:
 |---|---|
 | Casual chat in game threads (Sonnet) | $0.003 per message round-trip |
 | One Commander MTG game (Claude on both sides) | $0.15-$0.30 |
-| One Commander game, DeepSeek on both sides (autoplay default when `DEEPSEEK_API_KEY` is set) | ~$0.01 |
-| One Modern / Pauper game | $0.10-$0.20 |
+| One Commander autoplay game (DeepSeek or Qwen) | Varies by provider/model; see per-game stats |
+| One Modern / Pauper game | Varies with turn count and provider |
 
 `!cost` shows the lifetime running total; persisted in `data/api_costs.json`.
+Provider-specific counters keep future Qwen Flash, Plus, and Max usage separate;
+historical pre-split Qwen usage remains honestly labeled in the legacy aggregate.
 
-The DeepSeek figure is measured, not projected: a full 143-game regression
-batch (every matchup in the autoplay matrix) cost **$1.57** end to end, at a
-72.7% prompt-cache hit rate. That's what makes batch playtesting practical —
-the same batch on Claude both sides would run $20-40.
+The latest strict 160-entry regression matrix used 74 DeepSeek games, 85 Qwen
+games, and the cube pipeline. It consumed 42,525,805 prompt tokens and 2,740,136
+completion tokens at an estimated **$4.0776**. Treat that as a measured mixed-
+provider run, not a fixed budget: rates, cache behavior, and game length vary.
 
 ## Project status
 
-Pre-1.0. The rules engine is well-exercised — the [post-batch audit playbook](ARCHITECTURE.md#post-batch-audit-playbook) runs Tier 1 + Tier 2 agents against batches of 100+ autoplay games to catch regressions. See [ARCHITECTURE.md](ARCHITECTURE.md) for the open known limitations.
+Pre-1.0. The rules engine is well-exercised — the [post-batch audit playbook](ARCHITECTURE.md#post-batch-audit-playbook) runs independent audit passes against the 160-entry autoplay matrix to catch regressions. See [ARCHITECTURE.md](ARCHITECTURE.md) for the open known limitations.
 
 ## Contributing
 
 PRs welcome — and **adding support for a card needs no API keys and no
 Discord bot.** Most cards resolve from a name-keyed template table, so
 contributing one is an entry in [`data/card_templates.json`](data/card_templates.json)
-plus `python -m pytest tests -q` (~450 tests, runs offline in a few
-seconds). The loader is strict, so the test suite doubles as the schema
+plus `python -m pytest tests -q` (1,675 tests in the current public gate;
+runs offline in roughly two minutes on the reference workstation). The loader
+is strict, so the test suite doubles as the schema
 check, and CI validates every card name against Scryfall.
 
 Engine changes are the other path: write a failing test first, keep the

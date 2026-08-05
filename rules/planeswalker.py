@@ -1122,7 +1122,12 @@ class PlaneswalkerManager:
                     if c in mana_cost.upper():
                         color = c
                         break
-                player.mana_pool[color] = player.mana_pool.get(color, 0) + count
+                if 'spend this mana only to cast dragon spells' in text:
+                    player.add_restricted_mana(
+                        color, count, 'dragon_spell', source=card.name)
+                else:
+                    player.mana_pool[color] = (
+                        player.mana_pool.get(color, 0) + count)
                 messages.append(f"💎 Added {count} {color} mana to pool")
             else:
                 # Try to parse {X}{Y} style

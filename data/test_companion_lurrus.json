@@ -1,8 +1,8 @@
 {
-  "name": "Lurrus Companion (Modern)",
-  "format": "modern",
+  "name": "Lurrus Companion (Vintage)",
+  "format": "vintage",
   "companion": "Lurrus of the Dream-Den",
-  "description": "Companion mechanic stress test: starts outside game, pay 3 to move to hand, then cast normally. All permanent cards MV 2 or less (Lurrus companion restriction). Tests companion zone, companion restriction validation, Lurrus graveyard recursion.",
+  "description": "Vintage companion mechanic stress test: Lurrus is legal here, starts outside the game, costs 3 to move to hand, and then casts normally. All permanent cards have mana value 2 or less. Tests companion-zone validation and Lurrus graveyard recursion without presenting banned Modern Lurrus as legal.",
   "colors": [
     "B",
     "R"

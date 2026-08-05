@@ -229,6 +229,17 @@ class FormatValidator:
             commanders = [c for c in commander if c is not None]
         else:
             commanders = [commander]
+
+        # Oathbreaker has one planeswalker Oathbreaker and one signature
+        # instant/sorcery in the command zone. The signature spell is not a
+        # second commander, so it must not enter the CR 903.3 partner-pair
+        # validator. Keep it in `cards`, however, so its color identity is
+        # still checked against the Oathbreaker's identity below.
+        if format_name == "oathbreaker":
+            commanders = [
+                c for c in commanders
+                if not getattr(c, 'is_signature_spell', False)
+            ]
         
         # Check deck size
         if format_name in FORMAT_DECK_SIZE:
@@ -292,13 +303,25 @@ class FormatValidator:
                         f"**{card.name}** has colors {extra_colors} outside commander's identity {commander_identity or {'C'}}"
                     )
 
-        # Apr 29 audit: pauper legality check — uses Scryfall's authoritative
-        # `legalities.pauper` field rather than rarity (cached rarity is
-        # whichever printing was last reprinted, so Lightning Bolt shows up as
-        # Uncommon even though it has many Common printings). We look up each
-        # card name in the on-disk Scryfall cache; cards missing from the
-        # cache silently pass (load-time will populate them).
-        if format_name == "pauper":
+        # Cached Scryfall legality for constructed formats. Check each card
+        # name once so four-of decks do not emit four identical issues. Cache
+        # misses remain permissive because load-time population may lag.
+        legality_fields = {
+            "standard": "standard",
+            "modern": "modern",
+            "legacy": "legacy",
+            "vintage": "vintage",
+            "pioneer": "pioneer",
+            "pauper": "pauper",
+            "commander": "commander",
+            "edh": "commander",
+            # This project intentionally retains its 60-card Brawl contract;
+            # Scryfall calls that rotating format standardbrawl.
+            "brawl": "standardbrawl",
+            "oathbreaker": "oathbreaker",
+        }
+        legality_field = legality_fields.get(format_name)
+        if legality_field:
             try:
                 import json as _json
                 import os as _os
@@ -313,14 +336,23 @@ class FormatValidator:
                     scry_cache = {}
             except Exception:
                 scry_cache = {}
-            for card in cards:
-                if card.name.lower() in BASIC_LAND_NAMES:
+
+            legality_cards = list(cards)
+            if companion is not None:
+                legality_cards.append(companion)
+            seen_legality_names = set()
+            for card in legality_cards:
+                card_key = card.name.lower()
+                if (card_key in BASIC_LAND_NAMES
+                        or card_key in seen_legality_names):
                     continue
-                scry = scry_cache.get(card.name.lower(), {})
-                legal = (scry.get('legalities') or {}).get('pauper', '')
-                if legal == 'not_legal' or legal == 'banned':
+                seen_legality_names.add(card_key)
+                scry = scry_cache.get(card_key, {})
+                legal = ((scry.get('legalities') or {})
+                         .get(legality_field, ''))
+                if legal in ('not_legal', 'banned'):
                     issues.append(
-                        f"**{card.name}** is not pauper-legal ({legal})"
+                        f"**{card.name}** is not {format_name}-legal ({legal})"
                     )
 
         # Companion restriction (CR 702.139). There was no companion check at
@@ -521,7 +553,16 @@ class Card:
     # Cast/linked-effect bookkeeping used while the card is on the stack or
     # exiled by a specific source.
     _cast_origin: str = field(default="", repr=False, compare=False)
+    # Command-zone cards are temporarily moved to hand before the shared cast
+    # pipeline runs. Preserve the real origin through that move. Executors
+    # clear this per-cast stamp after success or failure.
+    _cast_from_command_zone: bool = field(
+        default=False, repr=False, compare=False)
     # Escape (CR 702.139). `_escape_cost` is the alternative cost the payment
+    # Exact card requested while a tutor spell is resolving. Executors set
+    # this transient bridge from the AI action and clear it after the cast.
+    _tutor_card: Optional[str] = field(
+        default=None, repr=False, compare=False)
     # stage should charge; `_was_escaped` is what Kroxa's "sacrifice it unless
     # it escaped" reads. Declared rather than stapled specifically because the
     # BUG here was a read with no writer anywhere — a flag nobody can find is a
@@ -1361,6 +1402,12 @@ class Card:
             return len(owner.lands())
         if 'number of creatures you control' in oracle:
             return len(owner.creatures())
+        if 'number of snow permanents you control' in oracle:
+            return sum(
+                1 for permanent in owner.battlefield
+                if 'snow' in (permanent.type_line or '').lower()
+                and not getattr(permanent, '_phased_out', False)
+            )
         if 'number of spirits you control' in oracle:
             return sum(
                 1 for permanent in owner.battlefield
@@ -1953,6 +2000,11 @@ class Player:
 
     # Mana pool {color: amount} - W, U, B, R, G, C (colorless)
     mana_pool: Dict[str, int] = field(default_factory=lambda: {'W': 0, 'U': 0, 'B': 0, 'R': 0, 'G': 0, 'C': 0})
+    # Mana with a spending restriction keeps its provenance until spent or
+    # the pool empties. Each bucket: color, amount, restriction, source.
+    restricted_mana_pool: List[Dict[str, Any]] = field(
+        default_factory=list, repr=False, compare=False)
+
 
     def record_life_loss(self, amount: int) -> None:
         """Record positive life loss for turn-scoped trigger conditions."""
@@ -2250,7 +2302,7 @@ class Player:
         # half of Dryad was implemented; the type-adding half did not exist
         # anywhere, and nothing could have consumed it if it had — mana
         # production is derived per card with no static-effect consultation.
-        # In a four-colour deck (Dryad is in the brawl_omnath deck) that half IS
+        # In a multicolour deck, that static ability is often the point of the card:
         # the card: every land taps for every colour, and without it the
         # castable list and can_pay_mana_cost reject casts that are legal on the
         # real board.
@@ -2472,7 +2524,7 @@ class Player:
         
         return pool_total + source_total
     
-    def one_tap_mana_total(self) -> int:
+    def one_tap_mana_total(self, spending_card=None) -> int:
         """Physical mana ceiling: floating pool + ONE tap of each untapped
         source (a source's single-tap output is max over its options — an
         OR-dual is 1, Sol Ring is 2).
@@ -2487,6 +2539,7 @@ class Player:
         must use this instead.
         """
         total = sum(self.mana_pool.values())
+        total += sum(self._restricted_mana_available(spending_card).values())
         for src in self.untapped_mana_sources():
             prod = self._get_mana_production(src)
             if prod:
@@ -2496,9 +2549,12 @@ class Player:
                 total += self._one_tap_output(prod, src)
         return total
 
-    def available_mana_detailed(self) -> Dict[str, int]:
+    def available_mana_detailed(self, spending_card=None) -> Dict[str, int]:
         """Get detailed available mana by color including 'any' for flexible sources."""
         available = dict(self.mana_pool)  # Start with pool
+        for color, amount in self._restricted_mana_available(spending_card).items():
+            available[color] = available.get(color, 0) + amount
+
         any_mana = 0
         
         for card in self.untapped_mana_sources():
@@ -2515,12 +2571,60 @@ class Player:
     def empty_mana_pool(self):
         """Empty mana pool (happens at end of each phase)."""
         self.mana_pool = {'W': 0, 'U': 0, 'B': 0, 'R': 0, 'G': 0, 'C': 0}
+        self.restricted_mana_pool = []
     
     def add_mana(self, colors: str):
         """Add mana to pool. colors like 'WU' or 'RRR' or 'C'."""
         for c in colors.upper():
             if c in self.mana_pool:
                 self.mana_pool[c] += 1
+
+    def add_restricted_mana(self, color: str, amount: int,
+                            restriction: str, source: str = "") -> None:
+        """Add mana that may be spent only when its restriction allows."""
+        color = (color or 'C').upper()
+        if color not in self.mana_pool or amount <= 0:
+            return
+        self.restricted_mana_pool.append({
+            'color': color, 'amount': int(amount),
+            'restriction': restriction, 'source': source,
+        })
+
+    @staticmethod
+    def _restricted_mana_allows(bucket: Dict[str, Any], spending_card=None) -> bool:
+        restriction = bucket.get('restriction', '')
+        if restriction == 'dragon_spell':
+            if spending_card is None:
+                return False
+            type_line = (getattr(spending_card, 'type_line', '') or '').lower()
+            oracle = (getattr(spending_card, 'oracle_text', '') or '').lower()
+            return bool(re.search(r'\bdragon\b', type_line) or 'changeling' in oracle)
+        return False
+
+    def _restricted_mana_available(self, spending_card=None) -> Dict[str, int]:
+        available: Dict[str, int] = {}
+        for bucket in self.restricted_mana_pool:
+            if self._restricted_mana_allows(bucket, spending_card):
+                color = bucket.get('color', 'C')
+                available[color] = available.get(color, 0) + int(bucket.get('amount', 0))
+        return available
+
+    def _spend_restricted_mana(self, color: str, amount: int,
+                               spending_card=None) -> int:
+        spent = 0
+        for bucket in self.restricted_mana_pool:
+            if spent >= amount:
+                break
+            if (bucket.get('color') != color
+                    or not self._restricted_mana_allows(bucket, spending_card)):
+                continue
+            take = min(int(bucket.get('amount', 0)), amount - spent)
+            bucket['amount'] = int(bucket.get('amount', 0)) - take
+            spent += take
+        self.restricted_mana_pool = [
+            b for b in self.restricted_mana_pool if int(b.get('amount', 0)) > 0
+        ]
+        return spent
     
     def _get_mana_tap_damage(self, card: Card) -> int:
         """Get self-damage dealt when tapping a land for mana.
@@ -2778,7 +2882,7 @@ class Player:
 
     def tap_sources_for_cost(self, mana_cost_str: str, additional_generic: int = 0,
                              x_value: int = 0, pay_phyrexian_with_life: bool = False,
-                             game=None) -> bool:
+                             game=None, spending_card=None) -> bool:
         """
         [MANA-ENGINE] Color-aware mana tapping using ManaCost parser.
 
@@ -2880,6 +2984,9 @@ class Player:
         # failures leave the pool untouched.
         pool_spent = {}
         _pool_avail = {k: v for k, v in self.mana_pool.items() if v > 0}
+        for _color, _amount in self._restricted_mana_available(spending_card).items():
+            _pool_avail[_color] = _pool_avail.get(_color, 0) + _amount
+
 
         def _spend_pool(color, amount):
             take = min(_pool_avail.get(color, 0), amount)
@@ -3279,7 +3386,12 @@ class Player:
             if _v > 0 and _deduct <= 0:
                 self.mana_pool[_k] = self.mana_pool.get(_k, 0) + _v
         for _k, _v in pool_spent.items():
-            self.mana_pool[_k] = max(0, self.mana_pool.get(_k, 0) - _v)
+            _ordinary = min(self.mana_pool.get(_k, 0), _v)
+            self.mana_pool[_k] = max(0, self.mana_pool.get(_k, 0) - _ordinary)
+            _restricted_needed = _v - _ordinary
+            if _restricted_needed > 0:
+                self._spend_restricted_mana(
+                    _k, _restricted_needed, spending_card=spending_card)
 
         # Apply Phyrexian life payment
         if phyrexian_life_cost > 0:
@@ -3479,7 +3591,7 @@ class Player:
         # (Pacts pass the normal can_pay_mana_cost check — printed cost {0}.)
         return False
 
-    def can_pay_mana_cost(self, mana_cost: str) -> Tuple[bool, str]:
+    def can_pay_mana_cost(self, mana_cost: str, spending_card=None) -> Tuple[bool, str]:
         """
         Check if player can pay a mana cost (color-aware).
         Returns (can_pay, reason).
@@ -3504,7 +3616,8 @@ class Player:
         if " // " in mana_cost:
             _reasons = []
             for _half in mana_cost.split(" // "):
-                ok, reason = self.can_pay_mana_cost(_half.strip())
+                ok, reason = self.can_pay_mana_cost(
+                    _half.strip(), spending_card=spending_card)
                 if ok:
                     return True, f"Can pay split half {_half.strip()}"
                 _reasons.append(reason)
@@ -3523,7 +3636,7 @@ class Player:
                 # refusal). A source taps ONCE: gate on the physical one-tap
                 # total (floating pool + max-one-mana per untapped source)
                 # before the color-wise check.
-                _one_tap_total = self.one_tap_mana_total()
+                _one_tap_total = self.one_tap_mana_total(spending_card=spending_card)
                 _parsed_for_total = ManaCost.parse(mana_cost)
                 _required_total = _parsed_for_total.generic_requirement
                 for _sym in _parsed_for_total.symbols:
@@ -3567,6 +3680,8 @@ class Player:
                 for _pair, _pips in _hybrid_pairs.items():
                     _pcolors = sorted(_pair)
                     _cap = sum(self.mana_pool.get(_pc, 0) for _pc in _pcolors)
+                    _cap += sum(self._restricted_mana_available(
+                        spending_card).get(_pc, 0) for _pc in _pcolors)
                     for _src in self.untapped_mana_sources():
                         _prod = self._get_mana_production(_src)
                         if not _prod:
@@ -3582,7 +3697,7 @@ class Player:
                                        f"({_need} needed)")
                 # Build pool from untapped sources + existing pool (not just pool dict)
                 # available_mana_detailed() already does this correctly
-                detailed = self.available_mana_detailed()
+                detailed = self.available_mana_detailed(spending_card=spending_card)
                 any_mana = detailed.get('any', 0)
                 pool = RulesManaPool()
                 pool.white = detailed.get('W', 0)
@@ -3754,6 +3869,7 @@ class Player:
             "max_lands_per_turn": self.max_lands_per_turn,
             "has_drawn_for_turn": self.has_drawn_for_turn,
             "mana_pool": self.mana_pool,
+            "restricted_mana_pool": self.restricted_mana_pool,
             "playable_from_exile": self.playable_from_exile,
             "playable_from_graveyard": self.playable_from_graveyard,
             "landfall_count_this_turn": self.landfall_count_this_turn,
@@ -3776,6 +3892,7 @@ class Player:
             max_lands_per_turn=data.get("max_lands_per_turn", 1),
             has_drawn_for_turn=data.get("has_drawn_for_turn", False),
             mana_pool=data.get("mana_pool", {'W': 0, 'U': 0, 'B': 0, 'R': 0, 'G': 0, 'C': 0}),
+            restricted_mana_pool=data.get("restricted_mana_pool", []),
         )
         # Reconstruct card zones
         player.library = [Card.from_dict(c) for c in data.get("library", [])]
@@ -3997,6 +4114,10 @@ class GameState:
     # grant_hand_cascade action; consulted by the cascade block in
     # mtg/triggers.py). Self-expires on turn mismatch.
     _hand_cascade_grants: dict = field(default_factory=dict, repr=False, compare=False)
+    # Chapter abilities whose tax duration is independent of their source
+    # permanent (Elspeth Conquers Death II). Entries are JSON-compatible.
+    _temporary_cost_increases: list = field(
+        default_factory=list, repr=False, compare=False)
     # Per-turn byte-identical Discord message counts (trigger-burst dedup
     # Layer 3 in _autoplay_send). Reset at turn advance.
     _turn_burst_counts: dict = field(default_factory=dict, repr=False, compare=False)
@@ -5054,6 +5175,7 @@ class GameState:
             "turn_effects": self.turn_effects,
             "last_unresolved_effect": self.last_unresolved_effect,
             "pending_resolves": self.pending_resolves,
+            "temporary_cost_increases": self._temporary_cost_increases,
         }
 
     def visible_state(self, viewer_index: int) -> Dict:
@@ -5139,6 +5261,8 @@ class GameState:
             turn_effects=data.get("turn_effects", []),
             last_unresolved_effect=data.get("last_unresolved_effect"),
             pending_resolves=data.get("pending_resolves", []),
+            _temporary_cost_increases=data.get(
+                "temporary_cost_increases", []),
         )
         # [LAYERS] Rebuild continuous effects from current battlefield state
         game.rebuild_layers_from_battlefield()

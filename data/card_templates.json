@@ -1927,7 +1927,8 @@
         {
           "action": "exile_from_stack",
           "controller": "$controller",
-          "max_mv": 4
+          "max_mv": 4,
+          "silent_on_no_result": true
         }
       ]
     },
@@ -1939,7 +1940,8 @@
       "actions": [
         {
           "action": "release_queller_exile",
-          "source": "Spell Queller"
+          "source": "Spell Queller",
+          "silent_on_no_result": true
         }
       ]
     },

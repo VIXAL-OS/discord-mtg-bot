@@ -263,7 +263,7 @@ def _fire_noncast_battlefield_entry(rules, game: GameState,
             messages.append(f"⚔️ {card.name} — Living weapon creates a 0/0 Phyrexian Germ token, equipped with {card.name}")
             print(f"[LIVING-WEAPON] {card.name} -> {germ.name} (noncast entry)")
     has_panharmonicon = (
-        (card.is_creature() or card.is_artifact())
+        (card.is_creature(game) or card.is_artifact())
         and any(p.name.lower() == 'panharmonicon' and p is not card
                 for p in player.battlefield)
     )
@@ -4154,12 +4154,15 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
         if p is None or engine_r is None:
             return None
         try:
-            from rules.replacement import ReplacementEffect, EventType as _RepEvent
+            from rules.replacement import (
+                ReplacementEffect as _TurnReplacementEffect,
+                EventType as _RepEvent,
+            )
         except ImportError:
             return None
         _turn = game.turn_number
         _sid = f"{src_name}_turn{_turn}_doubler"
-        engine_r.add_effect(ReplacementEffect(
+        engine_r.add_effect(_TurnReplacementEffect(
             id=_sid,
             source_name=src_name,
             source_id=_sid,
@@ -4860,11 +4863,25 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                     return base_msg
         return None
 
+    elif action_type == "shuffle_graveyard_into_library":
+        player = find_player(action.get("player", ""))
+        if player is None:
+            return None
+        import random as _rng
+        moved = len(player.graveyard)
+        player.library.extend(player.graveyard)
+        player.graveyard.clear()
+        _rng.shuffle(player.library)
+        return (f"?? {player.name} shuffles {moved} card(s) from graveyard "
+                f"into their library")
+
     elif action_type == "search_library":
         # Search library for one or more cards matching criteria (Recruiter,
         # Stoneforge, Trinket Mage, Tooth and Nail, Collected Company, etc.)
         player_name = action.get("player")
         card_type = action.get("card_type", "")  # "Creature", "Equipment", "Artifact"
+        requested_name = (action.get("card_name") or action.get("tutor_card")
+                          or "").strip().lower()
         max_toughness = action.get("max_toughness")
         max_mv = action.get("max_mv")
         exact_mv = action.get("exact_mv")
@@ -4895,6 +4912,9 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                           if t not in ('any', 'all', 'card', 'any card')]
 
             def _candidate(lib_card):
+                if (requested_name
+                        and lib_card.name.lower() != requested_name):
+                    return None
                 type_line = (lib_card.type_line or "").lower()
                 if type_parts and not any(t in type_line for t in type_parts):
                     return None

@@ -2473,24 +2473,50 @@ class CubeDraftCog(commands.Cog, name="Cube Draft"):
                 # the cog first, keep the engine attrs as a fallback, and
                 # never skip silently again.
                 _gc = getattr(self, 'game_cog', None)
-                actor_adapter = ((getattr(_gc, '_deepseek_adapter', None) if _gc else None)
-                                 or (getattr(_gc, '_openrouter_adapter', None) if _gc else None)
-                                 or getattr(self.engine, '_deepseek_actor_adapter', None)
-                                 or getattr(self.engine, '_openrouter_adapter', None))
-                if actor_adapter is not None and hasattr(actor_adapter, 'get_stats'):
-                    stats = actor_adapter.get_stats()
-                    print(f"[STATS-GAME] cube_draft: calls={stats.get('calls', 0)} "
-                          f"prompt_tokens={stats.get('prompt_tokens', 0)} "
-                          f"completion_tokens={stats.get('completion_tokens', 0)} "
-                          f"(cumulative under parallel batches — see CLAUDE.md caveat)")
-                    print(f"[CALL-BREAKDOWN-FINAL] cube_draft: "
-                          f"calls={stats.get('calls', 0)} "
-                          f"purpose_counts={stats.get('purpose_counts', {})}")
+                if (_gc is not None
+                        and getattr(_gc, 'batch_stats_adapters', None)):
+                    provider, actor_adapter, strat_adapter = (
+                        _gc.batch_stats_adapters())
                 else:
-                    # The silent-guard gap WAS the bug — always leave a line.
-                    print("[STATS-GAME] cube_draft: no actor adapter found — "
-                          "token stats unavailable for this game")
-                    print("[CALL-BREAKDOWN-FINAL] cube_draft: no actor adapter found")
+                    provider = "unknown"
+                    actor_adapter = None
+                    strat_adapter = None
+
+                if (actor_adapter is not None
+                        and hasattr(actor_adapter, 'get_stats')):
+                    actor_stats = actor_adapter.get_stats()
+                    strat_stats = {}
+                    if (strat_adapter is not None
+                            and strat_adapter is not actor_adapter
+                            and hasattr(strat_adapter, 'get_stats')):
+                        strat_stats = strat_adapter.get_stats()
+                    calls = (actor_stats.get('calls', 0)
+                             + strat_stats.get('calls', 0))
+                    prompt_tokens = (
+                        actor_stats.get('prompt_tokens', 0)
+                        + strat_stats.get('prompt_tokens', 0))
+                    completion_tokens = (
+                        actor_stats.get('completion_tokens', 0)
+                        + strat_stats.get('completion_tokens', 0))
+                    print(
+                        f"[STATS-GAME-SHARED] cube_draft "
+                        f"provider={provider} scope=cumulative-shared "
+                        f"calls={calls} "
+                        f"(actor={actor_stats.get('calls', 0)}, "
+                        f"strat={strat_stats.get('calls', 0)}) "
+                        f"prompt_tokens={prompt_tokens} "
+                        f"completion_tokens={completion_tokens}")
+                    print(
+                        f"[CALL-BREAKDOWN-FINAL] cube_draft "
+                        f"provider={provider} scope=cumulative-shared "
+                        f"actor={actor_stats.get('purpose_counts', {})} "
+                        f"strategist={strat_stats.get('purpose_counts', {})}")
+                else:
+                    print("[STATS-GAME-SHARED] cube_draft: "
+                          "no provider-aware actor adapter found \u2014 "
+                          "token stats unavailable")
+                    print("[CALL-BREAKDOWN-FINAL] cube_draft: "
+                          "no provider-aware actor adapter found")
             except Exception as _cb_err:
                 print(f"[CALL-BREAKDOWN-FINAL] cube_draft emit failed: {_cb_err}")
             # Cleanup logging and game state

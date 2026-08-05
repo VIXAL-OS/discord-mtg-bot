@@ -1,0 +1,32 @@
+{
+  "name": "Jund Midrange (Legacy-Legal)",
+  "format": "legacy",
+  "description": "60-card Legacy spot-check: discard, cascade, planeswalker activation, graveyard interaction, and diverse removal without Legacy-banned Ragavan or Wrenn and Six.",
+  "colors": ["B", "R", "G"],
+  "cards": [
+    {"name": "Tarmogoyf", "quantity": 4},
+    {"name": "Bloodbraid Elf", "quantity": 4},
+    {"name": "Dark Confidant", "quantity": 4},
+    {"name": "Scavenging Ooze", "quantity": 4},
+    {"name": "Thoughtseize", "quantity": 4},
+    {"name": "Lightning Bolt", "quantity": 4},
+    {"name": "Fatal Push", "quantity": 3},
+    {"name": "Kolaghan's Command", "quantity": 2},
+    {"name": "Assassin's Trophy", "quantity": 2},
+    {"name": "Liliana of the Veil", "quantity": 3},
+    {"name": "Inquisition of Kozilek", "quantity": 2},
+    {"name": "Verdant Catacombs", "quantity": 4},
+    {"name": "Bloodstained Mire", "quantity": 2},
+    {"name": "Wooded Foothills", "quantity": 2},
+    {"name": "Blood Crypt", "quantity": 2},
+    {"name": "Stomping Ground", "quantity": 1},
+    {"name": "Overgrown Tomb", "quantity": 1},
+    {"name": "Blackcleave Cliffs", "quantity": 3},
+    {"name": "Raging Ravine", "quantity": 2},
+    {"name": "Swamp", "quantity": 2},
+    {"name": "Forest", "quantity": 1},
+    {"name": "Mountain", "quantity": 1},
+    {"name": "Nurturing Peatland", "quantity": 2},
+    {"name": "Castle Locthwain", "quantity": 1}
+  ]
+}

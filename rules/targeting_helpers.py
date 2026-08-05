@@ -278,6 +278,39 @@ def _spell_requires_targets(card):
     return 'target' in stripped
 
 
+def aura_has_legal_target(game, card, caster) -> bool:
+    # Existence gate shared by cast validation and actor prompt hints.
+    oracle = (getattr(card, 'oracle_text', '') or '').lower()
+    type_line = (getattr(card, 'type_line', '') or '').lower()
+    if ('aura' not in type_line
+            or not ('enchant creature' in oracle
+                    or 'enchant permanent' in oracle)):
+        return True
+
+    if 'in a graveyard' in oracle:
+        return any(
+            grave_card.is_creature(game)
+            for player in game.players
+            for grave_card in player.graveyard
+        )
+
+    creature_only = 'enchant creature' in oracle
+    own_only = (
+        'enchant creature you control' in oracle
+        or 'enchant permanent you control' in oracle
+    )
+    for player in game.players:
+        if own_only and player is not caster:
+            continue
+        for permanent in player.battlefield:
+            if permanent.id == card.id:
+                continue
+            if creature_only and not permanent.is_creature(game):
+                continue
+            return True
+    return False
+
+
 def _find_any_valid_target(game, card, caster_name):
     """Return True if at least one legal target exists for a targeted spell.
 
@@ -313,7 +346,8 @@ def _find_any_valid_target(game, card, caster_name):
             # Check stack for counterspells ("target spell")
             if TargetType.SPELL in restriction.target_types:
                 for entry in getattr(game, 'stack', []):
-                    if hasattr(entry, 'card') and entry.card:
+                    if (hasattr(entry, 'card') and entry.card
+                            and not getattr(entry, 'countered', False)):
                         t = _card_to_targetable(entry.card, "", zone="stack")
                         t.types.add("spell")
                         if validator.can_target(src, t, restriction, caster_name)[0]:
@@ -343,6 +377,17 @@ def _find_any_valid_target(game, card, caster_name):
         # cast (CR 601.2c — mandatory targets only, the July 29 PW rule).
         # July 21's Swan Song whole-phrase capture is preserved: a sentence
         # without " and " is a single fragment captured to sentence end.
+        # Searing Blaze has a linked pair: the creature must be controlled
+        # by the first target's player/planeswalker controller.
+        if card.name.lower() == "searing blaze":
+            caster = next((p for p in game.players
+                           if p.name == caster_name), None)
+            return any(
+                p is not caster
+                and any(c.is_creature(game) for c in p.battlefield)
+                for p in game.players
+            )
+
         clauses = []
         for sentence in re.split(r'[.\n;]', stripped):
             if 'target' not in sentence:
@@ -535,6 +580,11 @@ def _validate_player_target_for_action(game, target_player, source_card_or_name=
             src.controller = caster_name
         tgt = _player_to_targetable(target_player)
         restriction = TargetRestriction(target_types={TargetType.PLAYER})
+        if not isinstance(source_card_or_name, str):
+            parsed = _parse_target_restriction_from_oracle(
+                source_card_or_name)
+            if parsed is not None:
+                restriction = parsed
         validator = TargetValidator()
         legal, reason = validator.can_target(src, tgt, restriction, caster_name)
         return legal, reason

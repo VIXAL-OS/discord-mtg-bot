@@ -74,6 +74,8 @@ from mtg.models import Card, Player, GameState
 # its own mutant.
 _SETS_UP_FUTURE_DAMAGE_RE = re.compile(
     r'\b(?:if|whenever|when)\b[^.]*\bwould deal\b|\buntil your next turn\b')
+_ATTACK_TRIGGER_CLAUSE_RE = re.compile(
+    r'\b(?:when|whenever)\b[^,.;]*\battacks?\b\s*,?', re.IGNORECASE)
 _COMBAT_SHAPED_RE = re.compile(
     r'\b(attack(?:s|ing|ed)?|combat damage|deals? lethal|'
     r'deal lethal damage|for lethal)\b')
@@ -91,6 +93,11 @@ def is_combat_shaped_resolve(effect_description: str) -> bool:
     lowered = (effect_description or "").lower()
     if _SETS_UP_FUTURE_DAMAGE_RE.search(lowered):
         return False
+    # "Whenever this creature ... attacks, search your library" is a legal
+    # attack-triggered effect, not an attempt to manufacture combat damage in
+    # a resolve action. Remove only the trigger condition before applying the
+    # combat guard; any combat claim in the effect itself remains visible.
+    lowered = _ATTACK_TRIGGER_CLAUSE_RE.sub('', lowered)
     return bool(_COMBAT_SHAPED_RE.search(lowered))
 
 

@@ -340,7 +340,8 @@ class RulesEngine:
                           f"{', '.join(_red_src)})")
                     mana_cost_to_check = reduced
 
-        can_pay, reason = player.can_pay_mana_cost(mana_cost_to_check)
+        can_pay, reason = player.can_pay_mana_cost(
+            mana_cost_to_check, spending_card=card)
         if not can_pay:
             # July 20: printed alternate costs (Force of Will's life+exile,
             # Fireblast's sacrifice) are payable with no mana at all — the
@@ -360,7 +361,8 @@ class RulesEngine:
             from mtg.helpers import spectacle_available
             _spec = spectacle_available(game, player, card)
             if _spec:
-                _spec_ok, _spec_reason = player.can_pay_mana_cost(_spec)
+                _spec_ok, _spec_reason = player.can_pay_mana_cost(
+                    _spec, spending_card=card)
                 if _spec_ok:
                     print(f"[CAST-GATE] {card.name}: spectacle cost {_spec} "
                           f"available — mana pre-gate passes")
@@ -374,7 +376,8 @@ class RulesEngine:
             from mtg.helpers import parse_impending
             _imp = parse_impending(card.oracle_text)
             if _imp:
-                _imp_ok, _ = player.can_pay_mana_cost(_imp[1])
+                _imp_ok, _ = player.can_pay_mana_cost(
+                    _imp[1], spending_card=card)
                 if _imp_ok:
                     print(f"[CAST-GATE] {card.name}: impending cost {_imp[1]} "
                           f"available — mana pre-gate passes")

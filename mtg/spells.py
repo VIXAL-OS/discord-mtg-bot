@@ -99,6 +99,7 @@ try:
         _validate_player_target_for_action,
         _find_any_valid_target,
         _spell_requires_targets,
+        aura_has_legal_target,
         _check_resolution_targets,
     )
     HAS_TARGETING = True
@@ -436,12 +437,7 @@ def _validate_cast(engine, game: GameState, player: Player, card: Card,
                              []), _cast_from_graveyard, target)
                 card._declared_graveyard_target_id = declared_graveyard_target.id
                 card._declared_graveyard_target_owner = declared_graveyard_owner.name
-            any_target = any(
-                gc.is_creature()
-                for p in game.players
-                for gc in p.graveyard
-            )
-            if not any_target:
+            if not aura_has_legal_target(game, card, player):
                 return ((False,
                          f"{card.name} can't be cast — no creature cards in any graveyard (CR 601.2c)",
                          []), _cast_from_graveyard, target)
@@ -452,23 +448,7 @@ def _validate_cast(engine, game: GameState, player: Player, card: Card,
             # July 20: "enchant creature YOU CONTROL" scans only the caster's
             # battlefield — Draconic Destiny passed this gate off opponent
             # creatures, paid its mana, then fizzled at resolution.
-            is_creature_only = 'enchant creature' in _oracle_lower
-            _own_only = ('enchant creature you control' in _oracle_lower
-                         or 'enchant permanent you control' in _oracle_lower)
-            any_target = False
-            for p in game.players:
-                if _own_only and p is not player:
-                    continue
-                for c in p.battlefield:
-                    if c.id == card.id:
-                        continue
-                    if is_creature_only and not c.is_creature():
-                        continue
-                    any_target = True
-                    break
-                if any_target:
-                    break
-            if not any_target:
+            if not aura_has_legal_target(game, card, player):
                 return ((False,
                          f"{card.name} can't be cast — no legal targets on the battlefield (CR 601.2c)",
                          []), _cast_from_graveyard, target)
@@ -522,7 +502,8 @@ def _validate_cast(engine, game: GameState, player: Player, card: Card,
     if 'counter target' in oracle_lower and 'spell' in oracle_lower:
         stack_has_spells = any(
             entry for entry in getattr(game, 'stack', [])
-            if hasattr(entry, 'card') and entry.card
+            if (hasattr(entry, 'card') and entry.card
+                and not getattr(entry, 'countered', False))
         )
         # A creature with counter-in-oracle is cast for its body; even if
         # the ETB counter fizzles on empty stack, the creature still enters.
@@ -565,11 +546,13 @@ def _validate_cast(engine, game: GameState, player: Player, card: Card,
                  or 'legendary spell' in oracle_lower)):
         stack_has_ability = any(
             not getattr(entry, 'is_spell', True)
+            and not getattr(entry, 'countered', False)
             for entry in getattr(game, 'stack', []))
         stack_has_legal_spell = False
         if 'legendary spell' in oracle_lower:
             stack_has_legal_spell = any(
                 getattr(entry, 'is_spell', True)
+                and not getattr(entry, 'countered', False)
                 and 'legendary' in (getattr(getattr(entry, 'card', None),
                                             'type_line', '') or '').lower()
                 for entry in getattr(game, 'stack', []))
@@ -587,23 +570,19 @@ def _validate_cast(engine, game: GameState, player: Player, card: Card,
     # burned the card and its mana, and fizzled with "no creature to
     # sacrifice" (game_1526071467035459665). Gate it here so EVERY cast path
     # is covered (CR 601.2g — a spell can't be cast without paying its costs).
-    _sac_m = re.search(
-        r'as an additional cost to cast this spell, sacrifice '
-        r'(?:a|an|two|three)?\s*(\w+)', oracle_lower)
-    if _sac_m:
-        _sac_type = _sac_m.group(1).rstrip('s')
-        _type_checks = {
-            'creature': lambda c: c.is_creature(),
-            'artifact': lambda c: c.is_artifact(),
-            'land': lambda c: c.is_land(),
-            'permanent': lambda c: True,
-        }
-        _chk = _type_checks.get(_sac_type)
-        if _chk is not None and not any(
-                _chk(c) and c is not card for c in player.battlefield):
-            return ((False,
-                     f"{card.name} needs a {_sac_type} to sacrifice as an additional cost",
-                     []), _cast_from_graveyard, target)
+    from mtg.legal_actions import (
+        additional_sacrifice_requirement,
+        can_pay_additional_sacrifice,
+    )
+    _sac_requirement = additional_sacrifice_requirement(card)
+    if (_sac_requirement is not None
+            and not can_pay_additional_sacrifice(card, player, game)):
+        _sac_count, _sac_type = _sac_requirement
+        _sac_noun = _sac_type if _sac_count == 1 else f"{_sac_type}s"
+        return ((False,
+                 f"{card.name} needs {_sac_count} {_sac_noun} to sacrifice "
+                 f"as an additional cost",
+                 []), _cast_from_graveyard, target)
 
     # [TARGETING] Pre-cast target validation (CR 601.2c) — block spells with
     # no legal targets.  Only checks instant/sorcery spells that require targets.
@@ -637,9 +616,18 @@ def _validate_cast(engine, game: GameState, player: Player, card: Card,
                 # at cast this way. Stack targets are validated by the
                 # counter-gate above (stack_has_spells) and fizzle-checked at
                 # resolution instead.
-                if any(getattr(entry, 'card', None) is declared_target
-                       for entry in getattr(game, 'stack', [])):
-                    continue
+                _stack_matches = [
+                    entry for entry in getattr(game, 'stack', [])
+                    if getattr(entry, 'card', None) is declared_target
+                ]
+                if _stack_matches:
+                    if any(not getattr(entry, 'countered', False)
+                           for entry in _stack_matches):
+                        continue
+                    return ((False,
+                             f"Illegal target for {card.name}: "
+                             f"{declared_target.name} is already countered",
+                             []), _cast_from_graveyard, target)
                 if hasattr(declared_target, 'battlefield'):
                     legal, target_reason = _validate_player_target_for_action(
                         game, declared_target, card, player.name)
@@ -1385,6 +1373,7 @@ def _pay_costs(engine, game: GameState, player: Player, card: Card,
                 x_value=x_value_chosen,
                 pay_phyrexian_with_life=has_phyrexian,
                 game=game,
+                spending_card=card,
             )
         else:
             # Fallback: amount-based tapping (no color awareness)
@@ -1401,6 +1390,24 @@ def _pay_costs(engine, game: GameState, player: Player, card: Card,
         if card._colors_spent:
             print(f"[CONVERGE] {card.name}: colors spent = "
                   f"{'/'.join(card._colors_spent)}")
+
+    # Mandatory additional sacrifices are paid during casting (CR 601.2h),
+    # after mana succeeds and before the spell leaves its origin zone. Route
+    # through the canonical action so death/SBA hooks fire exactly once.
+    from mtg.legal_actions import additional_sacrifice_requirement
+    _sac_requirement = additional_sacrifice_requirement(card)
+    if _sac_requirement is not None:
+        _sac_count, _sac_type = _sac_requirement
+        _cost_messages = costs.setdefault('additional_cost_messages', [])
+        for _ in range(_sac_count):
+            _sac_msg = engine.rules._execute_action_on_state(game, {
+                "action": "sacrifice_permanent",
+                "player": player.name,
+                "type_filter": _sac_type,
+                "reason": f"{card.name} additional cost",
+            })
+            if _sac_msg:
+                _cost_messages.append(_sac_msg)
 
     # Buyback's non-mana form (CR 702.26a — Forbid's "Discard two cards"),
     # paid HERE rather than in the cost stage so a cast that dies at the mana
@@ -1626,8 +1633,26 @@ async def _await_stack_window(engine, game: GameState, player: Player,
     if game.stack_enabled and getattr(game, '_stack_send_func', None):
         try:
             send_func = game._stack_send_func
+            narration = getattr(game, '_active_turn_narration', None)
+            if (isinstance(narration, dict)
+                    and narration.get('turn') == game.turn_number
+                    and narration.get('player') == player.name
+                    and narration.get('actions')):
+                prior_actions = helpers.sanitize_action_bullets(
+                    narration['actions'])
+                if prior_actions:
+                    turn_msg = (f"**{player.name}'s turn:**\n"
+                                + "\n".join(f"\u2022 {a}" for a in prior_actions))
+                    if len(turn_msg) <= 1900:
+                        await send_func(turn_msg)
+                    else:
+                        await send_func(f"**{player.name}'s turn:**")
+                        for action in prior_actions:
+                            await send_func(f"\u2022 {str(action)[:1900]}")
+                narration['actions'].clear()
+                narration['flushed'] = True
             source_tag = ""
-            if getattr(card, 'cast_from_command_zone', False):
+            if getattr(card, '_cast_from_command_zone', False):
                 source_tag = " from command zone"
             elif getattr(card, '_cast_from_graveyard', False):
                 source_tag = " from graveyard"
@@ -2298,6 +2323,8 @@ async def _dispatch_resolution(engine, game: GameState, player: Player,
                 # Apr 30 audit fix #21: pass modal mode selection to templates
                 if getattr(card, '_modes_chosen', None):
                     ctx['_modes'] = card._modes_chosen
+                if getattr(card, '_tutor_card', None):
+                    ctx['_tutor_card'] = card._tutor_card
                 lib = get_effect_library()
                 tmpl_actions, tmpl_explanation = lib.resolve_spell(
                     card_name=card.name,
@@ -2316,6 +2343,10 @@ async def _dispatch_resolution(engine, game: GameState, player: Player,
                             print(f"[SPELL-TEMPLATE] Skipping {action.get('action')} — spell fizzled")
                             break
                         if action.get("action") != "no_action":
+                            if (action.get("action") == "search_library"
+                                    and ctx.get('_tutor_card')
+                                    and not action.get("card_name")):
+                                action["card_name"] = ctx['_tutor_card']
                             # May 7 audit fix #6: inject source card name into
                             # the action so deal_damage can emit per-spell burn
                             # lines (🔥 Lava Spike deals 3 damage to Claude).
@@ -3379,7 +3410,8 @@ async def _dispatch_resolution(engine, game: GameState, player: Player,
                                             continue
                                     try:
                                         msg = engine.rules._execute_action_on_state(game, action)
-                                        _any_action_executed = True
+                                        if msg or not action.get("silent_on_no_result", False):
+                                            _any_action_executed = True
                                         if msg:
                                             effect_messages.append(msg)
                                         # Aug 2 batch-14 audit (R-M1, CRITICAL):
@@ -3405,6 +3437,12 @@ async def _dispatch_resolution(engine, game: GameState, player: Player,
                                     except Exception as e:
                                         print(f"[TEMPLATE] Action failed for {card.name}: {action} — {e}")
 
+                                if (not effect_messages
+                                        and any(a.get("silent_on_no_result", False)
+                                                for a in actions)):
+                                    _etb_handled_inline = True
+                                    print(f"[ETB-TEMPLATE] {card.name}: intentional "
+                                          "silent no-op")
                                 # May 13 audit: template fired, action executed,
                                 # but the action handler returned None (e.g. scry
                                 # that kept all cards on top — Omenspeaker, Watcher
@@ -3458,7 +3496,7 @@ async def _dispatch_resolution(engine, game: GameState, player: Player,
                                     # Panharmonicon doubles artifact AND creature ETBs (CR 603.1).
                                     # Restricting to entering type ensures non-ETB triggers can
                                     # never reach this announcement branch.
-                                    if has_panharmonicon and (card.is_creature() or card.is_artifact()):
+                                    if has_panharmonicon and (card.is_creature(game) or card.is_artifact()):
                                         print(f"[PANHARMONICON] Doubling ETB for {card.name}")
                                         effect_messages.append(f"⚡ Panharmonicon doubles {card.name}'s ETB!")
                                         # Re-resolve template with FRESH context (board state changed after 1st ETB)
@@ -3854,7 +3892,7 @@ async def cast_spell_async(engine, game: GameState, player: Player, card: Card, 
 
     # Preserve the origin for effects such as Wash Away that inspect where
     # the target spell was cast from after it has moved to the stack.
-    if getattr(card, 'cast_from_command_zone', False):
+    if getattr(card, '_cast_from_command_zone', False):
         card._cast_origin = 'command_zone'
     elif _cast_from_graveyard:
         card._cast_origin = 'graveyard'
@@ -3908,7 +3946,11 @@ async def cast_spell_async(engine, game: GameState, player: Player, card: Card, 
     elif 'sorcery' in type_l:
         counts['sorcery'] += 1
 
-    effect_messages = []
+    effect_messages = list(_costs.get('additional_cost_messages', []))
+    # Discard/sacrifice costs can synchronously create trigger narration.
+    # Drain it before the spell's response window so cost triggers precede
+    # resolution in Discord as they do in the rules.
+    effect_messages.extend(helpers.drain_pending_messages(game))
     # July 20 audit: surface pain-land tap damage (City of Brass, Ancient
     # Tomb) buffered by tap_sources_for_cost — it was console-only, leaving
     # unexplained life drops in the Discord narration (13 in one July 16
@@ -3953,6 +3995,52 @@ async def cast_spell_async(engine, game: GameState, player: Player, card: Card, 
 # drains the queue via drain_pending_triggers() and actually resolves the
 # effects via engine.rules.resolve_effect(). See CLAUDE.md "Known Limitation:
 # Sync Trigger Gap".
+
+
+def _resolve_restoration_chapter_two(engine, game: GameState, player: Player, card: Card) -> List[str]:
+    """Resolve Restoration II without letting Tier 3 split its dependent actions."""
+    def _is_small_permanent(candidate):
+        type_line = (candidate.type_line or '').lower()
+        return (
+            any(t in type_line for t in
+                ('artifact', 'creature', 'enchantment', 'land', 'planeswalker', 'battle'))
+            and int(candidate.cmc or 0) <= 2
+        )
+
+    existing = [c for c in player.graveyard if _is_small_permanent(c)]
+    returnable = [c for c in player.hand if _is_small_permanent(c)]
+    if not player.hand or (not existing and not returnable):
+        print(f"[SAGA-CHAPTER] {card.name} II declined ? no discard/return pair")
+        return []
+
+    if existing:
+        discard = min(player.hand, key=lambda c: int(c.cmc or 0))
+    else:
+        discard = min(returnable, key=lambda c: int(c.cmc or 0))
+    player.hand.remove(discard)
+    from mtg.helpers import madness_discard_to_exile
+    discard_msg = madness_discard_to_exile(game, player, discard)
+    if discard_msg is None:
+        player.graveyard.append(discard)
+        discard_msg = f"\U0001F0CF **{player.name}** discards **{discard.name}**"
+
+    candidates = [c for c in player.graveyard if _is_small_permanent(c)]
+    if not candidates:
+        print(f"[SAGA-CHAPTER] {card.name} II discarded but has no legal return target")
+        return [discard_msg]
+    target = max(candidates, key=lambda c: int(c.cmc or 0))
+    result = engine.rules._execute_action_on_state(game, {
+        "action": "move_card", "card": target.name,
+        "from_zone": "graveyard", "to_zone": "battlefield",
+        "player": player.name, "enters_tapped": True,
+    })
+    target.tapped = True
+    print(f"[SAGA-CHAPTER] {card.name} II: discarded {discard.name}, "
+          f"returned {target.name} tapped")
+    messages = [discard_msg]
+    if result:
+        messages.append(result)
+    return messages
 
 
 def _advance_sagas(engine, game: GameState, player: Player) -> List[str]:
@@ -4002,6 +4090,24 @@ def _advance_sagas(engine, game: GameState, player: Player) -> List[str]:
             if is_transforming_saga or looks_like_transform_chapter:
                 print(f"[SAGA-CHAPTER] {card.name} chapter {new_lore} IS the transform — "
                       f"skipping Tier 3 resolution (SBA SAGA_COMPLETE will handle)")
+            elif (card.name.lower() == "elspeth conquers death"
+                  and new_lore == 2):
+                _expires = game.turn_number + max(len(game.players), 1)
+                game._temporary_cost_increases.append({
+                    "source": card.name,
+                    "controller": player.name,
+                    "amount": 2,
+                    "restriction": "noncreature",
+                    "expires_turn": _expires,
+                })
+                messages.append(
+                    f"{card.name}: opponents' noncreature spells cost 2 more "
+                    f"until {player.name}'s next turn.")
+                print(f"[SAGA-TAX] {card.name} active until turn {_expires}")
+            elif (card.name.lower() == "the restoration of eiganjo"
+                  and new_lore == 2):
+                messages.extend(_resolve_restoration_chapter_two(
+                    engine, game, player, card))
             elif HAS_EFFECT_TEMPLATES:
                 # Try to resolve the chapter via template/tier system
                 try:

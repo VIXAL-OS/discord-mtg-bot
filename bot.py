@@ -218,6 +218,21 @@ class MTGBot(commands.Bot):
         self.deepseek_pro_input_tokens: int = 0
         self.deepseek_pro_output_tokens: int = 0
         self.deepseek_pro_calls: int = 0
+        self.qwen_input_tokens: int = 0
+        self.qwen_output_tokens: int = 0
+        self.qwen_calls: int = 0
+        self.qwen_plus_input_tokens: int = 0
+        self.qwen_plus_output_tokens: int = 0
+        self.qwen_plus_calls: int = 0
+        self.qwen_max_input_tokens: int = 0
+        self.qwen_max_output_tokens: int = 0
+        self.qwen_max_calls: int = 0
+        self.mtg_game_qwen_input_tokens: int = 0
+        self.mtg_game_qwen_output_tokens: int = 0
+        self.mtg_game_qwen_plus_input_tokens: int = 0
+        self.mtg_game_qwen_plus_output_tokens: int = 0
+        self.mtg_game_qwen_max_input_tokens: int = 0
+        self.mtg_game_qwen_max_output_tokens: int = 0
         self._load_persistent_costs()
 
         self.load_config()
@@ -375,6 +390,12 @@ class MTGBot(commands.Bot):
             "mtg_game_input_tokens", "mtg_game_output_tokens", "mtg_game_calls",
             "deepseek_input_tokens", "deepseek_output_tokens", "deepseek_calls",
             "deepseek_pro_input_tokens", "deepseek_pro_output_tokens", "deepseek_pro_calls",
+            "qwen_input_tokens", "qwen_output_tokens", "qwen_calls",
+            "qwen_plus_input_tokens", "qwen_plus_output_tokens", "qwen_plus_calls",
+            "qwen_max_input_tokens", "qwen_max_output_tokens", "qwen_max_calls",
+            "mtg_game_qwen_input_tokens", "mtg_game_qwen_output_tokens",
+            "mtg_game_qwen_plus_input_tokens", "mtg_game_qwen_plus_output_tokens",
+            "mtg_game_qwen_max_input_tokens", "mtg_game_qwen_max_output_tokens",
         ]
         data = {k: getattr(self, k, 0) for k in tracked_fields}
         with open("data/api_costs.json", 'w', encoding='utf-8') as f:
@@ -403,16 +424,29 @@ class MTGBot(commands.Bot):
         self.mtg_game_output_tokens += output_tokens
         self.mtg_game_calls += 1
 
-        # DeepSeek and Qwen share the fork's cheap-provider accounting
-        # buckets. Per-model precision for batch stats lives in
-        # rules.llm_adapter.MODEL_RATES.
-        if 'deepseek' in model.lower() or 'qwen' in model.lower():
-            model_low = model.lower()
-            # Qwen Plus/Max are premium tiers; ``plus`` does not contain
-            # ``-pro``, so it must be named explicitly.
-            is_pro = ('v4-pro' in model_low or '-pro' in model_low or
-                      'reasoner' in model_low or
-                      'plus' in model_low or 'max' in model_low)
+        model_low = model.lower()
+        if 'qwen' in model_low:
+            if 'max' in model_low:
+                self.qwen_max_input_tokens += input_tokens
+                self.qwen_max_output_tokens += output_tokens
+                self.qwen_max_calls += 1
+                self.mtg_game_qwen_max_input_tokens += input_tokens
+                self.mtg_game_qwen_max_output_tokens += output_tokens
+            elif 'plus' in model_low:
+                self.qwen_plus_input_tokens += input_tokens
+                self.qwen_plus_output_tokens += output_tokens
+                self.qwen_plus_calls += 1
+                self.mtg_game_qwen_plus_input_tokens += input_tokens
+                self.mtg_game_qwen_plus_output_tokens += output_tokens
+            else:
+                self.qwen_input_tokens += input_tokens
+                self.qwen_output_tokens += output_tokens
+                self.qwen_calls += 1
+                self.mtg_game_qwen_input_tokens += input_tokens
+                self.mtg_game_qwen_output_tokens += output_tokens
+        elif 'deepseek' in model_low:
+            is_pro = ('v4-pro' in model_low or '-pro' in model_low
+                      or 'reasoner' in model_low)
             if is_pro:
                 self.deepseek_pro_input_tokens += input_tokens
                 self.deepseek_pro_output_tokens += output_tokens
@@ -422,7 +456,6 @@ class MTGBot(commands.Bot):
                 self.deepseek_output_tokens += output_tokens
                 self.deepseek_calls += 1
         self._save_persistent_costs()
-
     def get_cost_summary(self) -> str:
         """Return a human-readable lifetime cost summary."""
         chat_in = self.total_input_tokens - self.mtg_game_input_tokens
@@ -437,30 +470,52 @@ class MTGBot(commands.Bot):
             + self.deepseek_pro_input_tokens * CONFIG.deepseek_pro_input_cost_per_million / 1_000_000
             + self.deepseek_pro_output_tokens * CONFIG.deepseek_pro_output_cost_per_million / 1_000_000
         )
-        # MTG-game Claude portion excludes the cheap-provider counters; using
-        # the whole MTG total here double-bills every DeepSeek/Qwen call.
-        cheap_in = self.deepseek_input_tokens + self.deepseek_pro_input_tokens
-        cheap_out = self.deepseek_output_tokens + self.deepseek_pro_output_tokens
+        from rules.llm_adapter import MODEL_RATES
+        qf = MODEL_RATES["qwen3.7-flash"]
+        qp = MODEL_RATES["qwen3.7-plus"]
+        qm = MODEL_RATES["qwen3.7-max"]
+        qwen_cost = (
+            self.qwen_input_tokens * qf[1] / 1_000_000
+            + self.qwen_output_tokens * qf[2] / 1_000_000
+            + self.qwen_plus_input_tokens * qp[1] / 1_000_000
+            + self.qwen_plus_output_tokens * qp[2] / 1_000_000
+            + self.qwen_max_input_tokens * qm[1] / 1_000_000
+            + self.qwen_max_output_tokens * qm[2] / 1_000_000
+        )
+        cheap_in = (self.deepseek_input_tokens + self.deepseek_pro_input_tokens
+                    + self.qwen_input_tokens + self.qwen_plus_input_tokens
+                    + self.qwen_max_input_tokens)
+        cheap_out = (self.deepseek_output_tokens + self.deepseek_pro_output_tokens
+                     + self.qwen_output_tokens + self.qwen_plus_output_tokens
+                     + self.qwen_max_output_tokens)
         mtg_sonnet_in = max(0, self.mtg_game_input_tokens - cheap_in)
         mtg_sonnet_out = max(0, self.mtg_game_output_tokens - cheap_out)
         mtg_sonnet_cost = (
             mtg_sonnet_in * CONFIG.sonnet_input_cost_per_million / 1_000_000
             + mtg_sonnet_out * CONFIG.sonnet_output_cost_per_million / 1_000_000
         )
+        qwen_in = (self.qwen_input_tokens + self.qwen_plus_input_tokens
+                   + self.qwen_max_input_tokens)
+        qwen_out = (self.qwen_output_tokens + self.qwen_plus_output_tokens
+                    + self.qwen_max_output_tokens)
+        qwen_calls = self.qwen_calls + self.qwen_plus_calls + self.qwen_max_calls
         lines = [
-            "💰 **Lifetime API Usage**",
+            "Lifetime API Usage",
             f"Total API calls: {self.api_calls:,}",
             "",
-            f"**Chat (Sonnet)**: {chat_in:,} in / {chat_out:,} out → ${chat_cost:.4f}",
-            f"**MTG games (Sonnet portion)**: {mtg_sonnet_in:,} in / "
-            f"{mtg_sonnet_out:,} out → ${mtg_sonnet_cost:.4f}",
-            f"**MTG games (DeepSeek/Qwen)**: {self.deepseek_input_tokens + self.deepseek_pro_input_tokens:,} in / "
-            f"{self.deepseek_output_tokens + self.deepseek_pro_output_tokens:,} out → ${ds_cost:.4f}",
+            f"Chat (Sonnet): {chat_in:,} in / {chat_out:,} out -> ${chat_cost:.4f}",
+            f"MTG games (Sonnet portion): {mtg_sonnet_in:,} in / "
+            f"{mtg_sonnet_out:,} out -> ${mtg_sonnet_cost:.4f}",
+            f"DeepSeek + legacy pre-split Qwen aggregate: "
+            f"{self.deepseek_input_tokens + self.deepseek_pro_input_tokens:,} in / "
+            f"{self.deepseek_output_tokens + self.deepseek_pro_output_tokens:,} out "
+            f"-> ${ds_cost:.4f}",
+            f"Qwen (provider-specific): {qwen_in:,} in / {qwen_out:,} out "
+            f"({qwen_calls} calls) -> ${qwen_cost:.4f}",
             "",
-            f"**Total**: ${chat_cost + mtg_sonnet_cost + ds_cost:.4f}",
+            f"Total: ${chat_cost + mtg_sonnet_cost + ds_cost + qwen_cost:.4f}",
         ]
         return "\n".join(lines)
-
     # -------------------------------------------------------------------------
     # Event handlers
     # -------------------------------------------------------------------------

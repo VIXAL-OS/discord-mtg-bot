@@ -115,6 +115,58 @@ SUSPEND_ONLY_CARDS = {
 }
 
 
+_ADDITIONAL_SACRIFICE_RE = re.compile(
+    r"as an additional cost to cast this spell, sacrifice "
+    r"(?:(a|an|one|two|three)\s+)?(creatures?|artifacts?|lands?|permanents?)\b",
+    re.IGNORECASE,
+)
+
+
+def additional_sacrifice_requirement(card):
+    """Return (count, permanent_type) for a printed sacrifice cost.
+
+    This is deliberately narrow: the current card inventory has Diabolic
+    Intent and Shard Volley in this family. Optional/alternative sacrifice
+    wording must not be mistaken for a mandatory additional cost.
+    """
+    match = _ADDITIONAL_SACRIFICE_RE.search(
+        getattr(card, "oracle_text", "") or "")
+    if not match:
+        return None
+    number_word = (match.group(1) or "a").lower()
+    count = {"a": 1, "an": 1, "one": 1, "two": 2, "three": 3}[number_word]
+    permanent_type = match.group(2).lower().rstrip("s")
+    return count, permanent_type
+
+
+def can_pay_additional_sacrifice(card, player, game=None) -> bool:
+    """Whether player can pay card's mandatory sacrifice cost.
+
+    Shared by advertisement and the authoritative cast gate so an action
+    cannot appear in CASTABLE NOW only to be rejected for missing fodder.
+    """
+    requirement = additional_sacrifice_requirement(card)
+    if requirement is None:
+        return True
+    count, permanent_type = requirement
+
+    def matches(permanent):
+        if permanent is card:
+            return False
+        if permanent_type == "creature":
+            try:
+                return permanent.is_creature(game)
+            except TypeError:
+                return permanent.is_creature()
+        if permanent_type == "artifact":
+            return permanent.is_artifact()
+        if permanent_type == "land":
+            return permanent.is_land()
+        return permanent_type == "permanent"
+
+    return sum(1 for permanent in player.battlefield if matches(permanent)) >= count
+
+
 def _entry(label: str, name: str, zone: str, action: Dict,
            tags: List[str] = None) -> Dict:
     return {"label": label, "name": name, "zone": zone,
@@ -396,6 +448,10 @@ def castable_entries(game, player, mana_by_color: Dict, any_color_mana: int,
         # Tokens in hand can't be cast (CR 110.5g — cease to exist in
         # non-battlefield zones)
         if getattr(card, 'is_token', False):
+            continue
+        # CR 601.2b/g: do not advertise a spell whose mandatory additional
+        # sacrifice cannot be paid. The cast gate calls the same predicate.
+        if not can_pay_additional_sacrifice(card, player, game):
             continue
         # July 29 batch audit: split cards store the COMBINED Scryfall
         # string ("{3}{U} // {4}{U}{U}"), which parses as one 10-CMC cost

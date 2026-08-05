@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Pre-warm the Scryfall card data cache for all test decks.
+"""Pre-warm the Scryfall card data cache for every discovered deck fixture.
 
 Run this ONCE offline to populate data/card_data_cache.json with card data
-for all 848+ unique cards across the 24 test decks. After this, the bot
-loads from disk on startup and never needs to hit Scryfall during autoplay.
+from every JSON deck in data/. After this, the bot loads from disk on startup
+and does not need to hit Scryfall for already-cached cards during autoplay.
 
 Usage: python prewarm_cache.py
 """
@@ -14,7 +14,7 @@ import os
 import sys
 import time
 
-# Add the project root to path so we can import mtg_game
+# Add the project root to the import path.
 sys.path.insert(0, os.path.dirname(__file__))
 
 
