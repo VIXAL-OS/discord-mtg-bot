@@ -127,7 +127,11 @@ EXCEPT_BASELINE = {
     # SPELL that already resolved and was already paid for — the spliced
     # text is an addition to it, not a precondition. Carries maybe_reraise,
     # so strict batches and pytest still see the failure.
-    "spells.py": 35,
+    # Aug 5 (+1): effect-granted casts share a crash barrier around the real
+    # cast pipeline. Production must clean up a generated spell copy or move a
+    # declined Rashmi card to hand; strict batches still re-raise through
+    # maybe_reraise, matching the madness/miracle barriers above.
+    "spells.py": 36,
     # Aug 1 deferred slate: +1 for the opponent-cast trigger window's
     # crash barrier around the LLM response evaluation — carries
     # maybe_reraise so strict batches see it; the sibling own-cast

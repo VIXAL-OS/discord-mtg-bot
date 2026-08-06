@@ -45,7 +45,8 @@ from mtg.helpers import (
     _collapse_repeated_life_gain, _should_emit_resolve_hint,
     _normalize_pw_ability_idx, _resolve_player_or_card_target,
     exile_after_resolution_reason, get_mdfc_info, library_top_cast_types,
-    note_miracle_on_draw, spell_face_for_gates, try_dredge,
+    is_castable_from_exile, note_miracle_on_draw, spell_face_for_gates,
+    try_dredge,
 )
 from mtg.models import Card, Player, GameState, StackEntry, FormatValidator
 from mtg import events
@@ -1409,10 +1410,59 @@ class GameEngine:
 
         return True, f"Cast {card.name}", effect_messages
 
-    async def cast_spell_async(self, game: GameState, player: Player, card: Card, pay_mana: bool = True, target: Any = None, additional_cost: int = 0) -> Tuple[bool, str, List[str]]:
+    async def cast_spell_async(self, game: GameState, player: Player, card: Card,
+                               pay_mana: bool = True, target: Any = None,
+                               additional_cost: int = 0, *,
+                               from_exile: bool = False
+                               ) -> Tuple[bool, str, List[str]]:
         """Delegates to mtg.spells.cast_spell_async (Phase 2G)."""
         from mtg.spells import cast_spell_async
-        return await cast_spell_async(self, game, player, card, pay_mana, target, additional_cost)
+        return await cast_spell_async(
+            self, game, player, card, pay_mana, target, additional_cost,
+            from_exile=from_exile)
+
+    def consume_conditional_exile_cast(self, game: GameState, player: Player,
+                                       card: Card, *, from_exile: bool) -> bool:
+        """Consume only the matching Chandra record once casting succeeds."""
+        if not from_exile:
+            return False
+        record = (getattr(game, 'conditional_exile_casts', None) or {}).get(card.id)
+        if not record:
+            return False
+        try:
+            controller_index = game.players.index(player)
+        except ValueError:
+            return False
+        if int(record.get('controller_index', -1)) != controller_index:
+            return False
+        game.conditional_exile_casts.pop(card.id, None)
+        print(f"[CHANDRA-CAST] {player.name} cast {card.name}; deferred damage cancelled")
+        return True
+
+    def resolve_expired_conditional_exile_casts(
+            self, game: GameState) -> List[str]:
+        """Resolve unconsumed card-scoped exile windows exactly once."""
+        messages = []
+        records = getattr(game, 'conditional_exile_casts', None) or {}
+        for card_id, record in list(records.items()):
+            if int(record.get('expires_turn', -1)) > game.turn_number:
+                continue
+            records.pop(card_id, None)
+            controller_index = int(record.get('controller_index', -1))
+            if not (0 <= controller_index < len(game.players)):
+                continue
+            source = record.get('source_name') or 'Chandra, Torch of Defiance'
+            damage = int(record.get('damage', 2) or 2)
+            for index, opponent in enumerate(game.players):
+                if index == controller_index:
+                    continue
+                actual = self.rules._apply_noncombat_damage_to_player(
+                    game, opponent, damage, source)
+                if actual:
+                    messages.append(
+                        f"🔥 {source} deals {actual} damage to {opponent.name} "
+                        f"(the exiled card was not cast)")
+        return messages
     def _queue_async_trigger(self, game: GameState, source_card: Card, trigger_text: str,
                              trigger_type: str, controller_name: str, context: str = "") -> None:
         """Enqueue a sync-context trigger for async Tier 3 resolution.
@@ -1962,7 +2012,8 @@ class GameEngine:
             target_player.record_life_loss(amount)
             actual = amount
 
-        if is_commander and source and actual > 0:
+        if (is_commander and source and actual > 0 and game
+                and getattr(game, 'format', '').lower() in ('commander', 'edh')):
             # Track commander damage — keyed by commander NAME (CR 903.10a is
             # per-commander; Aug 1 batch-12, the partner-deck finding).
             _cd_key = source.name
@@ -2647,6 +2698,11 @@ class GameEngine:
         except Exception as e:
             print(f"[DELAYED-TRIGGER] Error in end_turn: {e}")
 
+        # Chandra's cast-or-damage record expires after end-step/delayed
+        # triggers, before ordinary temporary permissions are cleared.
+        endstep_trigger_msgs.extend(
+            self.resolve_expired_conditional_exile_casts(game))
+
         # Clear all end-of-turn effects (pump spells, temp keywords, turn triggers)
         self.clear_end_of_turn_effects(game)
 
@@ -2898,9 +2954,8 @@ class GameEngine:
             # Check if it's playable from exile (Chandra impulse draw, Light Up the Stage, etc.)
             if not card and player.exile:
                 for c in player.exile:
-                    _castable_from_exile = (c.id in player.playable_from_exile
-                                            or getattr(c, '_adventure_exiled', False)
-                                            or getattr(c, '_foretold', False))
+                    _castable_from_exile = is_castable_from_exile(
+                        game, player, c)
                     if _castable_from_exile and card_name and c.name.lower() == card_name.lower():
                         card = c
                         _from_exile_card = c
@@ -3224,7 +3279,10 @@ class GameEngine:
 
                 # Use async version with spell resolution
                 card._cast_from_command_zone = from_command_zone
-                success, msg, effect_msgs = await self.cast_spell_async(game, player, card, target=target, additional_cost=commander_tax)
+                success, msg, effect_msgs = await self.cast_spell_async(
+                    game, player, card, target=target,
+                    additional_cost=commander_tax,
+                    from_exile=_from_exile_card is not None)
                 card._tutor_card = None
                 card._cast_from_command_zone = False
                 print(f"[EXECUTE] cast {card_name}: success={success}, msg={msg}")
@@ -3280,7 +3338,8 @@ class GameEngine:
                         card._foretold = True
                         card._face_down = True
                         card._cast_via_foretell = False
-                    elif card.id not in player.playable_from_exile:
+                    elif (card.id not in game.conditional_exile_casts
+                          and card.id not in player.playable_from_exile):
                         player.playable_from_exile.append(card.id)
                     print(f"[EXILE-CAST] {card.name} cast failed — returned to exile")
                 if not success and _from_library_top:
@@ -3509,6 +3568,7 @@ class GameEngine:
                 ability_idx = int(action.get("ability", 0))
             except (ValueError, TypeError):
                 ability_idx = 0
+            raw_target_spec = action.get("target")
             target_name = _normalize_action_target(action)
 
             # Per-turn activation limit to prevent infinite loops (Sensei's Divining Top, etc.)
@@ -3754,6 +3814,16 @@ class GameEngine:
                                   f"{ability_idx} → {_equip_idx} (equip intent: own-creature target)")
                             ability_idx = _equip_idx
                             ability = abilities[_equip_idx]
+
+                from mtg.helpers import activated_ability_restriction_failure
+                restriction_failure = activated_ability_restriction_failure(
+                    game, player, ability.get('effect', ''))
+                if restriction_failure:
+                    reason = f"{perm.name} {restriction_failure}"
+                    print(f"[ACTIVATE-RESTRICTION] {reason}")
+                    game._last_activation_failure = (
+                        game.turn_number, perm.name, reason)
+                    return None
 
                 # A named target cannot belong to a mana ability.  This also
                 # prevents a hand-only Channel request from silently clamping
@@ -4697,6 +4767,61 @@ class GameEngine:
                     effect_text2 = re.sub(r'\bX\b', str(_activation_x), effect_text2)
                 effect_lower2 = effect_text2.lower()
                 inline_msgs = []
+
+                # Aug 5 Terra recency audit: Cauldron of Souls was reaching
+                # Tier 3 with an any-number target list.  The generic action
+                # normalizer collapsed that list to its first entry, while the
+                # judge sometimes widened the effect to every permanent.  In
+                # one audited game Worldslayer, Golgari Rot Farm, and Skullclamp
+                # all gained Persist.  Resolve the printed creature-only effect
+                # deterministically and retain every declared creature target.
+                if perm.name.lower() == "cauldron of souls":
+                    if isinstance(raw_target_spec, list):
+                        _cauldron_names = [str(v) for v in raw_target_spec if v]
+                    elif raw_target_spec:
+                        _cauldron_names = [str(raw_target_spec)]
+                    else:
+                        _cauldron_names = []
+
+                    _cauldron_seen = set()
+                    _cauldron_rejected = []
+                    for _declared_name in _cauldron_names:
+                        # Board renderings commonly suffix a creature with its
+                        # current P/T ("Kor Outfitter 2/2").  That annotation is
+                        # not part of the card name used by the state model.
+                        _lookup_name = re.sub(
+                            r"\s+-?\d+/-?\d+\s*$", "", _declared_name).strip()
+                        _target = _resolve_player_or_card_target(
+                            game, player, _lookup_name)
+                        if (_target is None
+                                or not hasattr(_target, "type_line")
+                                or not _target.is_creature(game)):
+                            _cauldron_rejected.append(_declared_name)
+                            print(f"[TARGETING] Cauldron of Souls rejects "
+                                  f"noncreature target: {_declared_name}")
+                            continue
+                        if _target.id in _cauldron_seen:
+                            continue
+                        _cauldron_seen.add(_target.id)
+                        _owner = next(
+                            (p for p in game.players if _target in p.battlefield),
+                            player)
+                        _grant_msg = self.rules._execute_action_on_state(game, {
+                            "action": "grant_keywords",
+                            "player": _owner.name,
+                            "target_card": _target.name,
+                            "target_filter": "creature",
+                            "keywords": ["Persist"],
+                        })
+                        if _grant_msg:
+                            inline_msgs.append(_grant_msg)
+
+                    if inline_msgs:
+                        return "\n".join(cost_msgs + inline_msgs)
+                    return "\n".join(cost_msgs + [
+                        f"{player.name} activates {perm.name} "
+                        "(no legal creature targets selected)"
+                    ])
 
                 # (a) "Create N P/T <desc> creature token(s)" — Rhys class.
                 _tok_m = re.search(

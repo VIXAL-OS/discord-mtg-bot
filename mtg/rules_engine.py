@@ -176,6 +176,8 @@ class RulesEngine:
         # Entreat the Angels, Reforge the Soul are all sorceries).
         if getattr(card, '_cast_via_miracle', False):
             has_flash = True
+        if getattr(card, '_cast_via_effect', False):
+            has_flash = True
 
         # Split card: check if the half being cast is an instant (instant-speed)
         if getattr(card, 'cast_as_split_half', -1) >= 0 and card.split_types:
@@ -210,6 +212,13 @@ class RulesEngine:
                         return False, f"Can only cast spells with empty stack ({bf_card.name})"
                     print(f"[PW-STATIC] {bf_card.name} restricts {player.name} to sorcery speed")
                     break  # One Teferi is enough
+        # Rashmi/Hellraiser-style effects grant permission to cast during the
+        # resolving ability and waive the mana cost. Keep this after timing
+        # restrictions so Teferi can still prohibit the cast, but before the
+        # ordinary mana-affordability gate below.
+        if getattr(card, '_cast_via_effect', False):
+            return True, "OK (cast granted by resolving effect)"
+
 
         # Check for free-cast turn effect (Rishkar's Expertise, Cascade, etc.)
         if hasattr(game, 'turn_effects'):
@@ -752,6 +761,7 @@ class RulesEngine:
         # Empty mana pools
         for p in game.players:
             p.empty_mana_pool()
+            p._retain_mana_through_turn = None
     
     def on_end_step(self, game: GameState) -> List[str]:
         """Handle end step - clear damage, empty mana pools, discard to hand size, reset temporary modifiers."""
@@ -822,6 +832,7 @@ class RulesEngine:
                         and getattr(card, '_animated_expires_at_turn_of', None) is None):
                     self.revert_animation(card)
             player.empty_mana_pool()
+            player._retain_mana_through_turn = None
         
         return messages
     
@@ -845,7 +856,14 @@ class RulesEngine:
         """Handle phase transitions."""
         # Empty mana pools on phase change (technically should be each step but simplified)
         for player in game.players:
+            retained = None
+            if (getattr(player, '_retain_mana_through_turn', None)
+                    == game.turn_number):
+                # Kessig Naturalist: preserve the still-unspent floating mana.
+                retained = dict(player.mana_pool)
             player.empty_mana_pool()
+            if retained is not None:
+                player.mana_pool.update(retained)
     
     # =========================================================================
     # COMBAT RESOLUTION (Medium - Keyword-aware)

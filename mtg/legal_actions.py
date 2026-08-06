@@ -31,7 +31,7 @@ import re
 from typing import Dict, List
 
 from mtg.constants import COMMAND_ZONE_FORMATS
-from mtg.helpers import library_top_cast_types
+from mtg.helpers import is_castable_from_exile, library_top_cast_types
 
 try:
     from rules.mana import ManaCost
@@ -176,7 +176,8 @@ def _entry(label: str, name: str, zone: str, action: Dict,
 def graveyard_castable_entries(player, mana_by_color: Dict,
                                any_color_mana: int,
                                total_mana: int,
-                               turn_number: int = None) -> List[Dict]:
+                               turn_number: int = None,
+                               game=None) -> List[Dict]:
     """Everything playable from the graveyard or exile.
 
     Graveyard CASTS — flashback, escape, jump-start, aftermath, and the
@@ -378,10 +379,18 @@ def graveyard_castable_entries(player, mana_by_color: Dict,
     # says "play", but the from-exile path is a CAST path and land-play
     # from exile isn't modeled.
     for card in getattr(player, 'exile', []) or []:
-        if card.id not in (getattr(player, 'playable_from_exile', None) or []):
+        if game is not None:
+            castable = is_castable_from_exile(game, player, card)
+        else:
+            # Backward-compatible pure-provider calls have no GameState and
+            # therefore cannot see card-scoped conditional windows.
+            castable = card.id in (
+                getattr(player, 'playable_from_exile', None) or [])
+        if not castable:
             continue
-        if getattr(card, '_adventure_exiled', False):
-            continue  # already offered above under its adventure label
+        if (getattr(card, '_adventure_exiled', False)
+                or getattr(card, '_foretold', False)):
+            continue  # already offered above under its mechanic label
         if card.is_land():
             continue
         cost = card.mana_cost or ""
@@ -630,7 +639,7 @@ def castable_entries(game, player, mana_by_color: Dict, any_color_mana: int,
     # cards waiting in exile.
     entries.extend(graveyard_castable_entries(
         player, mana_by_color, any_color_mana, total_mana,
-        turn_number=getattr(game, 'turn_number', None)))
+        turn_number=getattr(game, 'turn_number', None), game=game))
 
     return entries
 

@@ -361,6 +361,14 @@ class EffectTemplateLibrary:
         if not card_name:
             return None, ""
         card_key = card_name.lower().strip()
+        # Scryfall stores transforming DFC names as "front // back". The
+        # name-keyed registry intentionally uses the front face, while split
+        # cards may have full-name templates. Fall back only for a confirmed
+        # transforming source and only when the combined key is unregistered.
+        _source_card = (game_context or {}).get('_source_card')
+        if (card_key not in self._card_templates and ' // ' in card_key
+                and getattr(_source_card, 'has_transform', False)):
+            card_key = card_key.split(' // ', 1)[0].strip()
         # May 16 audit: the outer gate used to be `event_type == "etb"`, which
         # silently bypassed the name-keyed block for every non-ETB dispatcher
         # (cast_trigger, dies, attacks, upkeep, end_step, beginning_combat).
@@ -1374,6 +1382,12 @@ class EffectTemplateLibrary:
             action_generator=lambda ctrl, opp, ctx: self._puppeteer_clique_etb(
                 ctrl, opp, ctx),
         ))
+        self._add_card("capricious hellraiser", EffectTemplate(
+            name="Capricious Hellraiser",
+            description=("Exile three random graveyard cards, choose a "
+                         "noncreature nonland card among them, copy and cast it"),
+            action_generator=self._gen_capricious_hellraiser_etb,
+        ))
 
         # --- Spell templates (instants/sorceries) ---
         self._add_card("rishkar's expertise", EffectTemplate(
@@ -1717,10 +1731,8 @@ class EffectTemplateLibrary:
         # Thassa's Oracle: registered once below (near line ~1175) with win condition check
 
         # --- Searing Blood: deal 2 to creature, if it dies this turn deal 3 to controller ---
-        # Heuristically check if 2 damage would be lethal by comparing against
-        # (toughness - existing_damage_marked).  Not 100% rules-correct (misses
-        # indestructible, damage prevention) but covers the common case.
-        # Default toughness=99 (unknown) so we do NOT assume lethal when context is missing.
+        # Register the contingent damage as an exact-object death watcher;
+        # prediction cannot account for prevention, indestructible, or SBAs.
         def _searing_blood_gen(ctrl, opp, ctx):
             # Aug 2 batch-14 audit (R-L2): "target creature" is UNRESTRICTED —
             # the caster's own creatures are legal targets (CR 601.2c), so
@@ -1748,16 +1760,16 @@ class EffectTemplateLibrary:
                        for c in getattr(_ctrl_player, 'battlefield', []) or []):
                     _tgt_ctrl = ctrl
             opp = _tgt_ctrl
-            target_toughness = ctx.get('target_toughness', 99)
-            target_damage = ctx.get('target_damage_marked', 0)
-            remaining_toughness = target_toughness - target_damage
-            actions = [
-                {"action": "deal_damage", "amount": 2, "target_card": target, "target_controller": opp},
+            return [
+                {"action": "deal_damage", "amount": 2, "target_card": target,
+                 "target_controller": opp, "source": "Searing Blood"},
+                {"action": "schedule_death_trigger", "watch_target": target,
+                 "watch_target_id": ctx.get('explicit_target_id', ''),
+                 "source": "Searing Blood",
+                 "on_death_actions": [{"action": "deal_damage", "amount": 3,
+                                       "target_player": opp,
+                                       "source": "Searing Blood"}]},
             ]
-            # Heuristic: 2 damage is lethal if remaining toughness <= 2
-            if remaining_toughness <= 2:
-                actions.append({"action": "deal_damage", "amount": 3, "target_player": opp})
-            return actions
 
         self._add_card("searing blood", EffectTemplate(
             name="Searing Blood",
@@ -1876,8 +1888,8 @@ class EffectTemplateLibrary:
             action_generator=lambda ctrl, opp, ctx: [
                 {"action": "move_card", "card": ctx.get('explicit_target_name') or ctx.get('best_opponent_creature') or '',
                  "from_zone": "battlefield", "to_zone": "exile", "player": ctx.get('explicit_target_owner') or opp},
-                {"action": "create_token", "player": ctx.get('explicit_target_owner') or opp, "name": "Manifest",
-                 "power": 2, "toughness": 2, "types": "Creature", "count": 1},
+                {"action": "manifest_top", "player": ctx.get('explicit_target_owner') or opp,
+                 "count": 1},
             ] if (ctx.get('explicit_target_name') or ctx.get('best_opponent_creature')) else [
                 {"action": "no_action", "reason": "No creature to target with Reality Shift"}
             ],
@@ -4987,6 +4999,120 @@ class EffectTemplateLibrary:
                 action_generator=lambda ctrl, opp, ctx: self._edict_effect(ctrl, opp, ctx),
             ))
 
+        # Aug 5 confirmation-batch card tail. These all reached the pending
+        # trigger drain in real games; keeping them in the shared library
+        # lets ordinary and sync-queued paths use the same deterministic
+        # actions.
+        def _greatest_live_power(ctrl, ctx):
+            controller = ctx.get('_controller_player')
+            game = ctx.get('_game')
+            if controller is None:
+                return int(ctx.get('greatest_power', 0) or 0)
+            powers = []
+            for creature in controller.battlefield:
+                if not creature.is_creature(game):
+                    continue
+                try:
+                    powers.append(creature.get_effective_power(game))
+                except (AttributeError, TypeError, ValueError):
+                    powers.append(int(creature.power or 0))
+            return max(powers, default=0)
+
+        self._add_attack_card("pathbreaker ibex", EffectTemplate(
+            name="Pathbreaker Ibex attack",
+            description=("Whenever Pathbreaker Ibex attacks, creatures you "
+                         "control gain trample and +X/+X until end of turn"),
+            action_generator=lambda ctrl, opp, ctx: [
+                {"action": "pump_all_creatures", "player": ctrl,
+                 "power": _greatest_live_power(ctrl, ctx),
+                 "toughness": _greatest_live_power(ctrl, ctx),
+                 "keywords": ["Trample"], "source": "Pathbreaker Ibex"},
+            ],
+        ))
+
+        self._add_attack_card("kessig naturalist", EffectTemplate(
+            name="Kessig Naturalist attack",
+            description=("Whenever Kessig Naturalist attacks, add green mana "
+                         "that does not empty until end of turn"),
+            action_generator=lambda ctrl, opp, ctx: [
+                {"action": "add_mana", "player": ctrl, "color": "G",
+                 "amount": 1, "retains_through_turn": True},
+            ],
+        ))
+
+        def _ardenn_attach(ctrl, opp, ctx):
+            controller = ctx.get('_controller_player')
+            game = ctx.get('_game')
+            if controller is None:
+                return []
+            creatures = [c for c in controller.battlefield
+                         if c.is_creature(game)]
+            if not creatures:
+                return []
+            def _power(creature):
+                try:
+                    return creature.get_effective_power(game)
+                except (AttributeError, TypeError, ValueError):
+                    return int(creature.power or 0)
+            target = max(creatures, key=_power)
+            attachments = [
+                card for card in controller.battlefield
+                if 'equipment' in (card.type_line or '').lower()
+                or (
+                    'aura' in (card.type_line or '').lower()
+                    and any(shape in (card.oracle_text or '').lower()
+                            for shape in ('enchant creature',
+                                          'enchant permanent'))
+                )
+            ]
+            return [
+                {"action": "attach", "player": ctrl,
+                 "attachment": card.name, "target": target.name}
+                for card in attachments
+            ]
+
+        self._add_card("ardenn, intrepid archaeologist", EffectTemplate(
+            name="Ardenn beginning combat",
+            description=("At beginning of combat, attach Auras and Equipment "
+                         "you control to the best creature you control"),
+            action_generator=_ardenn_attach,
+        ))
+
+        self._add_card("wandermare", EffectTemplate(
+            name="Wandermare Adventure cast trigger",
+            description=("Whenever you cast a creature spell with Adventure, "
+                         "put a +1/+1 counter on Wandermare"),
+            action_generator=lambda ctrl, opp, ctx: [
+                {"action": "add_counters", "card": "Wandermare",
+                 "counter_type": "+1/+1", "amount": 1},
+            ],
+        ))
+
+        self._add_card("gadwick, the wizened", EffectTemplate(
+            name="Gadwick blue-spell cast trigger",
+            description=("Whenever you cast a blue spell, tap target nonland "
+                         "permanent an opponent controls"),
+            action_generator=lambda ctrl, opp, ctx: (
+                [{"action": "tap", "card": ctx['best_opponent_nonland']}]
+                if ctx.get('best_opponent_nonland') else []),
+        ))
+
+        def _omarthis_manifest(ctrl, opp, ctx):
+            source = ctx.get('_source_card')
+            count = sum(int(v or 0) for v in
+                        (getattr(source, 'counters', {}) or {}).values())
+            if count <= 0:
+                return []
+            return [{"action": "manifest_top", "player": ctrl,
+                     "count": count, "source": "Omarthis, Ghostfire Initiate"}]
+
+        self._add_dies_card("omarthis, ghostfire initiate", EffectTemplate(
+            name="Omarthis dies",
+            description=("When Omarthis dies, manifest cards equal to the "
+                         "number of counters on it"),
+            action_generator=_omarthis_manifest,
+        ))
+
         # --- Rashmi, Eternities Crafter: reveal top card, cast free or put into hand ---
         self._add_card("rashmi, eternities crafter", EffectTemplate(
             name="Rashmi, Eternities Crafter",
@@ -5733,6 +5859,13 @@ class EffectTemplateLibrary:
             description="Create a green and white Elemental token with P/T = creatures you control",
             action_generator=_gen_voice_of_resurgence,
         ))
+        self._add_dies_card("voice of resurgence", EffectTemplate(
+            name="Voice of Resurgence dies",
+            description=("When Voice of Resurgence dies, create an Elemental "
+                         "token with P/T equal to creatures you control"),
+            action_generator=_gen_voice_of_resurgence,
+        ))
+
 
 
         # Goblin Guide: attack trigger — defending player reveals top card,
@@ -5927,6 +6060,91 @@ class EffectTemplateLibrary:
                 {"action": "damage_all_creatures", "amount": max(1, ctx.get('x_value', 3)),
                  "controller": opp},
             ],
+        )
+
+        # Confirmation-batch planeswalker tail: these repeated abilities must
+        # never depend on Tier 3's duplicate-suppression cache.
+        self._pw_ability_templates[(
+            "garruk wildspeaker", "untap two target lands")] = EffectTemplate(
+            name="Garruk Wildspeaker +1",
+            description="Untap up to two target lands",
+            action_generator=lambda ctrl, opp, ctx: [
+                {"action": "untap_lands", "player": ctrl, "count": 2},
+            ],
+        )
+        self._pw_ability_templates[(
+            "garruk wildspeaker", "get +3/+3 and gain trample")] = EffectTemplate(
+            name="Garruk Wildspeaker -4",
+            description="Creatures you control get +3/+3 and trample",
+            action_generator=lambda ctrl, opp, ctx: [
+                {"action": "pump_all_creatures", "player": ctrl,
+                 "power": 3, "toughness": 3, "keywords": ["Trample"],
+                 "source": "Garruk Wildspeaker"},
+            ],
+        )
+
+        self._pw_ability_templates[(
+            "liliana, dreadhorde general",
+            "each player sacrifices two creatures")] = EffectTemplate(
+            name="Liliana Dreadhorde General -4",
+            description="Each player sacrifices two creatures",
+            action_generator=lambda ctrl, opp, ctx: [
+                {"action": "sacrifice_permanent", "player": ctrl,
+                 "type_filter": "creature", "source": "Liliana -4"},
+                {"action": "sacrifice_permanent", "player": ctrl,
+                 "type_filter": "creature", "source": "Liliana -4"},
+                {"action": "sacrifice_permanent", "player": opp,
+                 "type_filter": "creature", "source": "Liliana -4"},
+                {"action": "sacrifice_permanent", "player": opp,
+                 "type_filter": "creature", "source": "Liliana -4"},
+            ],
+        )
+
+        def _jaya_discard_draw(ctrl, opp, ctx):
+            hand = list(ctx.get('controller_hand') or [])
+            count = min(3, len(hand))
+            if count <= 0:
+                return []
+            chosen = sorted(
+                hand, key=lambda c: (not c.is_land(), int(c.cmc or 0)))[:count]
+            actions = [
+                {"action": "discard", "player": ctrl, "card": card.name}
+                for card in chosen
+            ]
+            actions.append(
+                {"action": "draw_cards", "player": ctrl, "amount": count})
+            return actions
+
+        self._pw_ability_templates[(
+            "jaya ballard", "discard up to three cards")] = EffectTemplate(
+            name="Jaya Ballard +1 loot",
+            description="Discard up to three cards, then draw that many",
+            action_generator=_jaya_discard_draw,
+        )
+
+        def _nahiri_put_equipment(ctrl, opp, ctx):
+            candidates = [
+                (card, "hand") for card in (ctx.get('controller_hand') or [])
+                if 'equipment' in (card.type_line or '').lower()
+            ]
+            candidates.extend(
+                (card, "graveyard")
+                for card in (ctx.get('controller_graveyard') or [])
+                if 'equipment' in (card.type_line or '').lower())
+            if not candidates:
+                return []
+            card, zone = max(
+                candidates, key=lambda pair: int(pair[0].cmc or 0))
+            return [{"action": "move_card", "card": card.name,
+                     "from_zone": zone, "to_zone": "battlefield",
+                     "player": ctrl}]
+
+        self._pw_ability_templates[(
+            "nahiri, the lithomancer",
+            "equipment card from your hand or graveyard")] = EffectTemplate(
+            name="Nahiri Lithomancer -2",
+            description="Put an Equipment from hand or graveyard onto battlefield",
+            action_generator=_nahiri_put_equipment,
         )
 
         # Garruk, Primal Hunter +1: "Create a 3/3 green Beast creature token."
@@ -7566,6 +7784,14 @@ class EffectTemplateLibrary:
             description="Choose two: destroy artifact, recur creature from GY, opponent discards, 2 damage",
             action_generator=lambda ctrl, opp, ctx: self._gen_kolaghans_command(ctrl, opp, ctx),
         ))
+        self._add_card("blood on the snow", EffectTemplate(
+            name="Blood on the Snow",
+            description=("Choose creatures or planeswalkers, destroy all of that "
+                         "type, then return your creature/planeswalker with mana "
+                         "value at most the snow mana spent"),
+            action_generator=lambda ctrl, opp, ctx: self._gen_blood_on_the_snow(
+                ctrl, opp, ctx),
+        ))
 
 
         # =====================================================================
@@ -7907,10 +8133,8 @@ class EffectTemplateLibrary:
         """Chandra, Torch of Defiance +1: Exile top card, you may cast it this turn.
         If you don't, deal 2 damage to each opponent.
 
-        In autoplay, we exile the card and mark it as playable. The AI will attempt
-        to cast it; if it can't (e.g. wrong colors, too expensive), the 2 damage
-        is dealt at end of turn. For simplicity, we exile + deal damage immediately
-        since autoplay can't track "if you don't cast it" reliably.
+        The engine tracks the exact exiled object. Casting it consumes the
+        conditional record; otherwise end-turn cleanup deals the damage.
         """
         actions = []
         # Exile top card and mark as playable this turn
@@ -9321,10 +9545,18 @@ class EffectTemplateLibrary:
             actions.append(sac_action)
         return actions
 
+    def _gen_capricious_hellraiser_etb(self, ctrl, opp, ctx) -> List[Dict]:
+        """Queue Hellraiser's random graveyard exile and real spell-copy cast.
+
+        The synchronous action performs the random selection atomically; its
+        generated copy is then cast by the shared async free-cast drain.
+        """
+        return [{"action": "capricious_hellraiser_etb", "player": ctrl}]
+
     def _gen_rashmi_cast_trigger(self, ctrl, opp, ctx) -> List[Dict]:
         """Rashmi, Eternities Crafter cast trigger: reveal top card of library.
-        If it's a nonland card with lesser MV than the triggering spell, cast it free
-        (approximated as move to battlefield for permanents, otherwise to hand).
+        If it is a lower-MV nonland, queue a real free cast through the stack;
+        a declined or failed cast puts the revealed card into its owner's hand.
         Otherwise, put it into hand.
 
         Per-turn gating ('first spell each turn') is enforced upstream in
@@ -9341,21 +9573,12 @@ class EffectTemplateLibrary:
         is_land = 'land' in type_line
         # Triggering spell's MV (the spell whose cast triggered Rashmi)
         spell_mv = ctx.get('cast_spell_mv', ctx.get('spell_mv', ctx.get('mana_paid_total', 0))) or 0
-        permanent_types = ('creature', 'artifact', 'enchantment', 'planeswalker')
-        is_nonland_permanent = (not is_land) and any(t in type_line for t in permanent_types)
-
         if (not is_land) and spell_mv and top_cmc < spell_mv:
-            # Cast free: for permanents, move to battlefield; instants/sorceries
-            # can't meaningfully "cast free" without a stack model — route to hand.
-            if is_nonland_permanent:
-                return [{"action": "move_card", "card": top_name,
-                         "from_zone": "library", "to_zone": "battlefield",
-                         "player": ctrl,
-                         "reason": f"Rashmi: cast {top_name} free (MV {top_cmc} < {spell_mv})"}]
-            return [{"action": "move_card", "card": top_name,
-                     "from_zone": "library", "to_zone": "hand",
-                     "player": ctrl,
-                     "reason": f"Rashmi: {top_name} revealed (free-cast of non-permanent routed to hand)"}]
+            return [{"action": "queue_free_cast", "card": top_name,
+                     "from_zone": "library", "fallback_zone": "hand",
+                     "player": ctrl, "source": "Rashmi, Eternities Crafter",
+                     "reason": (f"Rashmi: may cast {top_name} without paying "
+                                f"(MV {top_cmc} < {spell_mv})")}]
         # Otherwise (land, MV too high, or unknown spell MV): put into hand
         return [{"action": "move_card", "card": top_name,
                  "from_zone": "library", "to_zone": "hand",
@@ -10686,6 +10909,49 @@ class EffectTemplateLibrary:
             ]
         return actions
 
+    def _gen_blood_on_the_snow(self, ctrl, opp, ctx) -> List[Dict]:
+        """Resolve the chosen wipe, then select the capped return afterward."""
+        modes = ctx.get('_modes') or []
+        if not isinstance(modes, (list, tuple)):
+            modes = [modes]
+        chosen = None
+        for mode in modes:
+            is_mode_one = (
+                isinstance(mode, int) and not isinstance(mode, bool) and mode == 1)
+            is_mode_one = is_mode_one or (
+                isinstance(mode, str)
+                and mode.lower() in ('1', 'creature', 'creatures'))
+            if is_mode_one:
+                chosen = 'creatures'
+                break
+            is_mode_two = (
+                isinstance(mode, int) and not isinstance(mode, bool) and mode == 2)
+            is_mode_two = is_mode_two or (
+                isinstance(mode, str)
+                and mode.lower() in ('2', 'planeswalker', 'planeswalkers'))
+            if is_mode_two:
+                chosen = 'planeswalkers'
+                break
+        if modes and chosen is None:
+            return [{"action": "no_action",
+                     "reason": f"Blood on the Snow: invalid mode {modes[0]!r}"}]
+        if chosen is None:
+            creature_net = (int(ctx.get('opponent_creature_count', 0) or 0)
+                            - int(ctx.get('controller_creature_count', 0) or 0))
+            walker_net = (int(ctx.get('opponent_planeswalker_count', 0) or 0)
+                          - int(ctx.get('controller_planeswalker_count', 0) or 0))
+            chosen = 'planeswalkers' if walker_net > creature_net else 'creatures'
+        wipe = ({"action": "destroy_all_creatures"}
+                if chosen == 'creatures'
+                else {"action": "destroy_all_by_type", "type": "planeswalkers"})
+        return [
+            wipe,
+            {"action": "reanimate", "player": ctrl, "own_graveyard": True,
+             "allow_types": ["creature", "planeswalker"],
+             "max_cmc": int(ctx.get('snow_mana_spent', 0) or 0),
+             "_source_card_name": "Blood on the Snow"},
+        ]
+
 
 # =============================================================================
 # Context Builder - prepares game context for template resolution
@@ -10737,6 +11003,8 @@ def build_game_context(game, player, opponent, card=None, entering_creature=None
     # like _cast_from_graveyard for flashback-doubled effects).
     if card is not None:
         ctx['_source_card'] = card
+        ctx['snow_mana_spent'] = int(
+            getattr(card, '_snow_mana_spent', 0) or 0)
         if getattr(card, '_cast_from_graveyard', False):
             ctx['_cast_from_graveyard'] = True
 
@@ -11269,6 +11537,7 @@ def build_game_context(game, player, opponent, card=None, entering_creature=None
         elif hasattr(explicit_target, 'name'):
             # It's a Card object — find which player owns it
             ctx['explicit_target_name'] = explicit_target.name
+            ctx['explicit_target_id'] = getattr(explicit_target, 'id', '')
             # July 27 fanout: `explicit_target_is_creature` is READ by the Rift
             # Bolt and Volcanic Geyser templates but was written NOWHERE outside
             # tests, so both guards were permanently False and both spells always
@@ -11294,6 +11563,7 @@ def build_game_context(game, player, opponent, card=None, entering_creature=None
             for p in game.players:
                 for c in p.battlefield:
                     if c.name.lower() == explicit_target.lower():
+                        ctx['explicit_target_id'] = getattr(c, 'id', '')
                         ctx['explicit_target_owner'] = p.name
                         ctx['explicit_target_is_creature'] = bool(c.is_creature(game))
                         ctx['explicit_target_mv'] = int(getattr(c, 'cmc', 0) or 0)

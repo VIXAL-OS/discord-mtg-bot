@@ -370,6 +370,14 @@ def _validate_cast(engine, game: GameState, player: Player, card: Card,
         _half = card.cast_as_split_half
         print(f"[AFTERMATH] {card.name} cast from graveyard — resolving to its "
               f"aftermath half (the only half castable from there)")
+    if (not _from_gy_pre and (_half is None or _half < 0)
+            and getattr(card, 'split_names', None)):
+        # A full split-card name from a non-graveyard zone is ambiguous.
+        # Normalize to the front/left half; summing both printed costs is
+        # never a legal cast (CR 708.3).
+        card.cast_as_split_half = 0
+        _half = 0
+        print(f"[SPLIT] {card.name}: full-name cast defaults to front half")
     if _half is not None and _half >= 0:
         _after = helpers.aftermath_half_index(card)
         _from_gy = _from_gy_pre
@@ -1106,7 +1114,8 @@ def _compute_alt_costs(engine, game: GameState, player: Player, card: Card,
                     ), []), None)
 
     # Check for free-cast from turn effects (Rishkar's Expertise, Cascade, etc.)
-    free_cast_source = None
+    free_cast_source = (
+        getattr(card, '_free_cast_source', '') if not pay_mana else None)
     if pay_mana and hasattr(game, 'turn_effects'):
         player_idx = game.players.index(player) if player in game.players else 0
         for te in game.turn_effects:
@@ -1357,6 +1366,7 @@ def _pay_costs(engine, game: GameState, player: Player, card: Card,
     total_alt_reduction = costs['total_alt_reduction']
     cost_increase = costs.get('cost_increase', 0)
     pay_mana = costs['pay_mana']
+    card._snow_mana_spent = 0
 
     # Pay mana cost — use color-aware tapping when mana engine is available
     if pay_mana and (effective_mana_cost or additional_cost > 0):
@@ -1384,6 +1394,11 @@ def _pay_costs(engine, game: GameState, player: Player, card: Card,
             return False, f"Not enough mana to cast {cast_name} (needs {effective_cmc}{tax_note} = {total_cost} total)", []
         # Track mana paid for X spell calculations
         card._mana_paid = total_cost
+        card._snow_mana_spent = int(
+            (getattr(player, '_last_payment', {}) or {}).get('snow_spent', 0)
+            or 0)
+        if card._snow_mana_spent:
+            print(f"[SNOW-SPEND] {card.name}: {card._snow_mana_spent} snow mana")
         # Converge (CR 702.100a): hand the colors the engine actually
         # committed to the spell, for its template to count.
         card._colors_spent = tuple(getattr(player, '_last_colors_spent', ()) or ())
@@ -2577,7 +2592,11 @@ async def _dispatch_resolution(engine, game: GameState, player: Player,
         # Goes to graveyard after resolving (or command zone for signature spells,
         # or exile for rebound spells with upkeep re-cast trigger)
         oracle_lower = (card.oracle_text or '').lower()
-        if getattr(card, 'is_signature_spell', False) and game.format == "oathbreaker":
+        if getattr(card, '_is_spell_copy', False):
+            effect_messages.append(
+                f"💨 The copy of {card.name} ceases to exist after resolving")
+            print(f"[SPELL-COPY] {card.name} resolved — copy ceases to exist")
+        elif getattr(card, 'is_signature_spell', False) and game.format == "oathbreaker":
             player.command_zone.append(card)
             effect_messages.append(f"📜 {card.name} returns to command zone (signature spell)")
             print(f"[OATHBREAKER] {card.name} resolved → returns to command zone")
@@ -2647,6 +2666,12 @@ async def _dispatch_resolution(engine, game: GameState, player: Player,
         # Only creatures get summoning sickness (planeswalkers, artifacts, enchantments don't)
         card.summoning_sick = True if card.is_creature() else False
         card.entered_this_turn = True
+        if getattr(card, '_is_spell_copy', False):
+            # A copy of a permanent spell becomes a token as it resolves
+            # rather than becoming a card on the battlefield (CR 707.10f).
+            card.is_token = True
+            effect_messages.append(
+                f"🪄 The copy of {card.name} resolves as a token")
         player.battlefield.append(card)
         engine.rules.log_event(f"{player.name} casts {card.name} (permanent)")
         # (Pub/sub slice 2: the PERMANENT_ENTERED emit for the cast path
@@ -3861,7 +3886,11 @@ async def _resolve_spliced_effects(engine, game: GameState, player: Player,
     return messages
 
 
-async def cast_spell_async(engine, game: GameState, player: Player, card: Card, pay_mana: bool = True, target: Any = None, additional_cost: int = 0) -> Tuple[bool, str, List[str]]:
+async def cast_spell_async(engine, game: GameState, player: Player, card: Card,
+                           pay_mana: bool = True, target: Any = None,
+                           additional_cost: int = 0, *,
+                           from_exile: bool = False
+                           ) -> Tuple[bool, str, List[str]]:
     """Cast a spell with full effect resolution (async version).
 
     Args:
@@ -3896,6 +3925,8 @@ async def cast_spell_async(engine, game: GameState, player: Player, card: Card, 
         card._cast_origin = 'command_zone'
     elif _cast_from_graveyard:
         card._cast_origin = 'graveyard'
+    elif from_exile:
+        card._cast_origin = 'exile'
     else:
         card._cast_origin = 'hand'
 
@@ -3917,6 +3948,11 @@ async def cast_spell_async(engine, game: GameState, player: Player, card: Card, 
               f"(leaves graveyard{'; exiled on resolve: ' + _why if _why else ''})")
     else:
         player.hand.remove(card)
+
+    # This is the point at which the spell has actually been cast: all gates
+    # and costs succeeded, and a later counter still counts as "you cast it."
+    engine.consume_conditional_exile_cast(
+        game, player, card, from_exile=from_exile)
 
     # Track spells cast this turn (for day/night, werewolf transform, Esper Sentinel)
     player.spells_cast_this_turn += 1
@@ -3970,6 +4006,11 @@ async def cast_spell_async(engine, game: GameState, player: Player, card: Card, 
     _success, _message, _effects = await _dispatch_resolution(
         engine, game, player, card, target, effect_messages,
         cast_trigger_msgs, player_idx)
+    # ETB templates are synchronous. If one queued a spell/card copy (most
+    # notably Capricious Hellraiser), cast it now, after the ETB ability has
+    # finished resolving and before control returns to the turn loop.
+    if getattr(game, '_free_cast_pending', None):
+        _effects = list(_effects) + await resolve_pending_free_casts(engine, game)
 
     # Spliced text resolves as part of the spell (CR 702.46), so it belongs
     # AFTER resolution and nowhere else. This one site covers every path
@@ -4164,6 +4205,95 @@ def _miracle_would_wipe_own_board(game, player, card) -> bool:
                         if c.is_creature(game=game))
     own_creatures = sum(1 for c in player.battlefield if c.is_creature(game=game))
     return opp_creatures == 0 and own_creatures > 0
+
+
+async def resolve_pending_free_casts(engine, game: GameState) -> List[str]:
+    """Cast cards/copies granted by resolving effects through the real stack.
+
+    Synchronous templates enqueue descriptors; this async drain supplies the
+    permission/timing marker, preserves normal targeting and response windows,
+    and applies the printed fallback when the optional cast is declined.
+    """
+    messages: List[str] = []
+    pending = list(getattr(game, '_free_cast_pending', None) or [])
+    if not pending:
+        return messages
+    game._free_cast_pending = []
+
+    def _remove_from_all_zones(player, card):
+        for zone in (player.hand, player.graveyard, player.exile,
+                     player.library, player.battlefield):
+            while card in zone:
+                zone.remove(card)
+
+    for entry in pending:
+        owner_idx = int(entry.get("owner_index", -1))
+        if not (0 <= owner_idx < len(game.players)):
+            continue
+        player = game.players[owner_idx]
+        card = entry.get("card")
+        if card is None or getattr(game, 'ended', False):
+            continue
+        source = entry.get("source", "resolving effect")
+        from_zone = entry.get("from_zone", "generated")
+        is_copy = bool(entry.get("is_copy"))
+        if from_zone != "generated":
+            zone = {
+                "library": player.library, "graveyard": player.graveyard,
+                "exile": player.exile, "hand": player.hand,
+            }.get(from_zone)
+            if zone is None or card not in zone:
+                print(f"[FREE-CAST] Stale {source} entry for {card.name}")
+                continue
+            zone.remove(card)
+        if card not in player.hand:
+            player.hand.append(card)
+
+        card._cast_via_effect = True
+        card._free_cast_source = source
+        if 'X' in (getattr(card, 'mana_cost', '') or '').upper():
+            card._x_value = 0
+        try:
+            success, cast_msg, effect_msgs = await engine.cast_spell_async(
+                game, player, card, pay_mana=False)
+        except Exception as exc:
+            print(f"[FREE-CAST] {source} cast raised for {card.name}: {exc}")
+            from mtg.util import maybe_reraise
+            maybe_reraise(exc)
+            success, cast_msg, effect_msgs = False, str(exc), []
+        finally:
+            card._cast_via_effect = False
+            card._free_cast_source = ""
+
+        if success:
+            print(f"[FREE-CAST] {source}: {player.name} cast {card.name}")
+            messages.append(
+                f"✨ **{player.name}** casts **{card.name}** without paying "
+                f"its mana cost via **{source}**")
+            messages.extend(effect_msgs or [])
+            # A countered or resolved nonpermanent spell copy is never a card
+            # in a graveyard/exile/hand. A resolved permanent copy is a token
+            # on the battlefield and must remain there.
+            if is_copy and card not in player.battlefield:
+                _remove_from_all_zones(player, card)
+            continue
+
+        if is_copy:
+            _remove_from_all_zones(player, card)
+            print(f"[FREE-CAST] {source}: copy of {card.name} not cast "
+                  f"({cast_msg}) — ceases to exist")
+            messages.append(
+                f"📍 **{source}**: the copy of **{card.name}** is not cast "
+                "and ceases to exist")
+        else:
+            _remove_from_all_zones(player, card)
+            player.hand.append(card)
+            print(f"[FREE-CAST] {source}: {card.name} not cast ({cast_msg}) "
+                  "— put into hand")
+            messages.append(
+                f"📥 **{source}** puts **{card.name}** into "
+                f"{player.name}'s hand")
+    return messages
 
 
 async def resolve_pending_miracles(engine, game: GameState) -> List[str]:

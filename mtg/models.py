@@ -553,6 +553,9 @@ class Card:
     # Cast/linked-effect bookkeeping used while the card is on the stack or
     # exiled by a specific source.
     _cast_origin: str = field(default="", repr=False, compare=False)
+    # Chosen X for the current cast. None means no caller-selected value;
+    # the cast pipeline stamps the paid/defaulted value before resolution.
+    _x_value: Optional[int] = field(default=None, repr=False, compare=False)
     # Command-zone cards are temporarily moved to hand before the shared cast
     # pipeline runs. Preserve the real origin through that move. Executors
     # clear this per-cast stamp after success or failure.
@@ -656,11 +659,20 @@ class Card:
     # pipeline reads _cast_via_miracle exactly as it reads _cast_via_madness.
     _miracle_cost: str = field(default="", repr=False, compare=False)
     _cast_via_miracle: bool = field(default=False, repr=False, compare=False)
+    # A resolving effect grants permission to cast this object now and
+    # without paying its mana cost. Ordinary timing/mana checks are waived,
+    # but restrictions such as Teferi, Time Raveler still apply.
+    _cast_via_effect: bool = field(default=False, repr=False, compare=False)
+    _free_cast_source: str = field(default="", repr=False, compare=False)
+    # Copies of spells are stack objects but are not cards. Instant/sorcery
+    # copies cease after resolution; permanent-spell copies resolve as tokens.
+    _is_spell_copy: bool = field(default=False, repr=False, compare=False)
     # Converge (CR 702.100a): the distinct COLORS of mana actually spent
     # casting this spell, recorded by the mana engine at payment time. The
     # engine already resolves each tapped source to one committed color, so
     # this is that set — not the colors the cost merely asked for.
     _colors_spent: tuple = field(default=(), repr=False, compare=False)
+    _snow_mana_spent: int = field(default=0, repr=False, compare=False)
     _declared_graveyard_target_id: Optional[str] = field(default=None, repr=False, compare=False)
     _declared_graveyard_target_owner: str = field(default="", repr=False, compare=False)
     _imprinted_card_id: Optional[str] = field(default=None, repr=False, compare=False)
@@ -675,6 +687,8 @@ class Card:
     # when the permanent changes zones (CR 707.8); the other fields describe
     # the battlefield-only copy state.
     _pre_copy_snapshot: Any = field(default=None, repr=False, compare=False)
+    _manifest_original: Any = field(default=None, repr=False, compare=False)
+    _manifested: bool = field(default=False, repr=False, compare=False)
     _is_copy: bool = field(default=False, repr=False, compare=False)
     _copy_of: Optional[str] = field(default=None, repr=False, compare=False)
     _original_name: str = field(default="", repr=False, compare=False)
@@ -1966,6 +1980,9 @@ class Player:
     # tap_sources_for_cost. Read once by the cost stage and stamped onto the
     # spell as Card._colors_spent.
     _last_colors_spent: tuple = field(default=(), repr=False, compare=False)
+    _last_payment: dict = field(
+        default_factory=lambda: {'snow_spent': 0},
+        repr=False, compare=False)
 
     # ---- Transient runtime state (reset/derived during play; NOT serialized) ----
     # Same convention as Card: declare runtime flags, don't staple
@@ -1989,6 +2006,9 @@ class Player:
     # log. Tap paths buffer a display line here; cast_spell_async drains
     # them into effect_messages after payment.
     _pending_tap_damage_msgs: list = field(default_factory=list, repr=False, compare=False)
+    # Kessig Naturalist-class mana persists through this numbered turn.
+    _retain_mana_through_turn: Optional[int] = field(
+        default=None, repr=False, compare=False)
 
     # Cards exiled but playable this turn (Chandra 0, Outpost Siege, etc.)
     # List of card IDs that can be played from exile until end of turn
@@ -2900,6 +2920,10 @@ class Player:
 
         Returns True if payment succeeded, False if not enough mana.
         """
+        # Per-payment provenance consumed by cards such as Blood on the Snow.
+        # Floating pool mana currently has no snow tag, so it deliberately
+        # contributes zero rather than fabricating provenance.
+        self._last_payment = {'snow_spent': 0}
         if not mana_cost_str and additional_generic <= 0 and x_value <= 0:
             return True  # Free spell
 
@@ -3331,6 +3355,7 @@ class Player:
         # the pool; only true EXCESS (e.g. Sol Ring's second mana covering a
         # 1-generic remainder) floats, and Phase-0 pool spending is applied.
         produced_by_color = {}
+        produced_by_source = []
         for card, production in sources:
             if id(card) in tapped_cards:
                 card.tapped = True
@@ -3361,6 +3386,10 @@ class Player:
                 for pc, pv in production.items():
                     _key = 'C' if pc == 'any' else pc
                     produced_by_color[_key] = produced_by_color.get(_key, 0) + pv
+                produced_by_source.append((card, {
+                    ('C' if pc == 'any' else pc): pv
+                    for pc, pv in production.items() if pv > 0
+                }))
                 # July 30: Mirari's Wake-class tap bonus — direct pool add
                 # (never enters produced_by_color, so the cost settle below
                 # can't consume it; it is pure floating excess).
@@ -3392,6 +3421,30 @@ class Player:
             if _restricted_needed > 0:
                 self._spend_restricted_mana(
                     _k, _restricted_needed, spending_card=spending_card)
+
+        # Attribute the settled (non-excess) units back to their tapped
+        # sources. Within one color, stable source order is the engine's
+        # deterministic payment choice. This counts mana actually consumed,
+        # not every unit a multi-mana snow source happened to produce.
+        try:
+            from rules.mana import SNOW_LANDS as _SNOW_LANDS
+        except ImportError:
+            _SNOW_LANDS = set()
+        _consumed_by_color = {
+            color: max(0, amount - _excess.get(color, 0))
+            for color, amount in produced_by_color.items()
+        }
+        _snow_spent = 0
+        for source, production in produced_by_source:
+            _is_snow = ((source.name and source.name in _SNOW_LANDS)
+                        or 'snow' in (source.type_line or '').lower())
+            for color, amount in production.items():
+                take = min(amount, _consumed_by_color.get(color, 0))
+                if take > 0:
+                    _consumed_by_color[color] -= take
+                    if _is_snow:
+                        _snow_spent += take
+        self._last_payment = {'snow_spent': _snow_spent}
 
         # Apply Phyrexian life payment
         if phyrexian_life_cost > 0:
@@ -4043,6 +4096,11 @@ class GameState:
     # (Phyrexian Tower dies-triggers, gain-life triggers) — flushed by the
     # next display pass.
     _pending_messages: list = field(default_factory=list, repr=False, compare=False)
+    # A wheel discards several cards as one event. These stamps let discard
+    # triggers deduplicate that wave without stapling invisible game state.
+    _discard_event_serial: int = field(default=0, repr=False, compare=False)
+    _active_discard_event_id: Optional[int] = field(
+        default=None, repr=False, compare=False)
     # Re-entrancy guard for "whenever you gain life" trigger resolution
     # (June 10, V26).
     _in_gain_life_triggers: bool = field(default=False, repr=False, compare=False)
@@ -4097,6 +4155,11 @@ class GameState:
     # (card, owner_index) here and spells.resolve_pending_miracles makes the
     # cast-or-keep call at the next async drain.
     _miracle_pending: list = field(default_factory=list, repr=False, compare=False)
+    # Effect-granted casts (Rashmi, Capricious Hellraiser). Their producers
+    # are synchronous template/action paths, while casting must traverse the
+    # async stack pipeline, so descriptors wait here for an async choke point.
+    _free_cast_pending: list = field(
+        default_factory=list, repr=False, compare=False)
     # Dredge (CR 702.52) replaces at most ONE draw per turn PER PLAYER — see
     # helpers.try_dredge for why. Seat indices; reset with the per-turn
     # counters.
@@ -4231,6 +4294,10 @@ class GameState:
     # same turn it opened. end_turn expires only the ENDING player's
     # previous-turn entries.
     _impulse_cast_turns: dict = field(default_factory=dict, repr=False, compare=False)
+    # Card-id keyed "cast this exact exile object or take damage" windows
+    # (Chandra, Torch of Defiance). Unlike ordinary impulse permissions this
+    # state is persisted and never grants a land play.
+    conditional_exile_casts: dict = field(default_factory=dict)
     # July 29 batch audit: True once a final=True game-summary send has gone
     # out. The post-game flush gate in cog._autoplay_send suppresses only
     # AFTER this — the ended→summary window carries the lethal combat's own
@@ -5176,6 +5243,7 @@ class GameState:
             "last_unresolved_effect": self.last_unresolved_effect,
             "pending_resolves": self.pending_resolves,
             "temporary_cost_increases": self._temporary_cost_increases,
+            "conditional_exile_casts": self.conditional_exile_casts,
         }
 
     def visible_state(self, viewer_index: int) -> Dict:
@@ -5263,6 +5331,7 @@ class GameState:
             pending_resolves=data.get("pending_resolves", []),
             _temporary_cost_increases=data.get(
                 "temporary_cost_increases", []),
+            conditional_exile_casts=data.get("conditional_exile_casts", {}),
         )
         # [LAYERS] Rebuild continuous effects from current battlefield state
         game.rebuild_layers_from_battlefield()

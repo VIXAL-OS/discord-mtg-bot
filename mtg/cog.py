@@ -48,7 +48,7 @@ from mtg.engine import GameEngine
 from mtg.helpers import (_normalize_pw_ability_idx,
                          _resolve_player_or_card_target,
                          exile_after_resolution_reason,
-                         library_top_cast_types)
+                         is_castable_from_exile, library_top_cast_types)
 from mtg.models import Card, Player, GameState, FormatValidator
 from mtg.rules_engine import RulesEngine
 from mtg.util import GameLogger, StdoutTee, StderrTee
@@ -1374,9 +1374,8 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
         # If not in hand, check if it's playable from exile (Chandra 0, etc.)
         if not card:
             exile_card = player.find_card(actual_card_name, Zone.EXILE)
-            if exile_card and (exile_card.id in player.playable_from_exile
-                               or getattr(exile_card, '_adventure_exiled', False)
-                               or getattr(exile_card, '_foretold', False)):
+            if exile_card and is_castable_from_exile(
+                    game, player, exile_card):
                 # Aug 3: the human path is the THIRD executor and got none of
                 # the wave-3a mechanics — the documented two-paths divergence.
                 if (getattr(exile_card, '_foretold', False)
@@ -1545,7 +1544,8 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
                 if from_exile and card in player.hand:
                     player.hand.remove(card)
                     player.exile.append(card)
-                    player.playable_from_exile.append(card.id)
+                    if card.id not in game.conditional_exile_casts:
+                        player.playable_from_exile.append(card.id)
                 await ctx.send(f"⚠️ {msg}")
                 return
         else:
@@ -1601,7 +1601,7 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
             card._cast_from_command_zone = from_command_zone
             success, msg, effect_msgs = await self.engine.cast_spell_async(
                 game, player, card, target=target,
-                additional_cost=commander_tax
+                additional_cost=commander_tax, from_exile=from_exile
             )
             card._cast_from_command_zone = False
             if success:
@@ -1663,7 +1663,8 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
                 if from_exile and card in player.hand:
                     player.hand.remove(card)
                     player.exile.append(card)
-                    player.playable_from_exile.append(card.id)
+                    if card.id not in game.conditional_exile_casts:
+                        player.playable_from_exile.append(card.id)
                 # If failed and was from command zone, move back
                 if from_command_zone and card in player.hand:
                     player.hand.remove(card)
@@ -2142,6 +2143,14 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
             return
         
         ability = abilities[ability_idx]
+
+        from mtg.helpers import activated_ability_restriction_failure
+        restriction_failure = activated_ability_restriction_failure(
+            game, player, ability.get('effect', ''))
+        if restriction_failure:
+            await ctx.send(
+                f"Cannot activate **{card.name}**: {restriction_failure}.")
+            return
         
         # Check if card needs to tap and is already tapped
         if ability['needs_tap'] and card.tapped:

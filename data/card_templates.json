@@ -356,18 +356,6 @@
       ]
     },
     {
-      "key": "blood on the snow",
-      "name": "Blood on the Snow",
-      "event": "etb",
-      "description": "Destroy creatures/planeswalkers with MV â‰¤ X; snow kicker: reanimate one with MV â‰¤ X",
-      "actions": [
-        {
-          "action": "no_action",
-          "reason": "Blood on the Snow: destroy-by-mana-value action not supported by engine (X-cost wipe + snow reanimate kicker)"
-        }
-      ]
-    },
-    {
       "key": "bogardan hellkite",
       "name": "Bogardan Hellkite",
       "event": "etb",
@@ -1396,19 +1384,24 @@
       "description": "Sacrifice, search for basic Plains/Island/Swamp tapped, gain 1 life",
       "actions": [
         {
-          "action": "destroy",
-          "card": "Obscura Storefront"
-        },
-        {
-          "action": "search_library_land",
           "player": "$controller",
-          "basic_only": true,
-          "enters_tapped": true
-        },
-        {
-          "action": "gain_life",
-          "player": "$controller",
-          "amount": 1
+          "action": "sacrifice_permanent",
+          "preferred_card": "Obscura Storefront",
+          "only_preferred": true,
+          "then_actions": [
+            {
+              "action": "search_library_land",
+              "player": "$controller",
+              "basic_only": true,
+              "land_types": ["Plains", "Island", "Swamp"],
+              "enters_tapped": true
+            },
+            {
+              "action": "gain_life",
+              "player": "$controller",
+              "amount": 1
+            }
+          ]
         }
       ]
     },
@@ -1882,7 +1875,8 @@
       "actions": [
         {
           "action": "grant_flashback",
-          "player": "$controller"
+          "player": "$controller",
+          "silent_on_no_result": true
         }
       ]
     },

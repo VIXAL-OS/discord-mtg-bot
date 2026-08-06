@@ -246,7 +246,7 @@ def _log_life_change(player, delta: int, source: str) -> None:
 
 
 async def drain_pending_triggers(engine, game: GameState) -> List[str]:
-    """Drain the pending async trigger queue by calling Tier 3 resolve_effect.
+    """Drain the pending async trigger queue, deterministic templates first.
 
     Should be called from every async caller of advance_phase / end_turn /
     cast_spell_async-equivalent paths, ideally immediately after the sync
@@ -257,6 +257,11 @@ async def drain_pending_triggers(engine, game: GameState) -> List[str]:
     queue as it processes.
     """
     messages: List[str] = []
+    # Effect-granted casts share the same sync→async bridge as madness and
+    # miracle. Hellraiser ETBs can arrive here from a synchronous trigger path.
+    if getattr(game, '_free_cast_pending', None):
+        from mtg.spells import resolve_pending_free_casts
+        messages.extend(await resolve_pending_free_casts(engine, game))
     # Madness first (Aug 1, 2026): discards redirected to exile by the sync
     # choke point (helpers.madness_discard_to_exile) resolve their
     # cast-or-graveyard choice at the first async opportunity — this drain
@@ -293,6 +298,149 @@ async def drain_pending_triggers(engine, game: GameState) -> List[str]:
         if getattr(game, 'ended', False):
             print(f"[DRAIN-{trigger_type.upper()}] Game ended mid-drain; skipping remaining triggers")
             break
+
+        # Aug 5 confirmation-batch audit: sync trigger producers (free casts,
+        # suspend, beginning-combat/attack tails, and several dies paths) all
+        # converge here. The drain used to jump straight to Tier 3, bypassing
+        # the deterministic library already used by ordinary async paths.
+        template_handled = False
+        if HAS_EFFECT_TEMPLATES:
+            try:
+                # A source still on the battlefield is authoritative for its
+                # controller. controller_name is only a fallback: one older
+                # cast-trigger producer records the caster there, which can be
+                # the wrong player for an opponent-controlled watcher.
+                controller = next(
+                    (p for p in game.players if src in p.battlefield), None)
+                if controller is None:
+                    controller = next(
+                        (p for p in game.players
+                         if p.name.lower() == controller_name.lower()), None)
+                if controller is None:
+                    controller = next(
+                        (p for p in game.players
+                         if any(src in zone for zone in
+                                (p.graveyard, p.exile, p.command_zone))), None)
+                opponent = next(
+                    (p for p in game.players if p is not controller), None)
+
+                if controller is not None and opponent is not None:
+                    dying = (src if trigger_type == "dies"
+                             and src not in controller.battlefield else None)
+                    template_ctx = build_game_context(
+                        game, controller, opponent, card=src,
+                        dying_creature=dying)
+                    template_ctx['_event_type'] = trigger_type
+                    template_ctx['_trigger_text'] = trigger_text
+                    template_ctx['_trigger_context'] = ctx
+
+                    # Recover the triggering spell from the structured log
+                    # context so MV-sensitive templates retain their condition.
+                    if trigger_type == "cast_trigger" and ctx:
+                        cast_match = re.search(
+                            r'\bcast (.+?)(?: \(via .+\)| \(via|$)', ctx)
+                        cast_name = (
+                            cast_match.group(1).strip() if cast_match else '')
+                        if cast_name:
+                            cast_card = next((
+                                c for p in game.players
+                                for zone in (p.battlefield, p.graveyard,
+                                             p.exile, p.hand)
+                                for c in zone
+                                if c.name.lower() == cast_name.lower()
+                            ), None)
+                            if cast_card is not None:
+                                template_ctx['cast_spell_mv'] = int(
+                                    getattr(cast_card, 'cmc', 0) or 0)
+                                template_ctx['_cast_spell'] = cast_card
+
+                    lib = get_effect_library()
+                    if trigger_type == "attack":
+                        attack_match = re.match(
+                            r'(.+?) was declared as an attacker', ctx or '')
+                        attacking_name = (
+                            attack_match.group(1).strip()
+                            if attack_match else src.name)
+                        attacking_card = next((
+                            c for p in game.players for c in p.battlefield
+                            if c.name.lower() == attacking_name.lower()
+                        ), src)
+                        try:
+                            attacking_power = (
+                                attacking_card.get_effective_power(game))
+                        except (AttributeError, TypeError, ValueError):
+                            attacking_power = int(
+                                getattr(attacking_card, 'power', 0) or 0)
+                        actions, explanation = lib.resolve_attack_trigger(
+                            trigger_card_name=src.name,
+                            trigger_oracle=trigger_text,
+                            attacking_creature_name=attacking_name,
+                            attacking_creature_power=attacking_power,
+                            controller=controller.name,
+                            opponent=opponent.name,
+                            game_context=template_ctx,
+                        )
+                    elif trigger_type == "upkeep":
+                        actions, explanation = lib.resolve_upkeep_trigger(
+                            trigger_card_name=src.name,
+                            trigger_oracle=trigger_text,
+                            controller=controller.name,
+                            opponent=opponent.name,
+                            game_context=template_ctx,
+                        )
+                    else:
+                        event_type = {
+                            "beginning_combat": "beginning_combat",
+                            "cast_trigger": "cast_trigger",
+                            "dies": "dies",
+                            "end_step": "end_step",
+                            "main_phase": "main_phase",
+                        }.get(trigger_type, trigger_type)
+                        actions, explanation = lib.resolve_etb(
+                            card_name=src.name,
+                            oracle_text=trigger_text,
+                            controller=controller.name,
+                            opponent=opponent.name,
+                            game_context=template_ctx,
+                            event_type=event_type,
+                        )
+
+                    if actions is not None:
+                        template_handled = True
+                        executed = 0
+                        for action in actions:
+                            if action.get('action') == 'no_action':
+                                continue
+                            action.setdefault('_source_card_name', src.name)
+                            action.setdefault(
+                                '_source_controller', controller.name)
+                            out = engine.rules._execute_action_on_state(
+                                game, action)
+                            executed += 1
+                            if out:
+                                messages.append(f"**{src.name}**: {out}")
+                        if getattr(game, '_free_cast_pending', None):
+                            from mtg.spells import resolve_pending_free_casts
+                            messages.extend(
+                                await resolve_pending_free_casts(engine, game))
+                        print(
+                            f"[DRAIN-{trigger_type.upper()}-TEMPLATE] "
+                            f"{src.name}: handled {executed} action(s) "
+                            f"({explanation})")
+                        sba_msgs = engine.rules.process_state_based_actions(
+                            game)
+                        if sba_msgs:
+                            messages.extend(sba_msgs)
+            except (AttributeError, KeyError, TypeError, ValueError
+                    ) as template_error:
+                print(
+                    f"[DRAIN-{trigger_type.upper()}-TEMPLATE] "
+                    f"{src.name}: error: {template_error}")
+                maybe_reraise(template_error)
+
+        if template_handled:
+            continue
+
         if not engine.rules.client:
             # No Claude client — fall back to the old hint form so the human
             # at least sees what triggered.
@@ -1616,29 +1764,16 @@ async def _check_cast_triggers(engine, game: GameState, caster: Player, card: Ca
                 # goes on the stack above the cast spell, the CASTER gets
                 # priority and can respond (e.g., Stifle the trigger, Voidslime,
                 # Trickbind, Disallow). Previously the engine resolved the
-                # trigger inline without offering this window. Now: scan
-                # caster's hand for trigger-countering instants; if any exist
-                # and the priority infrastructure is available, open a window.
-                # Otherwise fall through to inline resolution (the common case
-                # — autoplay decks rarely include Stifle-shaped cards).
+                # trigger inline without offering this window. Every player
+                # must now pass priority on the real StackEntry; hand-content
+                # heuristics cannot know whether the opponent has Disallow,
+                # Tale's End, Stifle, or another legal response.
                 if trigger_entry is not None and getattr(game, 'stack_enabled', False):
-                    _caster_has_stifle = False
-                    try:
-                        for _hc in caster.hand:
-                            if not _hc.oracle_text:
-                                continue
-                            _o = _hc.oracle_text.lower()
-                            if ('counter target triggered ability' in _o
-                                    or 'counter target activated or triggered ability' in _o):
-                                _caster_has_stifle = True
-                                break
-                    except Exception:
-                        pass
-                    if _caster_has_stifle:
+                    if getattr(game, '_stack_send_func', None):
                         send_fn = getattr(game, '_stack_send_func', None)
                         if send_fn:
-                            print(f"[CAST-TRIGGER-PRIORITY] {caster.name} has Stifle-shaped "
-                                  f"card in hand — opening priority window for "
+                            print(f"[CAST-TRIGGER-PRIORITY] opening priority "
+                                  f"window for all players over "
                                   f"{bf_card.name}'s trigger from cast of {card.name}")
                             # July 29 batch audit: expose the open window to
                             # the buried spell's LIFO wait loop (mtg/spells.py)
@@ -1819,7 +1954,7 @@ async def _check_cast_triggers(engine, game: GameState, caster: Player, card: Ca
                         # here and flagging it) keeps the whole trigger in one
                         # place and cannot double-draw.
                         _residual = (
-                            'put a land', 'you may put', 'create', 'gain ', 'lose ',
+                            'put a land', 'you may put', 'create', 'lose ',
                             'exile', 'destroy', 'return', 'search', 'scry',
                             'surveil', 'counter target', 'sacrifice',
                         )
@@ -1995,6 +2130,11 @@ async def _check_cast_triggers(engine, game: GameState, caster: Player, card: Ca
                                 and getattr(se, 'trigger_text', None) == trigger_text):
                             del game.stack[i]
                             break
+                if getattr(game, '_free_cast_pending', None):
+                    from mtg.spells import resolve_pending_free_casts
+                    messages.extend(
+                        await resolve_pending_free_casts(engine, game))
+
                 break
 
     # === PROWESS (keyword trigger: whenever you cast a noncreature spell, +1/+1 until EOT) ===
@@ -3036,8 +3176,12 @@ def _check_dies_triggers_sync(engine, game: GameState, dying_card: Card, dying_p
     if hasattr(game, '_death_watchers'):
         for watcher in list(game._death_watchers):
             if watcher.get('turn_registered') == game.turn_number:
+                watch_id = watcher.get('watch_target_id', '')
                 watch_target = watcher.get('watch_target', '').lower()
-                if dying_card.name.lower() == watch_target or watch_target in dying_card.name.lower():
+                name_matches = bool(watch_target) and (
+                    dying_card.name.lower() == watch_target
+                    or watch_target in dying_card.name.lower())
+                if (watch_id and dying_card.id == watch_id) or (not watch_id and name_matches):
                     source = watcher.get('source', 'Unknown')
                     print(f"[DEATH-WATCHER] {source}: watched creature {dying_card.name} died!")
                     for action in watcher.get('on_death_actions', []):
@@ -3852,6 +3996,60 @@ def _check_upkeep_triggers_sync(engine, game: GameState) -> Tuple[List[str], Lis
 
         # ---- HARDCODED HANDLERS ----
 
+        # Tovolar, Dire Overlord: if its controller has three Wolves and/or
+        # Werewolves at upkeep, it becomes night, transforms every Daybound
+        # permanent globally, then may transform any number of Human
+        # Werewolves they control. Autoplay takes the all-transform option.
+        if card.name.lower() == "tovolar, dire overlord":
+            source_name = card.name
+            wolves = [
+                perm for perm in active.battlefield
+                if perm.is_creature(game)
+                and 'wolf' in (getattr(perm, 'type_line', '') or '').lower()
+            ]
+            transformed_ids = set()
+            if len(wolves) >= 3:
+                game.day_night_active = True
+                game.is_day = False
+                for transform_player in game.players:
+                    for perm in list(transform_player.battlefield):
+                        front = (getattr(perm, 'oracle_text', '') or '').lower()
+                        back = (getattr(perm, 'back_face_oracle_text', '')
+                                or '').lower()
+                        if (getattr(perm, 'has_transform', False)
+                                and not getattr(perm, 'is_transformed', False)
+                                and ('daybound' in front or 'daybound' in back
+                                     or 'nightbound' in front
+                                     or 'nightbound' in back)):
+                            old_name = perm.name
+                            if perm.transform():
+                                transformed_ids.add(perm.id)
+                                messages.append(
+                                    f"{old_name} transforms into {perm.name} "
+                                    f"(Tovolar made it night)")
+                for perm in list(active.battlefield):
+                    type_line = (
+                        getattr(perm, 'type_line', '') or '').lower()
+                    if (getattr(perm, 'has_transform', False)
+                            and perm.id not in transformed_ids
+                            and not getattr(perm, 'is_transformed', False)
+                            and 'human' in type_line
+                            and 'werewolf' in type_line):
+                        old_name = perm.name
+                        if perm.transform():
+                            transformed_ids.add(perm.id)
+                            messages.append(
+                                f"{old_name} transforms into {perm.name} "
+                                f"({source_name})")
+                game.recalculate_granted_keywords()
+                game.recalculate_power_toughness()
+                print(f"[UPKEEP-TRIGGER] {source_name}: night; "
+                      f"transformed {len(transformed_ids)} permanent(s)")
+            else:
+                print(f"[UPKEEP-TRIGGER] {source_name}: {len(wolves)} "
+                      "Wolves/Werewolves; condition not met")
+            handled = True
+
         # Phyrexian Arena: draw + lose 1 life
         if card.name.lower() == "phyrexian arena":
             drawn = engine.draw_cards(active, 1, game=game)
@@ -4344,7 +4542,8 @@ def _check_end_step_triggers_sync(engine, game: GameState) -> Tuple[List[str], L
         # substring family. Require ONE sentence containing both the
         # end-step schedule and a SELF-sacrifice.
         _self_sac_re = re.compile(
-            r'sacrifice (?:it|this creature|this permanent|'
+            r'sacrifice (?:it|this (?:creature|permanent|enchantment|'
+            r'artifact|land|planeswalker|token)|'
             + re.escape(card.name.lower()) + r')\b')
         _self_sac_at_end_step = any(
             'end step' in _sent and _self_sac_re.search(_sent)
@@ -4425,14 +4624,16 @@ def _check_end_step_triggers_sync(engine, game: GameState) -> Tuple[List[str], L
 
     # Process sacrifices (Through the Breach / Sneak Attack cleanup)
     for card in cards_to_sacrifice:
-        if card in active.battlefield:
+        owner = next(
+            (p for p in game.players if card in p.battlefield), None)
+        if owner is not None:
             game.unregister_static_effects(card)
-            active.battlefield.remove(card)
+            owner.battlefield.remove(card)
             if card.is_commander and game.format in COMMAND_ZONE_FORMATS:
                 card.reset_battlefield_state()  # Clear damage/modifiers so recast starts clean
-                active.command_zone.append(card)
+                owner.command_zone.append(card)
             else:
-                active.graveyard.append(card)
+                owner.graveyard.append(card)
 
     return messages, unhandled
 
@@ -5536,6 +5737,9 @@ def fire_discard_triggers(game, player, discarded):
         oracle = getattr(perm, 'oracle_text', '') or ''
         for raw in oracle.split('\n'):
             line = re.sub(r'\([^)]*\)', '', raw).strip()
+            if re.match(r'^[+\-\u2212]?\d+\s*:', line):
+                continue
+
             match = _DISCARD_CLAUSE.search(line)
             if not match:
                 continue
@@ -5546,14 +5750,62 @@ def fire_discard_triggers(game, player, discarded):
             # state. madness_discard_to_exile owns that zone handoff and
             # resolves Containment Construct there; do not emit a false
             # unhandled marker before the card reaches its destination.
-            if ('may exile that card from your graveyard' in effect
-                    and 'may play that card this turn' in effect):
+            if (('may exile that card from your graveyard' in effect
+                 and 'may play that card this turn' in effect)
+                    or ('may exile one of them from your graveyard' in effect
+                        and 'may cast it this turn' in effect)):
                 continue
             # Anje's untap clause is handled at the madness choke point,
             # which knows whether the discarded card actually had madness.
             if 'untap' in effect and 'madness' in effect:
                 continue
             actions = []
+            # Surly Badgersaur's noncreature/nonland discard mode is a fight.
+            # It was the only direct discard-watcher shape in the confirmation
+            # batch that still fell through to an unhandled Tier-3 hint.
+            if 'fights up to one target creature' in effect:
+                target_owner = next(
+                    (p for p in game.players if p is not player
+                     and any(c.is_creature(game) for c in p.battlefield)),
+                    None)
+                target = None
+                if target_owner is not None:
+                    candidates = [
+                        c for c in target_owner.battlefield
+                        if c.is_creature(game)
+                    ]
+                    if candidates:
+                        target = max(
+                            candidates,
+                            key=lambda c: (
+                                c.get_effective_power(game)
+                                if hasattr(c, 'get_effective_power')
+                                else int(c.power or 0)))
+                if target is None:
+                    print(f"[DISCARD-TRIGGER] {perm.name}: no fight target")
+                    continue
+                try:
+                    source_power = perm.get_effective_power(game)
+                except (AttributeError, TypeError, ValueError):
+                    source_power = int(getattr(perm, 'power', 0) or 0)
+                try:
+                    target_power = target.get_effective_power(game)
+                except (AttributeError, TypeError, ValueError):
+                    target_power = int(getattr(target, 'power', 0) or 0)
+                actions.extend([
+                    {"action": "deal_damage", "amount": source_power,
+                     "target_card": target.name,
+                     "target_controller": target_owner.name,
+                     "source": perm.name,
+                     "_source_card_name": perm.name,
+                     "_source_controller": player.name},
+                    {"action": "deal_damage", "amount": target_power,
+                     "target_card": perm.name,
+                     "target_controller": player.name,
+                     "source": target.name,
+                     "_source_card_name": target.name,
+                     "_source_controller": target_owner.name},
+                ])
             if re.search(r'\+1/\+1 counter on', effect):
                 actions.append({"action": "add_counters", "card": perm.name,
                                 "counter_type": "+1/+1", "amount": 1})
@@ -5645,6 +5897,9 @@ def fire_draw_triggers(game, drawing_player, drawn_card=None):
                 oracle = getattr(perm, 'oracle_text', '') or ''
                 for raw in oracle.split('\n'):
                     line = re.sub(r'\([^)]*\)', '', raw).strip()
+                    if re.match(r'^[+\-\u2212]?\d+\s*:', line):
+                        continue
+
                     match = _DRAW_CLAUSE.search(line)
                     if not match:
                         continue

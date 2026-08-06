@@ -32,7 +32,8 @@ import asyncio, json, random, re
 from typing import Any, Dict, List, Optional, Tuple
 
 from mtg.constants import Phase, Zone, COMMAND_ZONE_FORMATS
-from mtg.helpers import _normalize_pw_ability_idx, library_top_cast_types
+from mtg.helpers import (_normalize_pw_ability_idx, is_castable_from_exile,
+                         library_top_cast_types)
 from mtg.models import Card, Player, GameState
 
 # June 10 audit (V31c): failure-indicator phrases for the "Action succeeded:"
@@ -252,9 +253,7 @@ def _validate_plan_mana(engine, game: GameState, player_idx: int, plan: list) ->
                     hand_names.add(_sname.lower())
                     _alt_zone_cards[_sname.lower()] = c
     for c in (getattr(player, 'exile', None) or []):
-        if (c.id in (getattr(player, 'playable_from_exile', None) or [])
-                or getattr(c, '_adventure_exiled', False)
-                or getattr(c, '_foretold', False)):
+        if is_castable_from_exile(game, player, c):
             hand_names.add(c.name.lower())
             _alt_zone_cards[c.name.lower()] = c
     # The TOP CARD of the library, when something grants casting from there

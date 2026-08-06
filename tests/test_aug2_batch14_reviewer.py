@@ -136,8 +136,13 @@ class TestSearingBloodHonorsDeclaredTargets:
         actions, _ = self._resolve(
             game, lib, make_card, own_creatures=["Monastery Swiftspear"],
             declared="Monastery Swiftspear")
-        face = [a for a in actions if a.get("target_player")]
-        assert face and face[0]["target_player"] == "Rick", (
+        # The contingent 3 damage is registered now and fires only if the
+        # exact creature actually dies this turn; it is not predicted and
+        # applied during spell resolution.
+        watchers = [a for a in actions
+                    if a.get("action") == "schedule_death_trigger"]
+        face = watchers[0]["on_death_actions"]
+        assert face[0]["target_player"] == "Rick", (
             "CR: 'the creature's controller' — targeting your own creature "
             "points the 3 damage at YOU")
 

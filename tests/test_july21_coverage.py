@@ -149,7 +149,7 @@ class TestStifleWindow:
         assert any("Drake" in c.name for c in rick.battlefield), \
             "uncountered trigger must still resolve after the window"
 
-    def test_no_window_without_stifle_shape(self, make_game, make_card, capsys):
+    def test_window_also_opens_without_caster_stifle_shape(self, make_game, make_card, capsys):
         from mtg.triggers import _check_cast_triggers
         engine = _engine()
         game, rick = self._game_with_talrand_and_stifle(make_game, make_card)
@@ -159,7 +159,9 @@ class TestStifleWindow:
 
         asyncio.run(_check_cast_triggers(engine, game, rick, spell))
 
-        assert "[CAST-TRIGGER-PRIORITY]" not in capsys.readouterr().out
+        assert "[CAST-TRIGGER-PRIORITY]" in capsys.readouterr().out, (
+            "every player gets priority; the caster's hand cannot prove the "
+            "opponent lacks Tale's End, Disallow, or another response")
 
 
 class TestStifleDeckRegistration:

@@ -52,9 +52,28 @@ from mtg.constants import Phase, Zone, COMMAND_ZONE_FORMATS, PHASE_NAMES
 from mtg.helpers import (_normalize_pw_ability_idx,
                          _resolve_player_or_card_target, coerce_ai_string,
                          exile_after_resolution_reason, library_top_cast_types,
-                         spell_face_for_gates)
+                         is_castable_from_exile, spell_face_for_gates)
 from mtg.models import Card, Player, GameState
 from mtg.util import GameLogger
+
+def _mark_active_turn_narration_sent(game: GameState) -> None:
+    """Consume the early-stack narration buffer after its summary is sent.
+
+    The stack announcement path may flush this same mutable list before a
+    response. Leaving the already-sent bullets attached lets a later response
+    spell flush them a second time.
+    """
+    narration = getattr(game, '_active_turn_narration', None)
+    if not isinstance(narration, dict):
+        return
+    if (narration.get('turn') != game.turn_number
+            or narration.get('player') != game.active_player.name):
+        return
+    live_actions = narration.get('actions')
+    if isinstance(live_actions, list):
+        live_actions.clear()
+    narration['flushed'] = True
+
 
 # June 11 audit: process-wide autoplay concurrency counters. Concurrent games
 # share one API adapter, so per-game stat deltas sweep up other games' tokens;
@@ -1502,6 +1521,10 @@ async def _autoplay_execute_action(cog, thread, game: GameState, player_idx: int
             return None
         target_name = action.get("target")
         adventure_name = action.get("adventure")
+        if not isinstance(adventure_name, str):
+            # Provider schema drift: a boolean ``adventure: true`` is not a
+            # half name. Treat it as absent instead of calling .lower() below.
+            adventure_name = None
         # Apr 30 audit: route mode='cycling' through the cycle action so the AI
         # pays the cycling cost (not the full hardcast cost) and gets the cycle
         # triggers (Shark Typhoon's X/X token).
@@ -1576,9 +1599,8 @@ async def _autoplay_execute_action(cog, thread, game: GameState, player_idx: int
         from_exile = False
         if not card:
             exile_card = player.find_card(card_name, Zone.EXILE)
-            if exile_card and (exile_card.id in player.playable_from_exile
-                               or getattr(exile_card, '_adventure_exiled', False)
-                               or getattr(exile_card, '_foretold', False)):
+            if exile_card and is_castable_from_exile(
+                    game, player, exile_card):
                 card = exile_card
                 from_exile = True
 
@@ -1857,9 +1879,12 @@ async def _autoplay_execute_action(cog, thread, game: GameState, player_idx: int
                     card._foretold = True
                     card._face_down = True
                     card._cast_via_foretell = False
-                elif card.id not in player.playable_from_exile:
+                elif (card.id not in game.conditional_exile_casts
+                      and card.id not in player.playable_from_exile):
                     player.playable_from_exile.append(card.id)
             card.cast_as_adventure = False
+            card.cast_as_split_half = -1
+            return None
 
         # Pass explicit X value from batch plan (Walking Ballista, Hangarback Walker, etc.)
         if action.get("X") is not None:
@@ -1881,7 +1906,7 @@ async def _autoplay_execute_action(cog, thread, game: GameState, player_idx: int
         card._cast_from_command_zone = from_command_zone
         success, msg, effect_msgs = await cog.engine.cast_spell_async(
             game, player, card, target=target,
-            additional_cost=commander_tax
+            additional_cost=commander_tax, from_exile=from_exile
         )
         card._cast_from_command_zone = False
         card._tutor_card = None
@@ -1963,7 +1988,7 @@ async def _autoplay_execute_action(cog, thread, game: GameState, player_idx: int
                     card._foretold = True
                     card._face_down = True
                     card._cast_via_foretell = False
-                else:
+                elif card.id not in game.conditional_exile_casts:
                     player.playable_from_exile.append(card.id)
             if from_command_zone and card in player.hand:
                 player.hand.remove(card)
@@ -3361,6 +3386,7 @@ async def _run_single_autoplay(cog, channel, game_format: str, deck1_name: str, 
                                 await cog._autoplay_send(thread, f"\u2022 {a[:1900]}")
                         else:
                             await cog._autoplay_send(thread, msg)
+                        _mark_active_turn_narration_sent(game)
                     elif not (
                             isinstance(getattr(game, '_active_turn_narration', None), dict)
                             and game._active_turn_narration.get('flushed')

@@ -728,7 +728,8 @@ def apply_combat_damage_to_player(rules, game: GameState, player: 'PlayerState',
     # could be ruled dead off 11+10 from two sub-lethal commanders. CR
     # 903.10a is "by the same commander"; key by the commander's name (two
     # commanders can never share one).
-    if is_combat and getattr(source_card, 'is_commander', False):
+    if (is_combat and getattr(source_card, 'is_commander', False)
+            and getattr(game, 'format', '').lower() in ('commander', 'edh')):
         _cd_key = source_card.name
         prior = player.commander_damage.get(_cd_key, 0)
         player.commander_damage[_cd_key] = prior + amount
@@ -990,6 +991,10 @@ def deal_combat_damage(rules, game: GameState, attackers: List[Tuple[Card, Playe
             print(f"[COMBAT-DAMAGE] Skipping {attacker.name} — no longer on battlefield (died in first-strike step)")
             continue
 
+        if getattr(attacker, '_phased_out', False):
+            print(f"[COMBAT-DAMAGE] Skipping {attacker.name} - phased out")
+            continue
+
         # Use get_effective_power which includes base, counters, modifiers,
         # equipment, CDA resolution, and anthem/continuous effects
         attacker_power = attacker.get_effective_power(game)
@@ -1005,9 +1010,25 @@ def deal_combat_damage(rules, game: GameState, attackers: List[Tuple[Card, Playe
             print(f"[COMBAT-DAMAGE] WARNING: game.blockers missing for {attacker.name} (id={attacker.id}) but card.blocked_by={attacker.blocked_by}")
             blocker_ids = attacker.blocked_by
 
+        # A phased-out or departed blocker deals/receives no damage, but the
+        # attacking creature remains blocked (CR 509.1h). Keep that historical
+        # fact separate from the active damage-assignment list.
+        was_blocked = bool(blocker_ids)
+        active_blocker_ids = []
+        for blocker_id in blocker_ids:
+            result = game.find_card_global(blocker_id)
+            if not result:
+                continue
+            blocker, _blocker_owner, zone = result
+            if zone != Zone.BATTLEFIELD or getattr(blocker, '_phased_out', False):
+                print(f"[COMBAT-DAMAGE] Skipping blocker {blocker.name} - inactive")
+                continue
+            active_blocker_ids.append(blocker_id)
+        blocker_ids = active_blocker_ids
+
         print(f"[COMBAT-DAMAGE] {attacker.name} (id={attacker.id}, power={attacker_power}): blocker_ids={blocker_ids}")
 
-        if not blocker_ids:
+        if not was_blocked:
             # Unblocked - damage to defending player (with replacement effect processing)
             if skip_attacker_damage:
                 # Regular step for FS-only board: unblocked FS attackers already dealt damage
@@ -1029,7 +1050,8 @@ def deal_combat_damage(rules, game: GameState, attackers: List[Tuple[Card, Playe
                 # only ([COMMANDER-DAMAGE]); players first learned of the 21
                 # rule from their own death message in 9/139 games. Surface the
                 # tally whenever a commander connects.
-                if getattr(attacker, 'is_commander', False):
+                if (getattr(attacker, 'is_commander', False)
+                        and getattr(game, 'format', '').lower() in ('commander', 'edh')):
                     _cd_total = defending_player.commander_damage.get(attacker.name)
                     if _cd_total:
                         messages.append(
@@ -1283,7 +1305,8 @@ def deal_combat_damage(rules, game: GameState, attackers: List[Tuple[Card, Playe
                     )
                     # June 11 audit: surface commander-damage tally (see the
                     # unblocked path above for rationale).
-                    if getattr(attacker, 'is_commander', False):
+                    if (getattr(attacker, 'is_commander', False)
+                            and getattr(game, 'format', '').lower() in ('commander', 'edh')):
                         _cd_total = defending_player.commander_damage.get(attacker.name)
                         if _cd_total:
                             messages.append(

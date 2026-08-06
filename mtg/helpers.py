@@ -900,22 +900,40 @@ def madness_discard_to_exile(game, player, card):
         # graveyard, so this shared zone-handoff is the first authoritative
         # point where the optional exile can resolve. Autoplay takes the
         # strictly-upside option and grants the existing impulse permission.
-        _construct = next((
-            perm for perm in player.battlefield
-            if ('whenever you discard a card' in
-                (getattr(perm, 'oracle_text', '') or '').lower()
-                and 'may exile that card from your graveyard' in
-                (getattr(perm, 'oracle_text', '') or '').lower()
-                and 'may play that card this turn' in
-                (getattr(perm, 'oracle_text', '') or '').lower())
-        ), None)
-        if _construct is not None:
+        impulse_source = None
+        for perm in player.battlefield:
+            oracle = (getattr(perm, 'oracle_text', '') or '').lower()
+            containment_shape = (
+                'whenever you discard a card' in oracle
+                and 'may exile that card from your graveyard' in oracle
+                and 'may play that card this turn' in oracle)
+            theorist_shape = (
+                'whenever you discard one or more nonland cards' in oracle
+                and 'may exile one of them from your graveyard' in oracle
+                and 'may cast it this turn' in oracle
+                and not card.is_land())
+            if containment_shape or theorist_shape:
+                # A wheel is one discard event even though the engine hands
+                # its cards through this choke point one at a time. When the
+                # caller supplies an event id, Conspiracy Theorist may exile
+                # only one of those cards (Containment Construct triggers per
+                # card and therefore deliberately has no such gate).
+                event_id = getattr(game, '_active_discard_event_id', None)
+                if (theorist_shape and event_id is not None
+                        and getattr(perm, '_last_impulse_discard_event', None)
+                        == event_id):
+                    continue
+                impulse_source = perm
+                if theorist_shape and event_id is not None:
+                    perm._last_impulse_discard_event = event_id
+                break
+        if impulse_source is not None:
             player.exile.append(card)
             if card.id not in player.playable_from_exile:
                 player.playable_from_exile.append(card.id)
-            print(f"[DISCARD-TRIGGER] {_construct.name} exiles {card.name} "
-                  f"from graveyard; playable this turn")
-            return (f"?? **{_construct.name}** exiles **{card.name}** ? "
+            print(f"[DISCARD-TRIGGER] {impulse_source.name} exiles "
+                  f"{card.name} from graveyard; playable this turn")
+            return (f"**{impulse_source.name}** exiles **{card.name}** - "
                     f"{player.name} may play it this turn")
         return None
     card._madness_cost = cost
@@ -2600,3 +2618,48 @@ def has_coven(player, game=None) -> bool:
         except (AttributeError, TypeError, ValueError):
             continue
     return len(powers) >= 3
+
+
+def activated_ability_restriction_failure(game, player, ability_text: str):
+    """Return a pre-cost failure reason for supported printed restrictions.
+
+    This deliberately starts with the restriction used by Inventors' Fair.
+    Unknown ``Activate only if`` clauses are left to existing card-specific
+    handlers rather than guessed at here.
+    """
+    text = (ability_text or '').lower()
+    match = re.search(
+        r'activate only if you control (a|an|one|two|three|four|five|six|'
+        r'seven|eight|nine|ten|\d+)(?: or more)? artifacts?', text)
+    if not match:
+        return None
+    raw = match.group(1)
+    needed = int(raw) if raw.isdigit() else (_NUMBER_WORDS.get(raw) or 1)
+    controlled = sum(
+        1 for permanent in (getattr(player, 'battlefield', []) or [])
+        if not getattr(permanent, '_phased_out', False)
+        and 'artifact' in (getattr(permanent, 'type_line', '') or '').lower()
+    )
+    if controlled < needed:
+        return (f"requires {needed} artifacts; {player.name} controls "
+                f"only {controlled}")
+    return None
+
+
+def is_castable_from_exile(game, player, card) -> bool:
+    """Whether this exact exiled object has a live cast permission."""
+    if card.id in (getattr(player, 'playable_from_exile', None) or []):
+        return True
+    if getattr(card, '_adventure_exiled', False):
+        return True
+    if getattr(card, '_foretold', False):
+        return getattr(card, '_foretold_turn', None) != game.turn_number
+    record = (getattr(game, 'conditional_exile_casts', None) or {}).get(card.id)
+    if not record or card.is_land():
+        return False
+    try:
+        controller_index = game.players.index(player)
+    except ValueError:
+        return False
+    return (int(record.get('controller_index', -1)) == controller_index
+            and int(record.get('expires_turn', -1)) == game.turn_number)

@@ -154,7 +154,7 @@ def _snapshot_copy_source(card) -> None:
 
 
 def _revert_copy_if_leaving_battlefield(card) -> None:
-    """Restore a clone's printed characteristics when it leaves the battlefield.
+    """Restore printed characteristics when a copy/manifest leaves the battlefield.
 
     Per CR 706.10, copy effects only apply on the battlefield (and stack).
     A Phantasmal Image that copied Korvold is back to being Phantasmal Image
@@ -163,25 +163,40 @@ def _revert_copy_if_leaving_battlefield(card) -> None:
     let a player's Phantasmal Image surface as a "Korvold" castable in hand.
     """
     snap = card._pre_copy_snapshot
-    if not snap:
-        return
-    card.name = snap['name']
-    card.power = snap['power']
-    card.toughness = snap['toughness']
-    card.type_line = snap['type_line']
-    card.oracle_text = snap['oracle_text']
-    card.mana_cost = snap['mana_cost']
-    card.cmc = snap['cmc']
-    card.loyalty = snap['loyalty']
-    card.keywords = list(snap['keywords'])
-    card.color_identity = list(snap['color_identity'])
-    card.loyalty_counters = 0
-    card.counters.clear()
-    card._pre_copy_snapshot = None
-    card._is_copy = False
-    card._copy_of = None
-    card._original_name = ""
-    print(f"[COPY-REVERT] {snap['name']} reverted to printed characteristics on leave-battlefield")
+    if snap:
+        card.name = snap['name']
+        card.power = snap['power']
+        card.toughness = snap['toughness']
+        card.type_line = snap['type_line']
+        card.oracle_text = snap['oracle_text']
+        card.mana_cost = snap['mana_cost']
+        card.cmc = snap['cmc']
+        card.loyalty = snap['loyalty']
+        card.keywords = list(snap['keywords'])
+        card.color_identity = list(snap['color_identity'])
+        card.loyalty_counters = 0
+        card.counters.clear()
+        card._pre_copy_snapshot = None
+        card._is_copy = False
+        card._copy_of = None
+        card._original_name = ""
+        print(f"[COPY-REVERT] {snap['name']} reverted to printed characteristics on leave-battlefield")
+
+    # CR 701.34d: a manifested permanent is face up again immediately after
+    # it leaves the battlefield. Reality Shift exposed the missing inverse:
+    # bounced/manifests were remaining named "Manifest" in hand.
+    manifest = getattr(card, '_manifest_original', None)
+    if manifest:
+        for attr in ('name', 'type_line', 'oracle_text', 'mana_cost', 'cmc',
+                     'power', 'toughness', 'loyalty', 'has_transform'):
+            setattr(card, attr, manifest[attr])
+        card.keywords = list(manifest.get('keywords', []))
+        card.colors = list(manifest.get('colors', []))
+        card._manifest_original = None
+        card._manifested = False
+        card.loyalty_counters = 0
+        card.counters.clear()
+        print(f"[MANIFEST-REVERT] {card.name} restored on leave-battlefield")
 
 
 def _fire_noncast_battlefield_entry(rules, game: GameState,
@@ -411,6 +426,8 @@ def _fire_sacrifice_triggers(rules, game: GameState, sac_player: Player, sacrifi
                                 msg = rules._execute_action_on_state(game, action)
                                 if msg:
                                     messages.append(f"⚡ {source.name}: {msg}")
+                                    print(f"[SAC-TRIGGER-RESULT] {source.name}: "
+                                          f"{msg}")
                             except Exception as e:
                                 print(f"[SAC-TRIGGER] Action failed for {source.name}: {e}")
                         print(f"[SAC-TRIGGER] {source.name} fired from {sac_player.name} sacrificing {sacrificed_card.name}")
@@ -1045,12 +1062,21 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                 _wheel_hand = player.hand
                 player.hand = []
                 _mad_lines = []
+                previous_discard_event = getattr(
+                    game, '_active_discard_event_id', None)
+                game._discard_event_serial = int(
+                    getattr(game, '_discard_event_serial', 0) or 0) + 1
+                game._active_discard_event_id = game._discard_event_serial
                 for _c in _wheel_hand:
                     _mm = madness_discard_to_exile(game, player, _c)
                     if _mm:
                         _mad_lines.append(_mm)
                     else:
                         player.graveyard.append(_c)
+                if previous_discard_event is None:
+                    game._active_discard_event_id = None
+                else:
+                    game._active_discard_event_id = previous_discard_event
                 rules.log_event(f"{player.name} discards their hand ({hand_size} cards)")
                 # June 10 audit: don't hide exactly ONE name behind "+1 more" —
                 # collapse only when 2+ names are hidden.
@@ -1440,12 +1466,13 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                         card._face_down = False
                     _shown = ("a face-down card" if action.get("hide_card_name")
                               else f"**{card.name}**")
+                    _display_zone = actual_to_zone.replace('_', ' ')
                     if source:
-                        msg = f"📦 {_shown} → {actual_to_zone}{_who} (from {source})"
+                        msg = f"📦 {_shown} → {_display_zone}{_who} (from {source})"
                     elif reason:
-                        msg = f"📦 {_shown} → {actual_to_zone}{_who} ({reason})"
+                        msg = f"📦 {_shown} → {_display_zone}{_who} ({reason})"
                     else:
-                        msg = f"📦 {_shown} → {actual_to_zone}{_who}"
+                        msg = f"📦 {_shown} → {_display_zone}{_who}"
                 if ltb_trigger_msgs:
                     msg += "\n" + "\n".join(ltb_trigger_msgs)
                 if entry_trigger_msgs:
@@ -1510,6 +1537,61 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
         if chosen:
             return f"👁️ {player.name} reveals {chosen.name} and puts it into their hand"
         return f"👁️ {player.name} finds no {card_type} among the top {len(top_n)} cards"
+
+    elif action_type == "manifest_top":
+        # CR 701.34: move actual cards from the top of the library onto the
+        # battlefield face down as colorless 2/2 creatures. Preserve their
+        # copiable values for a future turn-face-up action; do not create
+        # tokens or leave the cards in the library.
+        player = find_player(action.get("player", ""))
+        count = max(0, int(action.get("count", 1)))
+        if not player or count <= 0:
+            return None
+        manifested = []
+        entry_messages = []
+        for _ in range(min(count, len(player.library))):
+            card = player.library.pop(0)
+            card._manifest_original = {
+                "name": card.name, "type_line": card.type_line,
+                "oracle_text": card.oracle_text, "mana_cost": card.mana_cost,
+                "cmc": card.cmc, "power": card.power,
+                "toughness": card.toughness, "loyalty": card.loyalty,
+                "keywords": list(card.keywords or []),
+                "colors": list(getattr(card, 'colors', []) or []),
+                "has_transform": card.has_transform,
+            }
+            card._manifested = True
+            card.name = "Manifest"
+            card.type_line = "Creature"
+            card.oracle_text = ""
+            card.mana_cost = ""
+            card.cmc = 0
+            card.power = "2"
+            card.toughness = "2"
+            card.loyalty = None
+            card.keywords = []
+            card.colors = []
+            card.has_transform = False
+            card.tapped = False
+            card.summoning_sick = True
+            card.entered_this_turn = True
+            card.controller = player.name
+            player.battlefield.append(card)
+            manifested.append(card)
+            entry_messages.extend(
+                _fire_noncast_battlefield_entry(
+                    rules, game, player, card))
+            events.emit(events.PERMANENT_ENTERED, game, card=card,
+                        controller=player, via="manifest_top", rules=rules)
+        if not manifested:
+            return None
+        game.recalculate_granted_keywords()
+        game.recalculate_power_toughness()
+        result = f"{player.name} manifests {len(manifested)} card(s)"
+        if entry_messages:
+            result += "\n" + "\n".join(entry_messages)
+        print(f"[MANIFEST] {player.name}: {len(manifested)} card(s)")
+        return result
 
     elif action_type == "transform_permanent":
         player = find_player(action.get("player", ""))
@@ -2162,40 +2244,67 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                 return None
 
     # ---- EQUIP ----
-    elif action_type == "equip":
+    elif action_type in ("equip", "attach"):
         # May 14 audit (C4): the Embercleave template (and any future template
         # that wants to attach an Equipment to a creature post-cast) emits
         # `{"action": "equip", "equipment": "X", "creature": "Y", "player": "Z"}`
         # but no handler existed — the action was silently dropped. Add one.
         # Used by: Embercleave ETB, Sigarda's Aid auto-attach, Stoneforge
         # Mystic equip-from-hand follow-up plans.
-        equip_name = action.get("equipment", "")
-        creature_name = action.get("creature", "")
+        # Aug 5 confirmation audit: Ardenn may move both Auras and Equipment.
+        # Keep equip backward-compatible while exposing a neutral attach
+        # spelling so Aura movement updates attached_to/attachments instead of
+        # being misrepresented as a battlefield-to-battlefield zone move.
+        is_generic_attach = action_type == "attach"
+        attachment_name = (
+            action.get("attachment", "") if is_generic_attach
+            else action.get("equipment", "")
+        )
+        target_name = (
+            action.get("target", "") if is_generic_attach
+            else action.get("creature", "")
+        )
         player_name = action.get("player", "")
         p = find_player(player_name)
-        if not p or not equip_name or not creature_name:
+        if not p or not attachment_name or not target_name:
             return None
-        equip_card = None
-        target_creature = None
-        for c in p.battlefield:
-            if c.name.lower() == equip_name.lower() and not equip_card:
-                equip_card = c
-            elif c.name.lower() == creature_name.lower() and not target_creature:
-                if c.is_creature(game):
-                    target_creature = c
-        if not equip_card or not target_creature:
+        attachment = next(
+            (c for c in p.battlefield
+             if c.name.lower() == attachment_name.lower()),
+            None,
+        )
+        target = next(
+            (c for target_player in game.players
+             for c in target_player.battlefield
+             if c.name.lower() == target_name.lower()
+             and (is_generic_attach or c.is_creature(game))),
+            None,
+        )
+        if not attachment or not target:
             return None
         # Detach from previous target
-        if equip_card.attached_to:
-            for c in p.battlefield:
-                if c.id == equip_card.attached_to and equip_card.id in c.attachments:
-                    c.attachments.remove(equip_card.id)
+        if attachment.attached_to:
+            for target_player in game.players:
+                previous = next(
+                    (c for c in target_player.battlefield
+                     if c.id == attachment.attached_to),
+                    None,
+                )
+                if previous is not None:
+                    if attachment.id in previous.attachments:
+                        previous.attachments.remove(attachment.id)
                     break
-        equip_card.attached_to = target_creature.id
-        if not hasattr(target_creature, 'attachments'):
-            target_creature.attachments = []
-        if equip_card.id not in target_creature.attachments:
-            target_creature.attachments.append(equip_card.id)
+        attachment.attached_to = target.id
+        if not hasattr(target, 'attachments'):
+            target.attachments = []
+        if attachment.id not in target.attachments:
+            target.attachments.append(attachment.id)
+        if is_generic_attach:
+            game.recalculate_power_toughness()
+            print(f"[ATTACH-ACTION] {attachment.name} attached to {target.name}")
+            return f"**{attachment.name}** attached to **{target.name}**"
+        equip_card = attachment
+        target_creature = target
         game.recalculate_power_toughness()
         print(f"[EQUIP-ACTION] {equip_card.name} attached to {target_creature.name}")
         return f"⚔️ **{equip_card.name}** equipped to **{target_creature.name}**"
@@ -2437,6 +2546,9 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
             amount = int(action.get("amount", 1))
             if color in player.mana_pool:
                 player.mana_pool[color] = player.mana_pool.get(color, 0) + amount
+            if action.get("retains_through_turn"):
+                player._retain_mana_through_turn = game.turn_number
+
             return f"💎 **{player.name}** adds {{{color}}} x{amount}"
     
     # ---- COUNTER SPELL (from counterspell templates) ----
@@ -3342,6 +3454,12 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
         player_name = action.get("player")
         card_name = action.get("card", "")
         allow_types = action.get("allow_types", ["creature"])  # Default creature-only; Daretti passes ["artifact"]
+        max_cmc = action.get("max_cmc")
+        if max_cmc is not None:
+            try:
+                max_cmc = int(max_cmc)
+            except (TypeError, ValueError):
+                max_cmc = 0
         # June 10 audit (V7): "your graveyard"-restricted reanimation. Dread
         # Return ("Return target creature card from YOUR graveyard") was
         # taking the opponent's best creature because the search below always
@@ -3363,7 +3481,8 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
             if not card_name and p.graveyard:
                 for c in sorted(p.graveyard, key=lambda c: int(c.cmc) if c.cmc else 0, reverse=True):
                     type_lower = (c.type_line or "").lower()
-                    if any(t in type_lower for t in allow_types):
+                    if (any(t in type_lower for t in allow_types)
+                            and (max_cmc is None or int(c.cmc or 0) <= max_cmc)):
                         card_name = c.name
                         break
             if card_name:
@@ -3375,6 +3494,9 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                             if not any(t in type_lower for t in allow_types):
                                 print(f"[REANIMATE] Skipping {c.name} — not in allowed types {allow_types}")
                                 return f"⚠️ Cannot reanimate {c.name} — not a valid type"
+                            if max_cmc is not None and int(c.cmc or 0) > max_cmc:
+                                print(f"[REANIMATE] Skipping {c.name} - MV exceeds {max_cmc}")
+                                return f"Cannot reanimate {c.name} - mana value exceeds {max_cmc}"
                             search_player.graveyard.remove(c)
                             c.reset_battlefield_state()
                             c.summoning_sick = True
@@ -3386,6 +3508,14 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                                 if 'Haste' not in (c.temp_keywords or []):
                                     c.temp_keywords.append('Haste')
                             p.battlefield.append(c)
+                            if c.is_planeswalker():
+                                try:
+                                    c.loyalty_counters = int(c.loyalty or 0)
+                                except (TypeError, ValueError):
+                                    c.loyalty_counters = 0
+                                from mtg.helpers import loyalty_from_commander_casts
+                                c.loyalty_counters += loyalty_from_commander_casts(
+                                    game, p, c)
                             game.register_static_keyword_grants(c, p.name)
                             game.register_static_pt_effects(c, p.name)
                             game.register_replacement_effects(c, p.name)
@@ -3429,6 +3559,8 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                             if entry_msgs:
                                 result += "\n" + "\n".join(entry_msgs)
                             return result
+        if max_cmc is not None:
+            return f"No eligible permanent with mana value {max_cmc} or less to return"
         return None
 
     elif action_type == "search_library_to_graveyard":
@@ -3454,8 +3586,8 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                 p.library.remove(c)
                 p.graveyard.append(c)
             if found:
-                import random
-                random.shuffle(p.library)  # Shuffle after searching
+                import random as _rng
+                _rng.shuffle(p.library)  # Shuffle after searching
                 return f"🪦 {p.name} searches library, puts {', '.join(c.name for c in found)} into graveyard"
         return None
 
@@ -3593,26 +3725,92 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
     elif action_type == "open_the_vaults":
         # Open the Vaults: return all artifact and enchantment cards from ALL graveyards
         # to the battlefield under their OWNERS' control
-        returned = []
+        returning = []
         for search_player in game.players:
             qualifying = [c for c in search_player.graveyard
                           if ('artifact' in (c.type_line or '').lower()
                               or 'enchantment' in (c.type_line or '').lower())]
             for c in qualifying:
                 search_player.graveyard.remove(c)
-                c.summoning_sick = True
+                c.reset_battlefield_state()
                 c.entered_this_turn = True
-                c.damage_marked = 0
-                c.deathtouch_damage = 0
-                c.power_modifier = 0
-                c.toughness_modifier = 0
-                c.tapped = False
+                c.summoning_sick = c.is_creature()
+                c.controller = search_player.name
                 search_player.battlefield.append(c)
-                returned.append(f"{c.name} ({search_player.name})")
-        if returned:
+                returning.append((search_player, c))
+        if returning:
+            # Everything returns simultaneously. Finish the entire board wave
+            # before dispatching any ETB so watchers see the complete state.
+            for owner, card in returning:
+                if card.is_enchantment() and 'aura' in (card.type_line or '').lower():
+                    oracle = (card.oracle_text or '').lower()
+                    if 'card in a graveyard' not in oracle:
+                        if 'enchant land' in oracle:
+                            candidates = [x for p in game.players for x in p.battlefield
+                                          if x is not card and x.is_land()]
+                        elif 'enchant artifact' in oracle:
+                            candidates = [x for p in game.players for x in p.battlefield
+                                          if x is not card and x.is_artifact()]
+                        elif 'enchant permanent' in oracle:
+                            candidates = [x for p in game.players for x in p.battlefield
+                                          if x is not card]
+                        else:
+                            candidates = [x for p in game.players for x in p.battlefield
+                                          if x is not card and x.is_creature(game)]
+                        if 'you control' in oracle:
+                            candidates = [x for x in candidates if x in owner.battlefield]
+                        if candidates:
+                            target = candidates[0]
+                            card.attached_to = target.id
+                            if card.id not in target.attachments:
+                                target.attachments.append(card.id)
+                            print(f"[OPEN-VAULTS-AURA] {card.name} attached to {target.name}")
+                if 'saga' in (card.type_line or '').lower():
+                    card.counters['lore'] = 1
+                    print(f"[OPEN-VAULTS-SAGA] {card.name} enters with lore counter 1")
+                game.register_static_keyword_grants(card, owner.name)
+                game.register_static_pt_effects(card, owner.name)
+                game.register_replacement_effects(card, owner.name)
+                events.emit(events.PERMANENT_ENTERED, game, card=card,
+                            controller=owner, via="open_the_vaults", rules=rules)
+
+            entry_messages = []
+            for owner, card in returning:
+                entry_messages.extend(
+                    _fire_noncast_battlefield_entry(rules, game, owner, card))
+                if 'saga' in (card.type_line or '').lower():
+                    engine = getattr(rules, 'engine_ref', None)
+                    chapter = engine._get_saga_chapter_text(card, 1) if engine else ''
+                    if chapter:
+                        try:
+                            from rules.effect_templates import get_effect_library, build_game_context
+                            opponent = next(p for p in game.players if p is not owner)
+                            ctx = build_game_context(game, owner, opponent, card=card)
+                            chapter_actions, _ = get_effect_library().resolve_etb(
+                                card.name, chapter, owner.name, opponent.name,
+                                game_context=ctx)
+                            if chapter_actions:
+                                for chapter_action in chapter_actions:
+                                    msg = rules._execute_action_on_state(game, chapter_action)
+                                    if msg:
+                                        entry_messages.append(msg)
+                            else:
+                                engine._queue_async_trigger(
+                                    game, card, chapter, "saga_chapter_1", owner.name,
+                                    context=f"{card.name} Chapter I (Open the Vaults)")
+                        except Exception as exc:
+                            print(f"[OPEN-VAULTS-SAGA] chapter I error: {exc}")
+                            maybe_reraise(exc)
             game.recalculate_granted_keywords()
             game.recalculate_power_toughness()
-            return f"✨ Open the Vaults: {len(returned)} artifact/enchantment card(s) returned — {', '.join(returned[:8])}" + (f" and {len(returned) - 8} more" if len(returned) > 8 else "")
+            returned = [f"{c.name} ({p.name})" for p, c in returning]
+            result = (f"✨ Open the Vaults: {len(returned)} artifact/enchantment "
+                      f"card(s) returned — {', '.join(returned[:8])}")
+            if len(returned) > 8:
+                result += f" and {len(returned) - 8} more"
+            if entry_messages:
+                result += "\n" + "\n".join(entry_messages)
+            return result
         return "✨ Open the Vaults: no qualifying cards in any graveyard"
 
     elif action_type == "replenish":
@@ -3918,12 +4116,16 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
             keywords = list(keywords) if hasattr(keywords, '__iter__') else [str(keywords)]
         target = action.get("target", "all_own_permanents")
         target_card_name = action.get("target_card")
+        requires_creature = (
+            action.get("target_filter") == "creature")
         p = find_player(player_name)
         if p:
             if target_card_name:
                 # Single-target keyword grant (e.g. Vivien +1: "target creature gains vigilance and reach")
                 for card in p.battlefield:
                     if card.name.lower() == target_card_name.lower():
+                        if requires_creature and not card.is_creature(game):
+                            continue
                         for kw in keywords:
                             if kw not in (card.temp_keywords or []):
                                 card.temp_keywords = card.temp_keywords or []
@@ -3952,7 +4154,8 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
             count = 0
             granted = []
             for card in p.battlefield:
-                if target == "all_own_creatures" and not card.is_creature():
+                if ((target == "all_own_creatures" or requires_creature)
+                        and not card.is_creature(game)):
                     continue
                 if attacking_only:
                     if not card.is_creature() or not getattr(card, 'attacking', False):
@@ -4083,12 +4286,90 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
             return None
         return None
 
+    elif action_type == "queue_free_cast":
+        player_name = action.get("player", "")
+        p = find_player(player_name)
+        if not p:
+            return None
+        from_zone = (action.get("from_zone") or "library").lower()
+        zone = {
+            "library": p.library, "graveyard": p.graveyard,
+            "exile": p.exile, "hand": p.hand,
+        }.get(from_zone)
+        if zone is None:
+            print(f"[FREE-CAST-QUEUE] Unsupported source zone: {from_zone}")
+            return None
+        wanted = (action.get("card") or "").strip().lower()
+        card = next((c for c in zone if c.name.lower() == wanted), None)
+        if card is None:
+            print(f"[FREE-CAST-QUEUE] {wanted or '?'} not found in "
+                  f"{p.name}'s {from_zone}")
+            return None
+        game._free_cast_pending.append({
+            "card": card,
+            "owner_index": game.players.index(p),
+            "from_zone": from_zone,
+            "fallback_zone": action.get("fallback_zone", "hand"),
+            "source": action.get("source", "resolving effect"),
+            "is_copy": False,
+        })
+        print(f"[FREE-CAST-QUEUE] {action.get('source', 'effect')}: "
+              f"{card.name} from {from_zone}")
+        return None
+
+    elif action_type == "capricious_hellraiser_etb":
+        p = find_player(action.get("player", ""))
+        if not p:
+            return None
+        graveyard_cards = list(p.graveyard)
+        if not graveyard_cards:
+            return ("🔥 Capricious Hellraiser: graveyard is empty — "
+                    "no cards are exiled")
+        exiled = random.sample(
+            graveyard_cards, min(3, len(graveyard_cards)))
+        for card in exiled:
+            p.graveyard.remove(card)
+            p.exile.append(card)
+        eligible = [
+            card for card in exiled
+            if not card.is_creature(game) and not card.is_land()
+        ]
+        if not eligible:
+            names = ", ".join(card.name for card in exiled)
+            return (f"🔥 Capricious Hellraiser exiles {names}; "
+                    "none can be copied")
+        chosen = max(
+            eligible, key=lambda c: (int(getattr(c, 'cmc', 0) or 0), c.name))
+        import copy as _copy
+        import uuid as _uuid
+        spell_copy = _copy.deepcopy(chosen)
+        spell_copy.id = f"spellcopy_{_uuid.uuid4().hex[:10]}"
+        spell_copy.owner_index = game.players.index(p)
+        spell_copy._is_spell_copy = True
+        spell_copy._is_copy = True
+        spell_copy._copy_of = chosen.name
+        spell_copy.is_token = False
+        spell_copy._spell_resolved = False
+        game._free_cast_pending.append({
+            "card": spell_copy,
+            "owner_index": game.players.index(p),
+            "from_zone": "generated",
+            "fallback_zone": "cease",
+            "source": "Capricious Hellraiser",
+            "is_copy": True,
+        })
+        names = ", ".join(card.name for card in exiled)
+        print(f"[HELLRAISER] Exiled at random: {names}; "
+              f"queued copy of {chosen.name}")
+        return (f"🔥 Capricious Hellraiser exiles {names} and copies "
+                f"**{chosen.name}**")
     elif action_type == "schedule_death_trigger":
         # Register a "if this creature dies this turn" watcher (Searing Blood, etc.)
         if not hasattr(game, '_death_watchers'):
             game._death_watchers = []
         game._death_watchers.append({
             "watch_target": action.get("watch_target", ""),
+            "watch_target_id": action.get("watch_target_id", ""),
             "on_death_actions": action.get("on_death_actions", []),
             "source": action.get("source", "Unknown"),
             "turn_registered": game.turn_number,
@@ -4560,7 +4841,15 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
             for c in to_destroy:
                 if c.has_keyword('Indestructible', game=game):
                     continue
+                if c.counters.get('shield', 0) > 0:
+                    c.counters['shield'] -= 1
+                    print(f"[SHIELD-COUNTER] {c.name}: shield removed instead of destroyed")
+                    continue
+                if rules._has_totem_armor(c, p):
+                    rules._remove_totem_armor(c, p, game)
+                    continue
                 game.unregister_static_effects(c)
+                _revert_copy_if_leaving_battlefield(c)
                 p.battlefield.remove(c)
                 p.graveyard.append(c)
                 destroyed.append(c.name)
@@ -4816,6 +5105,8 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
         # Search library for a land and put it onto battlefield (Path to Exile, Sakura-Tribe Elder)
         player_name = action.get("player")
         basic_only = action.get("basic_only", False)
+        land_types = {str(t).strip().lower()
+                      for t in (action.get("land_types") or []) if str(t).strip()}
         enters_tapped = action.get("enters_tapped", False)
         p = find_player(player_name)
         if p:
@@ -4828,8 +5119,13 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
             import random as _rng
             for lib_card in p.library:
                 found_land = False
-                if basic_only and lib_card.name in basic_land_names:
-                    found_land = True
+                if basic_only and ('basic' in (lib_card.type_line or '').lower()
+                                   or lib_card.name in basic_land_names):
+                    if land_types:
+                        _subtypes = (lib_card.type_line or '').lower()
+                        found_land = any(t in _subtypes for t in land_types)
+                    else:
+                        found_land = True
                 elif not basic_only and lib_card.is_land():
                     found_land = True
                 if found_land:
@@ -5195,22 +5491,26 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
         return None
 
     elif action_type == "exile_top_play_or_damage":
-        # Exile top card, play it this turn or deal damage (Chandra +1)
+        # Chandra +1: exile the exact object. A nonland may be cast this turn;
+        # if that object was not cast, deferred cleanup damages each opponent.
         player_name = action.get("player")
-        damage = action.get("damage", 2)
+        damage = int(action.get("damage", 2) or 2)
         p = find_player(player_name)
         if p and p.library:
             card = p.library.pop(0)
             p.exile.append(card)
-            if not hasattr(p, 'playable_from_exile'):
-                p.playable_from_exile = []
-            p.playable_from_exile.append(card.id)
-            game._impulse_cast_turns[card.id] = game.turn_number
-            opponent = game.players[1 - game.players.index(p)] if len(game.players) > 1 else None
-            if opponent:
-                rules._apply_noncombat_damage_to_player(game, opponent, damage, "Chandra")
-            print(f"[CHANDRA-EXILE] {p.name} exiles {card.name}, deals {damage} to opponent")
-            return f"🔥 Exiles **{card.name}** (playable this turn). Deals {damage} damage to opponent."
+            game.conditional_exile_casts[card.id] = {
+                "card_id": card.id,
+                "controller_index": game.players.index(p),
+                "expires_turn": game.turn_number,
+                "source_name": action.get("source") or "Chandra, Torch of Defiance",
+                "damage": damage,
+            }
+            cast_note = ("You may cast it this turn."
+                         if not card.is_land()
+                         else "It is a land, so it cannot be cast.")
+            print(f"[CHANDRA-EXILE] {p.name} exiles {card.name}; conditional window opened")
+            return f"🔥 Exiles **{card.name}**. {cast_note}"
         return None
 
     elif action_type == "exile_top_of_library":
@@ -5820,4 +6120,3 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
         return f"🔍 {p.name} searches library and puts **{', '.join(msgs)}** {zone_label}" + (" (shuffled)" if shuffle and to_zone not in ("library_top", "top") else "")
 
     return None
-

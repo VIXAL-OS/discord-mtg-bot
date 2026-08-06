@@ -41,6 +41,14 @@ from mtg.helpers import command_zone_owner, owner_of
 from mtg.models import Card, Player, GameState
 
 
+def _restore_identity_on_battlefield_exit(card: Card) -> None:
+    """Share the copy/manifest zone-change inverse with action-driven exits."""
+    # Local import avoids making the actions/SBA extraction depend on import
+    # order while keeping one implementation of the printed-identity reset.
+    from mtg.actions import _revert_copy_if_leaving_battlefield
+    _revert_copy_if_leaving_battlefield(card)
+
+
 # Hardcoded back-face attributes for transforming sagas, used as a fallback
 # when Scryfall data only loaded the front face. Sagas in this dict will
 # actually return-transformed at chapter completion instead of getting stuck
@@ -168,7 +176,10 @@ def check_state_based_actions(rules, game: GameState) -> List[Dict]:
     for i, player in enumerate(game.players):
         # Commander damage (21+) — game-specific, not in CR 704.5
         cant_lose_source = rules._player_cant_lose(game, i)
-        for source_key, damage in player.commander_damage.items():
+        commander_damage = (player.commander_damage
+                            if getattr(game, 'format', '').lower() in ('commander', 'edh')
+                            else {})
+        for source_key, damage in commander_damage.items():
             if damage >= 21:
                 # Aug 1 batch-12: keys are commander NAMES now (CR 903.10a is
                 # per-commander — the partner-deck finding). Legacy int /
@@ -448,6 +459,7 @@ def process_state_based_actions(rules, game: GameState) -> List[str]:
         for _c in list(_plr.battlefield):
             bind_id = getattr(_c, '_reanimated_by_aura_id', None)
             if bind_id and bind_id not in alive_aura_ids:
+                _restore_identity_on_battlefield_exit(_c)
                 _plr.battlefield.remove(_c)
                 _plr.graveyard.append(_c)
                 _c._reanimated_by_aura_id = None
@@ -590,6 +602,7 @@ def process_state_based_actions(rules, game: GameState) -> List[str]:
 
                     # [LAYERS] Unregister static effects before removal
                     game.unregister_static_effects(card)
+                    _restore_identity_on_battlefield_exit(card)
                     player.battlefield.remove(card)
 
                     # Commanders can go to command zone instead of graveyard.
@@ -756,6 +769,7 @@ def process_state_based_actions(rules, game: GameState) -> List[str]:
                 if card:
                     # [LAYERS] Unregister static effects before removal
                     game.unregister_static_effects(card)
+                    _restore_identity_on_battlefield_exit(card)
                     player.battlefield.remove(card)
 
                     # Commanders can go to command zone instead of graveyard.
@@ -793,6 +807,7 @@ def process_state_based_actions(rules, game: GameState) -> List[str]:
                 card = player.find_card(card_id, Zone.BATTLEFIELD)
                 if card:
                     game.unregister_static_effects(card)
+                    _restore_identity_on_battlefield_exit(card)
                     player.battlefield.remove(card)
                     if card.is_commander and game.format in COMMAND_ZONE_FORMATS:
                         card.reset_battlefield_state()
@@ -816,6 +831,7 @@ def process_state_based_actions(rules, game: GameState) -> List[str]:
                 card = player.find_card(card_id, Zone.BATTLEFIELD)
                 if card:
                     game.unregister_static_effects(card)
+                    _restore_identity_on_battlefield_exit(card)
                     player.battlefield.remove(card)
                     owner_of(game, card, player).graveyard.append(card)
                     messages.append(f"⚔️ {card.name} defeated! (no defense counters remaining)")
@@ -845,6 +861,7 @@ def process_state_based_actions(rules, game: GameState) -> List[str]:
                 card = player.find_card(card_id, Zone.BATTLEFIELD)
                 if card:
                     game.unregister_static_effects(card)
+                    _restore_identity_on_battlefield_exit(card)
                     player.battlefield.remove(card)
                     owner_of(game, card, player).graveyard.append(card)
                     messages.append(f"💫 {card.name} goes to graveyard ({action['reason']})")
@@ -861,6 +878,7 @@ def process_state_based_actions(rules, game: GameState) -> List[str]:
                 card = player.find_card(card_id, Zone.BATTLEFIELD)
                 if card:
                     game.unregister_static_effects(card)
+                    _restore_identity_on_battlefield_exit(card)
                     player.battlefield.remove(card)
                     owner_of(game, card, player).graveyard.append(card)
                     messages.append(f"🌍 {card.name} goes to graveyard (World rule — CR 704.5k)")
@@ -892,6 +910,7 @@ def process_state_based_actions(rules, game: GameState) -> List[str]:
                         # We approximate transformation by toggling card._transformed
                         # and switching name/type/oracle to the back face (if present).
                         game.unregister_static_effects(card)
+                        _restore_identity_on_battlefield_exit(card)
                         player.battlefield.remove(card)
                         player.exile.append(card)
                         # Try to flip the DFC face

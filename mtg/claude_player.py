@@ -669,7 +669,7 @@ class ClaudePlayer:
             # Commander damage tracker for Commander-class formats. The 21-from-
             # one-commander loss condition is invisible without this.
             cmd_damage_section = ""
-            if fmt in ('commander', 'edh', 'brawl', 'oathbreaker'):
+            if fmt in ('commander', 'edh'):
                 you_taken = 0
                 opp_taken = 0
                 try:
