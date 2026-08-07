@@ -895,6 +895,80 @@ class TestTutorInjectionConsumedOnce:
 
 
 # ---------------------------------------------------------------------------
+# Registry dedup (Aug 7 follow-up): no duplicate registration KEYS
+# ---------------------------------------------------------------------------
+
+class TestNoDuplicateRegistryKeys:
+    def test_no_duplicate_add_card_keys(self):
+        """Structural: _add_card is a plain dict assignment, so a second
+        registration of the same KEY silently wins — the class that made
+        Shard Volley target-blind, kept the flat-draw Mystic Confluence
+        alive for months, and hid the dead _gen_reanimate (Aug 7 deep-dive:
+        NINE keys were doubled). The sibling pin covers duplicate _gen_*
+        DEFINITIONS; this one covers duplicate KEYS across all three
+        registries. Baseline: zero."""
+        import collections
+        import io
+        import re
+        buf = io.open("rules/effect_templates.py", encoding="utf-8").read()
+        for reg in ("_add_card", "_add_attack_card", "_add_dies_card"):
+            keys = [
+                m.group(1) or m.group(2)
+                for m in re.finditer(
+                    r"self\." + reg + r"\(\s*\n?\s*(?:\"([^\"]+)\"|'([^']+)')",
+                    buf)
+            ]
+            dupes = {k: c for k, c in collections.Counter(keys).items() if c > 1}
+            assert not dupes, (
+                f"duplicate {reg} keys (last registration silently wins): "
+                f"{dupes}")
+
+    def test_surviving_registrations_resolve(self, lib):
+        # The dedup kept the RICHER registration for every key — spot-check
+        # the three whose duplicate was the live one before the cleanup.
+        # Archmage's Charm: the surviving generator honors stack state.
+        a, _ = lib.resolve_spell(
+            "Archmage's Charm",
+            "Choose one —\n• Counter target spell.\n• Target player draws "
+            "two cards.\n• Gain control of target nonland permanent with "
+            "mana value 1 or less.",
+            "A", "B", game_context={})
+        assert a and a[0]["action"] == "draw_cards", (
+            "empty stack → the draw mode")
+        # Mystic Confluence: the surviving modal generator fills slots.
+        a2, _ = lib.resolve_spell(
+            "Mystic Confluence",
+            "Choose three. You may choose the same mode more than once.\n"
+            "• Counter target spell unless its controller pays {3}.\n"
+            "• Return target creature to its owner's hand.\n• Draw a card.",
+            "A", "B", game_context={})
+        kinds2 = [x["action"] for x in (a2 or [])]
+        assert "draw_cards" in kinds2, "empty board → draw slots fill"
+
+    def test_shard_volley_honors_declared_targets(self, lib):
+        oracle = ("As an additional cost to cast this spell, sacrifice a "
+                  "land.\nShard Volley deals 3 damage to any target.")
+        # Declared creature → target_card (the deleted live duplicate always
+        # hit the face, ignoring every declared target).
+        a, _ = lib.resolve_spell(
+            "Shard Volley", oracle, "A", "B",
+            game_context={"explicit_target_name": "Grizzly Bears",
+                          "explicit_target_is_creature": True,
+                          "explicit_target_owner": "B"})
+        assert a[0].get("target_card") == "Grizzly Bears"
+        # Declared player → target_player.
+        a2, _ = lib.resolve_spell(
+            "Shard Volley", oracle, "A", "B",
+            game_context={"explicit_target_player": "B",
+                          "explicit_target_is_player": True})
+        assert a2[0].get("target_player") == "B"
+        # No declared target → face.
+        a3, _ = lib.resolve_spell("Shard Volley", oracle, "A", "B",
+                                  game_context={})
+        assert a3[0].get("target_player") == "B"
+
+
+# ---------------------------------------------------------------------------
 # Backlog item 4: aura enchant restrictions
 # ---------------------------------------------------------------------------
 

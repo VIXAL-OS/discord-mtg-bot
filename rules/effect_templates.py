@@ -1171,15 +1171,9 @@ class EffectTemplateLibrary:
             ]
 
         # Modal spells — default to best autoplay mode choices
-        def _mystic_confluence(ctrl, opp, ctx):
-            # "Choose three" — default: draw 3 cards (safest autoplay choice)
-            return [{"action": "draw_cards", "player": ctrl, "amount": 3}]
-
-        self._add_card("mystic confluence", EffectTemplate(
-            name="Mystic Confluence",
-            description="Choose three: counter spell / draw a card / bounce creature. Default: draw 3.",
-            action_generator=_mystic_confluence,
-        ))
+        # (mystic confluence: single registration lives at
+        # _mystic_confluence_modal — real mode evaluation. Aug 7 registry
+        # dedup removed the flat draw-3 duplicate.)
 
         def _cryptic_command(ctrl, opp, ctx):
             # "Choose two" — default: counter + draw (strongest line in most cases)
@@ -1283,20 +1277,11 @@ class EffectTemplateLibrary:
             needs_target=True,
         ))
 
-        self._add_card("inferno titan", EffectTemplate(
-            name="Inferno Titan",
-            description="Deal 3 damage divided among up to 3 targets",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "deal_damage", "amount": 3, "target_player": opp,
-                 "source": "Inferno Titan"}
-            ],
-        ))
-
-        self._add_card("sun titan", EffectTemplate(
-            name="Sun Titan",
-            description="Return target permanent with MV 3 or less from graveyard to battlefield",
-            action_generator=lambda ctrl, opp, ctx: self._reanimate_small(ctrl, opp, ctx, max_mv=3),
-        ))
+        # (inferno titan + sun titan: Aug 7 registry dedup — their single
+        # registrations live further down: inferno titan's creature-first
+        # version, sun titan's _gen_sun_titan with the CR 110.1
+        # permanent-card filter. The _reanimate_small version here had no
+        # MV-3 or permanent filter at all.)
 
         self._add_card("frost titan", EffectTemplate(
             name="Frost Titan",
@@ -1327,11 +1312,9 @@ class EffectTemplateLibrary:
             needs_target=True,
         ))
 
-        self._add_card("eternal witness", EffectTemplate(
-            name="Eternal Witness",
-            description="Return target card from graveyard to hand",
-            action_generator=lambda ctrl, opp, ctx: self._return_best_from_graveyard(ctrl, opp, ctx),
-        ))
+        # (eternal witness: single registration lives further down — Aug 7
+        # registry dedup; both read the same aliased ctx key, the kept one
+        # has the cleaner no-op fallback.)
 
         self._add_card("meteor golem", EffectTemplate(
             name="Meteor Golem",
@@ -1866,20 +1849,9 @@ class EffectTemplateLibrary:
         # already have enough basic lands in hand to be flooded — searching for
         # more is wasted activation and floods the discard step. If the
         # controller already holds 5+ basic lands in hand, skip silently.
-        self._add_card("land tax", EffectTemplate(
-            name="Land Tax",
-            description="Search library for up to 3 basic land cards, put into hand",
-            action_generator=lambda ctrl, opp, ctx: (
-                [{"action": "no_action", "reason": ""}]
-                if int(ctx.get('controller_basic_lands_in_hand', 0)) >= 5
-                else (
-                    [{"action": "search_library", "player": ctrl, "card_type": "basic land",
-                      "count": 3, "to_zone": "hand"}]
-                    if ctx.get('opponent_land_count', 0) > ctx.get('controller_land_count', 0)
-                    else [{"action": "no_action", "reason": "Land Tax: opponent doesn't control more lands"}]
-                )
-            ),
-        ))
+        # (land tax: single registration lives at _land_tax_gen — the June 10
+        # audited version that reads real player objects and the real
+        # library. Aug 7 registry dedup removed the ctx-count duplicate.)
 
         # --- Removal spells that give controller a token ---
         self._add_card("reality shift", EffectTemplate(
@@ -2025,13 +1997,26 @@ class EffectTemplateLibrary:
         ))
 
         # --- Shard Volley: its land sacrifice is paid while casting ---
+        # Aug 7 registry dedup: this key was registered TWICE and the later,
+        # target-blind always-face version silently won (the deep-dive's
+        # dead-code example). One registration now, on the Volcanic Geyser
+        # any-target convention: declared creature → target_card; declared
+        # player → target_player; else face. The sacrifice-a-land additional
+        # cost is paid at CAST time (Aug 5 fix), not here.
         self._add_card("shard volley", EffectTemplate(
             name="Shard Volley",
-            description="Shard Volley deals 3 damage to any target (sacrifice a land as additional cost)",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "deal_damage", "amount": 3,
-                 "target_player": ctx.get('explicit_target_player') or ctx.get('explicit_target_name') or opp},  # B-2 (Aug 7): player key first
-            ],
+            description="Sacrifice a land. Shard Volley deals 3 damage to any target.",
+            action_generator=lambda ctrl, opp, ctx: (
+                [{"action": "deal_damage", "amount": 3,
+                  "target_card": ctx.get('explicit_target_name'),
+                  "target_controller": ctx.get('explicit_target_owner') or opp,
+                  "source": "Shard Volley"}]
+                if (ctx.get('explicit_target_name')
+                    and ctx.get('explicit_target_is_creature', False))
+                else [{"action": "deal_damage", "amount": 3,
+                       "target_player": ctx.get('explicit_target_player') or opp,
+                       "source": "Shard Volley"}]
+            ),
         ))
 
         # --- Shark Typhoon (enchantment): whenever you cast noncreature spell, create X/X Shark ---
@@ -3064,11 +3049,10 @@ class EffectTemplateLibrary:
             ))
 
 
-        self._add_card("reanimate", EffectTemplate(
-            name="Reanimate",
-            description="Return target creature from a graveyard to battlefield, lose life equal to CMC",
-            action_generator=self._gen_reanimate,
-        ))
+        # (reanimate: single registration lives at _reanimate_gen — the one
+        # that honors the declared target and charges the real mana value.
+        # Aug 7 registry dedup removed the _gen_reanimate duplicate, which
+        # the Aug 5 verification had already identified as dead code.)
 
         # Animate Dead: reanimate from any graveyard (no life loss, aura attaches)
         # Template avoids Tier 3 which incorrectly fires LTB trigger during ETB
@@ -3209,15 +3193,8 @@ class EffectTemplateLibrary:
         ))
 
         # --- Inferno Titan / Bogardan Hellkite: divided damage ETB ---
-        self._add_card("inferno titan", EffectTemplate(
-            name="Inferno Titan",
-            description="Deal 3 damage divided among targets on ETB and attack",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "deal_damage", "amount": 3, "target_player": opp,
-                 "source": "Inferno Titan"},
-            ],
-        ))
-
+        # (inferno titan: second duplicate removed here too — Aug 7 registry
+        # dedup; the surviving registration is the creature-first version.)
 
         # --- Altar of Dementia: sacrifice creature, mill equal to power ---
         self._add_card("altar of dementia", EffectTemplate(
@@ -4849,15 +4826,15 @@ class EffectTemplateLibrary:
                  "target": "best_creature", "filter": "any", "player": ctrl},
             ],
         ))
-        self._add_card("spark double", EffectTemplate(
-            name="Spark Double",
-            description="Enter as a copy of a creature or planeswalker you control with extra +1/+1 counter",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "become_copy", "source": ctx.get('_source_card_name', 'Spark Double'),
-                 "target": "best_creature", "filter": "own", "player": ctrl,
-                 "extra_counters": {"+1/+1": 1}},
-            ],
-        ))
+        # (spark double: single registration lives at the become_copy block
+        # above — the shape the handler actually reads (`target` = a NAME,
+        # `modifications` list). Aug 7 registry dedup removed the duplicate
+        # here, which passed an unresolvable "best_creature" sentinel and an
+        # `extra_counters` key nothing reads — the silent-no-op vocabulary
+        # class. NOTE: Clone / Clever Impersonator below still carry that
+        # sentinel shape at their only registrations; clones resolve via the
+        # cast-path Tier-1 branch in practice, so those templates are
+        # near-dead — flagged, not drive-by-changed.)
         self._add_card("clever impersonator", EffectTemplate(
             name="Clever Impersonator",
             description="Enter as a copy of any nonland permanent",
@@ -5808,15 +5785,8 @@ class EffectTemplateLibrary:
             ))
 
         # --- Shard Volley: sacrifice was already paid as an additional cost ---
-        def _shard_volley(ctrl, opp, ctx):
-            return [
-                {"action": "deal_damage", "amount": 3, "target_player": opp},
-            ]
-        self._add_card("shard volley", EffectTemplate(
-            name="Shard Volley",
-            description="Sacrifice a land. Deal 3 damage to any target.",
-            action_generator=_shard_volley,
-        ))
+        # (shard volley: single registration lives at the burn-spell block —
+        # Aug 7 registry dedup removed the target-blind duplicate here.)
 
         # --- Aura Shards: destroy target artifact/enchantment when creature enters ---
         self._add_card("aura shards", EffectTemplate(
@@ -6576,16 +6546,9 @@ class EffectTemplateLibrary:
         # Default to draw-two when no stack target exists; counter when stack has spell
         # May 14 audit: filter self from stack_top so an empty-stack cast doesn't
         # end up "countering itself".
-        self._add_card("archmage's charm", EffectTemplate(
-            name="Archmage's Charm",
-            description="Choose one: Counter target spell; Draw two cards; Gain control of target nonland permanent MV 1 or less",
-            action_generator=lambda ctrl, opp, ctx: (
-                [{"action": "counter_spell", "target": ctx.get('stack_top_spell', ''),
-                  "controller": ctrl}]
-                if ctx.get('stack_top_spell') and ctx.get('stack_top_spell', '').lower() != "archmage's charm" else
-                [{"action": "draw_cards", "player": ctrl, "amount": 2}]
-            ),
-        ))
+        # (archmage's charm: single registration lives at the charm block
+        # using _gen_archmages_charm — Aug 7 registry dedup removed the
+        # duplicate lambda here, which ignored the declared target.)
 
         # --- Mystic Confluence: modal spell (choose three, may repeat) ---
         # Modes: counter spell / draw card / bounce creature
@@ -8402,12 +8365,11 @@ class EffectTemplateLibrary:
             return [{"action": "move_card", "card": target, "from_zone": "graveyard", "to_zone": "hand", "player": ctrl}]
         return [{"action": "no_action", "reason": f"{ctrl} returns a card from graveyard (use !fix)"}]
     
-    def _reanimate_small(self, ctrl, opp, ctx, max_mv=3) -> List[Dict]:
-        target = ctx.get('best_own_graveyard_permanent')
-        if target:
-            return [{"action": "move_card", "card": target, "from_zone": "graveyard", "to_zone": "battlefield", "player": ctrl}]
-        return [{"action": "no_action", "reason": f"{ctrl} returns a permanent (MV≤{max_mv}) from graveyard (use !fix)"}]
-    
+    # (_reanimate_small deleted Aug 7 registry dedup — its only caller was the
+    # shadowed sun titan duplicate; it had neither the MV-3 filter nor the
+    # CR 110.1 permanent-card filter the surviving _gen_sun_titan carries.)
+
+
     def _knight_of_autumn(self, ctrl, opp, ctx) -> List[Dict]:
         """Knight of Autumn: choose based on board state."""
         # If opponent has artifacts/enchantments, destroy one
@@ -10517,19 +10479,9 @@ class EffectTemplateLibrary:
              "card_type": "creature", "reason": "Buried Alive: put 3 creatures from library into graveyard"},
         ]
 
-    def _gen_reanimate(self, ctrl, opp, ctx) -> List[Dict]:
-        """Reanimate: put target creature card from a graveyard onto the battlefield,
-        lose life equal to its mana value."""
-        # Find best creature in any graveyard
-        best = ctx.get('best_graveyard_creature', '')
-        best_cmc = ctx.get('best_graveyard_creature_cmc', 0)
-        if not best:
-            return [{"action": "no_action", "reason": "No creature cards in any graveyard"}]
-        return [
-            {"action": "reanimate", "player": ctrl, "card": best,
-             "reason": f"Reanimate: return {best} from graveyard to battlefield"},
-            {"action": "lose_life", "player": ctrl, "amount": best_cmc},
-        ]
+    # (_gen_reanimate deleted Aug 7 registry dedup — it was dead code shadowed
+    # by the _reanimate_gen registration since the Aug 5 verification, and the
+    # dedup removed its only registration.)
 
     def _gen_living_death(self, ctrl, opp, ctx) -> List[Dict]:
         """Living Death: each player exiles all creatures from their graveyard,
