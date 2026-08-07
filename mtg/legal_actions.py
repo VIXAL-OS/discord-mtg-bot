@@ -402,6 +402,36 @@ def graveyard_castable_entries(player, mana_by_color: Dict,
                 {"type": "cast", "card": card.name},
                 ["IMPULSE"]))
 
+    # Aug 7 queue item Q3: Draugr Necromancer's cross-player permission —
+    # cards exiled with ice counters sit in the OPPONENT'S exile, which no
+    # scan above ever visits. Affordability uses the REAL spending-aware
+    # check (can_pay_mana_cost with the card as spending_card), because the
+    # snow-as-any-color waiver makes the per-color aggregates here wrong in
+    # both directions for these casts.
+    if game is not None:
+        for other in getattr(game, 'players', None) or []:
+            if other is player:
+                continue
+            for card in getattr(other, 'exile', None) or []:
+                if getattr(card, '_castable_by_player', None) != getattr(
+                        player, 'name', None):
+                    continue
+                if not is_castable_from_exile(game, player, card):
+                    continue
+                cost = card.mana_cost or ""
+                try:
+                    _ok = player.can_pay_mana_cost(
+                        cost, spending_card=card)[0] if cost else True
+                except (AttributeError, TypeError):
+                    _ok = False
+                if _ok:
+                    results.append(_entry(
+                        f"{card.name} ({cost}) [DRAUGR — cast from "
+                        f"opponent's exile, snow pays any color]",
+                        card.name, "exile",
+                        {"type": "cast", "card": card.name},
+                        ["DRAUGR"]))
+
     return results
 
 

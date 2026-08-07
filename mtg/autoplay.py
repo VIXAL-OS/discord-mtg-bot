@@ -1598,13 +1598,16 @@ async def _autoplay_execute_action(cog, thread, game: GameState, player_idx: int
                     if card:
                         break
 
-        # Check exile zone (like !play does)
+        # Check exile zone (like !play does). Aug 7 (Q3): the finder scans
+        # ALL players' exiles — Draugr Necromancer's permission covers cards
+        # in the OPPONENT'S exile; the holder is whoever physically has it.
         from_exile = False
+        _exile_holder = None
         if not card:
-            exile_card = player.find_card(card_name, Zone.EXILE)
-            if exile_card and is_castable_from_exile(
-                    game, player, exile_card):
-                card = exile_card
+            from mtg.helpers import find_castable_exile_card
+            _found = find_castable_exile_card(game, player, card_name)
+            if _found:
+                card, _exile_holder = _found
                 from_exile = True
 
         # Cast from the TOP OF LIBRARY (Augur of Autumn's coven half).
@@ -1806,7 +1809,10 @@ async def _autoplay_execute_action(cog, thread, game: GameState, player_idx: int
                     game.turn_number, card.name,
                     "foretold this turn — castable from your next turn")
                 return None
-            player.exile.remove(card)
+            # Aug 7 (Q3): remove from the HOLDER's exile — for a
+            # Draugr-permitted card that is the opponent, not the caster.
+            _ex_home = _exile_holder if _exile_holder is not None else player
+            _ex_home.exile.remove(card)
             player.hand.append(card)
             if card.id in player.playable_from_exile:
                 player.playable_from_exile.remove(card.id)
@@ -1877,7 +1883,12 @@ async def _autoplay_execute_action(cog, thread, game: GameState, player_idx: int
                 _rollback_library_top_cast()
             if from_exile and card in player.hand:
                 player.hand.remove(card)
-                player.exile.append(card)
+                # Aug 7 (Q3): a failed cast returns the card to the exile it
+                # came FROM — for a Draugr-permitted card that is the
+                # opponent's, and dropping it into the caster's would move a
+                # card between players' zones on a FAILED cast.
+                (_exile_holder if _exile_holder is not None
+                 else player).exile.append(card)
                 if _was_foretold:
                     card._foretold = True
                     card._face_down = True
@@ -1905,6 +1916,18 @@ async def _autoplay_execute_action(cog, thread, game: GameState, player_idx: int
         card._tutor_card = (
             str(tutor_choice).strip() if tutor_choice is not None else None
         )
+        # Aug 7 queue item Q2a: split-destination tutors (Jarad's Orders —
+        # one creature to hand, one to graveyard) discard the model's choice
+        # for every search except the first; the destination-typed keys let
+        # each search consume its own choice. Same executor-twin exists in
+        # engine.py:_execute_action.
+        for _tk, _tattr in (("tutor_to_hand", "_tutor_to_hand"),
+                            ("tutor_to_graveyard", "_tutor_to_graveyard")):
+            _tv = action.get(_tk)
+            if isinstance(_tv, list):
+                _tv = _tv[0] if _tv else None
+            setattr(card, _tattr,
+                    str(_tv).strip() if _tv is not None else None)
 
         card._cast_from_command_zone = from_command_zone
         success, msg, effect_msgs = await cog.engine.cast_spell_async(
@@ -1913,6 +1936,8 @@ async def _autoplay_execute_action(cog, thread, game: GameState, player_idx: int
         )
         card._cast_from_command_zone = False
         card._tutor_card = None
+        card._tutor_to_hand = None
+        card._tutor_to_graveyard = None
 
         # May 23 audit (CRITICAL #4): even when cast_spell_async returns
         # success=True, the spell may have been countered on the stack. Record
@@ -1958,6 +1983,12 @@ async def _autoplay_execute_action(cog, thread, game: GameState, player_idx: int
             # Per-cast stamps; resolution has read them by now (engine twin).
             if from_graveyard:
                 card._cast_from_graveyard = False
+            # Aug 7 (Q3): the Draugr permission is spent by a successful
+            # cast — the object is on the battlefield now, and a later trip
+            # through exile must not resurrect the stamp (CR 400.7 spirit).
+            if from_exile and getattr(card, '_castable_by_player', None):
+                card._castable_by_player = None
+                card._snow_as_any_color = False
             # Without this, _cast_via_foretell becomes a PERMANENT "charge me
             # the foretell cost" marker on the card object — every later cast
             # from any zone is discounted, and can_cast_spell advertises it a
@@ -2412,6 +2443,15 @@ async def _autoplay_execute_action(cog, thread, game: GameState, player_idx: int
         if getattr(game, '_last_cast_countered', False):
             print(f"[AUTOPLAY-RESOLVE] Dropped orphan resolve — prior cast was countered: '{description[:80]}'")
             game._last_cast_countered = False
+            # Aug 7 confirmation-batch audit (C-3): this drop returned bare
+            # None with no stash — the C-4 fix (a394c83) covered only the
+            # positional-pairing sibling below, so this branch still fed
+            # "unknown reason" to the retry loop.
+            game._last_resolve_drop_reason = (
+                game.turn_number,
+                "orphan `resolve` dropped — the prior cast was COUNTERED, so "
+                "its effects never happen (CR 701.5a); choose a different "
+                "action or pass")
             return None
 
         # June 10 audit (C3/V28): positional pairing — name-matching below
@@ -2459,6 +2499,15 @@ async def _autoplay_execute_action(cog, thread, game: GameState, player_idx: int
             if acted_name and acted_name.lower() in desc_lower:
                 print(f"[AUTOPLAY-RESOLVE] Skipping orphan resolve — '{acted_name}' "
                       f"action already fired this turn: '{description[:80]}'")
+                # Aug 7 (C-3): live evidence game_1535218009269084230 — an
+                # Evolving Wilds orphan resolve hit this branch, got
+                # "unknown reason", and the whole batched plan fell back to
+                # per-action. Same stash as the positional sibling above.
+                game._last_resolve_drop_reason = (
+                    game.turn_number,
+                    f"redundant `resolve` dropped — '{acted_name}' already "
+                    f"performed its effect this turn; do not re-propose it, "
+                    f"choose a different action or pass")
                 return None
         # Also: certain description verbs are almost always redundant
         # filler ("Untap your lands", "Discard none, draw 0 cards",

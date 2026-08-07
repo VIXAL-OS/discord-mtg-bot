@@ -2144,6 +2144,79 @@ async def _await_stack_window(engine, game: GameState, player: Player,
     return None, cast_trigger_msgs, player_idx
 
 
+def inject_tutor_choice(action: dict, ctx: dict) -> None:
+    """Aug 7 queue item Q2a: route the AI's typed tutor choice into a
+    search_library action, destination-aware.
+
+    A hand-bound search consumes ctx['_tutor_to_hand'], a graveyard-bound
+    one ctx['_tutor_to_graveyard'] (Jarad's Orders — the model's choice for
+    the SECOND search used to be discarded entirely). The generic
+    ctx['_tutor_card'] stays as the consumed-once fallback (the Aug 7 C-5
+    fix: one name must never be injected into two searches). No-op when the
+    template already names a card.
+    """
+    if action.get("card_name"):
+        return
+    dest = (action.get("to_zone") or action.get("destination") or "hand").lower()
+    dest_key = {"hand": "_tutor_to_hand",
+                "graveyard": "_tutor_to_graveyard"}.get(dest)
+    if dest_key and ctx.get(dest_key):
+        action["card_name"] = ctx[dest_key]
+        ctx[dest_key] = None
+    elif ctx.get('_tutor_card'):
+        action["card_name"] = ctx['_tutor_card']
+        ctx['_tutor_card'] = None
+
+
+def maybe_resolve_devour(engine, game: GameState, player: Player, card) -> List[str]:
+    """DEVOUR (CR 702.81) — Aug 7 confirmation-batch audit (CO-3).
+
+    Devour is a keyword enters-with replacement printed with NO trigger word,
+    so _is_self_etb_trigger_paragraph correctly refuses it and the
+    ETB-template block never consulted the registered template — Mycoloth
+    entered with ZERO counters over three token fodder
+    (game_1535222978873266206; the wave-5 pin called resolve_etb DIRECTLY,
+    the pin-shape trap). Same funnel convention as the multikicker parse:
+    detect the keyword line, run the registered name-key template (which
+    owns the v1 tokens-only policy) through the standard action interpreter.
+    Module-level so the pin exercises the same function the funnel calls.
+    """
+    messages: List[str] = []
+    if not (HAS_EFFECT_TEMPLATES and card.oracle_text
+            and re.search(r'(?im)^devour \d+', card.oracle_text)):
+        return messages
+    try:
+        _dlib = get_effect_library()
+        if card.name.lower() in getattr(_dlib, '_card_templates', {}):
+            _opp = game.players[1 - game.players.index(player)] \
+                if player in game.players else game.players[0]
+            _dctx = build_game_context(game, player, _opp, card=card)
+            _dactions, _ddesc = _dlib.resolve_etb(
+                card.name, card.oracle_text, player.name, _opp.name,
+                game_context=_dctx, event_type='etb')
+            for _da in (_dactions or []):
+                if _da.get('action') == 'no_action':
+                    continue
+                # The wave-5 template emits card="self" — vocabulary the
+                # add_counters handler resolves by battlefield NAME lookup,
+                # so the literal "self" found nothing (it never ran live, so
+                # the silent no-op was never caught). Resolve it here where
+                # the entering card is in hand.
+                if _da.get('card') == 'self':
+                    _da = dict(_da, card=card.name)
+                _dmsg = engine.rules._execute_action_on_state(game, _da)
+                if _dmsg:
+                    messages.append(_dmsg)
+            print(f"[DEVOUR] {card.name}: {_ddesc}")
+    except Exception as _de:
+        # Crash barrier: a devour resolution failure must not abort the cast
+        # that already paid for the creature. maybe_reraise for strict/pytest.
+        print(f"[DEVOUR] Error resolving devour for {card.name}: {_de}")
+        from mtg.util import maybe_reraise
+        maybe_reraise(_de)
+    return messages
+
+
 async def _dispatch_resolution(engine, game: GameState, player: Player,
                                card: Card, target: Any,
                                effect_messages: List[str],
@@ -2350,6 +2423,11 @@ async def _dispatch_resolution(engine, game: GameState, player: Player,
                     ctx['_modes'] = card._modes_chosen
                 if getattr(card, '_tutor_card', None):
                     ctx['_tutor_card'] = card._tutor_card
+                # Aug 7 (Q2a): destination-typed choices ride alongside.
+                if getattr(card, '_tutor_to_hand', None):
+                    ctx['_tutor_to_hand'] = card._tutor_to_hand
+                if getattr(card, '_tutor_to_graveyard', None):
+                    ctx['_tutor_to_graveyard'] = card._tutor_to_graveyard
                 lib = get_effect_library()
                 tmpl_actions, tmpl_explanation = lib.resolve_spell(
                     card_name=card.name,
@@ -2386,15 +2464,8 @@ async def _dispatch_resolution(engine, game: GameState, player: Player,
                                   f"after a fizzled mode (CR 700.2)")
                             spell_fizzled = False
                         if action.get("action") != "no_action":
-                            if (action.get("action") == "search_library"
-                                    and ctx.get('_tutor_card')
-                                    and not action.get("card_name")):
-                                action["card_name"] = ctx['_tutor_card']
-                                # Aug 7 batch audit (C-5): the typed tutor
-                                # choice names ONE card — without consuming
-                                # it, a two-search template (Jarad's Orders)
-                                # injected the same name into BOTH searches.
-                                ctx['_tutor_card'] = None
+                            if action.get("action") == "search_library":
+                                inject_tutor_choice(action, ctx)
                             # May 7 audit fix #6: inject source card name into
                             # the action so deal_damage can emit per-spell burn
                             # lines (🔥 Lava Spike deals 3 damage to Claude).
@@ -3340,6 +3411,9 @@ async def _dispatch_resolution(engine, game: GameState, player: Player,
                 # can't clear it for us — the CAST path calls that at entry,
                 # upstream of this read.)
                 card._kicked_times = 0
+
+        # DEVOUR (CR 702.81) — Aug 7 confirmation-batch audit (CO-3).
+        effect_messages.extend(maybe_resolve_devour(engine, game, player, card))
 
         # Initialize planeswalker loyalty
         if card.is_planeswalker():

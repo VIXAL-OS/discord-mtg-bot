@@ -607,7 +607,15 @@ def create_doubling_season_counters(source_id: str, controller: str) -> Replacem
         source_id=source_id,
         controller=controller,
         replaces_event=EventType.COUNTER_PLACED,
-        condition=lambda e: True,  # Would check controller
+        # Aug 7 confirmation-batch audit (B-1, CRITICAL): this was a literal
+        # `lambda e: True  # Would check controller` stub — Doubling Season
+        # doubled counters on the OPPONENT'S permanents too. Rick's Season
+        # inflated Qwen's Predator Ooze from 4 to 9 power and decided brawl
+        # game_1535228613341872148. The printed text restricts to "a
+        # permanent YOU control"; Anointed Procession (below) always had the
+        # condition. All 8 COUNTER_PLACED/TOKEN_CREATED emit sites populate
+        # affected_player (verified), so the gate is safe.
+        condition=lambda e, _ctrl=controller: e.affected_player == _ctrl,
         condition_text="counters on a permanent you control",
         replacement_type="double_counters",
         multiply_amount=2.0,
@@ -625,7 +633,8 @@ def create_doubling_season_tokens(source_id: str, controller: str) -> Replacemen
         source_id=source_id,
         controller=controller,
         replaces_event=EventType.TOKEN_CREATED,
-        condition=lambda e: True,  # Would check controller
+        # Aug 7 (B-1): same stub as the counter half — "under YOUR control".
+        condition=lambda e, _ctrl=controller: e.affected_player == _ctrl,
         condition_text="create tokens under your control",
         replacement_type="double_tokens",
         multiply_amount=2.0,
@@ -646,7 +655,8 @@ def create_parallel_lives_effect(source_id: str, controller: str) -> Replacement
         source_id=source_id,
         controller=controller,
         replaces_event=EventType.TOKEN_CREATED,
-        condition=lambda e: True,  # Would check controller
+        # Aug 7 (B-1): same stub — Parallel Lives is "under YOUR control".
+        condition=lambda e, _ctrl=controller: e.affected_player == _ctrl,
         condition_text="create tokens under your control",
         replacement_type="double_tokens",
         multiply_amount=2.0,
@@ -930,11 +940,13 @@ _NAMED_CARD_REPLACEMENTS = {
     ],
     # July 30 (batch-8 deferred item): Draugr Necromancer was a vanilla
     # creature — neither half of his text existed anywhere. This models the
-    # DEATH-REDIRECT half only ("If a nontoken creature an opponent controls
+    # DEATH-REDIRECT half ("If a nontoken creature an opponent controls
     # would die, exile that card with an ice counter on it instead" — the
-    # RIP/Leyline family plus the counter rider). The second half (casting
-    # opponents' ice-countered cards from exile with snow mana as any color)
-    # needs cross-player impulse-cast machinery and is UNMODELED.
+    # RIP/Leyline family plus the counter rider). Aug 7 queue item Q3: the
+    # CAST half is now modeled too — the redirect consumer in mtg/sba.py
+    # stamps Card._castable_by_player/_snow_as_any_color, the executors
+    # cast from the opponent's exile, and the payment engine treats snow
+    # sources as any-color for those casts.
     "draugr necromancer": lambda card_id, controller: [
         ReplacementEffect(
             id=f"{card_id}_draugr",
@@ -1107,6 +1119,34 @@ _NAMED_CARD_REPLACEMENTS = {
             ),
         )
     ],
+    # Aug 7 confirmation-batch audit (C-1): entirely unregistered before —
+    # "If a source you control would deal NONCOMBAT damage to an opponent or
+    # a permanent an opponent controls, it deals double that damage instead."
+    # The Torbran condition shape (source you control, affected side is an
+    # opponent — affected_player carries the damaged permanent's controller
+    # for object events) plus the noncombat gate: is_combat_damage is set
+    # True only by the two combat funnels in mtg/combat.py (verified), so
+    # `not is_combat_damage` is exactly the printed restriction.
+    "solphim, mayhem dominus": lambda card_id, controller: [
+        ReplacementEffect(
+            id=f"{card_id}_solphim",
+            source_name="Solphim, Mayhem Dominus",
+            source_id=card_id,
+            controller=controller,
+            replaces_event=EventType.DAMAGE,
+            condition_text=("noncombat damage from your sources to opponents "
+                            "and their permanents doubled"),
+            replacement_type="double_damage",
+            multiply_amount=2.0,
+            condition=lambda ev, _ctrl=controller: (
+                not ev.is_combat_damage
+                and bool(ev.source_controller)
+                and ev.source_controller == _ctrl
+                and bool(ev.affected_player)
+                and ev.affected_player != _ctrl
+            ),
+        )
+    ],
     "doubling season": lambda card_id, controller: [
         create_doubling_season_counters(card_id, controller),
         create_doubling_season_tokens(card_id, controller),
@@ -1134,6 +1174,10 @@ _NAMED_CARD_REPLACEMENTS = {
             source_id=card_id,
             controller=controller,
             replaces_event=EventType.COUNTER_PLACED,
+            # Aug 7 (B-1 sweep): same missing-controller class as Doubling
+            # Season — neither card is in the cache today, but leaving the
+            # stubs reopens the class the day one is played.
+            condition=lambda e, _ctrl=controller: e.affected_player == _ctrl,
             condition_text="+1/+1 counters on a creature you control",
             replacement_type="double_counters",
             multiply_amount=2.0,
@@ -1146,6 +1190,8 @@ _NAMED_CARD_REPLACEMENTS = {
             source_id=card_id,
             controller=controller,
             replaces_event=EventType.COUNTER_PLACED,
+            # Aug 7 (B-1 sweep): "a creature you control" — same class.
+            condition=lambda e, _ctrl=controller: e.affected_player == _ctrl,
             condition_text="+1/+1 counters on a creature you control",
             replacement_type="extra_counter",
             add_amount=1,

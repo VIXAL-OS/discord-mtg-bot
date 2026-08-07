@@ -273,6 +273,19 @@ def _validate_plan_mana(engine, game: GameState, player_idx: int, plan: list) ->
         if is_castable_from_exile(game, player, c):
             hand_names.add(c.name.lower())
             _alt_zone_cards[c.name.lower()] = c
+    # Aug 7 Q3 adversarial review (#3): Draugr-permitted cards sit in the
+    # OPPONENT'S exile — without this loop the offer appeared, the model
+    # proposed the cast, and this validator dropped it as "not in hand"
+    # before any executor ran (the exact Aug-3 trap the comment above
+    # records; the feature was decorative on Claude's primary path).
+    for _op in (getattr(game, 'players', None) or []):
+        if _op is player:
+            continue
+        for c in (getattr(_op, 'exile', None) or []):
+            if (getattr(c, '_castable_by_player', None) == player.name
+                    and is_castable_from_exile(game, player, c)):
+                hand_names.add(c.name.lower())
+                _alt_zone_cards[c.name.lower()] = c
     # The TOP CARD of the library, when something grants casting from there
     # (Augur of Autumn's coven half). Without this the castable list offers
     # the card and the plan validator immediately drops it as "not in hand"
@@ -579,9 +592,35 @@ def _validate_plan_mana(engine, game: GameState, player_idx: int, plan: list) ->
                 # after spending `any`-color mana to fill gaps), reject — the
                 # engine would otherwise fail mid-plan with "Not enough <color>
                 # mana" and force a fallback to per-action mode.
-                ok, mana_by_color, any_color_mana = _simulate_cast_spend(
-                    _sim_cost, mana_by_color, any_color_mana
-                )
+                # Aug 7 Q3 adversarial review (#3): a Draugr-permitted card
+                # pays with snow-as-any-color, which the per-color pool
+                # simulation cannot express — it rejected the cast as a
+                # colored mismatch right after the offer appeared. Defer to
+                # the REAL spending-aware check and deduct the cost as
+                # fungible (exactly right when the payment is all-snow;
+                # plan simulation is approximate by design elsewhere too —
+                # the splice note).
+                _is_draugr_cast = (
+                    getattr(card_obj, '_snow_as_any_color', False)
+                    and getattr(card_obj, '_castable_by_player', None)
+                    == player.name)
+                if (_is_draugr_cast and player.can_pay_mana_cost(
+                        _sim_cost, spending_card=card_obj)[0]):
+                    _rem = cost
+                    _take = min(_rem, any_color_mana)
+                    any_color_mana -= _take
+                    _rem -= _take
+                    for _c in list(mana_by_color):
+                        if _rem <= 0:
+                            break
+                        _take = min(_rem, mana_by_color[_c])
+                        mana_by_color[_c] -= _take
+                        _rem -= _take
+                    ok = True
+                else:
+                    ok, mana_by_color, any_color_mana = _simulate_cast_spend(
+                        _sim_cost, mana_by_color, any_color_mana
+                    )
                 if not ok:
                     # May 17 audit: previously a bare print with the full
                     # mana-pool dict in the reason — that made the
@@ -2376,6 +2415,19 @@ def _get_action_error(engine, game: GameState, player_index: int, action: Dict) 
         _verb = ("foretell" if action_type == "foretell"
                  else f"{action.get('mechanic', 'activate')} from the graveyard")
         return f"Could not {_verb} {action.get('card', '?')}"
+
+    elif action_type == "attack":
+        # Aug 7 confirmation-batch audit (B-5): no branch existed for the
+        # (undocumented) {"type": "attack"} action, so its failures fell to
+        # the terminal "unknown reason" and the model varied JSON syntax
+        # blindly for 3 retries. Surface the stash the engine branch now
+        # writes; fall back to the teaching message either way.
+        _laa = getattr(game, '_last_attack_action_failure', None)
+        if _laa and _laa[0] == game.turn_number:
+            game._last_attack_action_failure = None
+            return _laa[1]
+        return ("attack is not a plan action — attackers are declared during "
+                "the Declare Attackers step (decide_attackers)")
 
     elif action_type == "activate":
         perm_name = action.get("permanent")

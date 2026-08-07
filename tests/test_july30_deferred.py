@@ -116,13 +116,18 @@ class TestDraugrNecromancerRedirect:
 
         assert tok not in rick.exile, "NONTOKEN creatures only"
 
-    def test_second_half_documented_unmodeled(self):
+    def test_second_half_now_modeled_and_documented(self):
+        # Aug 7 queue item Q3 retired the July-30 UNMODELED note: the cast
+        # half exists (stamp in mtg/sba.py, executors cast from the
+        # opponent's exile, snow-as-any payment waiver). The registration
+        # comment must say so — an UNMODELED note surviving past the model
+        # is the stale-doc class.
         from pathlib import Path
         src = (Path(__file__).resolve().parent.parent
                / "rules/replacement.py").read_text(encoding="utf-8")
-        assert "UNMODELED" in src.split("draugr necromancer")[0][-900:], (
-            "the cast-from-exile half must be noted unmodeled at the "
-            "registration site")
+        _before = src.split("draugr necromancer")[0][-900:]
+        assert "UNMODELED" not in _before
+        assert "CAST half is now modeled" in _before
 
 
 RIFT_BOLT = ("Rift Bolt deals 3 damage to any target.\n"

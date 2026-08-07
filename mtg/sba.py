@@ -674,6 +674,43 @@ def process_state_based_actions(rules, game: GameState) -> List[str]:
                                     print(f"  [REPLACEMENT-APPLY] {card.name} "
                                           f"exiled with a{'n' if _rc[:1] in 'aeiou' else ''} "
                                           f"{_rc} counter")
+                                    # Aug 7 queue item Q3: Draugr's CAST
+                                    # half — "You may cast spells from
+                                    # among cards in exile your opponents
+                                    # own with ice counters on them, and
+                                    # you may spend mana from snow sources
+                                    # as though it were mana of any color
+                                    # to cast those spells." Stamp the
+                                    # permission; is_castable_from_exile
+                                    # re-checks the stamping Draugr's
+                                    # presence at offer AND cast time.
+                                    if any('Draugr Necromancer' in _cn
+                                           for _cn in (getattr(final, 'replacement_chain', None) or [])):
+                                        # Q3 adversarial review #4: the
+                                        # redirect only ever applies to an
+                                        # OPPONENT's creature, so the
+                                        # stamping Draugr can never belong
+                                        # to the dying player — a snow
+                                        # mirror stamped the DYING player.
+                                        # #10: record WHICH Draugr, so the
+                                        # permission dies with that object
+                                        # (CR 607) and a new Draugr can't
+                                        # revive it.
+                                        _dr = next(
+                                            ((c, p) for p in game.players
+                                             if p is not player
+                                             for c in p.battlefield
+                                             if c.name == 'Draugr Necromancer'
+                                             and not getattr(c, '_phased_out', False)),
+                                            None)
+                                        if _dr:
+                                            _dr_card, _dr_owner = _dr
+                                            card._castable_by_player = _dr_owner.name
+                                            card._snow_as_any_color = True
+                                            card._draugr_source_id = _dr_card.id
+                                            print(f"  [DRAUGR-CAST] {card.name} "
+                                                  f"castable by {_dr_owner.name} "
+                                                  f"(snow as any color)")
                                 # May 17 audit: only emit the redirect log AFTER
                                 # we know we're actually honoring it below — see
                                 # the destination switch. Previously the log

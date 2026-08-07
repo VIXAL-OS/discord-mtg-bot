@@ -1643,7 +1643,7 @@ DECISION QUALITY — AVOID COMMON MISTAKES:
 - X-COST SPELLS (Walking Ballista, Hydroid Krasis, Blue Sun's Zenith): set X to a meaningful value. Casting X=0 wastes the card. If you can only afford X=1 and the effect needs more to matter, hold it.
 - DISCARD (Liliana of the Veil, Smallpox, end-step discard): when forced to discard, drop your highest-CMC unplayable card or a redundant land — never discard your only win condition or a card you can cast next turn.
 - LIFE AS A RESOURCE: at low life (≤5) treat your life total like cards in hand. Skip optional life payments (fetchlands, shocklands' 2-life option, Dark Confidant flips, Phyrexian mana) unless the payoff is decisive.
-- TUTORS (Demonic Tutor, Vampiric, Mystical): include `"tutor_card": "<exact card name>"`; name a card that wins or stabilizes immediately, not generic ramp.
+- TUTORS (Demonic Tutor, Vampiric, Mystical): include `"tutor_card": "<exact card name>"`; name a card that wins or stabilizes immediately, not generic ramp. SPLIT-DESTINATION tutors (Jarad's Orders — one card to hand, one to graveyard): use `"tutor_to_hand": "<name>"` and `"tutor_to_graveyard": "<name>"` so each search gets its own choice (put the reanimation target in the graveyard, the enabler in hand).
 - FLASHBACK GRANTERS (Snapcaster Mage, Lurrus, Past in Flames, Mizzix's Mastery): when you grant flashback to an instant/sorcery in your graveyard, follow through THIS TURN — include the flashback cast in the same plan if you have mana for both. Snapcaster {1}{U} + flashback Lightning Bolt {R} = 3 mana for 3 damage and a body. Skipping the flashback wastes the Snapcaster's whole reason to exist (granted ability ends at end of turn, the spell stays in your graveyard but unused). If you can't afford both, hold the granter for a turn you can. Same logic for Lurrus's once-per-turn permanent recursion — recur a value piece, don't waste the slot.
 - DON'T SANDBAG WHEN YOU'RE DYING (control decks especially): if your life is ≤5 and you have a body that can BLOCK in hand (Snapcaster Mage, Spell Queller, Solitude evoke, Watcher in the Mist, Reflector Mage — any flash creature, any 0-mana evoke), DEPLOY IT. Holding "for value" while taking lethal next turn is a known control-deck losing pattern. Evoke costs are FREE alternative casts — Solitude evokes for {0} and exiles a creature; Endurance evokes to shuffle graveyards; Grief evokes to discard. At 2 life vs a 4-power attacker, evoking Solitude to exile the attacker IS the play. Free spells (Force of Negation, Foil, alt-cost counterspells) are also free chumpings if cast on creatures, and free protection on your turn.
 - WHEN HOLDING REMOVAL: ask "what gets worse if I wait one turn?" If opp has lethal damage on board or a snowballing anthem (Cathar's Crusade, Sword of Feast and Famine), removal NOW is correct. If opp is empty-handed and tapped out, holding can be fine. Default to action-now over inaction.
@@ -1981,14 +1981,15 @@ What is your best play? Respond with a JSON action."""
         # as if they were in hand (Momentary Blink 7+ times in one game).
         gy_or_exile_castable = [c for c in castable_cards
                                 if 'FLASHBACK' in c or 'ESCAPE' in c or 'COMPANION' in c
-                                or 'TOP OF LIBRARY' in c]
+                                or 'TOP OF LIBRARY' in c or 'DRAUGR' in c]
         if gy_or_exile_castable:
             castable_section += (
                 "\nNOTE: cards tagged [FLASHBACK from graveyard], [ESCAPE], "
-                "[COMPANION], or [TOP OF LIBRARY] are NOT in your hand — they "
-                "are castable anyway, so the hand-only rule above does not "
-                "forbid them. Each can be cast at most ONCE this turn (then "
-                "they change zones). Don't plan multiple casts of the same one."
+                "[COMPANION], [TOP OF LIBRARY], or [DRAUGR — cast from "
+                "opponent's exile] are NOT in your hand — they are castable "
+                "anyway, so the hand-only rule above does not forbid them. "
+                "Each can be cast at most ONCE this turn (then they change "
+                "zones). Don't plan multiple casts of the same one."
             )
 
         # Bug fix: explicit land-drop-used warning. Deepseek ignores subtle hints like "Lands: 1/1".
@@ -2257,6 +2258,26 @@ Based on this game state, what is your best play?
                       f"{action.get('card') or action.get('permanent')} — "
                       f"vetoing to pass")
                 action = {"type": "pass"}
+            # Aug 7 confirmation-batch audit (CO-4): the PLAN path rejects
+            # board wipes on creatureless boards (_validate_plan_mana), but
+            # this inline fallback had no guard — the two-path divergence:
+            # in game_1535228649845030952 the plan cast was rejected and the
+            # inline path then cast Day of Judgment into a 0-creature board
+            # anyway (card + 4 mana for nothing). Same predicate as the plan
+            # guard, veto to pass.
+            if action.get("type") == "cast" and action.get("card"):
+                try:
+                    from mtg.helpers import names_match, board_wipe_on_empty_board
+                    _wc = next((c for c in game.players[player_index].hand
+                                if names_match(c.name, action["card"])), None)
+                    if board_wipe_on_empty_board(game, player_index, _wc):
+                        print(f"{self.provider_tag} [WIPE-HOLD] "
+                              f"{_wc.name}: board wipe on an empty "
+                              f"board — vetoing to pass (inline twin "
+                              f"of the plan-validate guard)")
+                        action = {"type": "pass"}
+                except (AttributeError, TypeError, IndexError):
+                    pass
 
             # Append assistant response to conversation if in conversation mode
             if conversation is not None:
@@ -2396,13 +2417,14 @@ Based on this game state, what is your best play?
         # Apr 30 audit fix #25: graveyard / exile zone reminder (mirrors decide_action).
         gy_or_exile_castable = [c for c in castable_cards
                                 if 'FLASHBACK' in c or 'ESCAPE' in c or 'COMPANION' in c
-                                or 'TOP OF LIBRARY' in c]
+                                or 'TOP OF LIBRARY' in c or 'DRAUGR' in c]
         if gy_or_exile_castable:
             castable_section += (
                 "\nNOTE: cards tagged [FLASHBACK from graveyard], [ESCAPE], "
-                "[COMPANION], or [TOP OF LIBRARY] are NOT in your hand — they "
-                "are castable anyway, so the hand-only rule above does not "
-                "forbid them. Cast each at most ONCE per turn."
+                "[COMPANION], [TOP OF LIBRARY], or [DRAUGR — cast from "
+                "opponent's exile] are NOT in your hand — they are castable "
+                "anyway, so the hand-only rule above does not forbid them. "
+                "Cast each at most ONCE per turn."
             )
 
         # Build state description (cached)
@@ -2666,6 +2688,7 @@ WHEN TO USE `cast` INSTEAD OF `resolve`:
 - Reanimate spells (Animate Dead, Reanimate, Victimize, Stitch Together): `{"type": "cast", "card": "Animate Dead", "target": "<creature in graveyard>"}`
   NOT `{"type": "resolve", "description": "Return Blood Artist from graveyard"}`
 - Tutor spells: `{"type": "cast", "card": "Demonic Tutor", "tutor_card": "Craterhoof Behemoth"}` — always name the exact card to find
+- Split-destination tutors (Jarad's Orders): `{"type": "cast", "card": "Jarad's Orders", "tutor_to_hand": "Sakura-Tribe Elder", "tutor_to_graveyard": "Kokusho, the Evening Star"}`
 - Spell-from-graveyard effects (Yawgmoth's Will, Past in Flames): `cast` the spell
 
 `resolve` description field rules (only when truly needed): ≤80 chars, imperative

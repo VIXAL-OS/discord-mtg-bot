@@ -173,7 +173,9 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
             create_deepseek_reasoner_adapter() if create_deepseek_reasoner_adapter else None
         )
         if self._deepseek_reasoner_adapter:
-            print("[DEEPSEEK] Phase 3 split active: actor=deepseek-v4-flash, strategist=deepseek-v4-pro")
+            # Aug 7 (CO-5): banner was stale — the strategist has been
+            # V4-Flash THINKING since the Aug 2 A/B (the factory is truth).
+            print("[DEEPSEEK] Phase 3 split active: actor=deepseek-v4-flash, strategist=deepseek-v4-flash THINKING")
 
         # Alibaba / DashScope (Qwen) — the second provider, so a batch is not
         # hostage to one vendor's congestion. Same actor/strategist split.
@@ -1372,6 +1374,11 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
                         break
 
         # If not in hand, check if it's playable from exile (Chandra 0, etc.)
+        # Aug 7 (Q3 review #9, documented gap): this human !play path scans
+        # the caster's OWN exile only — Draugr-permitted cards in the
+        # OPPONENT'S exile are reachable from the AI executors (via
+        # helpers.find_castable_exile_card) but not from here. A human can
+        # use !fix as the escape hatch until this path adopts the finder.
         if not card:
             exile_card = player.find_card(actual_card_name, Zone.EXILE)
             if exile_card and is_castable_from_exile(
@@ -5023,15 +5030,39 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
             tid = getattr(thread, 'id', None)
             if tid is not None:
                 if not hasattr(self, '_dedup_state'):
-                    self._dedup_state: Dict[int, Tuple[str, int]] = {}
-                last_content, last_count = self._dedup_state.get(tid, ("", 0))
+                    self._dedup_state: Dict[int, tuple] = {}
+                _ded = self._dedup_state.get(tid, ("", 0, None))
+                last_content, last_count = _ded[0], _ded[1]
+                last_msg = _ded[2] if len(_ded) > 2 else None
                 if content == last_content:
-                    # Skip back-to-back identical sends entirely; we'll catch
-                    # high counts at flush time below.
-                    self._dedup_state[tid] = (content, last_count + 1)
+                    # Aug 7 queue item Q1: the silent drop hid MULTIPLICITY —
+                    # two Swiftspears' prowess lines rendered as ONE line
+                    # with no ×2, and Burning Inquiry's second same-named
+                    # discard vanished (recorded as a known display
+                    # limitation in the batch-14 audit). The first message
+                    # is already POSTED, so the class fix is edit-in-place:
+                    # bump the count and edit the posted message to carry
+                    # " _(×N)_". Falls back to the old silent drop if the
+                    # edit fails (deleted message, permissions) — never
+                    # crash a game over display. The per-turn burst
+                    # sentinel below is untouched (it only sees NON-identical
+                    # consecutive content, same as before).
+                    new_count = last_count + 1
+                    self._dedup_state[tid] = (content, new_count, last_msg)
+                    if last_msg is not None:
+                        try:
+                            _edited = f"{content} _(×{new_count})_"
+                            await last_msg.edit(content=_edited)
+                            _logger = self.game_loggers.get(tid)
+                            if _logger:
+                                _logger.log_discord_out(
+                                    f"(edited ×{new_count}) {content}")
+                        except Exception as _ee:
+                            print(f"[DEDUP-EDIT] edit failed, falling back "
+                                  f"to silent drop: {_ee}")
                     return
                 else:
-                    self._dedup_state[tid] = (content, 1)
+                    self._dedup_state[tid] = (content, 1, None)
                 # May 18 audit: extend the byte-identical adjacent dedup above
                 # to byte-identical PER-TURN dedup. Species Specialist's
                 # "🃏 Species Specialist — Claude draws a card" fired 11 times
@@ -5120,7 +5151,18 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
             try:
                 if content:
                     # Use _thread_send for Discord logging (logs to game's discord log file)
-                    await self._thread_send(thread, content, embed=embed)
+                    _sent_msg = await self._thread_send(thread, content, embed=embed)
+                    # Aug 7 (Q1): remember the posted Message so a
+                    # back-to-back identical send can edit " _(×N)_" onto it
+                    # instead of silently dropping. Only when THIS content is
+                    # what the dedup state recorded (chunks and embeds never
+                    # touch the state).
+                    if not _is_chunk and embed is None:
+                        _tid = getattr(thread, 'id', None)
+                        if (_tid is not None and hasattr(self, '_dedup_state')
+                                and self._dedup_state.get(_tid, ("",))[0] == content):
+                            _cnt = self._dedup_state[_tid][1]
+                            self._dedup_state[_tid] = (content, _cnt, _sent_msg)
                 elif embed:
                     await thread.send(embed=embed)
                 # May 18 audit: stamp the game with the last successful send time

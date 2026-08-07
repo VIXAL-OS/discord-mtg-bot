@@ -2674,6 +2674,10 @@ class GameEngine:
             _p.instant_sorcery_spells_cast_this_turn = 0  # Arclight Phoenix
             _p.cards_drawn_this_turn = 0  # miracle (CR 702.94)
         game._creature_died_this_turn = False  # morbid (CR 207.2c)
+        # Aug 7 (A-2b/B-2): per-turn dealer→damaged attribution record
+        # ("dealt damage by this creature THIS TURN" watchers) resets with
+        # the other per-turn combat state.
+        game._creature_combat_damage_by_dealer = {}
         game._dredged_this_turn = set()  # dredge (CR 702.52) — one per player per turn
 
         # Reset per-turn flicker dedup tracker (see actions.py flicker handler)
@@ -2996,44 +3000,50 @@ class GameEngine:
             # Exile-cast bookkeeping, declared BEFORE the scan that
             # sets it — the failure rollback below reads both.
             _from_exile_card = None
+            _exile_holder = None
             _was_foretold = False
-            # Check if it's playable from exile (Chandra impulse draw, Light Up the Stage, etc.)
-            if not card and player.exile:
-                for c in player.exile:
-                    _castable_from_exile = is_castable_from_exile(
-                        game, player, c)
-                    if _castable_from_exile and card_name and c.name.lower() == card_name.lower():
-                        card = c
-                        _from_exile_card = c
-                        if getattr(c, '_foretold', False):
-                            _was_foretold = True
-                            # CR 702.143b: not the turn you foretold it. The
-                            # offer list gates this, but plan_turn emits a
-                            # whole main phase at once, so a single plan can
-                            # foretell and then cast the same card.
-                            if getattr(c, '_foretold_turn', None) == game.turn_number:
-                                print(f"[FORETELL] {c.name} was foretold this "
-                                      f"turn — can't cast it until your next "
-                                      f"turn (CR 702.143b)")
-                                game._last_cast_failure = (
-                                    game.turn_number, c.name,
-                                    "foretold this turn — castable from your next turn")
-                                return None
-                            # Cast for the foretell cost.
-                            c._foretold = False
-                            c._face_down = False
-                            c._cast_via_foretell = True
-                        player.exile.remove(c)
-                        # cast_spell_async gates on zone membership first (July
-                        # 20), so a card pulled out of exile with no home is
-                        # rejected as "Card not in hand" — the same hand-append
-                        # the cog and autoplay paths have always done.
-                        player.hand.append(c)
-                        if c.id in player.playable_from_exile:
-                            player.playable_from_exile.remove(c.id)
-                        c._adventure_exiled = False
-                        print(f"[IMPULSE-DRAW] AI casting {c.name} from exile")
-                        break
+            # Check if it's playable from exile (Chandra impulse draw, Light
+            # Up the Stage, etc.). Aug 7 (Q3): the finder scans ALL players'
+            # exiles — Draugr Necromancer's permission covers cards in the
+            # OPPONENT'S exile (autoplay executor twin).
+            if not card:
+                from mtg.helpers import find_castable_exile_card
+                _found = find_castable_exile_card(game, player, card_name)
+                if _found:
+                    c, _exile_holder = _found
+                    card = c
+                    _from_exile_card = c
+                    if getattr(c, '_foretold', False):
+                        _was_foretold = True
+                        # CR 702.143b: not the turn you foretold it. The
+                        # offer list gates this, but plan_turn emits a
+                        # whole main phase at once, so a single plan can
+                        # foretell and then cast the same card.
+                        if getattr(c, '_foretold_turn', None) == game.turn_number:
+                            print(f"[FORETELL] {c.name} was foretold this "
+                                  f"turn — can't cast it until your next "
+                                  f"turn (CR 702.143b)")
+                            game._last_cast_failure = (
+                                game.turn_number, c.name,
+                                "foretold this turn — castable from your next turn")
+                            return None
+                        # Cast for the foretell cost.
+                        c._foretold = False
+                        c._face_down = False
+                        c._cast_via_foretell = True
+                    # Aug 7 (Q3): remove from the HOLDER's exile — for a
+                    # Draugr-permitted card that is the opponent's.
+                    (_exile_holder if _exile_holder is not None
+                     else player).exile.remove(c)
+                    # cast_spell_async gates on zone membership first (July
+                    # 20), so a card pulled out of exile with no home is
+                    # rejected as "Card not in hand" — the same hand-append
+                    # the cog and autoplay paths have always done.
+                    player.hand.append(c)
+                    if c.id in player.playable_from_exile:
+                        player.playable_from_exile.remove(c.id)
+                    c._adventure_exiled = False
+                    print(f"[IMPULSE-DRAW] AI casting {c.name} from exile")
 
             # Cast from the TOP OF LIBRARY (Augur of Autumn's coven half).
             # Same pre-move-to-hand contract as the exile branch above:
@@ -3322,6 +3332,15 @@ class GameEngine:
                     tutor_choice = tutor_choice[0] if tutor_choice else None
                 card._tutor_card = (
                     str(tutor_choice).strip() if tutor_choice else None)
+                # Aug 7 queue item Q2a: destination-typed tutor choices
+                # (Jarad's Orders class) — twin of the autoplay executor.
+                for _tk, _tattr in (("tutor_to_hand", "_tutor_to_hand"),
+                                    ("tutor_to_graveyard", "_tutor_to_graveyard")):
+                    _tv = action.get(_tk)
+                    if isinstance(_tv, (list, tuple)):
+                        _tv = _tv[0] if _tv else None
+                    setattr(card, _tattr,
+                            str(_tv).strip() if _tv is not None else None)
 
                 # Use async version with spell resolution
                 card._cast_from_command_zone = from_command_zone
@@ -3330,6 +3349,8 @@ class GameEngine:
                     additional_cost=commander_tax,
                     from_exile=_from_exile_card is not None)
                 card._tutor_card = None
+                card._tutor_to_hand = None
+                card._tutor_to_graveyard = None
                 card._cast_from_command_zone = False
                 print(f"[EXECUTE] cast {card_name}: success={success}, msg={msg}")
                 # July 20 batch-3 audit: keep the REAL failure reason for
@@ -3379,7 +3400,10 @@ class GameEngine:
                 if (not success and _from_exile_card is not None
                         and card in player.hand):
                     player.hand.remove(card)
-                    player.exile.append(card)
+                    # Aug 7 (Q3): back to the exile it came FROM (the
+                    # opponent's, for a Draugr-permitted card).
+                    (_exile_holder if _exile_holder is not None
+                     else player).exile.append(card)
                     if _was_foretold:
                         card._foretold = True
                         card._face_down = True
@@ -3420,6 +3444,12 @@ class GameEngine:
                     # the foretell discount permanent on the card object, and
                     # can_cast_spell then advertises it a mana early too.
                     card._cast_via_foretell = False
+                    # Aug 7 (Q3): the Draugr permission is spent by a
+                    # successful cast (autoplay executor twin).
+                    if (_from_exile_card is not None
+                            and getattr(card, '_castable_by_player', None)):
+                        card._castable_by_player = None
+                        card._snow_as_any_color = False
                     # May 7 audit fix #1: if cast_spell_async already announced
                     # the cast (before the priority window), don't duplicate it.
                     # Drop the prefix line and just return the effect messages.
@@ -3596,7 +3626,20 @@ class GameEngine:
                     game.attackers.append(card.id)
             if attacking:
                 return f"{player.name} attacks with {', '.join(attacking)}"
-        
+            # Aug 7 confirmation-batch audit (B-5): every named creature was
+            # tapped/ineligible and the branch fell through returning bare
+            # None — the AI got "unknown reason" across 3 retries and just
+            # varied JSON syntax blindly (cube game_1535228578004729866,
+            # creatures that had already attacked that turn). Stash a real
+            # teaching reason for _get_action_error, same pattern as
+            # _last_cast_failure / _last_activation_failure.
+            game._last_attack_action_failure = (
+                game.turn_number,
+                "no named creature could attack (already tapped / already "
+                "attacked / not a creature) — declare attackers during the "
+                "Declare Attackers step, not with an 'attack' action")
+            return None
+
         elif action_type == "tap":
             card_name = action.get("card")
             card = player.find_card(card_name, Zone.BATTLEFIELD)

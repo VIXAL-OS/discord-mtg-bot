@@ -566,6 +566,29 @@ class Card:
     # this transient bridge from the AI action and clear it after the cast.
     _tutor_card: Optional[str] = field(
         default=None, repr=False, compare=False)
+    # Aug 7 queue item Q2a: destination-typed tutor choices for
+    # split-destination tutors (Jarad's Orders — one search to hand, one to
+    # graveyard). Each search_library action consumes the key matching its
+    # own to_zone; the generic _tutor_card stays as the consumed-once
+    # fallback. Same executor-set/cleared lifecycle as _tutor_card.
+    _tutor_to_hand: Optional[str] = field(
+        default=None, repr=False, compare=False)
+    _tutor_to_graveyard: Optional[str] = field(
+        default=None, repr=False, compare=False)
+    # Aug 7 queue item Q3 (Draugr Necromancer's cast half): the death
+    # redirect stamps WHO may cast this exiled card (Draugr's controller)
+    # and that snow mana may be spent as any color to do it (the printed
+    # permission). Valid while the card sits in exile and a Draugr remains
+    # on the stamped player's battlefield — is_castable_from_exile
+    # re-checks at offer AND cast time. Cleared when the cast succeeds.
+    _castable_by_player: Optional[str] = field(
+        default=None, repr=False, compare=False)
+    _snow_as_any_color: bool = field(default=False, repr=False, compare=False)
+    # Q3 adversarial review #10: WHICH Draugr granted the permission — the
+    # predicate requires that exact object on the battlefield (CR 607
+    # linked ability), so a replacement Draugr can't revive it.
+    _draugr_source_id: Optional[str] = field(
+        default=None, repr=False, compare=False)
     # stage should charge; `_was_escaped` is what Kroxa's "sacrifice it unless
     # it escaped" reads. Declared rather than stapled specifically because the
     # BUG here was a read with no writer anywhere — a flag nobody can find is a
@@ -1037,24 +1060,66 @@ class Card:
             if 'equipment' not in (equip_card.type_line or '').lower():
                 continue
             oracle = equip_card.oracle_text.lower()
-            # Parse "±X/±Y" from "equipped creature gets ±X/±Y". June 10 audit:
-            # the old r'\+(\d+)/\+(\d+)' silently dropped mixed-sign bonuses —
-            # Skullclamp's +1/-1 contributed nothing (Bruna attacked at 5
-            # instead of 6, and the -1 toughness never reached SBA).
-            pt_match = re.search(r'(?:gets?|has)\s*([+-]\d+)/([+-]\d+)', oracle)
-            if pt_match:
-                p_bonus += int(pt_match.group(1))
-                t_bonus += int(pt_match.group(2))
+            # Aug 7 confirmation-batch audit (A-2a, CRITICAL): the old
+            # whole-oracle regex matched "+2/+2" inside Umezawa's Jitte's
+            # COST-GATED MODAL activated ability ("Remove a charge counter…:
+            # Choose one — • Equipped creature gets +2/+2 until end of
+            # turn."), granting a permanent phantom +2/+2 while Jitte had
+            # zero counters (game_1535222945050271766). Anchor the P/T parse
+            # to LINES that BEGIN with "equipped creature get" — every
+            # legitimate static bonus in the inventory is printed that way
+            # (regression-swept: 23/24 equipment identical, only Jitte
+            # changes), while Jitte's modal bullets begin with "• ". June 10
+            # mixed-sign support ([+-]) preserved for Skullclamp's +1/-1.
+            for _line in oracle.split('\n'):
+                _line = _line.strip()
+                if not _line.startswith('equipped creature get'):
+                    continue
+                pt_match = re.search(r'gets?\s*([+-]\d+)/([+-]\d+)', _line)
+                if pt_match:
+                    p_bonus += int(pt_match.group(1))
+                    t_bonus += int(pt_match.group(2))
             # Parse granted keywords. May 17 audit: 'shroud' was missing from
-            # this list, so Lightning Greaves' shroud was never granted to the
-            # equipped creature — making it freely targetable. Same gap for
-            # 'fear' / 'intimidate' / 'protection' (the last two rarely come
-            # up but add them while we're here).
-            for kw in ['vigilance', 'lifelink', 'trample', 'flying', 'first strike',
-                        'double strike', 'deathtouch', 'haste', 'hexproof', 'shroud',
-                        'indestructible', 'menace', 'reach', 'fear', 'intimidate']:
-                if kw in oracle and 'equipped creature' in oracle:
-                    kw_list.append(kw)
+            # this list, so Lightning Greaves' shroud was never granted.
+            # Aug 7 (A-2a/A-4): the old test was `kw in oracle and 'equipped
+            # creature' in oracle` — two GLOBAL substring tests, so a keyword
+            # ANYWHERE in the text was granted: Shadowspear's "{1}:
+            # Permanents your opponents control lose hexproof and
+            # indestructible…" handed its own bearer permanent hexproof AND
+            # indestructible; Colossus Hammer's "loses flying" granted
+            # flying; Champion's Helm's "As long as equipped creature is
+            # legendary, it has hexproof" ignored the condition. Now:
+            # activated-ability lines are stripped, the keyword must share a
+            # SENTENCE with "equipped creature", "loses X" never grants X,
+            # and "as long as" conditions are evaluated when checkable
+            # (legendary via the bearer's type line) and skipped otherwise
+            # (undercount is the safe direction — never a phantom grant).
+            try:
+                from rules.effect_templates import strip_activated_ability_lines
+                kw_source = strip_activated_ability_lines(
+                    equip_card.oracle_text).lower()
+            except ImportError:
+                kw_source = oracle
+            for _sentence in re.split(r'[.\n]', kw_source):
+                if 'equipped creature' not in _sentence:
+                    continue
+                if 'as long as' in _sentence:
+                    if 'is legendary' in _sentence:
+                        if 'legendary' not in (self.type_line or '').lower():
+                            continue
+                    else:
+                        continue
+                for kw in ['vigilance', 'lifelink', 'trample', 'flying',
+                           'first strike', 'double strike', 'deathtouch',
+                           'haste', 'hexproof', 'shroud', 'indestructible',
+                           'menace', 'reach', 'fear', 'intimidate']:
+                    if kw not in _sentence:
+                        continue
+                    if re.search(rf'\blose[s]?\b[^.]*\b{re.escape(kw)}',
+                                 _sentence):
+                        continue
+                    if kw not in kw_list:
+                        kw_list.append(kw)
         return p_bonus, t_bonus, kw_list
 
     def get_effective_power(self, game=None) -> int:
@@ -1991,6 +2056,14 @@ class Player:
     # trigger scan; nothing tracked it before because nothing could ask.
     # Reset for every player with life_lost_this_turn in GameEngine.end_turn.
     dealt_combat_damage_this_turn: bool = False
+    # Aug 7 queue item Q3: while paying for a card that carries the Draugr
+    # snow-as-any-color permission, _get_mana_production reports snow
+    # sources as producing 'any'. Set (from spending_card) at the entry of
+    # can_pay_mana_cost AND tap_sources_for_cost — every call overwrites it
+    # from its own spending_card, so a stale True from an aborted call is
+    # corrected by the next payment call (the narrow exception window is
+    # documented at the setters; strict mode re-raises those anyway).
+    _spend_snow_as_any: bool = field(default=False, repr=False, compare=False)
     
     # Zones
     library: List[Card] = field(default_factory=list)
@@ -2325,8 +2398,27 @@ class Player:
         Get what mana a card produces when tapped.
         Returns dict like {'C': 2} for Ancient Tomb or {'R': 1} for Mountain.
         'any' key means can produce any color (Command Tower, etc.)
+
+        Aug 7 queue item Q3: while _spend_snow_as_any is set (paying for a
+        Draugr-permitted card), a SNOW source reports its one-tap output as
+        'any' — the printed "spend snow mana as though it were mana of any
+        color to cast it". One transform point, so every internal phase of
+        the payment engine (strict pips, hybrid caps, generic, one-tap
+        totals) inherits it consistently.
         """
         name_lower = card.name.lower()
+        if getattr(self, '_spend_snow_as_any', False):
+            _tl = getattr(card, 'type_line', '') or ''
+            if 'Snow' in _tl:
+                self._spend_snow_as_any = False  # avoid recursion below
+                try:
+                    _base = self._get_mana_production(card)
+                finally:
+                    self._spend_snow_as_any = True
+                _out = self._one_tap_output(_base, card) if _base else 0
+                if _out > 0:
+                    return {'any': _out}
+                return _base
 
         # === FETCH LANDS — produce NO mana ===
         if card.is_land() and self._is_fetch_land(card):
@@ -2593,6 +2685,21 @@ class Player:
         
         return pool_total + source_total
     
+    def _set_snow_waiver(self, spending_card=None) -> None:
+        """Aug 7 Q3 adversarial review (#1/#6): the snow-as-any waiver is
+        derived at the entry of EVERY payment/advertising function from that
+        call's own spending_card — a stale True can never leak into
+        advertising, plan validation, or tap_lands_for_mana (the reviewer
+        reproduced fabricated {G} off a Snow-Covered Plains from exactly
+        that leak). The permission cross-check (#6) stops a card that
+        drifted into its OWNER's hand from paying with its opponent's
+        waiver: the stamp names who may cast it.
+        """
+        self._spend_snow_as_any = bool(
+            spending_card is not None
+            and getattr(spending_card, '_snow_as_any_color', False)
+            and getattr(spending_card, '_castable_by_player', None) == self.name)
+
     def one_tap_mana_total(self, spending_card=None) -> int:
         """Physical mana ceiling: floating pool + ONE tap of each untapped
         source (a source's single-tap output is max over its options — an
@@ -2607,6 +2714,7 @@ class Player:
         Anything budgeting a TOTAL (X-sizing, the can_pay one-tap gate)
         must use this instead.
         """
+        self._set_snow_waiver(spending_card)  # Q3 review #1: per-entry derive
         total = sum(self.mana_pool.values())
         total += sum(self._restricted_mana_available(spending_card).values())
         for src in self.untapped_mana_sources():
@@ -2620,6 +2728,7 @@ class Player:
 
     def available_mana_detailed(self, spending_card=None) -> Dict[str, int]:
         """Get detailed available mana by color including 'any' for flexible sources."""
+        self._set_snow_waiver(spending_card)  # Q3 review #1: per-entry derive
         available = dict(self.mana_pool)  # Start with pool
         for color, amount in self._restricted_mana_available(spending_card).items():
             available[color] = available.get(color, 0) + amount
@@ -2896,8 +3005,14 @@ class Player:
         Returns True if successful, False if not enough mana.
         Now handles mana rocks and special lands!
 
+        Q3 review #1: this function had NO waiver setter, so a stale
+        _spend_snow_as_any from an earlier can_pay put a color into the
+        pool the source cannot produce (fabricated {G} off a snow Plains,
+        CR 106.1). It takes no spending_card, so the setter always clears.
+
         For color-aware tapping, use tap_sources_for_cost() instead.
         """
+        self._set_snow_waiver(None)  # Q3 review #1: always clears here
         # Calculate how much mana we can produce
         total_available = 0
         sources_with_production = []
@@ -2973,6 +3088,10 @@ class Player:
         # Floating pool mana currently has no snow tag, so it deliberately
         # contributes zero rather than fabricating provenance.
         self._last_payment = {'snow_spent': 0}
+        # Aug 7 (Q3): Draugr's snow-as-any-color permission, scoped to this
+        # payment — the shared setter derives per-entry and cross-checks
+        # the permission against the caster (adversarial review #1/#6).
+        self._set_snow_waiver(spending_card)
         if not mana_cost_str and additional_generic <= 0 and x_value <= 0:
             return True  # Free spell
 
@@ -3706,6 +3825,9 @@ class Player:
         the mana pool dict.  The pool dict is empty until tap_sources_for_cost()
         actually taps lands — this function must look at what we COULD produce.
         """
+        # Aug 7 (Q3): Draugr's snow-as-any-color permission, scoped to this
+        # check — the shared setter derives per-entry (review #1/#6).
+        self._set_snow_waiver(spending_card)
         if not mana_cost:
             return True, "No mana cost"
 
@@ -4173,6 +4295,11 @@ class GameState:
     # sickness or affordability checks). (turn, permanent_name, message);
     # consumed (and cleared) by _get_action_error.
     _last_activation_failure: Any = field(default=None, repr=False, compare=False)
+    # Aug 7 2026 (confirmation-batch audit, B-5): (turn, reason) stashed when
+    # an {"type": "attack"} action names only ineligible creatures — the
+    # branch used to fall through returning bare None and the AI burned 3
+    # retries on "unknown reason". Consumed by _get_action_error.
+    _last_attack_action_failure: Any = field(default=None, repr=False, compare=False)
     # Aug 7 batch audit (C-4): same stash for deliberately-DROPPED redundant
     # `resolve` actions — the June-10 positional-pairing drop returned bare
     # None, surfacing to the AI as "Action failed (unknown reason)", so the
@@ -4332,6 +4459,21 @@ class GameState:
     # _recently_died list is reset mid-turn by the dies dispatcher, so it
     # structurally cannot answer a whole-turn question.
     _creature_died_this_turn: bool = field(default=False, repr=False, compare=False)
+    # Aug 7 2026 (confirmation-batch audit, A-2b/B-2): per-turn record of
+    # which creature ids each dealer dealt COMBAT damage to this turn
+    # (dealer card id -> set of damaged creature ids). Two consumers:
+    # the "creature dealt damage by this creature this turn dies" dies-
+    # watcher premise gate (Predator Ooze — Tier 3 fabricated the premise
+    # in game_1535228613341872148), and equipment charge-counter triggers.
+    # Populated in apply_combat_damage_to_creature; cleared at turn advance
+    # beside the morbid flag.
+    _creature_combat_damage_by_dealer: dict = field(default_factory=dict, repr=False, compare=False)
+    # Aug 7 2026 (A-2b): equipment ids whose "equipped creature deals combat
+    # damage -> charge counters" trigger already fired THIS damage step —
+    # a trampler damaging blocker + player in one step is ONE damage event
+    # (Jitte rulings: one trigger), while first-strike + regular steps are
+    # two. Cleared at each resolve_combat_damage entry.
+    _equip_charge_fired_ids: set = field(default_factory=set, repr=False, compare=False)
     # Aug 2 2026 (batch-13 audit): True while the Moraug consumption loop is
     # running an ADDITIONAL combat phase. Karlach, Fury of Avernus's trigger
     # carries an intervening-if ("if it's the first combat phase of the

@@ -454,24 +454,6 @@
       ]
     },
     {
-      "key": "cryptic command",
-      "name": "Cryptic Command",
-      "event": "etb",
-      "description": "Choose two: counter / bounce / tap all / draw. Default: counter + draw.",
-      "actions": [
-        {
-          "action": "counter_spell",
-          "player": "$controller",
-          "target": "stack_top"
-        },
-        {
-          "action": "draw_cards",
-          "player": "$controller",
-          "amount": 1
-        }
-      ]
-    },
-    {
       "key": "decree of pain",
       "name": "Decree of Pain",
       "event": "etb",
@@ -1393,7 +1375,11 @@
               "action": "search_library_land",
               "player": "$controller",
               "basic_only": true,
-              "land_types": ["Plains", "Island", "Swamp"],
+              "land_types": [
+                "Plains",
+                "Island",
+                "Swamp"
+              ],
               "enters_tapped": true
             },
             {

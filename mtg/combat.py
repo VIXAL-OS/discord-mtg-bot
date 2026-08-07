@@ -82,6 +82,15 @@ except ImportError:
     HAS_EFFECT_TEMPLATES = False
 
 
+# Aug 7 confirmation-batch audit (C-1): the self-trigger scan's combat-damage
+# phrase, negation-aware — "NONcombat damage to an opponent" (Solphim's
+# replacement wording) CONTAINS the bare substring, the substring family's
+# 8th instance. Module-level so the pin and both gate sites share ONE
+# predicate (the mirrored-predicate rule).
+COMBAT_DAMAGE_SELF_PHRASE = re.compile(
+    r'(?<!non)combat damage to (?:a player|an opponent)')
+
+
 def resolve_combat_damage(rules, game: GameState) -> List[str]:
     """
     Resolve combat damage with keyword abilities.
@@ -89,6 +98,12 @@ def resolve_combat_damage(rules, game: GameState) -> List[str]:
     """
     messages = []
     lifelink_healing = {0: 0, 1: 0}  # player_index -> life to gain
+
+    # Aug 7 (A-2b): each resolve_combat_damage invocation is one damage
+    # step (FS and regular are separate calls/events); reset the per-step
+    # equipment charge-trigger dedupe so Jitte fires once per step, not
+    # once per game and not twice for a trample split.
+    game._equip_charge_fired_ids = set()
 
     # Refresh layer cache before reading effective P/T. The cache is updated
     # at 22+ sites but a stale `_layers_power_mod` was reported in the Apr 28
@@ -185,6 +200,10 @@ def resolve_combat_damage(rules, game: GameState) -> List[str]:
     # even when blocking first-strikers that already dealt damage in the FS step.
     if regular_attackers or first_strikers:
         print(f"[COMBAT-STEP] REGULAR step: {len(regular_attackers)} regular attacker(s)")
+        # Aug 7 (A-2b): the regular step is a SEPARATE damage event from the
+        # FS step — a double-striker's Jitte legitimately fires in both
+        # (rulings). Reset the per-step dedupe at the boundary.
+        game._equip_charge_fired_ids = set()
         _reg_header_idx = None
         if first_strikers:
             messages.append("**Regular Combat Damage:**")
@@ -358,17 +377,31 @@ def resolve_combat_damage(rules, game: GameState) -> List[str]:
             # fabricates a trigger the creature may not have. Same class as
             # the July 21 resolve_etb strip (Glen Elendra).
             oracle_lower = strip_activated_ability_lines(attacker.oracle_text).lower()
-            if "combat damage to a player" not in oracle_lower and "combat damage to an opponent" not in oracle_lower:
+            # Aug 7 confirmation-batch audit (C-1, CRITICAL): the bare
+            # substring test matched Solphim, Mayhem Dominus — "NONcombat
+            # damage to an opponent" CONTAINS "combat damage to an opponent"
+            # (the substring family's 8th instance). Its REPLACEMENT effect
+            # was routed into this self-trigger scan, and Tier 3 then
+            # fabricated a nonexistent "Mayhem Devil" source and dealt 40
+            # invented damage that illegitimately ended
+            # game_1535236954705240105. The (?<!non) lookbehind rejects the
+            # "noncombat" spelling; every real combat-damage trigger in the
+            # inventory prints the bare phrase and still passes.
+            _combat_phrase = COMBAT_DAMAGE_SELF_PHRASE
+            if not _combat_phrase.search(oracle_lower):
                 continue
             # Slice 5b: watcher-phrased text ("...you control deals combat
             # damage...") belongs to the battlefield-watcher loop above, not
             # to this SELF-trigger scan — an attacking Ohran/Tovolar would
             # otherwise double-dispatch (their own-connect templates were
             # removed for exactly that). Skip when no non-watcher sentence
-            # carries the phrase.
+            # carries the phrase. Aug 7 (C-1): same negation-aware phrase
+            # here, and "you control would deal" (Solphim's replacement
+            # wording) counts as watcher-shaped too.
             if not any(
-                    ('combat damage to a player' in s or 'combat damage to an opponent' in s)
+                    _combat_phrase.search(s)
                     and 'you control deal' not in s
+                    and 'you control would deal' not in s
                     for para in oracle_lower.split('\n') for s in para.split('.')):
                 continue
             try:
@@ -720,6 +753,11 @@ def apply_combat_damage_to_player(rules, game: GameState, player: 'PlayerState',
     if is_combat and amount > 0:
         events.emit(events.COMBAT_DAMAGE_DEALT, game, source=source_card,
                     target=player, amount=amount, target_kind="player")
+        # Aug 7 (A-2b): Jitte-class equipment triggers fire on combat damage
+        # to ANYTHING — the unblocked-connect case flows through this
+        # funnel. Deduped per step by _equip_charge_fired_ids, so a
+        # trampler that also damaged its blocker fires once.
+        fire_equipped_combat_damage_counters(game, source_card)
 
     # CR 903.10a / 704.5b — Commander damage tracking, PER COMMANDER.
     # Aug 1 batch-12 (reviewer, partner game): the dict was keyed by the
@@ -789,13 +827,87 @@ def apply_combat_damage_to_creature(rules, game: GameState, creature: Card,
     if amount > 0:
         events.emit(events.COMBAT_DAMAGE_DEALT, game, source=source_card,
                     target=creature, amount=amount, target_kind="creature")
+        # Aug 7 confirmation-batch audit (A-2b/B-2): per-turn dealer→damaged
+        # attribution. The Predator Ooze dies-watcher premise gate and
+        # equipment charge-counter triggers both read this record.
+        _dealer_id = getattr(source_card, 'id', None)
+        if _dealer_id:
+            game._creature_combat_damage_by_dealer.setdefault(
+                _dealer_id, set()).add(getattr(creature, 'id', ''))
+        fire_equipped_combat_damage_counters(game, source_card)
     return amount
+
+
+def fire_equipped_combat_damage_counters(game: GameState, dealer: Card) -> None:
+    """Aug 7 confirmation-batch audit (A-2b): Umezawa's Jitte's "Whenever
+    equipped creature deals combat damage, put two charge counters on
+    Umezawa's Jitte" — the trigger's printed phrase has NO "to a player"
+    (it also fires on damage to blockers), so the Worldslayer equipment scan
+    never matched it, and the creature-damage path had no equipment hook at
+    all: four unblocked connects in game_1535222945050271766 produced zero
+    charge counters.
+
+    Deterministic: parse "put N charge counter(s) on" from the trigger
+    sentence and add them to the equipment. Dedupe per damage STEP via
+    game._equip_charge_fired_ids (a trampler damaging blocker + player in
+    one step is ONE damage event per Jitte rulings; first-strike and
+    regular steps are separate events and fire separately). Messages ride
+    game._pending_messages — the funnel returns an amount, not text.
+    """
+    _word_nums = {'a': 1, 'one': 1, 'two': 2, 'three': 3, 'four': 4}
+    dealer_owner = None
+    for p in game.players:
+        if any(c is dealer for c in p.battlefield):
+            dealer_owner = p
+            break
+    if dealer_owner is None:
+        return
+    for att_id in list(getattr(dealer, 'attachments', []) or []):
+        att = next((c for c in dealer_owner.battlefield if c.id == att_id), None)
+        if att is None or not att.oracle_text:
+            continue
+        if 'equipment' not in (att.type_line or '').lower():
+            continue
+        if att.id in game._equip_charge_fired_ids:
+            continue
+        ot = att.oracle_text.lower()
+        m = re.search(
+            r'whenever equipped creature deals combat damage[^.]*?put '
+            r'(a|one|two|three|four|\d+) charge counters? on', ot)
+        if not m:
+            continue
+        n = _word_nums.get(m.group(1), None)
+        if n is None:
+            try:
+                n = int(m.group(1))
+            except ValueError:
+                continue
+        game._equip_charge_fired_ids.add(att.id)
+        if not hasattr(att, 'counters') or att.counters is None:
+            att.counters = {}
+        att.counters['charge'] = att.counters.get('charge', 0) + n
+        total = att.counters['charge']
+        print(f"[EQUIP-CHARGE] {att.name}: +{n} charge counter(s) "
+              f"(total {total}) — equipped creature dealt combat damage")
+        try:
+            game._pending_messages.append(
+                f"⚡ **{att.name}**: {n} charge counter(s) added (total {total})")
+        except AttributeError:
+            pass
 
 
 def apply_noncombat_damage_to_player(rules, game: GameState, player: 'PlayerState',
                                        amount: int, source_name: str = "",
-                                       source_id: str = "") -> int:
-    """Apply non-combat damage to a player, processing replacement effects. Returns final amount."""
+                                       source_id: str = "",
+                                       source_controller: str = "") -> int:
+    """Apply non-combat damage to a player, processing replacement effects. Returns final amount.
+
+    Aug 7 confirmation-batch audit (B-4): `source_controller` lets a caller
+    that KNOWS the caster (Tier-2 SpellResolver) say so directly — the
+    battlefield/stack lookups below fail for a spell mid-resolution (the
+    stack entry is popped before dispatch), which left Torbran's "a red
+    source you control" gate silently unmatched on Tier-2 burn (Skullcrack
+    dealt 3 instead of 5, game_1535228623240568872)."""
     if amount <= 0:
         return 0
     # Fallback damage prevention flag (when replacement engine not available)
@@ -820,8 +932,10 @@ def apply_noncombat_damage_to_player(rules, game: GameState, player: 'PlayerStat
         # Try to find the controller of the source by id or name so the
         # replacement layer can filter by source_controller (Fiery
         # Emancipation, Gisela, etc. — see _apply_combat_damage_to_player).
-        source_controller_name = ""
-        if source_id or source_name:
+        # Aug 7 (B-4): an explicitly-passed caster wins; lookups are the
+        # fallback for callers that only know a name/id.
+        source_controller_name = source_controller or ""
+        if not source_controller_name and (source_id or source_name):
             for _p in game.players:
                 for _c in _p.battlefield:
                     if (source_id and getattr(_c, 'id', '') == source_id) or \

@@ -1175,12 +1175,78 @@ class EffectTemplateLibrary:
         # _mystic_confluence_modal — real mode evaluation. Aug 7 registry
         # dedup removed the flat draw-3 duplicate.)
 
-        def _cryptic_command(ctrl, opp, ctx):
-            # "Choose two" — default: counter + draw (strongest line in most cases)
-            return [
-                {"action": "counter_spell", "player": ctrl, "target": "stack_top"},
-                {"action": "draw_cards", "player": ctrl, "amount": 1},
-            ]
+        # Aug 7 queue item Q2b: Cryptic Command reads the AI's actual mode
+        # choice (ctx['_modes'], the Kolaghan's Command pattern) instead of
+        # the fixed counter+draw pair. The old `_cryptic_command` def here
+        # was DEAD CODE (defined, never registered — the shadowed-duplicate
+        # class); the live registration was a fixed JSON pair, now retired.
+        def _gen_cryptic_command(ctrl, opp, ctx):
+            """Cryptic Command — choose two of four modes.
+
+            Modes:
+              1 / "counter" — Counter target spell
+              2 / "bounce"  — Return target permanent to its owner's hand
+              3 / "tap"     — Tap all creatures your opponents control
+              4 / "draw"    — Draw a card
+
+            Default (no modes given): counter + draw, the historical pair.
+            The G5-1 modal-fizzle discriminator already lets a chosen
+            non-counter mode resolve when the counter mode fizzles (CR 700.2).
+            """
+            modes = ctx.get('_modes')
+            normalized = []
+            if modes:
+                name_to_idx = {'counter': 1, 'bounce': 2, 'return': 2,
+                               'tap': 3, 'draw': 4}
+                for m in modes:
+                    if isinstance(m, int) and 1 <= m <= 4:
+                        normalized.append(m)
+                    elif isinstance(m, str):
+                        idx = name_to_idx.get(m.lower().strip())
+                        if idx:
+                            normalized.append(idx)
+            if not normalized:
+                normalized = [1, 4]
+            normalized = normalized[:2]  # "Choose two" (CR 700.2)
+
+            actions = []
+            for m in normalized:
+                if m == 1:
+                    actions.append({"action": "counter_spell", "player": ctrl,
+                                    "target": "stack_top"})
+                elif m == 2:
+                    # Best opponent creature first, else any opponent
+                    # nonland permanent; no legal object -> mode dropped
+                    # (the fallback below keeps the spell from blanking).
+                    _bounce = ctx.get('best_opponent_creature')
+                    if not _bounce:
+                        for c in (ctx.get('opponent_battlefield') or []):
+                            _tl = (getattr(c, 'type_line', '') or '').lower()
+                            if 'land' not in _tl:
+                                _bounce = getattr(c, 'name', None)
+                                break
+                    if _bounce:
+                        actions.append({"action": "move_card", "card": _bounce,
+                                        "from_zone": "battlefield",
+                                        "to_zone": "hand", "player": opp})
+                elif m == 3:
+                    actions.append({"action": "tap", "scope": "all_creatures",
+                                    "target_player": opp,
+                                    "types": "creatures"})
+                elif m == 4:
+                    actions.append({"action": "draw_cards", "player": ctrl,
+                                    "amount": 1})
+            if not actions:
+                actions = [{"action": "draw_cards", "player": ctrl,
+                            "amount": 1}]
+            return actions
+
+        self._add_card("cryptic command", EffectTemplate(
+            name="Cryptic Command",
+            description=("Choose two: counter / bounce / tap opponents' "
+                         "creatures / draw — honors the AI's mode choice"),
+            action_generator=_gen_cryptic_command,
+        ))
 
 
         # =================================================================

@@ -1030,7 +1030,78 @@ def counter_restriction_allows(counter_oracle, target_card):
                 return False
         elif q != 'spell' and q not in ttype:
             return False
+    # Aug 7 confirmation-batch audit (CO-1): Tale's End's multi-clause
+    # "Counter target activated ability, triggered ability, or LEGENDARY
+    # spell" defeats the single-word regex above (no "counter target X
+    # spell" shape), so no restriction was detected and a response cast was
+    # allowed at a declared NON-legendary spell (Counterspell) while the
+    # only legal spell target was Search for Azcanta — {0}{U} + the card
+    # burned, fizzle at resolution (CR 601.2c,
+    # game_1535212567969144902). When an ability-counter names "legendary
+    # spell" as its only SPELL clause, a spell target must be legendary.
+    # This helper is only ever handed a CARD (a spell on the stack), so for
+    # the Tale's End shape any card target must itself be legendary; the
+    # ability-counter half never routes a card through here. Disallow /
+    # Voidslime print "counter target spell" with no legendary qualifier and
+    # are untouched.
+    if ('legendary spell' in ot
+            and ('activated' in ot or 'triggered' in ot)
+            and 'legendary' not in ttype):
+        return False
     return True
+
+
+def find_castable_exile_card(game, player, card_name):
+    """Aug 7 queue item Q3: locate a castable exiled card by name across ALL
+    players' exiles, returning (card, holder) — the Draugr permission lets a
+    player cast cards sitting in the OPPONENT'S exile, and the executors'
+    own-exile-only scans could never find them. The caster's own exile is
+    searched first so ordinary impulse/foretell casts are unchanged. The
+    HOLDER matters: the physical removal (and any failure rollback) must
+    touch the exile list that actually contains the card — owner-index
+    discipline says never assume it is the caster's.
+    """
+    if not card_name:
+        return None
+    _wanted = card_name.lower()
+    ordered = [player] + [p for p in getattr(game, 'players', []) or []
+                          if p is not player]
+    for holder in ordered:
+        for c in getattr(holder, 'exile', None) or []:
+            if c.name.lower() != _wanted:
+                continue
+            # Q3 adversarial review #2 (CRITICAL): the _adventure_exiled /
+            # _foretold branches of is_castable_from_exile are
+            # controller-blind — they were only ever safe because every
+            # caller scanned the caster's OWN exile. A cross-player hit is
+            # legal ONLY under the explicit Draugr stamp.
+            if (holder is not player
+                    and getattr(c, '_castable_by_player', None)
+                    != getattr(player, 'name', None)):
+                continue
+            if is_castable_from_exile(game, player, c):
+                return c, holder
+    return None
+
+
+def board_wipe_on_empty_board(game, player_index, card) -> bool:
+    """Aug 7 confirmation-batch audit (CO-4): True when casting *card* would
+    be a board wipe into a battlefield with zero creatures anywhere — the
+    shape _validate_plan_mana has rejected since Apr 2026, but the inline
+    decide_action fallback had no guard (the two-path divergence): in
+    game_1535228649845030952 the plan cast was rejected and the inline path
+    then cast Day of Judgment into a 0-creature board anyway. Shared
+    predicate so the plan guard, the inline veto, and the pin agree.
+    """
+    if card is None or card.is_creature():
+        return False
+    _ol = (getattr(card, 'oracle_text', '') or '').lower()
+    if 'destroy all creatures' not in _ol and 'each creature' not in _ol:
+        return False
+    total = sum(
+        len([c for c in p.battlefield if c.is_creature(game=game)])
+        for p in game.players)
+    return total == 0
 
 
 def player_skips_draw_step(player):
@@ -2724,6 +2795,23 @@ def is_castable_from_exile(game, player, card) -> bool:
         return True
     if getattr(card, '_adventure_exiled', False):
         return True
+    # Aug 7 queue item Q3: Draugr Necromancer's cast permission — stamped by
+    # the death redirect, valid while THE STAMPING Draugr remains on this
+    # player's battlefield (adversarial review #10: a NEW Draugr must not
+    # revive a lapsed permission — CR 607 linked abilities; #5: a
+    # phased-out Draugr grants nothing, CR 702.26 — same live-computation
+    # convention as the other statics). Lands excluded: the permission is
+    # "cast", and lands aren't cast.
+    if (getattr(card, '_castable_by_player', None) == getattr(player, 'name', None)
+            and not card.is_land()):
+        _stamp_id = getattr(card, '_draugr_source_id', None)
+        for c in (getattr(player, 'battlefield', None) or []):
+            if getattr(c, '_phased_out', False):
+                continue
+            if c.name != 'Draugr Necromancer':
+                continue
+            if _stamp_id is None or c.id == _stamp_id:
+                return True
     if getattr(card, '_foretold', False):
         return getattr(card, '_foretold_turn', None) != game.turn_number
     record = (getattr(game, 'conditional_exile_casts', None) or {}).get(card.id)

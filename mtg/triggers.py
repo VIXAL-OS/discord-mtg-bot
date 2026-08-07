@@ -177,6 +177,20 @@ def _is_self_etb_trigger_paragraph(card: Card, paragraph: str) -> bool:
     text = (paragraph or "").lower().strip()
     if not text or "enters" not in text:
         return False
+    # Aug 7 confirmation-batch audit (CO-2): ability-word prefixes defeated
+    # the startswith gates below — "Imprint — When this artifact enters…"
+    # never classified as a self-ETB, so Isochron Scepter's registered JSON
+    # imprint template was UNREACHABLE and every Scepter resolved with no
+    # imprint (game_1535212567969144902). The ETB sibling of the batch-11
+    # Battalion strip (CR 207.2c: ability words are flavor). GUARD: ability
+    # words that own a DEDICATED watcher keep their prefix and stay
+    # unclassified here — the verification sweep showed stripping
+    # "Constellation —" newly classifies Eidolon of Blossoms as a self-ETB
+    # while its constellation watcher + JSON template already handle it (a
+    # double-draw), and landfall belongs to the landfall scanner.
+    _aw_m = re.match(r"^([a-z][\w'-]*(?: [\w'-]+)?) — ", text)
+    if _aw_m and _aw_m.group(1) not in ('constellation', 'landfall'):
+        text = text[_aw_m.end():]
     if text.startswith("when ") and not text.startswith("whenever "):
         return True
     if not text.startswith("whenever "):
@@ -665,7 +679,10 @@ def _check_creature_etb_triggers_sync(engine, game: GameState, entering_player: 
 
             if creature_power > 0:
                 actual_dmg = engine.rules._apply_noncombat_damage_to_player(game, opponent, creature_power, card.name)
-                messages.append(f"🔥 {card.name} deals {actual_dmg} damage to {opponent.name}!")
+                # Aug 7 (A-5, display): carry the running life total like the
+                # combat-damage lines do — clamped at 0 per the May 18 UX rule.
+                messages.append(f"🔥 {card.name} deals {actual_dmg} damage to "
+                                f"{opponent.name}! (life: {max(0, opponent.life)})")
 
                 if actual_dmg > 0 and opponent.life <= 0:
                     game.ended = True
@@ -1038,7 +1055,18 @@ def _spell_matches_cast_trigger(engine, sentence_lower: str, card: Card,
     # CONDITION clause (before the first comma) so a trigger whose EFFECT
     # half mentions a graveyard ("…, return target card from your
     # graveyard") isn't wrongly gated.
-    _cond_clause = sentence_lower.split(',', 1)[0]
+    # Aug 7 confirmation-batch audit (B-3, CRITICAL mechanism): sentence_lower
+    # can carry a preceding KEYWORD line ("First strike, haste\nWhenever a
+    # player casts a spell from a graveyard, …" — no period between them), so
+    # split(',', 1)[0] took the comma inside "First strike, haste" and
+    # returned "first strike" as the condition clause. The graveyard gate
+    # silently never ran and Ash Zealot fired on a COMMAND-ZONE commander
+    # cast (game_1535228623240568872) — the wrong-comma sibling of the
+    # substring family. Anchor at the trigger word before taking the comma;
+    # every other check on sentence_lower is deliberately left untouched.
+    _trig_m = re.search(r'\bwhen(?:ever)?\b', sentence_lower)
+    _trig_tail = sentence_lower[_trig_m.start():] if _trig_m else sentence_lower
+    _cond_clause = _trig_tail.split(',', 1)[0]
     if re.search(r'from (?:a|your|their) graveyard', _cond_clause):
         _origin = getattr(card, '_cast_origin', '')
         _is_graveyard_cast = (
@@ -2913,6 +2941,26 @@ def _check_dies_triggers_sync(engine, game: GameState, dying_card: Card, dying_p
         # "whenever a creature you control dies" — only fire if dying creature is ours
         if "you control" in oracle_lower and dying_player != player:
             continue
+
+        # Aug 7 confirmation-batch audit (B-2, CRITICAL): "Whenever a
+        # creature dealt damage by this creature this turn dies" (Predator
+        # Ooze) is CONDITIONAL on the watcher having actually damaged the
+        # dying creature — part of the trigger condition, not an
+        # intervening-if. Nothing checked it: the trigger queued to Tier 3,
+        # which FABRICATED the premise ("was dealt damage by it") and
+        # awarded a counter for a combat the Ooze never fought (then B-1's
+        # unconditioned Doubling Season doubled it,
+        # game_1535228613341872148). Gate on the per-turn dealer→damaged
+        # record populated in apply_combat_damage_to_creature.
+        if re.search(r'dealt damage by (?:this creature|this permanent|it)'
+                     r' this turn', oracle_lower):
+            _damaged_ids = game._creature_combat_damage_by_dealer.get(
+                card.id, set())
+            if dying_card.id not in _damaged_ids:
+                print(f"[DIES-TRIGGER] {card.name}: '{dying_card.name}' was "
+                      f"not dealt damage by it this turn — trigger condition "
+                      f"not met, skipping")
+                continue
 
         # June 10 audit (V16): enforce the "nontoken" qualifier against the
         # dying card. Detection matched Midnight Reaper, but nothing checked
@@ -5613,6 +5661,23 @@ def _accumulate_death_subscriber(game, card=None, player=None, **_):
     if card is None:
         return
     game._recently_died.append((card, player))
+    # Aug 7 confirmation-batch audit (A-1, CRITICAL): snapshot WHO WAS
+    # PRESENT when this death happened, for EVERY death — previously only
+    # Living Death populated _dies_source_ids_by_dead_id, so the deferred
+    # dies-drain scanned the LIVE battlefield and a watcher that entered in
+    # the gap fired retroactively: Zulaport Cutthroat, cast with mana from
+    # sacrificing Elvish Mystic, drained for the very death that paid for it
+    # (CR 603.3, game_1535222967376674879). The snapshot is battlefield ∪
+    # the emit's batch ∪ self — the batch matters because SBA sweeps remove
+    # every dying creature BEFORE queueing (the batch-13 Meren fix), and the
+    # dies scan's CR 603.10 batch-mate loop is gated on this same set.
+    # Living Death's own more-restrictive write lands AFTER queueing and
+    # deliberately overwrites this default.
+    _present = {c.id for p in game.players for c in p.battlefield}
+    _present.add(card.id)
+    for _bc, _bp in (_.get('batch') or []):
+        _present.add(_bc.id)
+    game._dies_source_ids_by_dead_id[card.id] = _present
     # Aug 2 2026: MORBID (CR 207.2c) asks 'did a creature die this turn'.
     # The wave-scoped _recently_died list is reset mid-turn by the
     # dispatcher, so it cannot answer that; stamp a per-turn flag at the

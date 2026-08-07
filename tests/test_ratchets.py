@@ -96,7 +96,11 @@ EXCEPT_BASELINE = {
     # strict would hand it the power to END a 160-game batch — the exact
     # failure it was built to prevent. It logs [PROVIDER-PROBE] and leaves
     # the running provider selected.
-    "cog.py": 32,
+    # Aug 7 queue item Q1 (+1): the dedup edit-in-place's Discord edit can
+    # fail (deleted message, permissions) — a display fallback to the old
+    # silent drop, Discord-I/O class, deliberately swallow-only per the
+    # convention (never crash a game over a cosmetic ×N edit).
+    "cog.py": 33,
     # July 30: _check_color_castable moved here from claude_player.py — its
     # ManaCost-parse fallback catch moved with it (claude_player's count
     # dropped by one under its unchanged ceiling).
@@ -131,7 +135,10 @@ EXCEPT_BASELINE = {
     # cast pipeline. Production must clean up a generated spell copy or move a
     # declined Rashmi card to hand; strict batches still re-raise through
     # maybe_reraise, matching the madness/miracle barriers above.
-    "spells.py": 36,
+    # Aug 7 confirmation audit (+1): the devour entry parse (CO-3) carries a
+    # crash barrier — a devour resolution failure must not abort a cast that
+    # already paid for the creature. maybe_reraise, so strict/pytest see it.
+    "spells.py": 37,
     # Aug 1 deferred slate: +1 for the opponent-cast trigger window's
     # crash barrier around the LLM response evaluation — carries
     # maybe_reraise so strict batches see it; the sibling own-cast

@@ -1243,6 +1243,17 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                 # revert their copy effect when leaving the battlefield (CR 706.10).
                 if from_zone.lower() == 'battlefield' and to_zone.lower() != 'battlefield':
                     _revert_copy_if_leaving_battlefield(card)
+                    # Aug 7 confirmation-batch audit (C-2, MAJOR class): a
+                    # permanent leaving the battlefield is removed from
+                    # combat (CR 506.4) — this generic move path never
+                    # stripped combat state, so Eerie Interlude exiling
+                    # mid-combat attackers leaked .attacking=True through
+                    # the exile→return round trip (Sun Titan + Trinket
+                    # Mage, game_1535217860513890324; the [COMBAT-SWEEP]
+                    # net caught it a full turn later). Any mid-combat
+                    # exile/bounce/tuck through move_card had the leak.
+                    from mtg.helpers import strip_combat_state
+                    strip_combat_state(game, card)
                 # [REPLACEMENT] Check for graveyard/death replacement (Rest in Peace → exile instead)
                 actual_to_zone = to_zone.lower()
                 if actual_to_zone == 'graveyard' and HAS_REPLACEMENT_ENGINE and game._replacement_engine and game._replacement_engine.effects:
@@ -3388,6 +3399,16 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                 if getattr(c, '_phased_out', False):
                     continue
                 c._phased_out = True
+                # Aug 7 confirmation-batch audit (A-3, MAJOR): a permanent
+                # that phases out is removed from combat (CR 506.4/702.26e).
+                # Teferi's Protection after attackers were declared left the
+                # phased-out attackers in game.attackers and a block was
+                # declared against a nonexistent Soulherder
+                # (game_1535212572960227388; damage was independently
+                # skipped, so the leak was display/blocks only — this
+                # closes it at the rule's own boundary).
+                from mtg.helpers import strip_combat_state
+                strip_combat_state(game, c)
                 phased.append(c.name)
             # Don't remove from battlefield — just mark as phased out
             # They'll phase back in at the untap step

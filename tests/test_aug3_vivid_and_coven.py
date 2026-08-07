@@ -645,7 +645,10 @@ class TestCovenReachability:
                / "mtg/claude_player.py").read_text(encoding="utf-8")
         assert src.count("'TOP OF LIBRARY' in c") == 2, (
             "both prompt builders must treat the tag as a not-in-hand offer")
-        assert src.count("[TOP OF LIBRARY] are NOT in your hand") == 2
+        # Aug 7 (Q3): the NOTE now also lists the DRAUGR tag, so the phrase
+        # check anchors on the tag's presence INSIDE both NOTE blocks rather
+        # than the exact old sentence tail.
+        assert src.count("[TOP OF LIBRARY], or [DRAUGR") == 2
 
     def test_plan_validator_still_rejects_a_buried_card(
             self, make_game, make_card):

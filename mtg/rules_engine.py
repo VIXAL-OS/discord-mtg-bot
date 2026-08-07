@@ -891,10 +891,16 @@ class RulesEngine:
         return apply_combat_damage_to_creature(self, game, creature, amount, source_card, source_has_deathtouch)
     def _apply_noncombat_damage_to_player(self, game: GameState, player: 'PlayerState',
                                            amount: int, source_name: str = "",
-                                           source_id: str = "") -> int:
-        """Delegates to mtg.combat.apply_noncombat_damage_to_player (Phase 2D)."""
+                                           source_id: str = "",
+                                           source_controller: str = "") -> int:
+        """Delegates to mtg.combat.apply_noncombat_damage_to_player (Phase 2D).
+
+        Aug 7 (B-4): source_controller threads the caster identity from
+        Tier-2 SpellResolver so Torbran-class "source you control" gates
+        fire for spells already off the stack."""
         from mtg.combat import apply_noncombat_damage_to_player
-        return apply_noncombat_damage_to_player(self, game, player, amount, source_name, source_id)
+        return apply_noncombat_damage_to_player(self, game, player, amount, source_name,
+                                                source_id, source_controller)
     def _check_enters_tapped(self, game: GameState, card: Card, player) -> tuple:
         """
         Check if a permanent enters the battlefield tapped.

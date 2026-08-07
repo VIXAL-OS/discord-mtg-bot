@@ -465,8 +465,15 @@ class SpellResolver:
                 # all fire — without it, life totals get reduced silently and
                 # damage-doubling/halving (Furnace of Rath, Gisela) is bypassed.
                 if rules_engine and hasattr(rules_engine, '_apply_noncombat_damage_to_player'):
+                    # Aug 7 (B-4): pass the caster explicitly — the spell has
+                    # already been popped off the stack mid-resolution, so
+                    # the funnel's battlefield/stack lookups come up blank
+                    # and Torbran-class "a source you control" replacements
+                    # silently never fired on Tier-2 burn.
                     actual = rules_engine._apply_noncombat_damage_to_player(
-                        game, target, amount, ctx.source_card.name
+                        game, target, amount, ctx.source_card.name,
+                        source_controller=getattr(ctx.source_controller,
+                                                  'name', '') or '',
                     )
                 else:
                     target.life -= amount
