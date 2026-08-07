@@ -1946,6 +1946,78 @@ def command_zone_owner(game, card, fallback):
     return fallback
 
 
+def strip_combat_state(game, card):
+    """Narrow combat-state strip for a permanent LEAVING the battlefield.
+
+    Aug 7 batch audit (C-3): Korvold's attack trigger sacrificed a fellow
+    declared attacker (Priest of Forgotten Gods); the object went to the
+    graveyard with `.attacking=True` and the per-combat clear couldn't find
+    it on the battlefield — the end-turn [COMBAT-SWEEP] net caught the flag,
+    but the leak class is closed here at the leave chokepoints. Deliberately
+    NOT `reset_battlefield_state` (that also wipes counters, which would
+    break persist's CR 702.77b "no -1/-1 counters" gate on a dying creature
+    and any dies trigger reading counters).
+    """
+    card.attacking = False
+    card.attacking_player = None
+    card.blocking = []
+    card.blocked_by = []
+    try:
+        if getattr(game, 'attackers', None) and card.id in game.attackers:
+            game.attackers.remove(card.id)
+        if getattr(game, 'blockers', None) and card.id in game.blockers:
+            del game.blockers[card.id]
+    except (AttributeError, TypeError):
+        pass
+
+
+def route_dead_permanent(game, card, holder, to_exile=False):
+    """Shared zone routing for a permanent DESTROYED/removed by a MASS
+    handler — the class fix for the Aug 7 batch audit's G3-1 (CRITICAL).
+
+    Mirrors the single-target destroy path's three routing rules, which the
+    four mass handlers (destroy_all_creatures / destroy_all_permanents /
+    destroy_by_power / exile-by-type callers use their own exile variant)
+    all skipped with a bare `p.graveyard.append(...)`:
+      1. CR 903.9a commander redirect to the OWNER's command zone (with the
+         escape-commander decline, e.g. Kroxa) — live-confirmed
+         game-deciding in game_1535060120164376726: Damnation put Korvold in
+         the GRAVEYARD, and Rise of the Dark Realms then put the opponent's
+         own commander onto the caster's battlefield for the lethal swing.
+      2. CR 404.3: a destroyed card goes to its OWNER's graveyard, not the
+         battlefield-holder's (stolen creatures were changing hands
+         permanently).
+      3. CR 702.83a: an unearthed creature leaving the battlefield is exiled.
+    Also strips combat state (C-3). Returns the destination string for
+    display: 'command_zone', 'exile', or 'graveyard'.
+    """
+    strip_combat_state(game, card)
+    if (getattr(card, 'is_commander', False)
+            and getattr(game, 'format', '') in ('commander', 'edh', 'brawl', 'oathbreaker')
+            and not (not to_exile and commander_declines_graveyard_redirect(card))):
+        # CR 903.9a applies to graveyard, exile, hand, and library moves
+        # alike; the escape-commander decline only makes sense for the
+        # graveyard destination (Kroxa wants to BE in the graveyard).
+        _zone_owner = command_zone_owner(game, card, holder)
+        if not hasattr(_zone_owner, 'command_zone'):
+            _zone_owner.command_zone = []
+        _zone_owner.command_zone.append(card)
+        print(f"  [CR-903.9] Commander {card.name} redirected from "
+              f"{'exile' if to_exile else 'graveyard'} → command zone "
+              f"(owner={_zone_owner.name}, mass removal)")
+        return 'command_zone'
+    _dest_owner = owner_of(game, card, holder)
+    if to_exile:
+        _dest_owner.exile.append(card)
+        return 'exile'
+    if unearthed_leaves_to_exile(card):
+        _dest_owner.exile.append(card)
+        print(f"[UNEARTH] {card.name} destroyed → exiled (CR 702.83a, mass removal)")
+        return 'exile'
+    _dest_owner.graveyard.append(card)
+    return 'graveyard'
+
+
 def clamp_noop_reason(reason: str, max_len: int = 160) -> str:
     """Clamp Tier-3 no_action reasons for player display.
 

@@ -1977,6 +1977,8 @@ class GameEngine:
                 card.power_modifier = 0
                 card.toughness_modifier = 0
                 card.temp_keywords = []
+                # G2-1 (Aug 7): "lose <keyword> until end of turn" expires here.
+                card.temp_removed_keywords = []
             # Clear playable from exile
             # Aug 2 batch-13 (delve reviewer): "until the end of your NEXT
             # turn" — the unconditional every-player clear ended the impulse
@@ -2134,6 +2136,24 @@ class GameEngine:
             game._active_dies_batch = []
             if game._recently_died and not game.ended:
                 messages.extend(self.check_state_based_actions(game))
+            # Aug 7 batch audit (B-4 deep dive, adjacent defect): the wave
+            # only re-checked itself when dies triggers caused MORE DEATHS —
+            # a Blood Artist drain taking a player to 0 during the wave is
+            # not a death, so the wave ended with the game in an illegal
+            # state that survived combat, MAIN2, and end_turn
+            # (game_1535070676371767378: a full Burnished Hart activation
+            # incl. library search executed at -1 life). Re-check once when
+            # a life total is on the floor; the sentinel prevents recursion
+            # when a can't-lose effect (Platinum Angel) legitimately keeps
+            # the player alive at <=0.
+            if (not game.ended
+                    and not getattr(game, '_in_sba_zero_life_recheck', False)
+                    and any(getattr(p, 'life', 1) <= 0 for p in game.players)):
+                game._in_sba_zero_life_recheck = True
+                try:
+                    messages.extend(self.check_state_based_actions(game))
+                finally:
+                    game._in_sba_zero_life_recheck = False
 
         return messages
     
@@ -2157,6 +2177,13 @@ class GameEngine:
             messages.append(f"⏫ **Untap Step** - {game.active_player.name}'s permanents untap")
         
         elif game.phase == Phase.UPKEEP:
+            # Aug 7 (B-4 deep dive): mirror the DRAW branch's ended-gate —
+            # upkeep triggers used to resolve INSIDE the first phase advance
+            # of the turn, before its own tail SBA check, so a player who
+            # died at the previous turn's tail got upkeep triggers (a Koma's
+            # Coil, a Bitterblossom Faerie) resolved for them at 0 life.
+            if game.ended:
+                return game.phase, messages
             messages.append(f"📍 **Upkeep**")
             # [TRANSFORM] Day/night transition and werewolf transform checks
             try:
@@ -2614,6 +2641,9 @@ class GameEngine:
                 _sw_c.attacking_player = None
                 _sw_c.blocking = []
                 _sw_c.blocked_by = []
+                # C-1 (Aug 7 batch audit): the Moraug attack counter is
+                # strictly per-turn ("...has attacked this turn").
+                _sw_c.attacks_this_turn = 0
         game.attackers = []
         game.blockers = {}
         # Unconsumed extra combats die with the turn — a Moraug/Port Razer
@@ -2708,6 +2738,22 @@ class GameEngine:
 
         end_step_msgs = self.rules.on_end_step(game)
         end_step_msgs = endstep_trigger_msgs + end_step_msgs
+
+        # Aug 7 batch audit (B-4, CR 704.3): a loss condition created by the
+        # active player's own tail-of-turn action (Read the Bones self-loss
+        # to 0, a fetch/Bitterblossom drain, an empty-library draw pending)
+        # used to survive the whole of end_turn and get detected only at the
+        # NEXT turn's first phase advance — after the winner's untap step,
+        # the turn banner, and in two corpus games an upkeep trigger
+        # resolving for the dead player (4 cross-turn deferrals in the
+        # e4057a0 batch). Check BEFORE the active-player switch so any
+        # deaths from the end-step triggers above drain under the correct
+        # APNAP order; deliberately NO early return when the game ends —
+        # six call sites depend on end_turn's player-switch contract, and
+        # sba.py's own `if game.ended` guards make every later check a
+        # no-op.
+        if not game.ended:
+            end_step_msgs.extend(self.check_state_based_actions(game))
 
         # Switch active player
         game.active_player_index = 1 - game.active_player_index
@@ -3544,6 +3590,7 @@ class GameEngine:
                 if card and card.is_creature(game=game) and not card.tapped:
                     card.attacking = True
                     card.attacking_player = 1 - player_index
+                    card.attacks_this_turn += 1  # C-1: Moraug's attack-count static
                     self.tap_permanent(card)
                     attacking.append(card.name)
                     game.attackers.append(card.id)
@@ -4926,6 +4973,33 @@ class GameEngine:
                             inline_msgs.append(_dmsg)
                         print(f"[ACTIVATE-CLAUDE-INLINE] {perm.name}: drew {_dn} (plain draw)")
 
+                # (d2) Shadowspear-class: "Permanents your opponents control
+                # lose <keywords> until end of turn." Aug 7 batch audit
+                # (G2-1): no remove-keyword vocabulary existed anywhere —
+                # three activations in one game were pure no-ops with a
+                # garbled "gain  until end of turn" display
+                # (game_1535060108650872832). Deterministic here, so the
+                # ability never needs Tier 3 at all.
+                elif re.match(
+                        r'permanents your opponents? control lose ([a-z\s,]+?)'
+                        r' until end of turn\.?\s*$',
+                        effect_lower2.strip()):
+                    _lkm = re.match(
+                        r'permanents your opponents? control lose ([a-z\s,]+?)'
+                        r' until end of turn',
+                        effect_lower2.strip())
+                    _kw_raw = _lkm.group(1)
+                    _kws = [k.strip().title() for k in
+                            re.split(r',| and ', _kw_raw) if k.strip()]
+                    if _kws:
+                        _rmsg = self.rules._execute_action_on_state(game, {
+                            "action": "remove_keywords", "player": player.name,
+                            "keywords": _kws})
+                        if _rmsg:
+                            inline_msgs.append(_rmsg)
+                        print(f"[ACTIVATE-CLAUDE-INLINE] {perm.name}: opponents' "
+                              f"permanents lose {', '.join(_kws)} (inline)")
+
                 # (e) Necropotence-class: "Exile the top card of your library
                 # face down. Put that card into your hand at the beginning of
                 # your next end step." July 23 audit (#7): no handler existed
@@ -5072,6 +5146,14 @@ class GameEngine:
                 print(f"[EXECUTE] Dropped resolve positionally paired with prior "
                       f"{_prev_cast_like.get('type')} of {_prev_cast_like.get('card', '?')}: "
                       f"'{description[:80]}'")
+                # C-4 (Aug 7): teach the retry loop instead of "unknown reason".
+                game._last_resolve_drop_reason = (
+                    game.turn_number,
+                    f"redundant `resolve` dropped — the prior "
+                    f"{_prev_cast_like.get('type')} of "
+                    f"{_prev_cast_like.get('card', '?')} already resolved its "
+                    f"effects; do not re-propose it, choose a different action "
+                    f"or pass")
                 return None
 
             # Find source card from the description for better context

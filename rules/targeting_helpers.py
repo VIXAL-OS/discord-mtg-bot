@@ -282,9 +282,21 @@ def aura_has_legal_target(game, card, caster) -> bool:
     # Existence gate shared by cast validation and actor prompt hints.
     oracle = (getattr(card, 'oracle_text', '') or '').lower()
     type_line = (getattr(card, 'type_line', '') or '').lower()
-    if ('aura' not in type_line
-            or not ('enchant creature' in oracle
-                    or 'enchant permanent' in oracle)):
+    if 'aura' not in type_line:
+        return True
+    # Aug 7 batch audit (backlog item 4): basic-land-subtype auras — Utopia
+    # Sprawl's "Enchant Forest" was castable with zero Forests anywhere,
+    # paid its mana, and fizzled at the attach step (CR 601.2c). The attach
+    # branch honors the subtype; the cast gate didn't exist.
+    _lsub = re.search(r'enchant (forest|plains|island|swamp|mountain)\b', oracle)
+    if _lsub:
+        _sub = _lsub.group(1)
+        return any(
+            _sub in (permanent.type_line or '').lower() and permanent.is_land()
+            for player in game.players
+            for permanent in player.battlefield
+        )
+    if not ('enchant creature' in oracle or 'enchant permanent' in oracle):
         return True
 
     if 'in a graveyard' in oracle:
@@ -299,6 +311,11 @@ def aura_has_legal_target(game, card, caster) -> bool:
         'enchant creature you control' in oracle
         or 'enchant permanent you control' in oracle
     )
+    # Aug 7 (backlog item 4): Daybreak Coronet's "Enchant creature with
+    # another Aura attached to it" — the restriction was checked NOWHERE
+    # (cast gate treated it as plain enchant-creature; auto-select ignored
+    # it). Latent in the aura_equipment deck; never fired live.
+    needs_aura_attached = 'with another aura attached' in oracle
     for player in game.players:
         if own_only and player is not caster:
             continue
@@ -307,7 +324,21 @@ def aura_has_legal_target(game, card, caster) -> bool:
                 continue
             if creature_only and not permanent.is_creature(game):
                 continue
+            if needs_aura_attached and not _has_aura_attached(game, permanent, exclude_id=card.id):
+                continue
             return True
+    return False
+
+
+def _has_aura_attached(game, permanent, exclude_id=None) -> bool:
+    """True when at least one Aura (other than exclude_id) is attached to
+    the permanent — Daybreak Coronet's enchant restriction."""
+    for player in game.players:
+        for perm in player.battlefield:
+            if (perm.id != exclude_id
+                    and getattr(perm, 'attached_to', None) == permanent.id
+                    and 'aura' in (getattr(perm, 'type_line', '') or '').lower()):
+                return True
     return False
 
 

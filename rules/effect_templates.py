@@ -2030,7 +2030,7 @@ class EffectTemplateLibrary:
             description="Shard Volley deals 3 damage to any target (sacrifice a land as additional cost)",
             action_generator=lambda ctrl, opp, ctx: [
                 {"action": "deal_damage", "amount": 3,
-                 "target_player": ctx.get('explicit_target_name') or opp},
+                 "target_player": ctx.get('explicit_target_player') or ctx.get('explicit_target_name') or opp},  # B-2 (Aug 7): player key first
             ],
         ))
 
@@ -4910,6 +4910,45 @@ class EffectTemplateLibrary:
             )
         )
 
+        # Molten Duplication — Aug 7 batch audit (A-2): no template existed,
+        # and the Tier-3 judge dropped the MANDATORY "Sacrifice it at the
+        # beginning of the next end step" clause — the token copy survived
+        # 2+ extra turns and attacked again (game_1535051230815064206). Same
+        # shape as the Feldon graveyard-copy generator, battlefield zone.
+        def _gen_molten_duplication(ctrl, opp, ctx):
+            target = (ctx.get('explicit_target_name')
+                      or ctx.get('controller_best_creature')
+                      or ctx.get('best_own_creature'))
+            if not target:
+                # "artifact or creature you control" — fall back to any own
+                # artifact when the board has no creatures.
+                for perm in (ctx.get('controller_battlefield') or []):
+                    tl = (perm.get('type_line') if isinstance(perm, dict) else getattr(perm, 'type_line', '')) or ''
+                    nm = perm.get('name') if isinstance(perm, dict) else getattr(perm, 'name', None)
+                    if nm and 'artifact' in tl.lower():
+                        target = nm
+                        break
+            if not target:
+                return [{"action": "no_action",
+                         "reason": "no artifact or creature you control to copy"}]
+            return [
+                {"action": "create_copy_token", "player": ctrl,
+                 "target": target, "count": 1,
+                 "extra_types": ["Artifact"], "keywords": ["Haste"]},
+                {"action": "schedule_delayed_trigger", "trigger_at": "end_step",
+                 "turn_delay": 0, "source": "Molten Duplication",
+                 "actions": [{
+                     "action": "sacrifice_permanent", "player": ctrl,
+                     "preferred_card": target, "only_preferred": True,
+                     "reason": "Molten Duplication: sacrifice the copy at the next end step",
+                 }]},
+            ]
+        self._add_card("molten duplication", EffectTemplate(
+            name="Molten Duplication",
+            description="Copy an artifact/creature you control as an artifact token with haste; sacrifice it at the next end step",
+            action_generator=_gen_molten_duplication,
+        ))
+
         # Rite of Replication — create 5 copies if kicked, 1 otherwise
         # Kicker detection: base cost {2}{U}{U} (4 mana), kicked adds {5} (total 9+)
         self._add_card("rite of replication", EffectTemplate(
@@ -5891,7 +5930,7 @@ class EffectTemplateLibrary:
             description="Draw X cards (default X=3), shuffle Blue Sun's Zenith into library",
             action_generator=lambda ctrl, opp, ctx: [
                 {"action": "draw_cards",
-                 "player": ctx.get('explicit_target_name') or ctrl,
+                 "player": ctx.get('explicit_target_player') or ctx.get('explicit_target_name') or ctrl,  # B-2 (Aug 7): player key first
                  "amount": max(1, ctx.get('x_value', 3))},
             ],
         ))
@@ -6499,16 +6538,35 @@ class EffectTemplateLibrary:
 
 
         # --- Assassin's Trophy: destroy nonland permanent, controller searches for basic land ---
+        # Aug 7 batch audit (B-1, CRITICAL): the old template hardcoded a
+        # "nonland" restriction the printed card does not have ("Destroy
+        # target PERMANENT an opponent controls") — cast against a lands-only
+        # board it burned {B}{G} for a "No nonland permanent to target" no-op
+        # (game_1535065702061318155). It also forced the ramp land in TAPPED
+        # (that's Path to Exile's clause, not Trophy's) and treated the "may
+        # search" as mandatory (kept: declining a free basic is almost never
+        # right, documented approximation).
+        def _gen_assassins_trophy(ctrl, opp, ctx):
+            target = ctx.get('explicit_target_name') or ctx.get('best_opponent_nonland')
+            if not target:
+                # Real card text: any permanent — fall back to an opponent
+                # LAND when the board is lands-only.
+                for perm in (ctx.get('opponent_battlefield') or []):
+                    nm = perm.get('name') if isinstance(perm, dict) else getattr(perm, 'name', None)
+                    if nm:
+                        target = nm
+                        break
+            if not target:
+                return [{"action": "no_action", "reason": "Opponent controls no permanents"}]
+            return [
+                {"action": "destroy", "card": target},
+                {"action": "search_library_land", "player": ctx.get('explicit_target_owner') or opp,
+                 "basic_only": True, "enters_tapped": False},
+            ]
         self._add_card("assassin's trophy", EffectTemplate(
             name="Assassin's Trophy",
-            description="Destroy target nonland permanent. Its controller searches for a basic land tapped.",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "destroy", "card": ctx.get('explicit_target_name') or ctx.get('best_opponent_nonland') or ''},
-                {"action": "search_library_land", "player": ctx.get('explicit_target_owner') or opp,
-                 "basic_only": True, "enters_tapped": True},
-            ] if (ctx.get('explicit_target_name') or ctx.get('best_opponent_nonland')) else [
-                {"action": "no_action", "reason": "No nonland permanent to target"}
-            ],
+            description="Destroy target permanent an opponent controls. Its controller may search for a basic land.",
+            action_generator=_gen_assassins_trophy,
             needs_target=True,
         ))
 
@@ -7712,7 +7770,7 @@ class EffectTemplateLibrary:
             description="When Huntmaster of the Fells enters or transforms into Huntmaster, deal 2 damage to target opponent and gain 2 life",
             action_generator=lambda ctrl, opp, ctx: [
                 {"action": "deal_damage", "amount": 2,
-                 "target_player": ctx.get('explicit_target_name') or opp},
+                 "target_player": ctx.get('explicit_target_player') or ctx.get('explicit_target_name') or opp},  # B-2 (Aug 7): player key first
                 {"action": "gain_life", "player": ctrl, "amount": 2},
             ],
         ))
@@ -7835,7 +7893,13 @@ class EffectTemplateLibrary:
                 if l not in lands_to_sac and len(lands_to_sac) < x:
                     lands_to_sac.append(l)
         for land_name in lands_to_sac[:x]:
-            actions.append({"action": "destroy", "card": land_name})
+            # Aug 7 batch audit (G1-1 family): "SACRIFICE X lands" — the old
+            # destroy emission let indestructible lands (Darksteel Citadel)
+            # survive their own sacrifice and never fired "whenever you
+            # sacrifice a permanent" (Korvold counts lands).
+            actions.append({"action": "sacrifice_permanent", "player": ctrl,
+                            "preferred_card": land_name, "only_preferred": True,
+                            "reason": "Nahiri's Lithoforming: sacrifice X lands"})
         # Draw X cards
         actions.append({"action": "draw_cards", "player": ctrl, "amount": x})
         return actions
@@ -7915,11 +7979,21 @@ class EffectTemplateLibrary:
         ]
 
     def _gen_sidisi_exploit(self, ctrl, opp, ctx) -> List[Dict]:
-        """Sidisi, Undead Vizier: Exploit — sacrifice a creature, search library for any card."""
+        """Sidisi, Undead Vizier: Exploit — sacrifice a creature, search library for any card.
+
+        Aug 7 batch audit (G1-1): exploit is a SACRIFICE (CR 701.19), not a
+        destroy (CR 701.4) — the destroy handler early-returns on
+        Indestructible (an indestructible creature could never be exploited)
+        and "whenever you sacrifice" triggers (Korvold, Mayhem Devil,
+        Yawgmoth) never fired from the old destroy emission.
+        """
         worst = ctx.get('controller_worst_creature')
         if worst:
             return [
-                {"action": "destroy", "card": worst},
+                {"action": "sacrifice_permanent", "player": ctrl,
+                 "preferred_card": worst, "only_preferred": True,
+                 "type_filter": "creature",
+                 "reason": "Sidisi, Undead Vizier: exploit"},
                 {"action": "search_library", "player": ctrl, "count": 1,
                  "reason": "Sidisi, Undead Vizier: exploited creature, tutor for any card"},
             ]
@@ -9353,66 +9427,58 @@ class EffectTemplateLibrary:
     def _edict_effect(self, ctrl, opp, ctx) -> List[Dict]:
         """Fleshbag Marauder / Merciless Executioner: each player sacrifices a creature.
 
-        We destroy the opponent's weakest creature (lowest power) and leave a
-        hint for the controller to sacrifice one of theirs manually if needed.
-        In autoplay the controller's sacrifice is handled by the AI decision loop.
+        Aug 7 batch audit (G2-2): an edict is a SACRIFICE (CR 701.19), not a
+        destroy — the old destroy emissions let indestructible creatures
+        survive their own edict and never fired "whenever you sacrifice"
+        watchers (Korvold, Mayhem Devil). Routed through sacrifice_permanent
+        (which fires sac triggers, queues deaths, and handles the CR 903.9a
+        commander redirect); the generator keeps its weakest-pick heuristic
+        as the preferred card and lets the handler's own priority order
+        (tokens first, lowest CMC) stand in for "of their choice" when the
+        preference is unavailable. This also retires the July-24 D1
+        simplification note — the source creature IS the controller's
+        sacrifice when it's their only creature, via the preferred-card
+        fallthrough.
         """
         actions = []
-        # Opponent: destroy their weakest creature
+
+        def _weakest(infos, skip_name=None):
+            best, best_p = None, 999
+            for info in infos or []:
+                if not isinstance(info, dict):
+                    continue
+                nm = info.get('name', '')
+                if skip_name and nm.lower() == skip_name:
+                    continue
+                p = info.get('power', 0) or 0
+                if p < best_p:
+                    best_p, best = p, nm
+            return best
+
+        # Opponent: sacrifices a creature of their choice.
         opp_creatures = ctx.get('_opponent_creatures', [])
-        if opp_creatures:
-            # Pick weakest by power (lowest is least valuable to lose)
-            weakest = None
-            weakest_power = 999
-            for info in opp_creatures:
-                p = info.get('power', 0) if isinstance(info, dict) else 0
-                if p < weakest_power:
-                    weakest_power = p
-                    weakest = info.get('name') if isinstance(info, dict) else None
-            if weakest:
-                actions.append({"action": "destroy", "card": weakest})
-            else:
-                # Fall back to best_opponent_creature if _opponent_creatures not populated
-                target = ctx.get('best_opponent_creature')
-                if target:
-                    actions.append({"action": "destroy", "card": target})
+        opp_pick = _weakest(opp_creatures) or ctx.get('best_opponent_creature')
+        if opp_pick or opp_creatures:
+            actions.append({"action": "sacrifice_permanent", "player": opp,
+                            "type_filter": "creature",
+                            "preferred_card": opp_pick or "",
+                            "reason": ctx.get('_source_card_name') or "edict: sacrifice a creature"})
         else:
-            # Context not populated — use best_opponent_creature
-            target = ctx.get('best_opponent_creature')
-            if target:
-                actions.append({"action": "destroy", "card": target})
-            else:
-                actions.append({"action": "no_action", "reason": f"{opp} has no creatures to sacrifice"})
-        # Controller: sacrifice their weakest creature too (symmetric effect)
+            actions.append({"action": "no_action", "reason": f"{opp} has no creatures to sacrifice"})
+
+        # Controller: sacrifices too (symmetric effect). July 24 batch-6
+        # audit (reviewer D1): the controller's MANDATORY sacrifice must not
+        # be skipped when the opponent had one (CR 701.20); when the source
+        # is the controller's only creature, IT is the sacrifice.
         ctrl_creatures = ctx.get('_controller_creatures', [])
         source_name = (ctx.get('_source_card_name') or '').lower()
         if ctrl_creatures:
-            # Pick weakest by power that isn't the source creature itself
-            weakest = None
-            weakest_power = 999
-            for info in ctrl_creatures:
-                name = info.get('name', '') if isinstance(info, dict) else ''
-                p = info.get('power', 0) if isinstance(info, dict) else 0
-                if name.lower() != source_name and p < weakest_power:
-                    weakest_power = p
-                    weakest = name
-            if weakest:
-                actions.append({"action": "destroy", "card": weakest})
-            else:
-                # July 24 batch-6 audit (reviewer D1): the old guard here was
-                # `elif not any(a.get('action') == 'destroy' ...)` — but the
-                # OPPONENT's forced sacrifice was already in the list, so the
-                # controller's own MANDATORY sacrifice was silently skipped
-                # whenever the opponent had a creature (Fleshbag Marauder
-                # survived its own edict, game_1529985418743910420 —
-                # CR 701.20). When the source is the controller's only
-                # creature, IT is the sacrifice. (Known simplification: the
-                # destroy action honors indestructible, a true sacrifice
-                # wouldn't — acceptable until a sacrifice-typed action
-                # serves this generator.)
-                source = ctx.get('_source_card_name', '')
-                if source:
-                    actions.append({"action": "destroy", "card": source})
+            ctrl_pick = _weakest(ctrl_creatures, skip_name=source_name) \
+                or ctx.get('_source_card_name', '')
+            actions.append({"action": "sacrifice_permanent", "player": ctrl,
+                            "type_filter": "creature",
+                            "preferred_card": ctrl_pick or "",
+                            "reason": ctx.get('_source_card_name') or "edict: sacrifice a creature"})
         return actions
 
     def _craterhoof_pump(self, ctrl, opp, ctx) -> List[Dict]:
@@ -11529,11 +11595,36 @@ def build_game_context(game, player, opponent, card=None, entering_creature=None
     # Explicit target (from AI cast decision or !play command)
     # Overrides auto-targeting in templates when present
     if explicit_target:
+        # Aug 7 batch audit (B-2, CRITICAL): resolve_cast_target resolves
+        # the pronoun "opponent" to a PLAYER object (by design, for burn
+        # spells) — and a Player has a .name, so it used to fall into the
+        # "It's a Card object" branch below, poisoning explicit_target_name
+        # with a player's name. Card-name consumers (Assassin's Trophy's
+        # destroy) whiffed silently while truthiness-gated side effects
+        # still fired (the opponent got a FREE land search,
+        # game_1535060193795248229). Duck-test: only Players have a
+        # battlefield. The three legitimate player-name consumers (Blue
+        # Sun's Zenith, Huntmaster, Shard Volley) read
+        # explicit_target_player first now.
+        def _is_player_like(obj):
+            return hasattr(obj, 'battlefield') and hasattr(obj, 'life')
         if isinstance(explicit_target, (list, tuple)):
-            target_names = [getattr(item, 'name', str(item)) for item in explicit_target]
+            _card_items = [item for item in explicit_target if not _is_player_like(item)]
+            _player_items = [item for item in explicit_target if _is_player_like(item)]
+            target_names = [getattr(item, 'name', str(item)) for item in _card_items]
             ctx['explicit_target_names'] = target_names
             if target_names:
                 ctx['explicit_target_name'] = target_names[0]
+            if _player_items:
+                ctx['explicit_target_is_player'] = True
+                ctx['explicit_target_player'] = getattr(_player_items[0], 'name', '')
+        elif _is_player_like(explicit_target):
+            ctx['explicit_target_is_player'] = True
+            ctx['explicit_target_player'] = getattr(explicit_target, 'name', '')
+            ctx['explicit_target_is_creature'] = False
+            # Deliberately NOT set: explicit_target_name / _id / _mv / _owner —
+            # every card-name consumer must see "no card target declared" and
+            # fall to its own heuristics or no_action.
         elif hasattr(explicit_target, 'name'):
             # It's a Card object — find which player owns it
             ctx['explicit_target_name'] = explicit_target.name

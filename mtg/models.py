@@ -623,6 +623,14 @@ class Card:
     # detect graveyard-origin casting; declared July 29 when the autoplay
     # path gained the same stamp.
     _cast_from_graveyard: bool = field(default=False, repr=False, compare=False)
+    # Aug 7 2026 batch audit (C-1): per-turn declared-attacker count, read by
+    # Moraug, Fury of Akoum's "+1/+0 for each time it has attacked this turn"
+    # static (compute-on-read in get_effective_power). Incremented at the six
+    # DECLARED-attacker sites only — a token put onto the battlefield attacking
+    # was never declared and has not "attacked" (Moraug Gatherer ruling
+    # 2020-09-25), so the create-token-attacking path deliberately skips it.
+    # Cleared by end_turn's combat sweep.
+    attacks_this_turn: int = field(default=0, repr=False, compare=False)
     # Adventure (CR 715.3): set when the adventure half resolves and the card
     # goes to exile, cleared when it leaves. Deliberately separate from
     # Player.playable_from_exile, which end_turn wipes every turn — adventure
@@ -698,6 +706,13 @@ class Card:
     power_modifier: int = 0
     toughness_modifier: int = 0
     temp_keywords: List[str] = field(default_factory=list)  # Keywords granted until end of turn
+    # Aug 7 batch audit (G2-1): "lose <keyword> until end of turn"
+    # (Shadowspear: "Permanents your opponents control lose hexproof and
+    # indestructible until end of turn") had NO action vocabulary — every
+    # activation was a silent no-op. A removal here beats every grant source
+    # for the turn (approximation of the Layer-6 later-timestamp ordering a
+    # "lose" effect nearly always has). Cleared by clear_end_of_turn_effects.
+    temp_removed_keywords: List[str] = field(default_factory=list)
     
     # Planeswalker loyalty counters
     loyalty_counters: int = 0
@@ -787,11 +802,16 @@ class Card:
         self.power_modifier = 0
         self.toughness_modifier = 0
         self.temp_keywords = []
+        self.temp_removed_keywords = []
         self.tapped = False
         self.attacking = False
         self.attacking_player = None
         self.blocking = []
         self.blocked_by = []
+        # C-1 (Aug 7): the per-turn attack counter is battlefield history the
+        # new object must not remember (CR 400.7) — a same-turn reanimation
+        # would otherwise keep its pre-death Moraug bonus.
+        self.attacks_this_turn = 0
         self.summoning_sick = True
         self.entered_this_turn = False
         self.attached_to = None
@@ -1126,6 +1146,11 @@ class Card:
         # Ascendant) — dynamic like the debuff above, computed on read.
         lt_p, _ = self._get_life_threshold_bonus(game)
         result += lt_p
+        # Moraug, Fury of Akoum: "+1/+0 for each time it has attacked this
+        # turn" — dynamic per-creature amount the layers engine can't cache,
+        # computed on read (Aug 7 batch audit C-1: both combats of the Moraug
+        # turn dealt base-power damage because this clause was unimplemented).
+        result += self._get_attack_count_bonus(game)
         return result
 
     def get_effective_toughness(self, game=None) -> int:
@@ -1202,6 +1227,26 @@ class Card:
         for p in game.players:
             if self in p.battlefield:
                 return max(0, int(getattr(p, 'life', 0)))
+        return 0
+
+    def _get_attack_count_bonus(self, game) -> int:
+        """Moraug, Fury of Akoum: "Each creature you control gets +1/+0 for
+        each time it has attacked this turn." A battlefield-wide static whose
+        amount is per-creature and per-turn — the layers engine skips dynamic
+        amounts, so compute on read (the Death's Shadow family). Reads the
+        declared `attacks_this_turn` counter maintained at the six
+        declared-attacker sites and cleared by end_turn's combat sweep.
+        Power only — the printed clause has no toughness half."""
+        if not game or not self.attacks_this_turn:
+            return 0
+        for p in game.players:
+            if self in p.battlefield:
+                for perm in p.battlefield:
+                    o = (getattr(perm, 'oracle_text', '') or '').lower()
+                    if ('gets +1/+0 for each time it has attacked this turn'
+                            in o):
+                        return int(self.attacks_this_turn)
+                return 0
         return 0
 
     def _get_life_threshold_bonus(self, game):
@@ -1596,6 +1641,10 @@ class Card:
     def has_keyword(self, keyword: str, game=None) -> bool:
         """Check if card has a keyword ability (permanent, temporary, equipment, or static effects)."""
         keyword_lower = keyword.lower()
+        # G2-1 (Aug 7): "loses <keyword> until end of turn" (Shadowspear
+        # class) — the removal wins over every grant source for the turn.
+        if keyword_lower in (k.lower() for k in self.temp_removed_keywords):
+            return False
         # May 30 audit (option b — compute-on-read for keywords): under a board-
         # wide "lose all abilities" effect (Humility, Layer 6), defer to the layers
         # engine's resolved ability set rather than reading raw keyword lists.
@@ -4124,6 +4173,13 @@ class GameState:
     # sickness or affordability checks). (turn, permanent_name, message);
     # consumed (and cleared) by _get_action_error.
     _last_activation_failure: Any = field(default=None, repr=False, compare=False)
+    # Aug 7 batch audit (C-4): same stash for deliberately-DROPPED redundant
+    # `resolve` actions — the June-10 positional-pairing drop returned bare
+    # None, surfacing to the AI as "Action failed (unknown reason)", so the
+    # model re-proposed the identical resolve, burning a retry AND a Tier-3
+    # judge call (two games in the e4057a0 batch). (turn, message); consumed
+    # by _get_action_error's resolve branch.
+    _last_resolve_drop_reason: Any = field(default=None, repr=False, compare=False)
     # July 24 batch-6: aura auto-target fizzle context — set when a beneficial
     # aura declines an opponent-only legal-target board so the fizzle message
     # can say "declined" instead of the misleading "no creature you control".

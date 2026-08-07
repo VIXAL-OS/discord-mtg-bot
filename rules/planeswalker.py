@@ -752,11 +752,22 @@ class PlaneswalkerManager:
             pw_ctx['_pw_targets'] = list(targets or [])
             if targets:
                 first_target = targets[0]
-                pw_ctx['explicit_target_name'] = getattr(first_target, 'name', first_target)
-                for target_player in game.players:
-                    if first_target in target_player.battlefield:
-                        pw_ctx['explicit_target_owner'] = target_player.name
-                        break
+                # Aug 7 batch audit (B-2, second injection site): the PW
+                # forward path resolves pronouns/player names to PLAYER
+                # objects (mtg.helpers._resolve_player_or_card_target) —
+                # a Player must not poison explicit_target_name with a
+                # player's name (the Aminatou -1 flicker template is a
+                # card-name reader with a truthiness gate). Duck-test as in
+                # build_game_context.
+                if hasattr(first_target, 'battlefield') and hasattr(first_target, 'life'):
+                    pw_ctx['explicit_target_is_player'] = True
+                    pw_ctx['explicit_target_player'] = getattr(first_target, 'name', '')
+                else:
+                    pw_ctx['explicit_target_name'] = getattr(first_target, 'name', first_target)
+                    for target_player in game.players:
+                        if first_target in target_player.battlefield:
+                            pw_ctx['explicit_target_owner'] = target_player.name
+                            break
             # Greatest power among creatures (for Garruk -3, etc.)
             greatest_power = 0
             for c in player.battlefield:

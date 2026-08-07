@@ -440,10 +440,18 @@ class ClaudePlayer:
 
     @property
     def provider_tag(self):
-        """Console log tag that reflects actual provider."""
+        """Console log tag that reflects actual provider.
+
+        Aug 7 batch audit (C-2): Qwen had no branch, so all 50 Qwen-wave
+        games logged [CLAUDE AI] console tags — a provider-tag grep by
+        future audit tooling would silently miss them (Discord seat names
+        were correct throughout; this is console-only).
+        """
         model_lower = self.model.lower()
         if 'deepseek' in model_lower:
             return '[DEEPSEEK AI]'
+        if 'qwen' in model_lower:
+            return '[QWEN AI]'
         if 'openrouter/' in model_lower or self.model.startswith('openrouter/'):
             short = self.model.split('/')[-1]
             return f'[OPENROUTER:{short} AI]'
@@ -455,6 +463,8 @@ class ClaudePlayer:
         model_lower = self.model.lower()
         if 'deepseek' in model_lower:
             return '[DEEPSEEK TURN]'
+        if 'qwen' in model_lower:
+            return '[QWEN TURN]'
         if 'openrouter/' in model_lower or self.model.startswith('openrouter/'):
             short = self.model.split('/')[-1]
             return f'[OPENROUTER:{short} TURN]'

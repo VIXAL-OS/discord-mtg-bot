@@ -42,6 +42,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from mtg.constants import Phase, Zone, COMMAND_ZONE_FORMATS
 from mtg.models import Card, Player, GameState
 from mtg import events
+from mtg import helpers
 # Slice 3a (July 21): every death queue goes through the choke-point
 # (append + CREATURE_DIED shadow emit).
 from mtg.triggers import queue_deaths as _queue_deaths_3a
@@ -4114,6 +4115,12 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
         elif not isinstance(keywords, list):
             # Fallback: try to wrap in a list
             keywords = list(keywords) if hasattr(keywords, '__iter__') else [str(keywords)]
+        # Aug 7 batch audit (G6-1): a Tier-3 grant with keywords=[] produced
+        # the garbled "🛡️ Qwen's 13 permanents gain  until end of turn" —
+        # an empty grant is a no-op, not a message.
+        if not keywords:
+            print("[GRANT-KEYWORDS] Refusing empty keyword list (no-op)")
+            return None
         target = action.get("target", "all_own_permanents")
         target_card_name = action.get("target_card")
         requires_creature = (
@@ -4170,11 +4177,65 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                 granted.append(card.name)
             if not count:
                 return None
-            perm_word = "permanent" if count == 1 else "permanents"
+            # G6-1 (Aug 7): say "creature(s)" when the grant was
+            # creature-filtered — "N permanents" for Unbreakable Formation
+            # read as if lands were buffed.
+            _noun = ("creature" if (target == "all_own_creatures" or requires_creature)
+                     else "permanent")
+            perm_word = _noun if count == 1 else _noun + "s"
             if subtype or attacking_only:
                 who = ", ".join(granted[:4]) + (f" (+{count - 4} more)" if count > 4 else "")
                 return f"🛡️ {who} gain {', '.join(keywords)} until end of turn"
             return f"🛡️ {p.name}'s {count} {perm_word} gain {', '.join(keywords)} until end of turn"
+        return None
+
+    elif action_type == "remove_keywords":
+        # Aug 7 batch audit (G2-1, CRITICAL): "lose <keyword> until end of
+        # turn" had NO action vocabulary — Shadowspear's "{1}: Permanents
+        # your opponents control lose hexproof and indestructible until end
+        # of turn" was a pure no-op on every activation (the Tier-3 judge
+        # understood the semantics in prose but could only emit
+        # grant_keywords with keywords=[]). Scope shapes: a named card via
+        # "card", or every permanent of the named player's OPPONENTS via
+        # "player" + target="opponent_permanents" (the Shadowspear shape).
+        keywords = action.get("keywords", [])
+        if isinstance(keywords, str):
+            keywords = [k.strip() for k in re.split(r'[,;|]+', keywords) if k.strip()]
+        keywords = [k for k in (keywords or []) if k]
+        if not keywords:
+            print("[REMOVE-KEYWORDS] Refusing empty keyword list (no-op)")
+            return None
+        target_card_name = action.get("card") or action.get("target_card")
+        player_name = action.get("player")
+        if target_card_name:
+            for pl in game.players:
+                for card in pl.battlefield:
+                    if card.name.lower() == str(target_card_name).lower():
+                        for kw in keywords:
+                            if kw not in card.temp_removed_keywords:
+                                card.temp_removed_keywords.append(kw)
+                        print(f"[REMOVE-KEYWORDS] {card.name} loses "
+                              f"{', '.join(keywords)} until end of turn")
+                        return (f"🚫 {card.name} loses {', '.join(keywords)} "
+                                f"until end of turn")
+            return None
+        controller = find_player(player_name)
+        if controller:
+            count = 0
+            for pl in game.players:
+                if pl is controller:
+                    continue
+                for card in pl.battlefield:
+                    for kw in keywords:
+                        if kw not in card.temp_removed_keywords:
+                            card.temp_removed_keywords.append(kw)
+                    count += 1
+            if count:
+                print(f"[REMOVE-KEYWORDS] {count} opponent permanent(s) lose "
+                      f"{', '.join(keywords)} until end of turn")
+                _pw = "permanent" if count == 1 else "permanents"
+                return (f"🚫 Opponents' {count} {_pw} lose "
+                        f"{', '.join(keywords)} until end of turn")
         return None
 
     elif action_type == "prevent_combat_damage":
@@ -4570,6 +4631,20 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                     game.register_static_pt_effects(creature, p.name)
                     from mtg.sba import _finalize_death_save_return
                     save_return_msgs.extend(_finalize_death_save_return(rules, game, p, creature, 'PERSIST'))
+                else:
+                    # Aug 7 batch audit (G3-1, CRITICAL): the mass path did a
+                    # bare local-graveyard append, skipping the CR 903.9a
+                    # commander redirect + CR 404.3 owner routing + CR 702.83a
+                    # unearth exile that the single-target destroy performs —
+                    # Damnation put Korvold in the graveyard and Rise of the
+                    # Dark Realms handed the opponent their own commander for
+                    # the lethal swing (game_1535060120164376726). Re-route
+                    # the provisional placement through the shared helper.
+                    # Dies triggers (queued above) still fire per CR 903.9b.
+                    p.graveyard.remove(creature)
+                    _dest = helpers.route_dead_permanent(game, creature, p)
+                    if _dest == 'command_zone':
+                        destroyed[-1] = f"{creature.name} (→ command zone, CR 903.9)"
         # Fire dies triggers for all creatures that died simultaneously
         # (Blood Artist, Zulaport Cutthroat, etc.)
         if died_list:
@@ -4670,7 +4745,9 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                 if getattr(perm, 'is_token', False):
                     destroyed.append(perm.name)
                     continue
-                p.graveyard.append(perm)
+                # G3-1 (Aug 7): shared routing — CR 903.9a redirect,
+                # CR 404.3 owner graveyard, CR 702.83a unearth exile.
+                helpers.route_dead_permanent(game, perm, p)
                 destroyed.append(perm.name)
                 if perm.is_creature():
                     died_list.append((perm, p))
@@ -4709,7 +4786,8 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                     continue
                 game.unregister_static_effects(creature)
                 p.battlefield.remove(creature)
-                p.graveyard.append(creature)
+                # G3-1 (Aug 7): shared routing (CR 903.9a / 404.3 / 702.83a).
+                helpers.route_dead_permanent(game, creature, p)
                 destroyed.append(creature.name)
                 died_list.append((creature, p))
         if died_list:
@@ -4744,7 +4822,9 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
             for c in to_exile:
                 game.unregister_static_effects(c)
                 p.battlefield.remove(c)
-                p.exile.append(c)
+                # G3-1 (Aug 7): CR 903.9a applies to exile too; owner's exile
+                # zone, not the battlefield-holder's (CR 406.3 ownership).
+                helpers.route_dead_permanent(game, c, p, to_exile=True)
                 exiled.append(c.name)
                 if c.is_creature():
                     died_list.append((c, p))
@@ -4789,7 +4869,8 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                     continue
                 game.unregister_static_effects(c)
                 p.battlefield.remove(c)
-                p.graveyard.append(c)
+                # G3-1 (Aug 7): shared routing (CR 903.9a / 404.3 / 702.83a).
+                helpers.route_dead_permanent(game, c, p)
                 destroyed_names.append(c.name)
                 if c.is_creature():
                     died_list.append((c, p))
@@ -4851,7 +4932,8 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                 game.unregister_static_effects(c)
                 _revert_copy_if_leaving_battlefield(c)
                 p.battlefield.remove(c)
-                p.graveyard.append(c)
+                # G3-1 (Aug 7): shared routing (CR 903.9a / 404.3 / 702.83a).
+                helpers.route_dead_permanent(game, c, p)
                 destroyed.append(c.name)
                 if c.is_creature():
                     died_list.append((c, p))
@@ -4892,7 +4974,8 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                     continue
                 game.unregister_static_effects(c)
                 p.battlefield.remove(c)
-                p.graveyard.append(c)
+                # G3-1 (Aug 7): shared routing (CR 903.9a / 404.3 / 702.83a).
+                helpers.route_dead_permanent(game, c, p)
                 destroyed.append(c.name)
                 died_list.append((c, p))
         if died_list:
@@ -5386,6 +5469,13 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
             victim = candidates[0]
             game.unregister_static_effects(victim)
             p.battlefield.remove(victim)
+            # Aug 7 batch audit (C-3): a declared attacker sacrificed
+            # mid-combat (Korvold's attack trigger eating a fellow attacker)
+            # kept its .attacking flag into the graveyard — the per-combat
+            # clear can't find an object that left the battlefield, and only
+            # the end-turn [COMBAT-SWEEP] net caught it
+            # (game_1535060130167521392). Strip at the leave chokepoint.
+            helpers.strip_combat_state(game, victim)
             moved_to_command_zone = False
             # Commanders go to command zone — the OWNER's, not the
             # battlefield-holder's (June 10 audit C7, CR 903.9a).

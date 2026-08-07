@@ -38,6 +38,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from mtg.constants import Phase, Zone, COMMAND_ZONE_FORMATS
 from mtg import events
 from mtg.helpers import command_zone_owner, owner_of
+from mtg import helpers
 from mtg.models import Card, Player, GameState
 
 
@@ -506,6 +507,17 @@ def process_state_based_actions(rules, game: GameState) -> List[str]:
             if action['type'] == 'player_loses':
                 idx = action['player_index']
                 player = game.players[idx]
+                # Aug 7 batch audit (G3-2): trigger messages buffered by an
+                # EARLIER action (a Mayhem Devil ping from an Altar
+                # activation) were still sitting in _pending_messages and
+                # flushed AFTER this loss line, so the transcript showed the
+                # dead player's life "rising" post-loss
+                # (game_1535060120164376726 — state was correct throughout,
+                # pure ordering). Drain the buffer ahead of the terminal
+                # line so pre-loss events display pre-loss.
+                _pending = getattr(game, '_pending_messages', None)
+                if _pending:
+                    messages.extend(helpers.drain_pending_messages(game))
                 messages.append(f"💀 **{player.name}** loses the game! ({action['reason']})")
                 game.ended = True
                 game.winner = 1 - idx

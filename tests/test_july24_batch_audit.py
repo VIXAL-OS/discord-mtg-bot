@@ -983,9 +983,15 @@ class TestEdictControllerSideNotSkipped:
             "When this creature enters, each player sacrifices a creature "
             "of their choice.",
             "Rick", "Claude", ctx)
-        destroyed = [a["card"] for a in actions
-                     if a.get("action") == "destroy"]
-        assert "Selfless Spirit" in destroyed, "opponent's sacrifice missing"
-        assert "Fleshbag Marauder" in destroyed, (
+        # Aug 7 batch audit (G2-2): the edict now emits real
+        # sacrifice_permanent actions (CR 701.19) instead of destroys — the
+        # July-24 guarantee (the controller's MANDATORY sacrifice is never
+        # skipped, and the source IS the sacrifice when it's their only
+        # creature) is unchanged, expressed through the sacrifice action's
+        # preferred_card.
+        sacs = {(a.get("player"), a.get("preferred_card")) for a in actions
+                if a.get("action") == "sacrifice_permanent"}
+        assert ("Claude", "Selfless Spirit") in sacs, "opponent's sacrifice missing"
+        assert ("Rick", "Fleshbag Marauder") in sacs, (
             "controller's own mandatory sacrifice was skipped because the "
-            "opponent's destroy was already in the action list")
+            "opponent's sacrifice was already in the action list")

@@ -215,6 +215,7 @@ PART 2 - ACTIONS: A JSON array of game state changes to apply. Use these action 
 - {{"action": "move_card", "card": "X", "from_zone": "graveyard", "to_zone": "library", "position": "top", "player": "name"}}
 - {{"action": "create_token", "player": "name", "name": "N", "power": P, "toughness": T, "types": "...", "count": N, "keywords": ["defender", "flying"]}} — ALWAYS include the token's keywords (defender, flying, etc.); omitting them creates a token WITHOUT those abilities
 - {{"action": "add_counters", "card": "X", "counter_type": "+1/+1", "amount": N}}
+- {{"action": "remove_keywords", "card": "X", "keywords": ["Hexproof"]}} — a permanent LOSES keywords until end of turn; use "player": "name" (omit "card") for "permanents your opponents control lose ..." effects
 - {{"action": "pump_all_creatures", "player": "name", "power": N, "toughness": N}} — TEMPORARY +N/+N until end of turn (NOT counters). Add "card": "Name" to pump ONLY that one creature — "this creature gets +N/+N" MUST be scoped with "card", never applied to the whole team
 - {{"action": "scry", "player": "name", "amount": N}}
 - {{"action": "tap", "card": "X"}}
@@ -586,7 +587,30 @@ async def resolve_effect(rules, game: GameState, effect_description: str,
     # empty pool. If the effect hinges on an optional mana payment and no
     # mana is available at all, resolve it as a decline instead of letting
     # the model invent the payment.
-    if re.search(r'\byou may pay\b', _guard_desc.lower()) and controller:
+    # Aug 7 batch audit (A-1a): multikicker's REMINDER text ("You may pay an
+    # additional {1} any number of times AS YOU CAST this spell") matched this
+    # guard at RESOLUTION time — by then the kick count is fixed (CR 601.2b)
+    # and there is nothing left to pay, so an unkicked Comet Storm with zero
+    # untapped sources was refused wholesale: full X paid, zero damage dealt
+    # (game_1535051230815064206). Remove parentheticals that describe a
+    # CAST-time payment before running the guard; extort's reminder ("you may
+    # pay {W/B}", no cast-time phrase) is a genuine resolution-time payment
+    # and stays guarded, as does all body-text "you may pay" (Leyline Tyrant,
+    # the guard's origin).
+    def _strip_cast_time_pay_parens(text):
+        # Order-agnostic within the parenthetical: multikicker puts "you may
+        # pay" BEFORE "as you cast this spell"; suspend puts "rather than
+        # cast this card" first.
+        def _repl(m):
+            body = m.group(1)
+            if ('you may pay' in body
+                    and ('as you cast this spell' in body
+                         or 'rather than cast this card' in body)):
+                return ''
+            return m.group(0)
+        return re.sub(r'\(([^)]*)\)', _repl, text)
+    _guard_pay_text = _strip_cast_time_pay_parens(_guard_desc.lower())
+    if re.search(r'\byou may pay\b', _guard_pay_text) and controller:
         _ctrl_p = next((p for p in game.players if p.name == controller), None)
         if _ctrl_p is not None:
             _pool_total = sum((getattr(_ctrl_p, 'mana_pool', {}) or {}).values())
@@ -825,6 +849,7 @@ AVAILABLE ACTIONS (use ONLY these exact types):
 zones: hand, battlefield, graveyard, exile, library
 - {{"action": "add_counters", "card": "Card Name", "counter_type": "+1/+1", "amount": N}} — PERMANENT counters only
 - {{"action": "remove_counters", "card": "Card Name", "counter_type": "+1/+1", "amount": N}}
+- {{"action": "remove_keywords", "card": "Card Name", "keywords": ["Hexproof", "Indestructible"]}} — permanent LOSES keywords until end of turn; "player": "name" without "card" = all permanents that player's OPPONENTS control lose them
 - {{"action": "pump_all_creatures", "player": "name", "power": N, "toughness": N}} — TEMPORARY +N/+N until end of turn. Add "card": "Name" to pump ONLY that one creature — "this creature gets +N/+N" MUST be scoped with "card", never applied to the whole team
 - {{"action": "scry", "player": "name", "amount": N}} — scry N (look at top N, reorder/bottom)
 - {{"action": "create_token", "player": "name", "name": "Token Name", "power": N, "toughness": N, "types": "Creature — Type", "count": N, "keywords": ["defender", "flying"]}} — ALWAYS include the token's printed keywords; a "0/4 Wall with defender" created without "keywords" can illegally attack
@@ -991,6 +1016,33 @@ Respond with ONLY the JSON object, no markdown, no backticks, no preamble."""
                     reason = action.get("reason", "no effect")
                     print(f"[RESOLVE] No action: {reason}")
                     continue
+
+                # Aug 7 batch audit (A-4): the Tier-3 judge placed a -1/-1
+                # counter on SKULLCLAMP (an Equipment) for Yawgmoth's "Put a
+                # -1/-1 counter on up to one target creature"
+                # (game_1535060075683651725) — nothing validated the emitted
+                # target against the ability's printed restriction. The guard
+                # lives HERE and not in the add_counters handler because that
+                # handler legitimately serves non-creatures (charge counters
+                # on artifacts, loyalty, lore, +1/+1 on a Vehicle).
+                if (action_type == "add_counters"
+                        and 'target creature' in _guard_desc.lower()
+                        and action.get("card")):
+                    _tgt_nm = str(action.get("card")).lower()
+                    _tgt_obj = None
+                    for _gp in game.players:
+                        for _gc in _gp.battlefield:
+                            if _gc.name.lower() == _tgt_nm:
+                                _tgt_obj = _gc
+                                break
+                        if _tgt_obj:
+                            break
+                    if _tgt_obj is not None and not _tgt_obj.is_creature(game):
+                        print(f"[RESOLVE-REFUSED] add_counters on "
+                              f"{_tgt_obj.name} — the ability targets a "
+                              f"CREATURE (CR 601.2c/608.2b); dropping the "
+                              f"illegal action")
+                        continue
 
                 try:
                     msg = rules._execute_action_on_state(game, action)

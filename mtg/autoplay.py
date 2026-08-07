@@ -653,6 +653,7 @@ async def _claude_extra_combats(cog, thread, game: GameState) -> None:
                 if card:
                     card.attacking = True
                     card.attacking_player = 1 - claude_idx
+                    card.attacks_this_turn += 1  # C-1: Moraug's attack-count static
                     if not card.has_vigilance():
                         cog.engine.tap_permanent(card)
                     game.attackers.append(card.id)
@@ -993,6 +994,7 @@ async def _autoplay_human_turn(cog, thread, game: GameState, player_idx: int):
                 if card:
                     card.attacking = True
                     card.attacking_player = 1 - player_idx
+                    card.attacks_this_turn += 1  # C-1: Moraug's attack-count static
                     if not card.has_vigilance():
                         cog.engine.tap_permanent(card)
                     game.attackers.append(card.id)
@@ -1237,6 +1239,7 @@ async def _autoplay_human_turn(cog, thread, game: GameState, player_idx: int):
                 if card:
                     card.attacking = True
                     card.attacking_player = 1 - player_idx
+                    card.attacks_this_turn += 1  # C-1: Moraug's attack-count static
                     if not card.has_vigilance():
                         cog.engine.tap_permanent(card)
                     game.attackers.append(card.id)
@@ -2420,6 +2423,14 @@ async def _autoplay_execute_action(cog, thread, game: GameState, player_idx: int
             print(f"[AUTOPLAY-RESOLVE] Dropped resolve positionally paired with prior "
                   f"{_prev_cast_like.get('type')} of {_prev_cast_like.get('card', '?')} — "
                   f"the cascade already resolves its own effects: '{description[:80]}'")
+            # C-4 (Aug 7): teach the retry loop instead of "unknown reason".
+            game._last_resolve_drop_reason = (
+                game.turn_number,
+                f"redundant `resolve` dropped — the prior "
+                f"{_prev_cast_like.get('type')} of "
+                f"{_prev_cast_like.get('card', '?')} already resolved its "
+                f"effects; do not re-propose it, choose a different action "
+                f"or pass")
             return None
 
         # Prevent double-resolution: if this spell/effect was already resolved
@@ -3339,8 +3350,13 @@ async def _run_single_autoplay(cog, channel, game_format: str, deck1_name: str, 
                     # Bolt's damage hit lethal in _p2), and the unguarded _p3
                     # call still ran the DRAW step — the winner drew a card
                     # and posted Draw/Main banners AFTER the loss line.
-                    _, _p1 = cog.engine.advance_phase(game)  # UNTAP → UPKEEP
-                    _p2 = _p3 = []
+                    # Aug 7 (B-4): _p1 gains the same ended-guard as its
+                    # _p2/_p3 siblings — defense-in-depth behind the new
+                    # end_turn-tail SBA check (the loop-top break handles
+                    # the common case once that check marks the game ended).
+                    _p1 = _p2 = _p3 = []
+                    if not game.ended:
+                        _, _p1 = cog.engine.advance_phase(game)  # UNTAP → UPKEEP
                     if not game.ended:
                         _, _p2 = cog.engine.advance_phase(game)  # UPKEEP → DRAW (upkeep triggers here)
                     if not game.ended:
@@ -3535,10 +3551,15 @@ async def _run_single_autoplay(cog, channel, game_format: str, deck1_name: str, 
                 for msg in end_msgs:
                     await cog._autoplay_send(thread, msg)
                 # Drain end-step triggers queued by end_turn (Meren, Athreos, etc.)
-                for _m in await cog.engine.drain_pending_triggers(game):
-                    await cog._autoplay_send(thread, _m)
+                # Aug 7 (B-4, CR 104.2a): end_turn's tail SBA check can now END
+                # the game — no Tier-3 trigger drain or discard-to-hand-size
+                # for a game that is already over.
+                if not game.ended:
+                    for _m in await cog.engine.drain_pending_triggers(game):
+                        await cog._autoplay_send(thread, _m)
 
-                if game.pending_action and game.pending_action.get('type') == 'discard_to_hand_size':
+                if (not game.ended and game.pending_action
+                        and game.pending_action.get('type') == 'discard_to_hand_size'):
                     pa = game.pending_action
                     pi = pa['player_idx']
                     discard_count = pa['cards_to_discard']

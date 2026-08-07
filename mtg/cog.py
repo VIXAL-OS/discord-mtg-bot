@@ -3411,6 +3411,7 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
         
         for card in attackers:
             card.attacking = True
+            card.attacks_this_turn += 1  # C-1: Moraug's attack-count static
             card.attacking_player = 1 - player_idx
             # Tap attacker (unless vigilance)
             if not card.has_vigilance():

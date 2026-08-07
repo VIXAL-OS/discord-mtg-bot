@@ -419,6 +419,16 @@ def _validate_cast(engine, game: GameState, player: Player, card: Card,
         if target_error:
             return (False, target_error, []), _cast_from_graveyard, target
         target = chosen_targets
+    # Aug 7 (backlog item 4): basic-land-subtype auras (Utopia Sprawl's
+    # "Enchant Forest") get the same CR 601.2c existence gate — castable
+    # with zero Forests used to pay mana then fizzle at attach.
+    if ('aura' in _type_line_lower
+            and re.search(r'enchant (forest|plains|island|swamp|mountain)\b', _oracle_lower)):
+        if not aura_has_legal_target(game, card, player):
+            _m = re.search(r'enchant (forest|plains|island|swamp|mountain)\b', _oracle_lower)
+            return ((False,
+                     f"{card.name} can't be cast — no {_m.group(1).title()} on the battlefield (CR 601.2c)",
+                     []), _cast_from_graveyard, target)
     if 'aura' in _type_line_lower and ('enchant creature' in _oracle_lower or 'enchant permanent' in _oracle_lower):
         # June 11 audit: Animate Dead / Necromancy / Dance of the Dead say
         # "Enchant creature card in a graveyard" — this scan checked the
@@ -2350,18 +2360,41 @@ async def _dispatch_resolution(engine, game: GameState, player: Player,
                 )
                 if tmpl_actions is not None:
                     spell_fizzled = False
+                    # Aug 7 batch audit (G5-1): the fizzle-cascade is correct
+                    # for single-resolution riders (Arcane Denial's draws,
+                    # Remand's draw, Pact's delayed trigger — a fizzled spell
+                    # does nothing, CR 608.2b) but WRONG for a true modal
+                    # spell (CR 700.2): Cryptic Command's chosen non-counter
+                    # mode still resolves when the counter mode's target is
+                    # gone — the old cascade turned it into 4 mana for zero
+                    # effect (game_1535082915917209690). Discriminator: a
+                    # printed modal header. Of the 9 counter_spell-carrying
+                    # templates, only Cryptic Command has one.
+                    _is_modal_spell = bool(re.search(
+                        r'^choose (one|two|three|one or more)\b',
+                        (card.oracle_text or '').lower(), re.MULTILINE))
                     actions_executed = 0  # Apr 30 audit: track action runs separately
                     for action in tmpl_actions:
                         # If a counter_spell fizzled, skip remaining actions
                         # (Arcane Denial shouldn't draw when counter has no target)
-                        if spell_fizzled:
+                        if spell_fizzled and not _is_modal_spell:
                             print(f"[SPELL-TEMPLATE] Skipping {action.get('action')} — spell fizzled")
                             break
+                        if spell_fizzled and _is_modal_spell:
+                            print(f"[SPELL-TEMPLATE] {card.name}: modal spell — "
+                                  f"'{action.get('action')}' mode still resolves "
+                                  f"after a fizzled mode (CR 700.2)")
+                            spell_fizzled = False
                         if action.get("action") != "no_action":
                             if (action.get("action") == "search_library"
                                     and ctx.get('_tutor_card')
                                     and not action.get("card_name")):
                                 action["card_name"] = ctx['_tutor_card']
+                                # Aug 7 batch audit (C-5): the typed tutor
+                                # choice names ONE card — without consuming
+                                # it, a two-search template (Jarad's Orders)
+                                # injected the same name into BOTH searches.
+                                ctx['_tutor_card'] = None
                             # May 7 audit fix #6: inject source card name into
                             # the action so deal_damage can emit per-spell burn
                             # lines (🔥 Lava Spike deals 3 damage to Claude).
@@ -2967,6 +3000,15 @@ async def _dispatch_resolution(engine, game: GameState, player: Player,
                         if is_creature_only_check and not target_card.is_creature():
                             print(f"[AURA-TARGET] AI target {target_card.name} is not a creature — falling back to auto-select")
                             target_card = None
+                        # Aug 7 (backlog item 4): Daybreak Coronet's "Enchant
+                        # creature with another Aura attached to it" — honor
+                        # the printed restriction at attach.
+                        elif 'with another aura attached' in oracle_lower:
+                            from rules.targeting_helpers import _has_aura_attached
+                            if not _has_aura_attached(game, target_card, exclude_id=card.id):
+                                print(f"[AURA-TARGET] AI target {target_card.name} has no "
+                                      f"other Aura attached (enchant restriction) — falling back")
+                                target_card = None
                         # July 20 audit (Faith Unbroken): "Enchant creature
                         # YOU CONTROL" — the honoring path attached the aura
                         # to the OPPONENT's creature (the AI's single target
@@ -3019,6 +3061,13 @@ async def _dispatch_resolution(engine, game: GameState, player: Player,
                                 if c not in player.battlefield:
                                     if c.has_keyword("Hexproof") or c.has_keyword("Shroud"):
                                         continue
+                            # Aug 7 (backlog item 4): Daybreak Coronet's
+                            # "with another Aura attached" restriction in
+                            # the auto-select path too.
+                            if 'with another aura attached' in oracle_lower:
+                                from rules.targeting_helpers import _has_aura_attached
+                                if not _has_aura_attached(game, c, exclude_id=card.id):
+                                    continue
                             valid_targets.append(c)
 
                     print(f"[AURA] {card.name}: creature_only={is_creature_only}, valid_targets={[c.name for c in valid_targets]}")
@@ -3918,6 +3967,24 @@ async def cast_spell_async(engine, game: GameState, player: Player, card: Card,
     _rejection = _pay_costs(engine, game, player, card, _costs, additional_cost)
     if _rejection is not None:
         return _rejection
+
+    # Aug 7 batch audit (A-1b): "Choose any target, then choose ANOTHER
+    # target FOR EACH TIME this spell was KICKED" (Comet Storm — the only
+    # such card in the cache). CR 601.2b/702.33: the legal target count is
+    # 1 + kick count, fixed at cast. Nothing clamped the AI's declared list,
+    # so an unkicked Comet Storm dealt full X to every declared target
+    # (game_1535059989109018665: 3 damage to BOTH declared creatures, one
+    # kill, zero kicker paid). Runs after _compute_alt_costs so
+    # _kicked_times is final; Everflowing Chalice (the MULTIKICKER_MODELED
+    # entry) targets nothing, so this can never touch it.
+    if (isinstance(target, (list, tuple))
+            and 'another target for each time' in (card.oracle_text or '').lower()):
+        _allowed = 1 + int(getattr(card, '_kicked_times', 0) or 0)
+        if len(target) > _allowed:
+            print(f"[MULTIKICKER] {card.name}: clamping declared targets "
+                  f"{len(target)} → {_allowed} (kicked {getattr(card, '_kicked_times', 0)}x, "
+                  f"CR 601.2b)")
+            target = list(target)[:_allowed]
 
     # Preserve the origin for effects such as Wash Away that inspect where
     # the target spell was cast from after it has moved to the stack.

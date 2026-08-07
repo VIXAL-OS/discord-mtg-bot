@@ -54,9 +54,26 @@ FAILURE_RESULT_PHRASES = (
 
 def _result_looks_like_failure(result) -> bool:
     """True when an action handler returned a truthy string that is actually
-    a rejection message (Bug E class)."""
-    _rl = (result or "").lower()
-    return bool(result) and any(p in _rl for p in FAILURE_RESULT_PHRASES)
+    a rejection message (Bug E class).
+
+    Aug 7 batch audit (B-3): a LEGALLY-RESOLVED no-op is not a failure —
+    Inquisition of Kozilek cast successfully against a hand with no
+    qualifying card and its "📋 No valid targets in opponent's hand"
+    resolution line was sniffed as a cast failure, burning a retry on a
+    card already in the graveyard (game_1535060193795248229). Template
+    no-op RESOLUTION lines carry the 📋 display prefix; Bug-E executor
+    rejections never do — exempt those lines from the sniff.
+    """
+    if not result:
+        return False
+    for line in str(result).splitlines():
+        stripped = line.strip()
+        if stripped.startswith("📋"):
+            continue
+        _ll = stripped.lower()
+        if any(p in _ll for p in FAILURE_RESULT_PHRASES):
+            return True
+    return False
 
 try:
     from rules.mana import ManaCost
@@ -1051,8 +1068,18 @@ def _validate_plan_mana(engine, game: GameState, player_idx: int, plan: list) ->
                             if not opp_creatures:
                                 print(f"[PLAN-VALIDATE] Rejected activate {action.get('permanent')} — no opponent creature target")
                                 continue
-                        # "sacrifice an artifact" — needs an artifact (Daretti -2)
-                        elif 'sacrifice an artifact' in ability_text:
+                        # "sacrifice an artifact" — needs an artifact (Daretti -2).
+                        # Aug 7 batch audit (A-3): OPTIONAL or OR-alternative
+                        # costs must not gate on the artifact half — Chandra,
+                        # Spark Hunter's "+2: You MAY sacrifice an artifact OR
+                        # DISCARD a card" was rejected with 8 cards in hand
+                        # (game_1535051230815064206) while the same action
+                        # succeeded via decide_action_inline (two-path
+                        # divergence). Daretti's unconditional "-2: Sacrifice
+                        # an artifact." carries neither marker.
+                        elif ('sacrifice an artifact' in ability_text
+                                and 'may sacrifice' not in ability_text
+                                and 'or discard' not in ability_text):
                             owner_artifacts = [c for c in player.battlefield if c.is_artifact() and c is not perm_obj]
                             if not owner_artifacts:
                                 print(f"[PLAN-VALIDATE] Rejected activate {action.get('permanent')} — no artifact to sacrifice")
@@ -1536,6 +1563,7 @@ async def execute_claude_turn(engine, game: GameState) -> List[str]:
                         print(f"[COMBAT] Rejected attacker {card.name}: {tax_reason}")
                         continue
                     card.attacking = True
+                    card.attacks_this_turn += 1  # C-1: Moraug's attack-count static
                     card.attacking_player = 1 - claude_index
                     engine.tap_permanent(card)
                     game.attackers.append(card.id)
@@ -1926,7 +1954,17 @@ def _get_action_error(engine, game: GameState, player_index: int, action: Dict) 
     """Get human-readable error for why an action failed."""
     player = game.players[player_index]
     action_type = action.get("type")
-    
+
+    # Aug 7 batch audit (C-4): a deliberately-dropped redundant `resolve`
+    # stashes its real reason — surface it so the model stops re-proposing
+    # the same resolve (it used to see "unknown reason", retry the identical
+    # action, and burn a Tier-3 judge call on the second pass).
+    if action_type == "resolve":
+        _lrd = getattr(game, '_last_resolve_drop_reason', None)
+        if _lrd and _lrd[0] == game.turn_number:
+            game._last_resolve_drop_reason = None
+            return _lrd[1]
+
     if action_type == "cast":
         card_name = action.get("card")
         # July 20 batch-3 audit: if the executor just ran this exact cast and
