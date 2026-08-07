@@ -847,7 +847,17 @@ DASHSCOPE_BASE_URL = _dashscope_base_url()
 # wired here (it needs its own rate entries, since Alibaba's resale price is
 # not DeepSeek's), but it is the lowest-risk failover available.
 QWEN_ACTOR_MODEL = os.getenv("QWEN_ACTOR_MODEL", "qwen3.7-flash")
-QWEN_STRATEGIST_MODEL = os.getenv("QWEN_STRATEGIST_MODEL", "qwen3.7-plus")
+# Aug 7, 2026 A/B (maintainer-approved): strategist default Plus → FLASH
+# thinking mode — the exact mirror of the Aug 2 DeepSeek A/B (V4-Pro →
+# V4-Flash thinking, which saved 61% with quality holding). The Plus
+# strategist's thinking output was the entire Qwen cost premium in the
+# Aug 7 batch ($1.4268 of $1.7498 — ~19x the DS strategist per game).
+# Verdict criteria on the next Qwen batch: `Win condition:` compliance
+# >=95%, nukes near zero, stale-30s waits not worse, strat cost/game
+# ~$0.0285 → ~$0.003, memo quality eyeball in 2-3 games. REVERT PATH:
+# QWEN_STRATEGIST_MODEL=qwen3.7-plus (env, no code change) or flip this
+# default back.
+QWEN_STRATEGIST_MODEL = os.getenv("QWEN_STRATEGIST_MODEL", "qwen3.7-flash")
 
 
 def create_dashscope_adapter(model: str, api_key: str = None,
@@ -898,12 +908,11 @@ def create_qwen_actor_adapter(api_key: str = None):
 def create_qwen_strategist_adapter(api_key: str = None):
     """Strategist role on Qwen: one deep-reasoning memo per turn.
 
-    Defaults to the PLUS tier, by operator choice. Worth stating the cost
-    consequence plainly: Plus is the quality tier, not a cost play — at the
-    verified Fireworks rate ($0.40/$1.60) it is dearer than the DeepSeek
-    strategist currently in place (V4-Flash thinking, $0.14/$0.28), which
-    the Aug 2 A/B adopted for a 61% saving. Set QWEN_STRATEGIST_MODEL to the
-    flash slug to mirror the DeepSeek arrangement instead.
+    Aug 7, 2026: defaults to FLASH thinking mode (see the A/B note at
+    QWEN_STRATEGIST_MODEL above) — the DeepSeek-arrangement mirror. The
+    thinking toggle rides the same adapter mechanism the Plus strategist
+    already used; the strategist billing routes by the reported model
+    string, so the flash rates apply automatically.
     """
     return create_dashscope_adapter(
         QWEN_STRATEGIST_MODEL, api_key=api_key,
@@ -928,6 +937,15 @@ MODEL_RATES = {
     # DeepSeek — verified against the account's own usage export (reproduced
     # a known monthly bill to the cent); the April 2026 price cut put the hit
     # rate at 98% off, which is unusually aggressive (most providers do 90%).
+    #
+    # ⚠️ PENDING INCREASE (Aug 7, 2026): DeepSeek emailed that "a significant
+    # increase" to API pricing is coming "in the near future" — no numbers,
+    # no date. These DeepSeek rows are correct only until that lands. When
+    # the official notice arrives: update these rows SAME DAY (from the
+    # official pricing page, never the email or an aggregator — the Aug 4
+    # source lesson), reconcile one bill, and drop this warning. Until then
+    # every [STATS-*] line on a DeepSeek batch after the change silently
+    # under-reports.
     "deepseek-v4-flash": (0.0028, 0.14, 0.28),
     "deepseek-v4-pro": (0.0036, 0.435, 0.87),
 
@@ -1063,13 +1081,53 @@ async def probe_adapter_latency(adapter, samples: int = 2,
             "errors": errors, "detail": last_err}
 
 
+def provider_cost_score(adapter) -> float:
+    """Heuristic $-per-token-mix score for ORDERING providers by price.
+
+    Aug 7, 2026 (maintainer-approved, prompted by DeepSeek's announced
+    "significant" price increase): the probe used to optimise latency only,
+    which was the right call when DeepSeek was unambiguously the cheap
+    default. This scores the provider's ACTOR model (the high-volume role —
+    the same role the probe measures) as
+        blended_input * 20 + output * 1
+    per token: 75%-hit-share blended input, 20 input tokens per output
+    token (the Aug-7 batch measured ~34:1 for the DS actor and ~10:1 for
+    the thinking-inflated Qwen side — 20:1 sits between and the ORDERING is
+    insensitive to the exact weight). This is a ranking heuristic, NOT a
+    bill prediction; MODEL_RATES stays the single pricing truth, so a
+    repricing (the pending DeepSeek increase) reorders selection by itself
+    the day the table is updated. Reads rate_key first so the
+    DashScope-resold DeepSeek prices at its resale rates.
+    """
+    model = getattr(adapter, "rate_key", None) or getattr(adapter, "model", "")
+    hit, miss, out = rates_for_model(model)
+    # rates_for_model returns per-TOKEN dollars; score in $-per-MILLION-mix
+    # units so the probe log line is legible (qwen ~0.34, DS ~1.02,
+    # DS-via-Alibaba ~1.39 at today's table).
+    blended_in = 0.75 * hit + 0.25 * miss
+    return (blended_in * 20.0 + out) * 1_000_000
+
+
 async def choose_fastest_provider(candidates: list, samples: int = 2,
                                   timeout: float = 25.0):
-    """Pick the responsive provider with the lowest median latency.
+    """Pick the CHEAPEST responsive provider within a latency band.
 
     `candidates` is [(name, probe_adapter), ...] — probe the ACTOR adapter of
     each provider, since that is the high-volume role whose latency dominates
     a batch.
+
+    Selection (Aug 7, 2026 — cost-aware upgrade, maintainer-approved):
+      1. Any probe ERROR disqualifies outright, exactly as before — the
+         failure being dodged is 503, and a cheap-but-erroring provider is
+         precisely the one not to pick.
+      2. Healthy providers within the latency BAND of the fastest —
+         median <= fastest * MTG_PROBE_BAND (default 1.5) + 250ms — are
+         eligible; the cheapest eligible (provider_cost_score) wins, ties
+         going to the faster one. A provider outside the band loses no
+         matter how cheap: the Aug-3/Aug-7 Qwen probe spikes (7.4-7.6s vs a
+         ~1s DS median) must still route away.
+      3. MTG_PROBE_BAND=0 (or "off") restores pure latency selection — the
+         documented revert path, no code change needed.
 
     Returns (winner_name_or_None, results_by_name). None means nothing was
     usable and the caller should keep whatever default it already had; it
@@ -1084,18 +1142,36 @@ async def choose_fastest_provider(candidates: list, samples: int = 2,
     results = await asyncio.gather(
         *[probe_adapter_latency(a, samples, timeout) for _, a in named])
     by_name = {n: r for (n, _), r in zip(named, results)}
+    adapters_by_name = {n: a for n, a in named}
     healthy = {n: r for n, r in by_name.items() if r["ok"]}
     for n, r in by_name.items():
         if r["median_ms"] is None:
             print(f"[PROVIDER-PROBE] {n}: UNUSABLE — {r['detail']}")
         elif r["ok"]:
-            print(f"[PROVIDER-PROBE] {n}: median {r['median_ms']:.0f}ms")
+            print(f"[PROVIDER-PROBE] {n}: median {r['median_ms']:.0f}ms "
+                  f"(cost score {provider_cost_score(adapters_by_name[n]):.3f})")
         else:
             print(f"[PROVIDER-PROBE] {n}: median {r['median_ms']:.0f}ms "
                   f"but {r['errors']} error(s) — disqualified: {r['detail']}")
     if not healthy:
         return None, by_name
-    winner = min(healthy, key=lambda n: healthy[n]["median_ms"])
+    fastest = min(healthy, key=lambda n: healthy[n]["median_ms"])
+    _band_raw = os.getenv("MTG_PROBE_BAND", "1.5").strip().lower()
+    try:
+        _band = 0.0 if _band_raw in ("0", "off", "") else float(_band_raw)
+    except ValueError:
+        _band = 1.5
+    if _band <= 0 or len(healthy) == 1:
+        return fastest, by_name
+    _cutoff = healthy[fastest]["median_ms"] * _band + 250.0
+    eligible = {n: r for n, r in healthy.items() if r["median_ms"] <= _cutoff}
+    winner = min(
+        eligible,
+        key=lambda n: (provider_cost_score(adapters_by_name[n]),
+                       eligible[n]["median_ms"]))
+    if winner != fastest:
+        print(f"[PROVIDER-PROBE] cost-aware: {winner} over {fastest} "
+              f"(within {_cutoff:.0f}ms band, cheaper score)")
     return winner, by_name
 
 

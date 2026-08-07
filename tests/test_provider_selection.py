@@ -178,9 +178,14 @@ class TestDashScopeFactories:
         monkeypatch.delenv("ALIBABA_API_KEY", raising=False)
         assert create_dashscope_adapter("qwen3.7-flash") is None
 
-    def test_actor_and_strategist_are_distinct_models(self, monkeypatch):
-        """The point of DashScope over OpenRouter: two slugs, so the Phase-3
-        actor/strategist split survives the provider switch."""
+    def test_actor_and_strategist_are_distinct_roles(self, monkeypatch):
+        """The point of DashScope over OpenRouter: two independently
+        configured roles, so the Phase-3 actor/strategist split survives
+        the provider switch. Aug 7: the flash-strategist A/B makes the two
+        MODEL STRINGS equal (exactly like the DeepSeek arrangement —
+        V4-Flash non-thinking actor vs V4-Flash THINKING strategist), so
+        the invariant is role-distinct CONFIGURATION: opposite thinking
+        flags, separate env overrides, separate log tags."""
         pytest.importorskip("openai")
         monkeypatch.setenv("DASHSCOPE_API_KEY", "test-key-not-used")
         from rules.llm_adapter import (create_qwen_actor_adapter,
@@ -188,11 +193,11 @@ class TestDashScopeFactories:
         actor = create_qwen_actor_adapter()
         strat = create_qwen_strategist_adapter()
         assert actor is not None and strat is not None
-        assert actor._model != strat._model
         assert actor.messages._thinking_enabled is False, (
             "actor emits JSON — thinking must be EXPLICITLY off, never left "
             "to an endpoint default")
         assert strat.messages._thinking_enabled is True
+        assert actor.messages._log_tag != strat.messages._log_tag
 
     def test_every_shipped_slug_has_a_rate(self, monkeypatch):
         """A model we can select but cannot price is how cost reporting goes
@@ -531,3 +536,91 @@ class TestCostStatsFollowTheProvider:
         being subtracted."""
         src = self._src()
         assert "_game_start_stats = use_alt_adapter.get_stats().copy()" in src
+
+
+class TestCostAwareSelection:
+    """Aug 7, 2026 (maintainer-approved, prompted by DeepSeek's announced
+    price increase): the probe prefers the CHEAPEST healthy provider within
+    a latency band of the fastest — median <= fastest * MTG_PROBE_BAND
+    (default 1.5) + 250ms. Errors still disqualify outright, and
+    MTG_PROBE_BAND=0 is the documented revert to pure latency selection."""
+
+    def _run(self, candidates):
+        import asyncio
+        from rules.llm_adapter import choose_fastest_provider
+        return asyncio.run(choose_fastest_provider(candidates, samples=1))
+
+    def test_cost_score_ordering_matches_the_rate_table(self):
+        from rules.llm_adapter import provider_cost_score
+        qwen = provider_cost_score(_FakeAdapter("qwen3.7-flash"))
+        ds = provider_cost_score(_FakeAdapter("deepseek-v4-flash"))
+        ali = _FakeAdapter("deepseek-v4-flash")
+        ali.rate_key = "dashscope:deepseek-v4-flash"
+        ds_ali = provider_cost_score(ali)
+        assert qwen < ds < ds_ali, (
+            "the score must reproduce the verified per-token economics: "
+            "qwen3.7-flash < deepseek direct < deepseek-via-alibaba")
+
+    def test_cheaper_provider_within_band_wins(self, monkeypatch):
+        monkeypatch.delenv("MTG_PROBE_BAND", raising=False)
+        # Qwen slightly slower (still inside 1.5x + 250ms) but cheaper -> wins.
+        ds = _FakeAdapter("deepseek-v4-flash", latency=0.0)
+        qwen = _FakeAdapter("qwen3.7-flash", latency=0.05)
+        winner, _ = self._run([("deepseek", ds), ("qwen", qwen)])
+        assert winner == "qwen", (
+            "cheapest-within-band must beat fastest (the whole point of the "
+            "cost-aware upgrade)")
+
+    def test_cheap_provider_outside_band_loses(self, monkeypatch):
+        monkeypatch.delenv("MTG_PROBE_BAND", raising=False)
+        # The Aug-3/Aug-7 Qwen spike shape: ~7.5s vs ~0.05s. Way outside
+        # 1.5x + 250ms -> the fastest wins despite being dearer.
+        ds = _FakeAdapter("deepseek-v4-flash", latency=0.05)
+        qwen = _FakeAdapter("qwen3.7-flash", latency=7.5)
+        winner, _ = self._run([("deepseek", ds), ("qwen", qwen)])
+        assert winner == "deepseek", (
+            "a probe spike must still route away no matter how cheap")
+
+    def test_errors_disqualify_regardless_of_cheapness(self, monkeypatch):
+        monkeypatch.delenv("MTG_PROBE_BAND", raising=False)
+        cheap_broken = _FakeAdapter("qwen3.7-flash", latency=0.0, fail_first=1)
+        dear_healthy = _FakeAdapter("deepseek-v4-flash", latency=0.05)
+        import asyncio
+        from rules.llm_adapter import choose_fastest_provider
+        winner, _ = asyncio.run(choose_fastest_provider(
+            [("qwen", cheap_broken), ("deepseek", dear_healthy)], samples=2))
+        assert winner == "deepseek"
+
+    def test_band_zero_restores_latency_only(self, monkeypatch):
+        monkeypatch.setenv("MTG_PROBE_BAND", "0")
+        ds = _FakeAdapter("deepseek-v4-flash", latency=0.0)
+        qwen = _FakeAdapter("qwen3.7-flash", latency=0.05)
+        winner, _ = self._run([("deepseek", ds), ("qwen", qwen)])
+        assert winner == "deepseek", (
+            "MTG_PROBE_BAND=0 is the documented revert path to pure latency")
+
+
+class TestQwenStrategistFlashDefault:
+    """Aug 7 A/B: the Qwen strategist default is FLASH thinking mode (the
+    Aug-2 DeepSeek A/B mirror) — the Plus strategist's thinking output was
+    the entire Qwen cost premium ($1.4268 of $1.7498 in the Aug 7 batch).
+    Revert path: QWEN_STRATEGIST_MODEL=qwen3.7-plus."""
+
+    def test_default_is_flash(self):
+        import importlib
+        import rules.llm_adapter as la
+        # The module-level default (env unset in CI) must be the flash slug.
+        import os
+        if os.getenv("QWEN_STRATEGIST_MODEL"):
+            import pytest
+            pytest.skip("env override present — the default is not observable")
+        assert la.QWEN_STRATEGIST_MODEL == "qwen3.7-flash"
+
+    def test_strategist_factory_keeps_thinking_enabled(self):
+        # Flash's whole viability as a strategist is thinking mode — the
+        # factory must pass thinking_enabled=True (the actor passes False).
+        import io
+        src = io.open("rules/llm_adapter.py", encoding="utf-8").read()
+        idx = src.find("def create_qwen_strategist_adapter")
+        body = src[idx:idx + 900]
+        assert "thinking_enabled=True" in body
