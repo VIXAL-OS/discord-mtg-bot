@@ -4398,7 +4398,8 @@ class GameEngine:
                                     f"{player.name} controls no coloured permanents")
                         perm.tapped = True
                         for _c in _vivid:
-                            player.mana_pool[_c] = player.mana_pool.get(_c, 0) + 1
+                            # Q4: grant_pool_mana tags snow provenance
+                            player.grant_pool_mana(_c, 1, source=perm)
                         _vstr = ''.join(f"{{{c}}}" for c in _vivid)
                         print(f"[ACTIVATE-MANA] {perm.name}: added {_vstr} "
                               f"to {player.name}'s pool (Vivid — "
@@ -4428,7 +4429,8 @@ class GameEngine:
                         for color_char in mana_pattern:
                             c = color_char.upper()
                             if c in color_map:
-                                player.mana_pool[c] = player.mana_pool.get(c, 0) + 1
+                                # Q4: grant_pool_mana tags snow provenance
+                                player.grant_pool_mana(c, 1, source=perm)
                                 added_colors.append(f"{{{c}}}")
                         if added_colors:
                             mana_str = ''.join(added_colors)
@@ -4442,7 +4444,8 @@ class GameEngine:
                     # "Add one mana of any color" — default to most-needed color
                     if 'any color' in effect_lower or 'any one color' in effect_lower:
                         # Pick the color the player has least of (heuristic)
-                        player.mana_pool['C'] = player.mana_pool.get('C', 0) + 1
+                        # Q4: grant_pool_mana tags snow provenance
+                        player.grant_pool_mana('C', 1, source=perm)
                         print(f"[ACTIVATE-MANA] {perm.name}: added {{any}} to {player.name}'s pool")
                         return f"{player.name} activates {perm.name}, adds mana of any color"
 
@@ -4457,12 +4460,14 @@ class GameEngine:
                                 except:
                                     pass
                         if max_power > 0:
-                            player.mana_pool['G'] = player.mana_pool.get('G', 0) + max_power
+                            # Q4: grant_pool_mana tags snow provenance
+                            player.grant_pool_mana('G', max_power, source=perm)
                             return f"{player.name} activates {perm.name}, adds {max_power} mana"
                         return f"{player.name} activates {perm.name} (no creatures for mana)"
 
                     # Generic fallback: add 1 colorless
-                    player.mana_pool['C'] = player.mana_pool.get('C', 0) + 1
+                    # Q4: grant_pool_mana tags snow provenance
+                    player.grant_pool_mana('C', 1, source=perm)
                     return f"{player.name} activates {perm.name}, adds {{C}}"
 
                 # Handle "search your library for a land / land subtype" effects

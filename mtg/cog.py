@@ -2592,7 +2592,9 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
         mana_match = re.search(r'add \{([WUBRGC])\}', effect_text, re.IGNORECASE)
         if mana_match and not effect_resolved:
             color = mana_match.group(1).upper()
-            player.mana_pool[color] = player.mana_pool.get(color, 0) + 1
+            # Q4: grant_pool_mana tags snow provenance (card = the
+            # activated permanent)
+            player.grant_pool_mana(color, 1, source=card)
             messages.append(f"💎 Added {{{color}}} to mana pool")
             effect_resolved = True
         

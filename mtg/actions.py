@@ -2557,7 +2557,23 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
             color = action.get("color", "C").upper()
             amount = int(action.get("amount", 1))
             if color in player.mana_pool:
-                player.mana_pool[color] = player.mana_pool.get(color, 0) + amount
+                # Q4: NON-snow unless the emitting source resolves to a
+                # snow permanent on the player's battlefield (an action
+                # 'source' key, else the resolution-source name). A
+                # source we can't resolve stays untagged — undercount,
+                # the safe direction.
+                _src_ctx = getattr(game, '_current_resolution_source', None)
+                _src_name = action.get("source") or action.get(
+                    "_source_card_name") or (
+                    _src_ctx[0] if isinstance(_src_ctx, tuple) and _src_ctx
+                    else None)
+                _src_card = None
+                if _src_name:
+                    _want = str(_src_name).strip().lower()
+                    _src_card = next(
+                        (c for c in player.battlefield
+                         if (c.name or '').strip().lower() == _want), None)
+                player.grant_pool_mana(color, amount, source=_src_card)
             if action.get("retains_through_turn"):
                 player._retain_mana_through_turn = game.turn_number
 

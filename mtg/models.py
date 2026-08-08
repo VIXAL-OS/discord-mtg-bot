@@ -2105,6 +2105,20 @@ class Player:
     _last_payment: dict = field(
         default_factory=lambda: {'snow_spent': 0},
         repr=False, compare=False)
+    # Aug 7 2026 queue item Q4 — snow provenance for FLOATING pool mana.
+    # `_last_payment['snow_spent']` has been exact for mana consumed from
+    # sources tapped by the payment engine, but `mana_pool` stores only
+    # color totals, so mana floated BEFORE a payment (Phase-4 settle
+    # excess, [ACTIVATE-MANA], rituals, Tier-3 add_mana) counted as
+    # non-snow. This shadow dict tags the KNOWN-snow portion of the pool
+    # per color. HARD RULES: a tag may never exceed the pool's own count
+    # for that color (credit/debit clamp with min()), and a producer that
+    # doesn't mark snow merely undercounts — the safe, documented
+    # direction. Cleared with the pool; NOT serialized (a save/load drops
+    # the tags, which is an undercount, per the declared-transient
+    # convention).
+    _pool_snow: Dict[str, int] = field(
+        default_factory=dict, repr=False, compare=False)
 
     # ---- Transient runtime state (reset/derived during play; NOT serialized) ----
     # Same convention as Card: declare runtime flags, don't staple
@@ -2750,12 +2764,75 @@ class Player:
         """Empty mana pool (happens at end of each phase)."""
         self.mana_pool = {'W': 0, 'U': 0, 'B': 0, 'R': 0, 'G': 0, 'C': 0}
         self.restricted_mana_pool = []
-    
+        # Q4: snow tags describe pool contents — they die with the pool.
+        self._pool_snow = {}
+
     def add_mana(self, colors: str):
         """Add mana to pool. colors like 'WU' or 'RRR' or 'C'."""
         for c in colors.upper():
             if c in self.mana_pool:
                 self.mana_pool[c] += 1
+
+    # ---- Q4 (Aug 7, 2026): snow provenance for floating pool mana ----
+
+    @staticmethod
+    def _is_snow_source(card) -> bool:
+        """Snow-source detection for the Q4 pool-provenance producers.
+
+        Same shape as the payment engine's consumed-snow attribution walk
+        (name in rules.mana.SNOW_LANDS, or 'snow' in the type line,
+        case-insensitive — Scryfall prints the supertype capitalized, so
+        the case-insensitive test is the superset the walk already uses).
+        """
+        try:
+            from rules.mana import SNOW_LANDS as _SNOW_LANDS
+        except ImportError:
+            _SNOW_LANDS = set()
+        name = getattr(card, 'name', None)
+        type_line = getattr(card, 'type_line', '') or ''
+        return bool((name and name in _SNOW_LANDS)
+                    or 'snow' in type_line.lower())
+
+    def credit_pool_snow(self, color: str, amount: int) -> None:
+        """Tag `amount` of the pool's `color` mana as verified snow.
+
+        Clamped so the tag can never exceed what the pool actually holds
+        for that color (the Q4 hard rule) — call AFTER the pool add.
+        """
+        if amount <= 0 or color not in self.mana_pool:
+            return
+        self._pool_snow[color] = min(
+            self._pool_snow.get(color, 0) + int(amount),
+            self.mana_pool.get(color, 0))
+
+    def debit_pool_snow(self, color: str, amount: int) -> int:
+        """Consume snow tags for `amount` of `color` spent from the pool.
+
+        Returns the verified-snow portion (≤ amount). Untagged pool mana
+        spends as non-snow — the documented undercount direction.
+        """
+        if amount <= 0:
+            return 0
+        take = min(self._pool_snow.get(color, 0), int(amount))
+        if take > 0:
+            self._pool_snow[color] -= take
+        return take
+
+    def grant_pool_mana(self, color: str, amount: int = 1,
+                        source=None) -> None:
+        """Add floating mana to the pool, tagging snow provenance (Q4).
+
+        The sanctioned pool-add for activation/effect paths (the
+        [ACTIVATE-MANA] sites, the Tier-3 add_mana action). Marks snow
+        only when `source` is a snow permanent — a caller with no source
+        in hand adds untagged mana, which undercounts (safe).
+        """
+        color = (color or 'C').upper()
+        if color not in self.mana_pool or amount <= 0:
+            return
+        self.mana_pool[color] += int(amount)
+        if source is not None and self._is_snow_source(source):
+            self.credit_pool_snow(color, int(amount))
 
     def add_restricted_mana(self, color: str, amount: int,
                             restriction: str, source: str = "") -> None:
@@ -3055,8 +3132,21 @@ class Player:
                     production = {'C': 1}
                     mana_amount = 1
 
-            # Add mana to pool based on what the card produces
-            self._add_production_to_pool(production, preferred_colors)
+            # Add mana to pool based on what the card produces.
+            # Q4: a snow source's contribution is tagged via a pool
+            # before/after delta — immune to _add_production_to_pool's
+            # internal 'any'-color branching. The Wake bonus below stays
+            # OUTSIDE the delta window: bonus mana is from the Wake, not
+            # the land, so it is deliberately untagged (non-snow).
+            if self._is_snow_source(card):
+                _pre_pool = dict(self.mana_pool)
+                self._add_production_to_pool(production, preferred_colors)
+                for _sc, _sv in self.mana_pool.items():
+                    _gain = _sv - _pre_pool.get(_sc, 0)
+                    if _gain > 0:
+                        self.credit_pool_snow(_sc, _gain)
+            else:
+                self._add_production_to_pool(production, preferred_colors)
             # July 30: Mirari's Wake-class tap bonus (second producer site).
             self._fire_tap_for_mana_bonuses(card, production)
 
@@ -3085,8 +3175,10 @@ class Player:
         Returns True if payment succeeded, False if not enough mana.
         """
         # Per-payment provenance consumed by cards such as Blood on the Snow.
-        # Floating pool mana currently has no snow tag, so it deliberately
-        # contributes zero rather than fabricating provenance.
+        # Q4 (Aug 7, 2026): floating pool mana now carries snow tags
+        # (_pool_snow) — Phase-4's pool spend consumes them below. Untagged
+        # pool mana still counts as non-snow rather than fabricating
+        # provenance (the documented undercount direction).
         self._last_payment = {'snow_spent': 0}
         # Aug 7 (Q3): Draugr's snow-as-any-color permission, scoped to this
         # payment — the shared setter derives per-entry and cross-checks
@@ -3582,8 +3674,18 @@ class Player:
         for _k, _v in _excess.items():
             if _v > 0 and _deduct <= 0:
                 self.mana_pool[_k] = self.mana_pool.get(_k, 0) + _v
+        # Q4 ordering rule — DEBIT before CREDIT. Phase-0 spent mana that
+        # was in the pool BEFORE this payment, so its snow portion must be
+        # judged against the PRE-EXISTING tags only. The excess floated
+        # just above is credited AFTER this loop (in the attribution walk
+        # below); crediting it first would let freshly-floated snow
+        # masquerade as spent pool snow — an overcount, the forbidden
+        # direction. Restricted-pool spends carry no tags (non-snow,
+        # undercount-safe).
+        _pool_snow_spent = 0
         for _k, _v in pool_spent.items():
             _ordinary = min(self.mana_pool.get(_k, 0), _v)
+            _pool_snow_spent += self.debit_pool_snow(_k, _ordinary)
             self.mana_pool[_k] = max(0, self.mana_pool.get(_k, 0) - _ordinary)
             _restricted_needed = _v - _ordinary
             if _restricted_needed > 0:
@@ -3612,7 +3714,19 @@ class Player:
                     _consumed_by_color[color] -= take
                     if _is_snow:
                         _snow_spent += take
-        self._last_payment = {'snow_spent': _snow_spent}
+                # Q4: the un-consumed remainder of a snow source's
+                # production is excess that just floated (the settle above
+                # adds _excess to the pool only when _deduct <= 0, i.e.
+                # the payment was fully covered). Tag it so a LATER
+                # payment's Phase-0 pool spend can count it as snow.
+                # Credit is clamped against the pool's final count, and
+                # deliberately happens AFTER the pool-spend debit above —
+                # see the ordering rule there.
+                if _is_snow and _deduct <= 0:
+                    _floated = amount - take
+                    if _floated > 0:
+                        self.credit_pool_snow(color, _floated)
+        self._last_payment = {'snow_spent': _snow_spent + _pool_snow_spent}
 
         # Apply Phyrexian life payment
         if phyrexian_life_cost > 0:
