@@ -2337,7 +2337,18 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                 return None
             scope = action.get("scope", "creatures_and_artifacts")
             skip_next = bool(action.get("skip_next_untap", False))
+            # Aug 8 batch audit (#5): opt-in "no_tap" — Icebreaker Kraken's
+            # printed ETB says ONLY "artifacts and creatures target opponent
+            # controls don't untap during that player's next untap step";
+            # this handler was force-tapping them on the spot (an illegal
+            # extra effect the card never grants), and the message counted
+            # only the newly-tapped under a "won't untap" label (displayed
+            # 4 while 8 were affected). Sleep-class cards that print BOTH
+            # "tap" and "don't untap" keep the default tapping behavior;
+            # Cryptic Command mode 3 (tap-only) is the untouched control.
+            no_tap = bool(action.get("no_tap", False))
             tapped_cards = []
+            affected = []
             for c in tgt.battlefield:
                 if c.is_land():
                     continue
@@ -2350,15 +2361,20 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                     want = c.is_artifact()
                 if not want:
                     continue
-                if not c.tapped:
+                if not no_tap and not c.tapped:
                     c.tapped = True
                     tapped_cards.append(c.name)
                 if skip_next:
                     c._skip_next_untap = True
-            if not tapped_cards and not skip_next:
+                    affected.append(c.name)
+            if not tapped_cards and not affected:
                 return None
-            qual = "won't untap next turn" if skip_next else "tapped"
-            return f"❄️ {len(tapped_cards)} of **{tgt.name}**'s permanents {qual}"
+            if skip_next:
+                # Honest count: EVERY permanent carrying the skip flag, not
+                # just the ones newly tapped by this action.
+                return (f"❄️ {len(affected)} of **{tgt.name}**'s permanents "
+                        f"won't untap next turn")
+            return f"❄️ {len(tapped_cards)} of **{tgt.name}**'s permanents tapped"
         result = find_card_on_battlefield(action.get("card", ""))
         if result:
             card, owner = result
@@ -5080,75 +5096,6 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
             return f"🌊 Bounced {len(bounced)} nonland permanents: {', '.join(bounced[:8])}{'...' if len(bounced) > 8 else ''}"
         return None
 
-    elif action_type == "become_copy":
-        # Clone creature: modifies an existing card to copy another creature's stats
-        # Used by Clone, Spark Double, Clever Impersonator, etc.
-        source_name = action.get("source", "")
-        target_spec = action.get("target", "best_creature")
-        filter_type = action.get("filter", "any")  # "own", "any"
-        player_name = action.get("player")
-        extra_counters = action.get("extra_counters", {})
-        p = find_player(player_name)
-        if p:
-            # Find the source card (the clone) on the battlefield
-            source_card = None
-            for c in p.battlefield:
-                if c.name.lower() == source_name.lower():
-                    source_card = c
-                    break
-            if not source_card:
-                for c in p.battlefield:
-                    if source_name.lower() in c.name.lower():
-                        source_card = c
-                        break
-            if not source_card:
-                return None
-
-            # Find the best creature to copy
-            copy_target = None
-            best_value = -1
-            for sp in game.players:
-                if filter_type == "own" and sp.name != p.name:
-                    continue
-                for c in sp.battlefield:
-                    if c.id == source_card.id:
-                        continue  # Can't copy itself
-                    if not c.is_creature():
-                        continue
-                    try:
-                        power = c.get_effective_power(game) if hasattr(c, 'get_effective_power') else (int(c.power) if c.power else 0)
-                    except (ValueError, TypeError):
-                        power = 0
-                    if power > best_value:
-                        best_value = power
-                        copy_target = c
-
-            if copy_target:
-                # Copy stats onto the clone
-                old_name = source_card.name
-                source_card.name = copy_target.name
-                source_card.power = copy_target.power
-                source_card.toughness = copy_target.toughness
-                source_card.type_line = copy_target.type_line
-                source_card.oracle_text = copy_target.oracle_text
-                source_card.mana_cost = copy_target.mana_cost
-                source_card.cmc = copy_target.cmc
-                if hasattr(copy_target, 'color_identity'):
-                    source_card.color_identity = copy_target.color_identity
-                if hasattr(copy_target, 'keywords') and copy_target.keywords:
-                    source_card.keywords = list(copy_target.keywords)
-                # Apply extra counters (Spark Double gets +1/+1)
-                for counter_type, amount in extra_counters.items():
-                    source_card.counters[counter_type] = source_card.counters.get(counter_type, 0) + amount
-                print(f"[COPY] {old_name} becomes a copy of {copy_target.name}")
-                extra = ""
-                if extra_counters:
-                    extra = f" with {', '.join(f'{v} {k}' for k, v in extra_counters.items())} counter(s)"
-                return f"🪞 {old_name} enters as a copy of {copy_target.name}{extra}"
-            else:
-                print(f"[COPY] No valid creature to copy for {source_name}")
-                return None
-        return None
 
     elif action_type == "steal_permanent":
         # Move a permanent from one player's battlefield to another's (Agent of Treachery, etc.)
@@ -5294,16 +5241,33 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
     elif action_type == "search_library":
         # Search library for one or more cards matching criteria (Recruiter,
         # Stoneforge, Trinket Mage, Tooth and Nail, Collected Company, etc.)
+        #
+        # Aug 8 audit (#3, CRITICAL): the interpreter chain briefly carried
+        # TWO search_library branches — this one (reachable) read "card_type"
+        # / "max_mv", while the JSON templates (Jarad's Orders, Gravebreaker
+        # Lamia) and two effect_templates emitters (the generic "ETB: search
+        # your library for a [X] card" PATTERN FAMILY, and Vivien, Monsters'
+        # Advocate -2) send "filter_type" / "max_cmc" — the keys of a DEAD
+        # duplicate branch shadowed by first-match if/elif. Result: those
+        # tutors ran UNFILTERED and UNCAPPED (Jarad's Orders tutored a Swamp
+        # to hand; Vivien -2 could put the highest-CMC creature onto the
+        # battlefield with no cap). The duplicate is deleted; this branch
+        # accepts both key families. A structural pin now forbids duplicate
+        # action_type comparisons in this chain.
         player_name = action.get("player")
-        card_type = action.get("card_type", "")  # "Creature", "Equipment", "Artifact"
+        card_type = action.get("card_type") or action.get("filter_type") or ""
         requested_name = (action.get("card_name") or action.get("tutor_card")
                           or "").strip().lower()
         max_toughness = action.get("max_toughness")
         max_mv = action.get("max_mv")
+        if max_mv is None:
+            max_mv = action.get("max_cmc")  # the duplicate's key (Vivien -2)
         exact_mv = action.get("exact_mv")
         # Accept both "to_zone" and "destination" (some templates use
         # destination — Tooth and Nail is one of them).
         to_zone = action.get("to_zone") or action.get("destination") or "hand"
+        tapped = bool(action.get("tapped", False))
+        do_shuffle = action.get("shuffle", True)
         try:
             count = max(1, int(action.get("count", 1) or 1))
         except (TypeError, ValueError):
@@ -5316,7 +5280,12 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                 print(f"[PW-STATIC] {blocker} prevents {p.name} from searching their library")
                 return f"🚫 {p.name} can't search their library ({blocker})"
             import random as _rng
-            type_parts = [t.strip().lower() for t in card_type.split(" or ")] if card_type else []
+            # Aug 8 (#3): underscore compound sentinels ("aura_or_equipment",
+            # Open the Armory) never split on " or " and matched no type line
+            # — that tutor found NOTHING, ever. Normalize before splitting.
+            _ct_normalized = card_type.replace("_", " ")
+            type_parts = ([t.strip().lower() for t in _ct_normalized.split(" or ")]
+                          if _ct_normalized else [])
             # Aug 2 batch-13 (escape/graveyard reviewer): the JSON templates
             # use "card_type": "Any" as an unrestricted-tutor sentinel
             # (Demonic Tutor, Entomb, Vile Entomber, Vampiric Tutor), but
@@ -5327,10 +5296,9 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
             type_parts = [t for t in type_parts
                           if t not in ('any', 'all', 'card', 'any card')]
 
-            def _candidate(lib_card):
-                if (requested_name
-                        and lib_card.name.lower() != requested_name):
-                    return None
+            def _passes_filters(lib_card):
+                """Type/MV/toughness restriction check — the printed search
+                restriction, independent of any requested name."""
                 type_line = (lib_card.type_line or "").lower()
                 if type_parts and not any(t in type_line for t in type_parts):
                     return None
@@ -5351,26 +5319,72 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                     return None
                 return cmc
 
+            # Aug 8 (#3d): a requested name (the AI's typed tutor choice, or
+            # a template's card_name) must STILL satisfy the printed search
+            # restriction — the live defect was the model requesting a Swamp
+            # from a creature-only search and the engine honoring it. A
+            # rejected request falls back to auto-pick, with a visible line
+            # so the AI feedback loop sees the rejection.
+            named_pick = None
+            if requested_name:
+                for lib_card in p.library:
+                    if lib_card.name.lower() == requested_name:
+                        if _passes_filters(lib_card) is not None:
+                            named_pick = lib_card
+                        else:
+                            print(f"[SEARCH-LIBRARY] rejected requested "
+                                  f"'{lib_card.name}' — doesn't match the "
+                                  f"printed search restriction "
+                                  f"({card_type or 'any'}); auto-picking")
+                        break
+
             # Pick the top-N candidates by CMC (highest first — mimic
-            # the strategic "best creature" heuristic).
+            # the strategic "best creature" heuristic). A valid named pick
+            # takes the first slot; auto-picks fill the rest.
             scored = []
             for lib_card in p.library:
-                score = _candidate(lib_card)
+                if lib_card is named_pick:
+                    continue
+                score = _passes_filters(lib_card)
                 if score is not None:
                     scored.append((score, lib_card))
             scored.sort(key=lambda t: t[0], reverse=True)
-            chosen = [c for _, c in scored[:count]]
+            chosen = ([named_pick] if named_pick else []) + [c for _, c in scored]
+            chosen = chosen[:count]
 
             if not chosen:
                 return f"🔍 {p.name} searches library but finds nothing matching"
 
             found_names = []
+            entry_msgs = []
             for chosen_card in chosen:
                 p.library.remove(chosen_card)
                 if to_zone == "battlefield":
                     chosen_card.entered_this_turn = True
                     chosen_card.summoning_sick = True
+                    chosen_card.tapped = tapped
                     p.battlefield.append(chosen_card)
+                    # The deleted duplicate registered statics on battlefield
+                    # entry — keep that intent, and complete it with the
+                    # mutation-site entry conventions every other
+                    # put-onto-battlefield action follows (PERMANENT_ENTERED
+                    # + the noncast entry funnel; the Pattern-of-Rebirth /
+                    # Dread Return class).
+                    try:
+                        game.register_static_keyword_grants(chosen_card, p.name)
+                        game.register_static_pt_effects(chosen_card, p.name)
+                        game.register_replacement_effects(chosen_card, p.name)
+                    except Exception as e:
+                        maybe_reraise(e)
+                        print(f"[SEARCH-LIBRARY] re-register failed for {chosen_card.name}: {e}")
+                    events.emit(events.PERMANENT_ENTERED, game, card=chosen_card,
+                                controller=p, via="search_library", rules=rules)
+                    try:
+                        entry_msgs.extend(
+                            _fire_noncast_battlefield_entry(rules, game, p, chosen_card))
+                    except Exception as e:
+                        maybe_reraise(e)
+                        print(f"[SEARCH-LIBRARY] entry triggers failed for {chosen_card.name}: {e}")
                 elif to_zone == "library_top":
                     p.library.insert(0, chosen_card)
                 elif to_zone == "graveyard":
@@ -5386,12 +5400,16 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                 found_names.append(chosen_card.name)
                 print(f"[SEARCH-LIBRARY] {p.name} found {chosen_card.name} ({card_type}) → {to_zone}")
 
-            if to_zone != "library_top":
+            if do_shuffle and to_zone != "library_top":
                 _rng.shuffle(p.library)
 
             names_str = ", ".join(f"**{n}**" for n in found_names)
             if to_zone == "battlefield":
-                return f"🔍 {p.name} searches library and puts {names_str} onto the battlefield"
+                base = (f"🔍 {p.name} searches library and puts {names_str} "
+                        f"onto the battlefield{' tapped' if tapped else ''}")
+                if entry_msgs:
+                    return base + "\n" + "\n".join(entry_msgs)
+                return base
             if to_zone == "library_top":
                 return f"🔍 {p.name} searches library and places {names_str} on top"
             return f"🔍 {p.name} searches library and finds {names_str}"
@@ -6130,120 +6148,5 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
             return base + "\n" + "\n".join(cycle_msgs)
         return base
 
-    elif action_type == "search_library":
-        # Apr 30 audit fix: real tutoring instead of "use !fix to add" stubs.
-        # Searches the player's library for a card matching simple filters,
-        # moves it to a destination zone, and shuffles. Used by Demonic Tutor,
-        # Jarad's Orders, Gravebreaker Lamia, fetchlands, etc.
-        #
-        # Action params:
-        #   player           — whose library to search (defaults: card's controller)
-        #   card_name        — exact card name to find (highest priority)
-        #   filter_type      — substring of type_line (e.g. "creature", "land",
-        #                       "basic land", "instant")
-        #   max_cmc          — optional CMC cap
-        #   to_zone          — "hand" (default), "graveyard", "battlefield",
-        #                       "exile", "library_top"
-        #   tapped           — bool, only for to_zone="battlefield"
-        #   reveal           — bool, default True (cosmetic; affects message)
-        #   shuffle          — bool, default True
-        #   count            — number of cards to find (default 1)
-        player_name = action.get("player")
-        card_name = (action.get("card_name") or action.get("card") or "").lower()
-        filter_type = (action.get("filter_type") or "").lower()
-        # Aug 2 batch-13: same "Any" no-filter sentinel as the template-path
-        # search handler above (Tier-3 emissions use this vocabulary).
-        if filter_type in ('any', 'all', 'card', 'any card'):
-            filter_type = ""
-        max_cmc = action.get("max_cmc")
-        to_zone = (action.get("to_zone") or "hand").lower()
-        tapped = action.get("tapped", False)
-        shuffle = action.get("shuffle", True)
-        count = max(1, int(action.get("count", 1)))
-        p = find_player(player_name)
-        if not p:
-            return None
-
-        # Anti-search static abilities (Aven Mindcensor, Stranglehold, etc.) live
-        # in rules_engine.is_search_blocked. Defer to it if available; else allow.
-        try:
-            blocked = getattr(rules, 'is_search_blocked', None)
-            if callable(blocked) and blocked(game, p):
-                return f"🔒 {p.name}'s search blocked by static ability"
-        except Exception:
-            pass
-
-        def matches(c) -> bool:
-            if card_name:
-                if c.name.lower() == card_name or card_name in c.name.lower():
-                    return True
-                return False
-            if filter_type:
-                tl = (c.type_line or '').lower()
-                # Common filters: "basic land" / "land" / "creature" / "instant"
-                if filter_type == "basic land":
-                    if "basic" not in tl or "land" not in tl:
-                        return False
-                elif filter_type not in tl:
-                    return False
-            if max_cmc is not None:
-                try:
-                    if (c.cmc or 0) > int(max_cmc):
-                        return False
-                except (ValueError, TypeError):
-                    return False
-            return True
-
-        found = []
-        for c in list(p.library):
-            if len(found) >= count:
-                break
-            if matches(c):
-                found.append(c)
-
-        if not found:
-            if shuffle:
-                random.shuffle(p.library)
-            descriptor = card_name or filter_type or "card"
-            return f"🔍 {p.name} searches library, finds no {descriptor}"
-
-        # Move to destination zone
-        msgs = []
-        for fc in found:
-            p.library.remove(fc)
-            if to_zone == "graveyard":
-                p.graveyard.append(fc)
-            elif to_zone == "battlefield":
-                fc.tapped = bool(tapped)
-                fc.summoning_sick = True
-                fc.entered_this_turn = True
-                p.battlefield.append(fc)
-                # Re-register effects for the new permanent
-                try:
-                    game.register_static_keyword_grants(fc, p.name)
-                    game.register_static_pt_effects(fc, p.name)
-                    game.register_replacement_effects(fc, p.name)
-                except Exception as e:
-                    print(f"[SEARCH-LIBRARY] re-register failed for {fc.name}: {e}")
-            elif to_zone == "exile":
-                p.exile.append(fc)
-            elif to_zone in ("library_top", "top"):
-                p.library.insert(0, fc)
-            else:  # hand (default)
-                p.hand.append(fc)
-            msgs.append(fc.name)
-
-        if shuffle and to_zone not in ("library_top", "top"):
-            random.shuffle(p.library)
-
-        zone_label = {
-            "hand": "into hand",
-            "graveyard": "into graveyard",
-            "battlefield": f"onto battlefield{' tapped' if tapped else ''}",
-            "exile": "into exile",
-            "library_top": "on top of library",
-            "top": "on top of library",
-        }.get(to_zone, "into hand")
-        return f"🔍 {p.name} searches library and puts **{', '.join(msgs)}** {zone_label}" + (" (shuffled)" if shuffle and to_zone not in ("library_top", "top") else "")
 
     return None

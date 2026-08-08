@@ -1415,7 +1415,18 @@ RULES (apply to your output, not your reasoning):
                 # exactly because the prompt's "HARD LIMIT 500" reframed as a
                 # target to hit; the new prompt asks for "~800 max" so the
                 # cap is intentionally a ceiling, not a target.
-                return cleaned[:800]
+                #
+                # Aug 8 (queue R1): 800 → 1000. Two consecutive flash-
+                # strategist batches ran cap_binding=yes at 41.5% / 42.7% —
+                # and unlike V4-Pro's 4.2-4.6k scaffolding rambles, the
+                # flash memos running 800-1000 raw are GOOD content being
+                # chopped (board-grounded, format-perfect on eyeball). The
+                # prompt phrasing stays at "~800" deliberately (the model's
+                # target is fine; only the truncation moves). A/B
+                # expectation for the next batch: cap_binding=yes (raw >
+                # 1000) drops below ~15% with no scaffolding-nuke increase;
+                # if quality visibly degrades instead, revert this cap.
+                return cleaned[:1000]
 
             # May 18 audit: capture pre-sanitize and pre-truncate lengths so a
             # post-batch grep can answer "is the 800-char cap binding?". If
@@ -1435,7 +1446,7 @@ RULES (apply to your output, not your reasoning):
             # stale memo from last turn.
             if memo and len(memo) >= 80:
                 _record_strategy_memo_result(game, accepted=True)
-                self._strategy_memo = memo[:800]  # Cap length (matches sanitizer)
+                self._strategy_memo = memo[:1000]  # Cap length (matches sanitizer; R1 Aug 8)
                 game._strategy_memo = self._strategy_memo
                 # Emit the kept memo update + a separate measurement line so a
                 # batch-level grep for [STRATEGIST-LEN] can build a histogram.
@@ -1446,14 +1457,15 @@ RULES (apply to your output, not your reasoning):
                 # target the prompt sets.
                 _final_len = len(self._strategy_memo)
                 print(f"[STRATEGIST] Strategy memo updated ({_final_len} chars): {self._strategy_memo[:120]}...")
-                # May 20 audit: post_sanitize is captured AFTER cleaned[:800]
-                # so it can never exceed 800 — cap_binding=yes was mathematically
-                # impossible. The 800 cap binds whenever the model's raw output
-                # exceeds 800, regardless of sanitizer outcome.
+                # May 20 audit: post_sanitize is captured AFTER the sanitizer
+                # truncate so it can never exceed the cap — cap_binding=yes
+                # was mathematically impossible. The cap binds whenever the
+                # model's raw output exceeds it (1000 since Aug 8 / R1),
+                # regardless of sanitizer outcome.
                 print(f"[STRATEGIST-LEN] raw={_memo_raw_len} "
                       f"post_sanitize={_memo_post_sanitize_len} "
                       f"final={_final_len} "
-                      f"cap_binding={'yes' if _memo_raw_len > 800 else 'no'}")
+                      f"cap_binding={'yes' if _memo_raw_len > 1000 else 'no'}")
             else:
                 # June 11 audit: game 1514621840440561704 paid for another
                 # 4,521-character memo that density validation discarded.

@@ -1281,7 +1281,7 @@ class PlaneswalkerManager:
         # === COMPLEX/ULTIMATE ABILITIES ===
         if ability.is_ultimate and not messages:
             # For ultimates we haven't handled, try Tier 3 before announcing failure
-            resolved = await self._try_tier3_pw_ability(game, player, card, ability)
+            resolved = await self._try_tier3_pw_ability(game, player, card, ability, targets=targets)
             if resolved:
                 messages.extend(resolved)
             else:
@@ -1303,7 +1303,7 @@ class PlaneswalkerManager:
             is_static_only = any(pat in ability_lower for pat in static_patterns)
             if not is_static_only:
                 # Try Tier 3 (Claude API via rules engine) before falling back to text dump
-                resolved = await self._try_tier3_pw_ability(game, player, card, ability)
+                resolved = await self._try_tier3_pw_ability(game, player, card, ability, targets=targets)
                 if resolved:
                     messages.extend(resolved)
                 else:
@@ -1347,12 +1347,23 @@ class PlaneswalkerManager:
 
         return messages
 
-    async def _try_tier3_pw_ability(self, game, player, card, ability) -> list:
+    async def _try_tier3_pw_ability(self, game, player, card, ability,
+                                    targets=None) -> list:
         """Attempt to resolve an unhandled planeswalker ability via Tier 3 (Claude API).
 
         Returns a list of messages if successful, or empty list if unavailable/failed.
         Called as a last resort from _execute_ability when templates and inline
         handlers both miss (suppresses the raw oracle text dump).
+
+        Aug 8 batch audit (#6): `targets` carries the DECLARED target(s)
+        forward. This function used to build its prompt from ability.text
+        alone, so the forwarded explicit target ([ACTIVATE-PW] Forwarding)
+        never reached Tier 3 — which then guessed a DIFFERENT permanent for
+        Teferi -3 (blocked by the move validator; 3 loyalty paid for
+        nothing, game_1535478621572173844). The declared target rides
+        resolve_effect's `context=` parameter, NOT effect_desc — several
+        deterministic guards regex/substring-match effect_desc and a card
+        name injected there could spuriously trip them.
         """
         rules_engine = (getattr(game, '_rules_engine', None)
                         or getattr(self, '_rules_engine', None))
@@ -1365,6 +1376,28 @@ class PlaneswalkerManager:
         effect_desc = (
             f"{card.name} planeswalker [{cost_str}] ability: {ability.text}"
         )
+        # Conditional (many ultimates take no target) and never for a Player
+        # target unless the ability text says "target player" — the Aug-7
+        # B-2 lesson: a player's name in a card-target slot poisons every
+        # card-name consumer downstream.
+        target_context = ""
+        _declared = [t for t in (targets or []) if t is not None]
+        if _declared:
+            _names = []
+            for t in _declared:
+                _tname = getattr(t, 'name', None) or (t if isinstance(t, str) else None)
+                if _tname is None:
+                    continue
+                _is_player = hasattr(t, 'battlefield')
+                if _is_player and 'target player' not in (ability.text or '').lower():
+                    continue
+                _names.append(_tname)
+            if _names:
+                target_context = (
+                    "The controller has DECLARED the target(s): "
+                    + ", ".join(_names)
+                    + ". Resolve the ability against the declared target(s), "
+                      "not a target of your choosing.")
 
         # Deduplicate Tier 3 calls — once per unique ability per game session.
         # On a dedupe hit we DON'T have a cached result to apply (Tier 3 doesn't
@@ -1389,7 +1422,8 @@ class PlaneswalkerManager:
             msgs, _actions = await rules_engine.resolve_effect(
                 game, effect_desc,
                 source_card=card.name,
-                controller=player.name
+                controller=player.name,
+                context=target_context
             )
             if msgs:
                 print(f"[PW-TIER3] {card.name} resolved: {msgs[0][:80] if msgs else ''}")

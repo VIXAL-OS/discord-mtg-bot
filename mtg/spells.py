@@ -615,9 +615,35 @@ def _validate_cast(engine, game: GameState, player: Player, card: Card,
     _gate_card = helpers.spell_face_for_gates(card)
     if HAS_TARGETING and _spell_requires_targets(_gate_card):
         if not _find_any_valid_target(game, _gate_card, player.name):
-            print(f"[TARGETING] {_gate_card.name} has no valid targets — cast blocked")
-            return ((False, f"{_gate_card.name} has no valid targets", []),
-                    _cast_from_graveyard, target)
+            # Aug 8 batch audit (#12): overload carve-out. Overloading
+            # replaces "target" with "each" (CR 702.96b), so a spell with an
+            # AFFORDABLE overload cost is legally castable with zero targets
+            # — and overload intent is inferred from mana paid at
+            # resolution, so this pre-gate can't see it. Block only when the
+            # overload cost is also unaffordable (the live waste this gate
+            # now catches: a {1}{U} Cyclonic Rift with 2 mana against an
+            # opponent controlling only lands, game_1535486721779568700 —
+            # the "you don't control" restriction that makes the finder
+            # return False here is the other half of this fix).
+            _ovl = re.search(r'\boverload\s+((?:\{[^}]+\})+)',
+                             card.oracle_text or '', re.IGNORECASE)
+            if _ovl:
+                try:
+                    _can_ovl, _ = player.can_pay_mana_cost(_ovl.group(1))
+                except (TypeError, ValueError, AttributeError):
+                    _can_ovl = True  # err permissive on parse trouble
+                if _can_ovl:
+                    print(f"[TARGETING] {_gate_card.name} has no valid targets "
+                          f"but overload {_ovl.group(1)} is affordable — allowing")
+                else:
+                    print(f"[TARGETING] {_gate_card.name} has no valid targets "
+                          f"(overload unaffordable) — cast blocked")
+                    return ((False, f"{_gate_card.name} has no valid targets", []),
+                            _cast_from_graveyard, target)
+            else:
+                print(f"[TARGETING] {_gate_card.name} has no valid targets — cast blocked")
+                return ((False, f"{_gate_card.name} has no valid targets", []),
+                        _cast_from_graveyard, target)
 
         # Validate the target actually declared by the caller, not merely the
         # existence of some other legal target. Graveyard Auras are handled
@@ -1411,9 +1437,14 @@ def _pay_costs(engine, game: GameState, player: Player, card: Card,
             print(f"[SNOW-SPEND] {card.name}: {card._snow_mana_spent} snow mana")
         # Converge (CR 702.100a): hand the colors the engine actually
         # committed to the spell, for its template to count.
+        # Aug 8 (queue R3): the tag is [COLORS-SPENT] — the old
+        # converge-named tag printed for EVERY cast that committed colors
+        # (3,877 lines in the f6187ab batch, overwhelmingly on casts with
+        # no converge ability), and audits kept reading the name as a
+        # converge-specific signal.
         card._colors_spent = tuple(getattr(player, '_last_colors_spent', ()) or ())
         if card._colors_spent:
-            print(f"[CONVERGE] {card.name}: colors spent = "
+            print(f"[COLORS-SPENT] {card.name}: colors spent = "
                   f"{'/'.join(card._colors_spent)}")
 
     # Mandatory additional sacrifices are paid during casting (CR 601.2h),

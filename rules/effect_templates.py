@@ -2299,6 +2299,23 @@ class EffectTemplateLibrary:
             action_generator=_gen_drakuseth,
         ))
 
+        # Aug 8 batch audit (#4): Kogla's attack trigger was a JSON entry
+        # whose action named the sentinel "BEST_ARTIFACT_OR_ENCHANTMENT" —
+        # resolved NOWHERE (only $controller/$opponent substitute), so the
+        # destroy silently no-opped on every attack while [ATTACK-TEMPLATE]
+        # printed "Resolved" (two live games: Golgari/Dimir Signet survived
+        # every Kogla attack). A computed choice can't live in constant
+        # JSON — the migrator's rule. The printed clause is verbatim
+        # Frenzied Trapbreaker's ("destroy target artifact or enchantment
+        # defending player controls"), so it shares that generator; the
+        # JSON entry is deleted, and the loader's Python/JSON collision
+        # check guarantees it stays deleted.
+        self._add_attack_card("kogla, the titan ape", EffectTemplate(
+            name="Kogla, the Titan Ape (attack)",
+            description="Destroy the defending player's best artifact or enchantment (fizzles when none, CR 603.3c)",
+            action_generator=self._gen_frenzied_trapbreaker,
+        ))
+
         # June 10 deep-dive: Karlach, Fury of Avernus — "Whenever you attack"
         # was unreachable behind the bare-"attacks" pre-filter in
         # mtg/triggers.py (now relaxed). Model the untap + first-strike

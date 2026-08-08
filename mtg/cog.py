@@ -1374,15 +1374,17 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
                         break
 
         # If not in hand, check if it's playable from exile (Chandra 0, etc.)
-        # Aug 7 (Q3 review #9, documented gap): this human !play path scans
-        # the caster's OWN exile only — Draugr-permitted cards in the
-        # OPPONENT'S exile are reachable from the AI executors (via
-        # helpers.find_castable_exile_card) but not from here. A human can
-        # use !fix as the escape hatch until this path adopts the finder.
+        # Aug 8 (queue R2 — closing the Q3 review #9 documented gap): the
+        # human !play path now uses helpers.find_castable_exile_card, the
+        # same holder-aware finder the AI executors adopted — a
+        # Draugr-permitted card sits in the OPPONENT'S exile, and the
+        # physical removal/rollback must touch the holder's list.
+        _exile_holder = None
         if not card:
-            exile_card = player.find_card(actual_card_name, Zone.EXILE)
-            if exile_card and is_castable_from_exile(
-                    game, player, exile_card):
+            from mtg.helpers import find_castable_exile_card
+            _found = find_castable_exile_card(game, player, actual_card_name)
+            if _found:
+                exile_card, _exile_holder = _found
                 # Aug 3: the human path is the THIRD executor and got none of
                 # the wave-3a mechanics — the documented two-paths divergence.
                 if (getattr(exile_card, '_foretold', False)
@@ -1524,7 +1526,10 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
         if card.is_land():
             # If from exile, move to hand first (play_land expects hand)
             if from_exile:
-                player.exile.remove(card)
+                # Aug 8 (R2): remove from the HOLDER's exile — for a
+                # Draugr-permitted card that is the opponent's.
+                (_exile_holder if _exile_holder is not None
+                 else player).exile.remove(card)
                 player.hand.append(card)
                 # An adventure card is castable from exile without being
                 # in playable_from_exile — don't remove what isn't there.
@@ -1550,7 +1555,9 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
                 # If it failed and was from exile, move back
                 if from_exile and card in player.hand:
                     player.hand.remove(card)
-                    player.exile.append(card)
+                    # Aug 8 (R2): back to the exile it came FROM.
+                    (_exile_holder if _exile_holder is not None
+                     else player).exile.append(card)
                     if card.id not in game.conditional_exile_casts:
                         player.playable_from_exile.append(card.id)
                 await ctx.send(f"⚠️ {msg}")
@@ -1558,7 +1565,9 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
         else:
             # If from exile, move to hand first (cast_spell expects hand)
             if from_exile:
-                player.exile.remove(card)
+                # Aug 8 (R2): the HOLDER's exile, not necessarily the caster's.
+                (_exile_holder if _exile_holder is not None
+                 else player).exile.remove(card)
                 player.hand.append(card)
                 # GUARDED, like the land branch above says it must be: a card
                 # castable from exile need not be on this list at all — an
@@ -1612,6 +1621,11 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
             )
             card._cast_from_command_zone = False
             if success:
+                # Aug 8 (R2): the Draugr permission is spent by a successful
+                # cast (engine/autoplay executor twins).
+                if from_exile and getattr(card, '_castable_by_player', None):
+                    card._castable_by_player = None
+                    card._snow_as_any_color = False
                 # Graveyard casts: exile after resolution only for the
                 # mechanics that print an exile clause (mirror of the engine
                 # and autoplay cast branches). The old blanket exile also
@@ -1669,8 +1683,20 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
                 # If failed and was from exile, move back
                 if from_exile and card in player.hand:
                     player.hand.remove(card)
-                    player.exile.append(card)
-                    if card.id not in game.conditional_exile_casts:
+                    # Aug 8 (R2): back to the exile it came FROM (the
+                    # opponent's, for a Draugr-permitted card) — and restore
+                    # the FORETELL markers, which the engine executor's
+                    # rollback has restored since the alt-cost wave while
+                    # this third executor stripped them (leaving the card
+                    # face-up, uncastable, and permanently discounted).
+                    (_exile_holder if _exile_holder is not None
+                     else player).exile.append(card)
+                    if getattr(card, '_cast_via_foretell', False):
+                        card._foretold = True
+                        card._face_down = True
+                        card._cast_via_foretell = False
+                    elif (card.id not in game.conditional_exile_casts
+                          and card.id not in player.playable_from_exile):
                         player.playable_from_exile.append(card.id)
                 # If failed and was from command zone, move back
                 if from_command_zone and card in player.hand:

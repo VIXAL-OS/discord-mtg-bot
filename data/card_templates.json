@@ -80,7 +80,7 @@
           "name": "Goblin",
           "power": 1,
           "toughness": 1,
-          "types": "Creature â€” Goblin",
+          "types": "Creature — Goblin",
           "count": 1,
           "tapped": true,
           "attacking": true,
@@ -112,7 +112,7 @@
           "name": "Zombie",
           "power": 2,
           "toughness": 2,
-          "types": "Creature â€” Zombie",
+          "types": "Creature — Zombie",
           "count": 2
         }
       ]
@@ -132,20 +132,6 @@
           "reason": "Jorn attack: untap each snow permanent you control"
         }
       ]
-    },
-    {
-      "key": "kogla, the titan ape",
-      "name": "Kogla, the Titan Ape (attack)",
-      "event": "attack",
-      "description": "Destroy target artifact or enchantment defending player controls",
-      "actions": [
-        {
-          "action": "destroy",
-          "card": "BEST_ARTIFACT_OR_ENCHANTMENT",
-          "target_controller": "$opponent"
-        }
-      ],
-      "needs_target": true
     },
     {
       "key": "lightning reaver",
@@ -224,7 +210,7 @@
       "key": "protean hulk",
       "name": "Protean Hulk",
       "event": "dies",
-      "description": "When Protean Hulk dies, search library for creatures with total MV â‰¤ 6, put them onto the battlefield",
+      "description": "When Protean Hulk dies, search library for creatures with total MV ≤ 6, put them onto the battlefield",
       "actions": [
         {
           "action": "search_library",
@@ -275,7 +261,7 @@
           "name": "Spirit",
           "power": 1,
           "toughness": 1,
-          "types": "Creature â€” Spirit",
+          "types": "Creature — Spirit",
           "count": 1,
           "keywords": [
             "Flying"
@@ -291,7 +277,7 @@
       "actions": [
         {
           "action": "no_action",
-          "reason": "Azcanta, the Sunken Ruin: look at top 4, put instant/sorcery/land in hand â€” library order not tracked"
+          "reason": "Azcanta, the Sunken Ruin: look at top 4, put instant/sorcery/land in hand — library order not tracked"
         }
       ]
     },
@@ -307,7 +293,7 @@
           "name": "Germ",
           "power": 0,
           "toughness": 0,
-          "types": "Creature â€” Germ",
+          "types": "Creature — Germ",
           "count": 1
         },
         {
@@ -348,7 +334,7 @@
           "name": "Faerie Rogue",
           "power": 1,
           "toughness": 1,
-          "types": "Creature â€” Faerie Rogue",
+          "types": "Creature — Faerie Rogue",
           "count": 1,
           "keywords": "Flying",
           "colors": "B"
@@ -560,7 +546,7 @@
       "key": "draconic destiny",
       "name": "Draconic Destiny",
       "event": "etb",
-      "description": "Static +3/+3 aura â€” handled via layers, not an ETB action",
+      "description": "Static +3/+3 aura — handled via layers, not an ETB action",
       "actions": [
         {
           "action": "no_action",
@@ -615,7 +601,7 @@
       "actions": [
         {
           "action": "no_action",
-          "reason": "Duskwatch Recruiter: day/night transform â€” check if no spells were cast last turn to transform into Krallenhorde Howler (use !fix transform if needed)"
+          "reason": "Duskwatch Recruiter: day/night transform — check if no spells were cast last turn to transform into Krallenhorde Howler (use !fix transform if needed)"
         }
       ]
     },
@@ -839,7 +825,7 @@
           "name": "Treasure",
           "power": 0,
           "toughness": 0,
-          "types": "Artifact â€” Treasure",
+          "types": "Artifact — Treasure",
           "count": 1
         }
       ]
@@ -848,7 +834,7 @@
       "key": "granted",
       "name": "Granted",
       "event": "etb",
-      "description": "Wishboard fetch (not modeled â€” sideboard not tracked)",
+      "description": "Wishboard fetch (not modeled — sideboard not tracked)",
       "actions": [
         {
           "action": "no_action",
@@ -921,7 +907,7 @@
           "name": "Heart's Desire",
           "power": 1,
           "toughness": 1,
-          "types": "Creature â€” Human",
+          "types": "Creature — Human",
           "count": 1
         }
       ]
@@ -934,7 +920,7 @@
       "actions": [
         {
           "action": "no_action",
-          "reason": "Hellkite Courser: command zone â†’ battlefield not modeled; commander stays in command zone"
+          "reason": "Hellkite Courser: command zone → battlefield not modeled; commander stays in command zone"
         }
       ]
     },
@@ -974,13 +960,14 @@
       "key": "icebreaker kraken",
       "name": "Icebreaker Kraken",
       "event": "etb",
-      "description": "Tap each artifact and creature target opponent controls â€” they don't untap next turn",
+      "description": "Artifacts and creatures target opponent controls don't untap during that player's next untap step (no tap — the card doesn't tap them)",
       "actions": [
         {
           "action": "tap",
           "scope": "creatures_and_artifacts",
           "target_player": "$opponent",
           "skip_next_untap": true,
+          "no_tap": true,
           "source": "Icebreaker Kraken"
         }
       ]
@@ -1066,7 +1053,7 @@
           "name": "Koma's Coil",
           "power": 3,
           "toughness": 3,
-          "types": "Creature â€” Serpent",
+          "types": "Creature — Serpent",
           "count": 1
         }
       ]
@@ -1126,7 +1113,7 @@
       "actions": [
         {
           "action": "no_action",
-          "reason": "Krallenhorde Howler: day/night transform â€” check if 2+ spells were cast last turn to transform back into Duskwatch Recruiter (use !fix transform if needed)"
+          "reason": "Krallenhorde Howler: day/night transform — check if 2+ spells were cast last turn to transform back into Duskwatch Recruiter (use !fix transform if needed)"
         }
       ]
     },
@@ -1138,7 +1125,7 @@
       "actions": [
         {
           "action": "no_action",
-          "reason": "Lambholt Butcher: day/night transform â€” check if 2+ spells were cast last turn to transform back into Lambholt Pacifist (use !fix transform if needed)"
+          "reason": "Lambholt Butcher: day/night transform — check if 2+ spells were cast last turn to transform back into Lambholt Pacifist (use !fix transform if needed)"
         }
       ]
     },
@@ -1150,7 +1137,7 @@
       "actions": [
         {
           "action": "no_action",
-          "reason": "Lambholt Pacifist: day/night transform â€” check if no spells were cast last turn to transform into Lambholt Butcher (use !fix transform if needed)"
+          "reason": "Lambholt Pacifist: day/night transform — check if no spells were cast last turn to transform into Lambholt Butcher (use !fix transform if needed)"
         }
       ]
     },
@@ -1192,7 +1179,7 @@
           "name": "Spirit",
           "power": 1,
           "toughness": 1,
-          "types": "Creature â€” Spirit",
+          "types": "Creature — Spirit",
           "count": 2,
           "keywords": "Flying",
           "colors": "W"
@@ -1252,7 +1239,7 @@
           "name": "Human Warrior",
           "power": 1,
           "toughness": 1,
-          "types": "Creature â€” Human Warrior",
+          "types": "Creature — Human Warrior",
           "count": 1
         }
       ]
@@ -1299,7 +1286,7 @@
         {
           "action": "counter_spell",
           "max_mv": 3,
-          "reason": "Mesmeric Glare: counter spell with MV â‰¤ 3"
+          "reason": "Mesmeric Glare: counter spell with MV ≤ 3"
         }
       ]
     },
@@ -1354,7 +1341,7 @@
           "name": "Wolf",
           "power": 2,
           "toughness": 2,
-          "types": "Creature â€” Wolf",
+          "types": "Creature — Wolf",
           "count": 1
         }
       ]
@@ -1633,7 +1620,7 @@
           "name": "Wolf",
           "power": 2,
           "toughness": 2,
-          "types": "Creature â€” Wolf",
+          "types": "Creature — Wolf",
           "count": 1
         }
       ]
@@ -1735,7 +1722,7 @@
           "name": "Insect",
           "power": 1,
           "toughness": 1,
-          "types": "Creature â€” Insect",
+          "types": "Creature — Insect",
           "count": 1,
           "colors": "G"
         }
@@ -1891,7 +1878,7 @@
           "name": "Spirit",
           "power": 1,
           "toughness": 1,
-          "types": "Creature â€” Spirit",
+          "types": "Creature — Spirit",
           "count": 3,
           "keywords": "Flying",
           "colors": "W"
@@ -2008,7 +1995,7 @@
           "name": "Bird",
           "power": 2,
           "toughness": 2,
-          "types": "Creature â€” Bird",
+          "types": "Creature — Bird",
           "count": 1,
           "colors": "U"
         }
@@ -2104,7 +2091,7 @@
       "key": "temple of the false god",
       "name": "Temple of the False God",
       "event": "etb",
-      "description": "No ETB trigger (taps for 2 colorless if 5+ lands â€” mana ability handled by mana system)",
+      "description": "No ETB trigger (taps for 2 colorless if 5+ lands — mana ability handled by mana system)",
       "actions": [
         {
           "action": "no_action",
@@ -2124,7 +2111,7 @@
           "name": "Saproling",
           "power": 1,
           "toughness": 1,
-          "types": "Creature â€” Saproling",
+          "types": "Creature — Saproling",
           "count": 1
         }
       ]
@@ -2229,7 +2216,7 @@
           "name": "Food",
           "power": 0,
           "toughness": 0,
-          "types": "Artifact â€” Food",
+          "types": "Artifact — Food",
           "count": 1,
           "oracle_text": "{2}, {T}, Sacrifice this artifact: You gain 3 life."
         }
@@ -2292,7 +2279,7 @@
           "name": "Soldier",
           "power": 1,
           "toughness": 1,
-          "types": "Creature â€” Soldier",
+          "types": "Creature — Soldier",
           "count": 2,
           "keywords": "lifelink"
         }
@@ -2372,7 +2359,7 @@
           "name": "Bear",
           "power": 2,
           "toughness": 2,
-          "types": "Creature â€” Bear",
+          "types": "Creature — Bear",
           "count": 3
         }
       ]

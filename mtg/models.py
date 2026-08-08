@@ -1848,7 +1848,35 @@ class Card:
         # Check for "can't attack" from layers/effects
         if getattr(self, 'cant_attack_this_turn', False):
             return False
+        # Aug 8 batch audit (#2): Ascend (CR 702.131). "This creature can't
+        # attack or block unless you have the city's blessing" is a
+        # restriction printed on the card's OWN text (Wayward Swordtooth),
+        # gated on its controller's blessing — a mechanic that previously
+        # did not exist anywhere in the engine (the creature blocked and
+        # killed a commander at six permanents, game_1535486721779568700).
+        if not self._city_blessing_combat_ok(game):
+            return False
         return True
+
+    def _city_blessing_combat_ok(self, game) -> bool:
+        """False only when this card's own oracle carries the Ascend combat
+        restriction AND its controller lacks the city's blessing. Shared by
+        can_attack and can_block — the restriction's printed phrasing covers
+        both verbs at once."""
+        oracle = (self.oracle_text or '').lower()
+        if "unless you have the city's blessing" not in oracle:
+            return True
+        if game is None:
+            # No game context — cannot evaluate the blessing; err permissive
+            # (matches how the aura-restriction loop degrades without game).
+            return True
+        controller = next(
+            (p for p in getattr(game, 'players', []) or []
+             if self in getattr(p, 'battlefield', [])), None)
+        if controller is None:
+            return True
+        from mtg.helpers import has_city_blessing
+        return has_city_blessing(game, controller)
 
     def can_block(self, attacker: 'Card' = None, game=None) -> bool:
         """Check if creature can legally block (optionally a specific attacker)."""
@@ -1873,6 +1901,12 @@ class Card:
                         return False
             except Exception:
                 pass
+        # Aug 8 batch audit (#2): the Ascend combat restriction covers
+        # blocking too ("can't attack or block unless you have the city's
+        # blessing") — the live defect WAS a block (Wayward Swordtooth
+        # killed Jorn as a blocker at six permanents).
+        if not self._city_blessing_combat_ok(game):
+            return False
         if attacker:
             # Flying creatures can only be blocked by flying/reach
             if attacker.has_flying() and not (self.has_flying() or self.has_reach()):
@@ -2098,6 +2132,13 @@ class Player:
     # GameEngine.draw_cards (the draw choke point) and reset with the other
     # per-turn counters at turn advance.
     cards_drawn_this_turn: int = 0
+    # Aug 8 2026 batch audit (#2) — Ascend / the city's blessing
+    # (CR 702.131c-d): once earned it lasts the REST OF THE GAME, so this is
+    # PERSISTENT state, not a per-turn transient — it serializes through
+    # to_dict/from_dict (dropping it on save/load or !undo would strip an
+    # earned blessing, a real correctness loss). Awarded sticky by
+    # helpers.has_city_blessing.
+    city_blessing: bool = False
     # Converge (CR 702.100a): colors committed by the most recent successful
     # tap_sources_for_cost. Read once by the cost stage and stamped onto the
     # spell as Card._colors_spent.
@@ -4211,6 +4252,9 @@ class Player:
             "playable_from_exile": self.playable_from_exile,
             "playable_from_graveyard": self.playable_from_graveyard,
             "landfall_count_this_turn": self.landfall_count_this_turn,
+            # Aug 8 (#2): the city's blessing is game-lifetime state
+            # (CR 702.131c) — it must survive save/load and !undo.
+            "city_blessing": self.city_blessing,
         }
     
     @classmethod
@@ -4243,6 +4287,7 @@ class Player:
         player.playable_from_exile = data.get("playable_from_exile", [])
         player.playable_from_graveyard = data.get("playable_from_graveyard", [])
         player.landfall_count_this_turn = data.get("landfall_count_this_turn", 0)
+        player.city_blessing = data.get("city_blessing", False)
         return player
 
 
@@ -4770,6 +4815,21 @@ class GameState:
             have = sum(v for k, v in (getattr(card, 'counters', {}) or {}).items()
                        if kind in k.lower())
             return have >= need
+        # (a2) Aug 8 batch audit (#2): the city's blessing (CR 702.131).
+        # "as long as you have the city's blessing" (Tendershoot Dryad's
+        # anthem) must route through the STICKY blessing predicate, not the
+        # generic live-count branch below — the blessing survives the count
+        # dropping. Checked BEFORE (b) because Ascend's reminder text ("If
+        # you control ten or more permanents...") also matches (b)'s regex,
+        # whose <type>-substring counting can never see a "permanent" (no
+        # type line contains that word) — which is exactly how Tendershoot's
+        # anthem was permanently OFF before this branch existed.
+        if "city's blessing" in oracle_lower:
+            controller = next((p for p in self.players if card in p.battlefield), None)
+            if controller is None:
+                return True
+            from mtg.helpers import has_city_blessing
+            return has_city_blessing(self, controller)
         # (b) controller's permanents: "control N or more <type>"
         m = _re.search(r'control (\w+) or more (\w+)', oracle_lower)
         if m:
@@ -4779,8 +4839,14 @@ class GameState:
             controller = next((p for p in self.players if card in p.battlefield), None)
             if controller is None:
                 return True
-            have = sum(1 for perm in controller.battlefield
-                       if kind in (getattr(perm, 'type_line', '') or '').lower())
+            # Aug 8 (#2): "permanent" as the counted kind means EVERY
+            # battlefield object (no type line contains the word
+            # "permanent", so the substring count was structurally zero).
+            if kind == 'permanent':
+                have = len(controller.battlefield)
+            else:
+                have = sum(1 for perm in controller.battlefield
+                           if kind in (getattr(perm, 'type_line', '') or '').lower())
             return have >= need
         # Recognized "as long as"/"or more" but unparseable specifics — be
         # conservative and register (prior behavior) rather than risk turning

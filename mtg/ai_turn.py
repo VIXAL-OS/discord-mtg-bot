@@ -1308,7 +1308,7 @@ async def execute_claude_turn(engine, game: GameState) -> List[str]:
                 if game.ended:
                     break
                 if action.get("type") == "pass":
-                    print(f"{engine.claude_ai.turn_tag} [PLAN] Claude passes")
+                    print(f"{engine.claude_ai.turn_tag} [PLAN] {game.players[claude_index].name} passes")
                     _, _ph_msgs = engine.advance_phase(game)
                     if _ph_msgs:
                         actions_taken.extend(_ph_msgs)
@@ -1414,7 +1414,7 @@ async def execute_claude_turn(engine, game: GameState) -> List[str]:
             continue
 
         if action.get("type", "pass") == "pass":
-            print(f"{engine.claude_ai.turn_tag} Claude chose to pass")
+            print(f"{engine.claude_ai.turn_tag} {game.players[claude_index].name} chose to pass")
             _, _ph_msgs = engine.advance_phase(game)
             if _ph_msgs:
                 actions_taken.extend(_ph_msgs)
@@ -1622,7 +1622,7 @@ async def execute_claude_turn(engine, game: GameState) -> List[str]:
                 actions_taken.append(f"⚔️ {player.name} attacks with {', '.join(declared_names)}")
                 print(f"[EXECUTE_CLAUDE] Declared {len(game.attackers)} attacker(s)")
         else:
-            print(f"[EXECUTE_CLAUDE] Claude chose not to attack")
+            print(f"[EXECUTE_CLAUDE] {game.players[claude_index].name} chose not to attack")
 
     # Process combat if attackers were declared
     if game.attackers and not game.ended:
@@ -1793,7 +1793,7 @@ async def execute_claude_turn(engine, game: GameState) -> List[str]:
             )
 
             if action.get("type", "pass") == "pass":
-                print(f"{engine.claude_ai.turn_tag} Claude passes in MAIN2")
+                print(f"{engine.claude_ai.turn_tag} {game.players[claude_index].name} passes in MAIN2")
                 break
 
             # Detect repeated identical actions (prevents infinite resolve loops)
@@ -1893,7 +1893,7 @@ async def continue_claude_post_combat(engine, game: GameState) -> List[str]:
             )
 
             if action.get("type", "pass") == "pass":
-                print(f"{engine.claude_ai.turn_tag} Claude passes in MAIN2 (post-combat)")
+                print(f"{engine.claude_ai.turn_tag} {game.players[claude_index].name} passes in MAIN2 (post-combat)")
                 break
 
             # Detect repeated identical actions (prevents infinite resolve loops)
@@ -1987,6 +1987,17 @@ async def continue_claude_post_combat(engine, game: GameState) -> List[str]:
             engine.claude_ai._strategy_task = None
 
     return actions_taken
+
+
+# Aug 8 batch audit (#11): the plan-action vocabulary both executors
+# dispatch. Used by _get_action_error's unknown-type teaching message; the
+# grammar-consistency pin (tests/test_july31_batch_audit.py) asserts every
+# provider-advertised type is in this set so the list cannot silently drift.
+KNOWN_PLAN_ACTION_TYPES = frozenset({
+    "cast", "play_land", "activate", "resolve", "pass", "suspend",
+    "foretell", "graveyard_activate", "crew", "cycle", "attack",
+    "companion",
+})
 
 
 def _get_action_error(engine, game: GameState, player_index: int, action: Dict) -> str:
@@ -2515,7 +2526,17 @@ def _get_action_error(engine, game: GameState, player_index: int, action: Dict) 
         if perm.tapped:
             return f"'{perm_name}' is already tapped"
         return None  # Valid - proceed to execution
-    
+
+    # Aug 8 batch audit (#11): an UNRECOGNIZED action type used to fall out
+    # as the generic "unknown reason" — the model emitted 'pas' (a typo'd
+    # pass) and 'error' this batch and learned nothing from the reply. Name
+    # the offending type and the valid vocabulary (the Ashiok retry-teaching
+    # pattern). repr() guards non-string types (the Aug-4 Qwen
+    # {"adventure": true} lesson). KNOWN_PLAN_ACTION_TYPES is pinned against
+    # the provider grammar by TestProviderExecutorConsistency.
+    if action_type not in KNOWN_PLAN_ACTION_TYPES:
+        return (f"unknown action type {action_type!r} — valid types are: "
+                + ", ".join(sorted(KNOWN_PLAN_ACTION_TYPES)))
     return "Action failed (unknown reason)"
 
 

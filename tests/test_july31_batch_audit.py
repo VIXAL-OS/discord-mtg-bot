@@ -121,6 +121,19 @@ class TestProviderExecutorConsistency:
             assert f'action_type == "{t}"' in eng_src, \
                 f"engine executor cannot dispatch advertised type {t!r}"
 
+    def test_unknown_type_teaching_list_covers_advertised_grammar(self):
+        # Aug 8 batch audit (#11): _get_action_error's unknown-action-type
+        # teaching message names KNOWN_PLAN_ACTION_TYPES; every type the
+        # provider grammar advertises must be in that set, or a legitimate
+        # action would be "taught" as unknown.
+        import mtg.legal_actions as la
+        from mtg.ai_turn import KNOWN_PLAN_ACTION_TYPES
+        provider_src = inspect.getsource(la)
+        emitted = set(re.findall(r'\{"type": "([a-z_]+)"', provider_src))
+        missing = emitted - KNOWN_PLAN_ACTION_TYPES
+        assert not missing, \
+            f"advertised action types missing from KNOWN_PLAN_ACTION_TYPES: {missing}"
+
 
 # ---------------------------------------------------------------------------
 # F-E: activated-ability lines invisible to the combat/attack scans

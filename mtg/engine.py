@@ -3609,35 +3609,24 @@ class GameEngine:
             return msg
 
         elif action_type == "attack":
-            creature_names = action.get("creatures", [])
-            attacking = []
-            for name in creature_names:
-                card = player.find_card(name, Zone.BATTLEFIELD)
-                # May 25 audit (F24): pass `game` to is_creature so devotion-
-                # gated Theros gods (Heliod isn't a creature unless devotion
-                # to white ≥5) can't attack while their condition fails.
-                # CR 508.1a: attackers must be creatures.
-                if card and card.is_creature(game=game) and not card.tapped:
-                    card.attacking = True
-                    card.attacking_player = 1 - player_index
-                    card.attacks_this_turn += 1  # C-1: Moraug's attack-count static
-                    self.tap_permanent(card)
-                    attacking.append(card.name)
-                    game.attackers.append(card.id)
-            if attacking:
-                return f"{player.name} attacks with {', '.join(attacking)}"
-            # Aug 7 confirmation-batch audit (B-5): every named creature was
-            # tapped/ineligible and the branch fell through returning bare
-            # None — the AI got "unknown reason" across 3 retries and just
-            # varied JSON syntax blindly (cube game_1535228578004729866,
-            # creatures that had already attacked that turn). Stash a real
-            # teaching reason for _get_action_error, same pattern as
-            # _last_cast_failure / _last_activation_failure.
+            # Aug 8 batch-audit (#1, CRITICAL): this branch used to PARTIALLY
+            # EXECUTE the (undocumented, model-hallucinated) attack action —
+            # setting .attacking/.attacking_player/.attacks_this_turn, tapping,
+            # and appending to game.attackers with NO can_attack_with
+            # validation, NO attack tax, NO attack triggers, and NO damage
+            # step. In game_1535473341308215377 a MAIN1 phantom "attack"
+            # tapped Frog Lizard outside combat, the real declare step then
+            # ignored it, and the creature was illegally unavailable to block
+            # the following turn (CR 508) — the [COMBAT-SWEEP] net's one
+            # catch this batch, and the FIFTH stale-flag leak source. Attack
+            # is NOT a plan action (the teaching stash below has said so
+            # since Aug 7); now the handler behaves like the message: it
+            # never mutates. The five legitimate declare sites live in
+            # ai_turn/autoplay/cog declare-attackers flows.
             game._last_attack_action_failure = (
                 game.turn_number,
-                "no named creature could attack (already tapped / already "
-                "attacked / not a creature) — declare attackers during the "
-                "Declare Attackers step, not with an 'attack' action")
+                "attack is not a plan action — attackers are declared during "
+                "the Declare Attackers step (decide_attackers)")
             return None
 
         elif action_type == "tap":

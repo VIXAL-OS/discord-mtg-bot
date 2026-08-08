@@ -124,10 +124,16 @@ class TestMoraugAttackCountStatic:
         assert bear.attacks_this_turn == 0
 
     def test_declare_sites_increment(self):
-        # Structural: all six DECLARED-attacker sites carry the increment;
+        # Structural: all five DECLARED-attacker sites carry the increment;
         # the token-created-attacking site (actions.py) must NOT (Moraug
         # Gatherer ruling 2020-09-25: put-onto-battlefield-attacking never
         # "attacked").
+        #
+        # Aug 8 batch-audit (#1): engine.py's count is now ZERO — its one
+        # increment lived in the phantom {"type":"attack"} plan-action
+        # handler, which partially executed attacks outside combat (the
+        # fifth stale-flag leak source) and now never mutates. This pin
+        # previously asserted == 1 and CEMENTED that bug.
         import io
         counts = {}
         for path in ("mtg/ai_turn.py", "mtg/autoplay.py", "mtg/cog.py",
@@ -137,7 +143,7 @@ class TestMoraugAttackCountStatic:
         assert counts["mtg/ai_turn.py"] == 1
         assert counts["mtg/autoplay.py"] == 3
         assert counts["mtg/cog.py"] == 1
-        assert counts["mtg/engine.py"] == 1
+        assert counts["mtg/engine.py"] == 0
         assert counts["mtg/actions.py"] == 0
 
 

@@ -268,6 +268,42 @@ def find_keyword_pollution(cache: dict, oracle_index: dict) -> list:
     return polluted
 
 
+def find_double_encoding() -> list:
+    """Strings in the checked data files carrying the double-encoding
+    signature: U+00E2 (â) followed by a cp1252-punctuation codepoint — the
+    shape produced when UTF-8 text ('—', '≤') is read as cp1252 and
+    re-encoded. Aug 8, 2026 batch audit (#8): card_templates.json carried 30
+    such strings; a U+FFFD scan finds nothing because the � glyph exists
+    only in terminal RENDERING (the encoding-illusion class).
+    """
+    import json as _json
+    _sig = "â"
+    _tail = {"€", "”", "‰", "¤", "†", "‡",
+             "…", "ˆ", "‹"}
+    hits = []
+    for path in ("data/card_templates.json", "data/card_data_cache.json"):
+        try:
+            data = _json.loads(open(path, encoding="utf-8").read())
+        except (OSError, ValueError):
+            continue
+
+        def _walk(obj):
+            if isinstance(obj, dict):
+                for v in obj.values():
+                    _walk(v)
+            elif isinstance(obj, list):
+                for v in obj:
+                    _walk(v)
+            elif isinstance(obj, str):
+                for i, ch in enumerate(obj[:-1]):
+                    if ch == _sig and obj[i + 1] in _tail:
+                        hits.append((path, obj[:80]))
+                        return
+
+        _walk(data)
+    return hits
+
+
 def collect_hardcoded_names():
     """Yield (raw_key, lookup_name, source) for every hardcoded card name."""
     out = []
@@ -452,6 +488,25 @@ def main(argv=None) -> int:
                   "site writing through card.keywords instead of temp_keywords.")
         else:
             print("[VALIDATOR] OK — no phantom keywords in the cache")
+
+        # Double-encoding check (Aug 8, 2026 batch audit #8): data files have
+        # carried UTF-8 text re-read as cp1252 and re-encoded ('â€"' where an
+        # em dash belongs) — 28 em dashes + 2 '≤' in card_templates.json,
+        # which broke display.py's em-dash type-line split and degraded
+        # actions.py's subtype extraction. The signature is U+00E2 followed
+        # by a cp1252 punctuation codepoint; a check for U+FFFD would find
+        # NOTHING (that glyph only exists in terminal RENDERING of these
+        # sequences — the encoding-illusion class, three occurrences now).
+        _dbl = find_double_encoding()
+        if _dbl:
+            failed = True
+            print(f"[VALIDATOR] {len(_dbl)} double-encoded string(s) in data files:")
+            for src, sample in _dbl[:20]:
+                print(f"  - {src}: {sample!r}")
+            print("Repair: s.encode('cp1252').decode('utf-8') on the affected "
+                  "strings (verify with ord(), never terminal glyphs).")
+        else:
+            print("[VALIDATOR] OK — no double-encoded strings in data files")
 
     # Templating-drift stage (July 30, 2026): full runs only — it needs the
     # live pattern registry, which the names stage already imported.

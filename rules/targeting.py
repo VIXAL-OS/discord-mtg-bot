@@ -617,7 +617,19 @@ class TargetTextParser:
             restriction.target_types = {TargetType.CARD}
         
         # Controller restriction
-        if "you control" in text:
+        # Aug 8 batch audit (#12): "you don't control" was UNRECOGNIZED — it
+        # fell through to ControllerRestriction.ANY, so the CR 601.2c
+        # satisfiability gate accepted the CASTER'S OWN permanents for
+        # Cyclonic Rift's "target nonland permanent you don't control"
+        # (cast + mana wasted against an empty opponent board,
+        # game_1535486721779568700). Checked FIRST: neither phrase contains
+        # the other today, but the negated form must never lose to a future
+        # broadening of the positive one (the substring-family lesson).
+        # OPPONENT's `controller != targeting_player` check is exactly
+        # "you don't control" semantics for permanents.
+        if "you don't control" in text:
+            restriction.controller = ControllerRestriction.OPPONENT
+        elif "you control" in text:
             restriction.controller = ControllerRestriction.YOU
         elif "opponent control" in text or "an opponent controls" in text:
             restriction.controller = ControllerRestriction.OPPONENT

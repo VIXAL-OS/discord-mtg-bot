@@ -2512,6 +2512,38 @@ def _keyword_line_tokens(oracle_text: str):
                 yield tok
 
 
+def has_city_blessing(game, player) -> bool:
+    """Ascend / the city's blessing (CR 702.131) — Aug 8 batch audit (#2).
+
+    Ten or more permanents awards the city's blessing for the REST OF THE
+    GAME (CR 702.131c-d): sticky once earned, even if the permanent count
+    later drops. Compute-on-read with a sticky award, and the award is
+    CR-correct by construction: every read site lives inside an Ascend
+    card's OWN condition check (Wayward Swordtooth's combat gate in
+    Card.can_attack/can_block; Tendershoot Dryad's anthem condition in
+    GameState._static_condition_met), so the award can never fire without
+    an Ascend source on the battlefield — which is what CR 702.131a
+    requires. The residual miss (a player momentarily at ten permanents
+    between reads, dropping below before any Ascend card asks) is an
+    undercount, the safe direction.
+
+    Before this existed the mechanic was entirely unimplemented: in
+    game_1535486721779568700 Wayward Swordtooth blocked and killed Jorn at
+    six permanents and attacked on three turns, and Tendershoot Dryad's
+    anthem was permanently OFF (its reminder text routed into the generic
+    "control N or more <type>" static-condition regex, which counts
+    permanents whose TYPE LINE contains the word "permanent" — never true).
+    """
+    if getattr(player, 'city_blessing', False):
+        return True
+    if len(getattr(player, 'battlefield', []) or []) >= 10:
+        player.city_blessing = True
+        print(f"[ASCEND] {player.name} gets the city's blessing "
+              f"(ten or more permanents — permanent for the rest of the game)")
+        return True
+    return False
+
+
 def parse_attack_keywords(oracle_text: str) -> dict:
     """Keyword abilities that trigger on attack. Returns {name: value}.
 

@@ -814,7 +814,18 @@ def _parse_target_restriction_from_oracle(card):
             return restriction
         # Primary restriction (first phrase) — preserves controller, P/T,
         # color, keyword, and zone fields for the fizzle check.
-        tm = re.search(r'target\s+([\w\s,/-]+?)(?:\.|;|\band\b|\bor\b|$)', stripped)
+        #
+        # Aug 8 batch audit (#6): the capture class must include the
+        # APOSTROPHE. Without it, a phrase like Teferi, Hero of Dominaria's
+        # "target nonland permanent into its owner's library third from the
+        # top" cannot match at all (the ' aborts the lazy capture before any
+        # terminator), so re.search skipped PAST the card's real first
+        # target phrase and picked the -8 EMBLEM's "target permanent an
+        # opponent controls." as the "primary" restriction — which is how a
+        # legal own-side Teferi -3 move got blocked as "wrong controller"
+        # (game_1535478621572173844). Also covers "you don't control"
+        # phrases, which the parser now recognizes (#12).
+        tm = re.search(r"target\s+([\w\s,/'-]+?)(?:\.|;|\band\b|\bor\b|$)", stripped)
         if not tm:
             return None
         restriction = TargetTextParser.parse(tm.group(0).strip().rstrip('.,;'))
