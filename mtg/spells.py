@@ -1814,7 +1814,7 @@ async def _await_stack_window(engine, game: GameState, player: Player,
                         if opp_instants:
                             # July 20: alternate-cost aware — FoW class
                             affordable = [c for c in opp_instants
-                                          if opp.can_pay_mana_cost(c.mana_cost)[0]
+                                          if opp.can_pay_mana_cost(c.mana_cost, spending_card=c)[0]
                                           or opp.can_pay_printed_alternate_cost(c)]
                             if affordable:
                                 opponent_has_interaction = True

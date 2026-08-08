@@ -2326,12 +2326,25 @@ class Player:
         }
         
         name_lower = card.name.lower()
-        
+
+        # Aug 8 (queue R4, found by the R4 pin's first run): a PLANESWALKER
+        # whose LOYALTY text says "Add {R}{R}{R}" matched the oracle scan
+        # below and became an auto-tappable mana source — the tap engine
+        # tapped Jaya Ballard and minted phantom mana (CR 601.2g), and the
+        # advertisement counted her. Loyalty abilities are once-per-turn,
+        # sorcery-speed activations the payment engine may never auto-tap.
+        # Live phantom sources: Jaya Ballard, Chandra Torch of Defiance,
+        # Chandra Flameshaper, Domri Anarch of Bolas (all mythic-deck).
+        # Their mana arrives ONLY via the explicit PW activation path,
+        # which routes restrictions correctly.
+        if 'planeswalker' in (card.type_line or '').lower():
+            return False
+
         # Check known mana rocks
         for rock in mana_rocks:
             if rock in name_lower:
                 return True
-        
+
         # Check oracle text for mana abilities
         if card.oracle_text:
             text_lower = card.oracle_text.lower()
@@ -2888,13 +2901,41 @@ class Player:
 
     @staticmethod
     def _restricted_mana_allows(bucket: Dict[str, Any], spending_card=None) -> bool:
+        """Does this restricted-mana bucket permit paying for spending_card?
+
+        Aug 8 (queue R4): grew the instant_sorcery / creature predicates —
+        the Aug-5 machinery shipped with dragon_spell only, and the OTHER
+        two inventory producers (Jaya Ballard, Castle Garenbrig) leaked
+        their mana unrestricted because their branches never routed here.
+        Unknown keys (the 'unmodeled:' family) fall through to False: the
+        mana is HELD, never silently unrestricted. Type-line substring
+        tests are safe here — no type LINE carries a "non" prefix (the
+        substring-negation family lives in oracle text, not type lines).
+        """
         restriction = bucket.get('restriction', '')
+        if spending_card is None:
+            return False
+        type_line = (getattr(spending_card, 'type_line', '') or '').lower()
+        oracle = (getattr(spending_card, 'oracle_text', '') or '').lower()
+        # Aug 8 (R4 adversarial review #1): an ADVENTURE cast is an
+        # instant/sorcery cast (CR 715.2a), but the Card's type_line is the
+        # CREATURE face (deck_loader normalizes multi-face lines) — so
+        # 'creature' in type_line was True while casting Stomp, and
+        # Garenbrig's restricted G would have paid for it. The runtime
+        # cast_as_adventure stamp is set before payment at all three
+        # executors; the cache's adventure_type field is None and must not
+        # be consulted.
+        if getattr(spending_card, 'cast_as_adventure', False):
+            type_line = 'instant sorcery'
         if restriction == 'dragon_spell':
-            if spending_card is None:
-                return False
-            type_line = (getattr(spending_card, 'type_line', '') or '').lower()
-            oracle = (getattr(spending_card, 'oracle_text', '') or '').lower()
             return bool(re.search(r'\bdragon\b', type_line) or 'changeling' in oracle)
+        if restriction == 'instant_sorcery_spell':
+            return 'instant' in type_line or 'sorcery' in type_line
+        if restriction == 'creature_spell':
+            # Castle Garenbrig's "or activate abilities of creatures" half
+            # is deliberately NOT modeled (activation payments carry no
+            # spending context) — ability spends hold, the safe direction.
+            return 'creature' in type_line
         return False
 
     def _restricted_mana_available(self, spending_card=None) -> Dict[str, int]:
@@ -3311,6 +3352,23 @@ class Player:
         _pool_avail = {k: v for k, v in self.mana_pool.items() if v > 0}
         for _color, _amount in self._restricted_mana_available(spending_card).items():
             _pool_avail[_color] = _pool_avail.get(_color, 0) + _amount
+        # Aug 8 (queue R4): audit visibility — when restricted buckets exist
+        # but NONE of them permit this spell, say so once per payment. The
+        # gate itself has held correctly since Aug 5; what was missing is
+        # the line an audit greps to SEE it hold ([RESTRICTED-MANA]).
+        # Aggregated by (color, restriction, source): the engine producer
+        # appends one bucket PER UNIT, and six identical lines per refused
+        # payment defeats the grep this line exists for (adversarial
+        # review, note class).
+        if self.restricted_mana_pool and not self._restricted_mana_available(spending_card):
+            _held: Dict[tuple, int] = {}
+            for _b in self.restricted_mana_pool:
+                _key = (_b.get('color', '?'), _b.get('restriction', '?'),
+                        _b.get('source', 'unknown source'))
+                _held[_key] = _held.get(_key, 0) + int(_b.get('amount', 0))
+            for (_c, _r, _s), _amt in _held.items():
+                print(f"[RESTRICTED-MANA] {_amt} {_c} held — "
+                      f"{_r} only ({_s})")
 
 
         def _spend_pool(color, amount):

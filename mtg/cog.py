@@ -2615,13 +2615,49 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
             effect_resolved = True
         
         # === ADD MANA ===
-        mana_match = re.search(r'add \{([WUBRGC])\}', effect_text, re.IGNORECASE)
+        # Aug 8 (R4, hardened by the adversarial review): the optional word
+        # between "add" and the symbol lets "Add six {G}" (Castle
+        # Garenbrig) reach this branch — but ONLY a KNOWN count word may
+        # fill it. The reviewer's two refutations: (a) an unanchored
+        # `(?:\w+ )?` matched "add X {R}" (7 bulk cards), marking the
+        # effect resolved and SUPPRESSING the tier cascade that used to
+        # handle X-adds; (b) the count regex searched the whole
+        # effect_text, so Undermountain Adventurer's CONDITIONAL second
+        # clause ("If you've completed a dungeon, add six {G} instead.")
+        # fabricated 6 unconditional mana. The trigger now admits only
+        # count words, and the count is anchored to the SAME add clause
+        # the symbol came from.
+        mana_match = re.search(
+            r'add (?:(?:two|three|four|five|six|seven|eight) )?\{([WUBRGC])\}',
+            effect_text, re.IGNORECASE)
         if mana_match and not effect_resolved:
             color = mana_match.group(1).upper()
-            # Q4: grant_pool_mana tags snow provenance (card = the
-            # activated permanent)
-            player.grant_pool_mana(color, 1, source=card)
-            messages.append(f"💎 Added {{{color}}} to mana pool")
+            # Aug 8 (queue R4): the manual !activate twin of the engine's
+            # [ACTIVATE-MANA] branch (the two-activation-paths divergence
+            # rule). Word-number counts ("Add six {G}", Castle Garenbrig)
+            # and the printed "Spend this mana only ..." clause both route
+            # the same way the engine path does.
+            from mtg.helpers import parse_mana_spend_restriction
+            _word_counts = {'two': 2, 'three': 3, 'four': 4, 'five': 5,
+                            'six': 6, 'seven': 7, 'eight': 8}
+            _m_count = re.search(r'add (\w+) \{', mana_match.group(0),
+                                 re.IGNORECASE)
+            _count = (_word_counts.get(_m_count.group(1).lower(), 1)
+                      if _m_count else 1)
+            _spend_key = parse_mana_spend_restriction(effect_text)
+            if _spend_key:
+                player.add_restricted_mana(
+                    color, _count, _spend_key, source=card.name)
+                messages.append(f"💎 Added {_count} {{{color}}} to mana pool "
+                                f"(restricted: {_spend_key})")
+            else:
+                # Q4: grant_pool_mana tags snow provenance (card = the
+                # activated permanent)
+                player.grant_pool_mana(color, _count, source=card)
+                if _count > 1:
+                    messages.append(f"💎 Added {_count} {{{color}}} to mana pool")
+                else:
+                    messages.append(f"💎 Added {{{color}}} to mana pool")
             effect_resolved = True
         
         # === LOTUS BLOOM / BLACK LOTUS STYLE: Add three mana of any one color ===

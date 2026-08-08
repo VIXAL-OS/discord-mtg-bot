@@ -2512,6 +2512,56 @@ def _keyword_line_tokens(oracle_text: str):
                 yield tok
 
 
+_SPEND_RESTRICTION_FAMILIES = (
+    # Aug 8, 2026 (queue R4): the "Spend this mana only ..." clause family,
+    # swept against the full Scryfall bulk BEFORE these regexes were
+    # written (the alt-cost wave discipline): ~180 cards carry the phrase
+    # (oracle_text scan; ~188 counting card faces — the bulk drifts);
+    # the three period-ANCHORED families below classify ~37 of them —
+    # including all three inventory cards (Sarkhan, Fireblood → dragon;
+    # Jaya Ballard → instant/sorcery; Castle Garenbrig → creature, whose
+    # "or activate abilities of creatures" half is deliberately
+    # under-permitted: our activation payments carry no spending context,
+    # so ability spends HOLD, the safe direction). The anchors matter:
+    # unanchored, "creature spells OF THE CHOSEN TYPE" (Unclaimed
+    # Territory) would classify as plain creature_spell and OVER-permit.
+    # The remaining 143 unmodeled variants return an 'unmodeled:' key that
+    # _restricted_mana_allows never matches — the mana is HELD, per the
+    # July-26 cost-reduction precedent (never grant a benefit you can't
+    # gate).
+    (re.compile(r'spend this mana only to cast dragon spells\.'),
+     'dragon_spell'),
+    (re.compile(r'spend this mana only to cast (?:an )?instant '
+                r'(?:or|and) sorcery spells?\.'),
+     'instant_sorcery_spell'),
+    (re.compile(r'spend this mana only to cast (?:a )?creature spells?'
+                r'(?: or activate abilities of creatures)?\.'),
+     'creature_spell'),
+)
+
+
+def parse_mana_spend_restriction(text):
+    """Parse a printed "Spend this mana only ..." clause to a predicate key.
+
+    Returns None when the text carries no such clause (ordinary mana), a
+    known predicate key ('dragon_spell' / 'instant_sorcery_spell' /
+    'creature_spell') for the modeled families, or an 'unmodeled:...' key
+    for any other variant — which Player._restricted_mana_allows never
+    matches, so that mana is added RESTRICTED and held unspent (the safe
+    direction; an unmodeled restriction must never become unrestricted
+    mana, which is exactly the Jaya Ballard / Castle Garenbrig producer
+    leak this helper closes).
+    """
+    low = (text or '').lower()
+    if 'spend this mana only' not in low:
+        return None
+    for pat, key in _SPEND_RESTRICTION_FAMILIES:
+        if pat.search(low):
+            return key
+    m = re.search(r'spend this mana only[^.\n]*', low)
+    return 'unmodeled:' + (m.group(0)[:80] if m else 'unknown')
+
+
 def has_city_blessing(game, player) -> bool:
     """Ascend / the city's blessing (CR 702.131) — Aug 8 batch audit (#2).
 

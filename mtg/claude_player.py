@@ -3749,7 +3749,7 @@ Respond with ONLY "keep" or "mulligan"."""
             # July 20: alternate-cost aware — Force of Will is castable off
             # 1 life + a blue card even at zero mana (was dead in hand).
             _affordable = [c for c in instants
-                           if player.can_pay_mana_cost(c.mana_cost)[0]
+                           if player.can_pay_mana_cost(c.mana_cost, spending_card=c)[0]
                            or player.can_pay_printed_alternate_cost(c)]
             if len(_affordable) < len(instants):
                 _dropped = [c.name for c in instants if c not in _affordable]

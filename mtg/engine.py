@@ -773,7 +773,7 @@ class GameEngine:
                             if (card_name_lower in stifle_names or
                                 ("counter target" in oracle_lower and "ability" in oracle_lower)):
                                 # Check if affordable
-                                can_pay, _ = player.can_pay_mana_cost(hand_card.mana_cost)
+                                can_pay, _ = player.can_pay_mana_cost(hand_card.mana_cost, spending_card=hand_card)
                                 if can_pay:
                                     has_stifle = True
                                     break
@@ -808,7 +808,7 @@ class GameEngine:
 
                 # Check affordability (July 20: alternate-cost aware — FoW class)
                 affordable = [c for c in instants
-                              if player.can_pay_mana_cost(c.mana_cost)[0]
+                              if player.can_pay_mana_cost(c.mana_cost, spending_card=c)[0]
                               or player.can_pay_printed_alternate_cost(c)]
                 if not affordable:
                     print(f"[STACK-AI] {player_name} has instants but can't afford any — auto-pass")
@@ -954,7 +954,7 @@ class GameEngine:
             if instants:
                 # July 20: alternate-cost aware — FoW class
                 affordable = [c for c in instants
-                              if p.can_pay_mana_cost(c.mana_cost)[0]
+                              if p.can_pay_mana_cost(c.mana_cost, spending_card=c)[0]
                               or p.can_pay_printed_alternate_cost(c)]
                 if affordable:
                     any_instants = True
@@ -4414,21 +4414,52 @@ class GameEngine:
                                           key=lambda cc: player.mana_pool.get(cc, 0))
                             print(f"[ACTIVATE-MANA] {perm.name}: or-choice → {{{_chosen}}}")
                             mana_pattern = [_chosen]
+                        # Aug 8 (queue R4): word-NUMBER multiplier — Castle
+                        # Garenbrig's big ability prints "Add six {G}" (one
+                        # symbol, a word count), which this branch read as
+                        # ONE {G}. Applies only to a single-distinct-symbol
+                        # add clause; "Add {C}{C}"-style repeats unchanged.
+                        _word_counts = {'two': 2, 'three': 3, 'four': 4,
+                                        'five': 5, 'six': 6, 'seven': 7,
+                                        'eight': 8}
+                        _m_count = re.search(r'add (\w+) \{', _add_clause,
+                                             re.IGNORECASE)
+                        if (_m_count and len(set(mana_pattern)) == 1
+                                and len(mana_pattern) == 1
+                                and _m_count.group(1).lower() in _word_counts):
+                            mana_pattern = (mana_pattern
+                                            * _word_counts[_m_count.group(1).lower()])
+                        # Aug 8 (queue R4): a printed "Spend this mana only
+                        # ..." clause routes to the RESTRICTED pool — this
+                        # producer added Castle Garenbrig's mana
+                        # unrestricted (the Jaya-class leak, activation
+                        # flavor). Unmodeled variants get an 'unmodeled:'
+                        # key and the mana is held.
+                        from mtg.helpers import parse_mana_spend_restriction
+                        _spend_key = parse_mana_spend_restriction(ability['effect'])
                         added_colors = []
                         for color_char in mana_pattern:
                             c = color_char.upper()
                             if c in color_map:
-                                # Q4: grant_pool_mana tags snow provenance
-                                player.grant_pool_mana(c, 1, source=perm)
+                                if _spend_key:
+                                    player.add_restricted_mana(
+                                        c, 1, _spend_key, source=perm.name)
+                                else:
+                                    # Q4: grant_pool_mana tags snow provenance
+                                    player.grant_pool_mana(c, 1, source=perm)
                                 added_colors.append(f"{{{c}}}")
                         if added_colors:
                             mana_str = ''.join(added_colors)
-                            print(f"[ACTIVATE-MANA] {perm.name}: added {mana_str} to {player.name}'s pool")
+                            _restr_note = (f" (restricted: {_spend_key})"
+                                           if _spend_key else "")
+                            print(f"[ACTIVATE-MANA] {perm.name}: added {mana_str} "
+                                  f"to {player.name}'s pool{_restr_note}")
                             # July 30: Mirari's Wake-class tap bonus (third
                             # producer site — the explicit mana activation).
                             player._fire_tap_for_mana_bonuses(
                                 perm, {mana_pattern[0].upper(): 1})
-                            return f"{player.name} activates {perm.name}, adds {mana_str}"
+                            return (f"{player.name} activates {perm.name}, "
+                                    f"adds {mana_str}{_restr_note}")
 
                     # "Add one mana of any color" — default to most-needed color
                     if 'any color' in effect_lower or 'any one color' in effect_lower:

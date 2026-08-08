@@ -1122,6 +1122,17 @@ class PlaneswalkerManager:
         elif 'add' in text and ('mana' in text or '{' in ability.text):
             # Parse mana from ability text: "Add two mana in any combination of R and/or G"
             # or "Add {R}{R}" style
+            # Aug 8 (queue R4): BOTH branches route a printed "Spend this
+            # mana only ..." clause through the restricted pool. The old
+            # code checked only the hardcoded dragon phrase and only in the
+            # word-form branch — Jaya Ballard's "+1: Add {R}{R}{R}. Spend
+            # this mana only to cast instant or sorcery spells." parses via
+            # the EXPLICIT-symbol branch below, which added 3 unrestricted
+            # R (a live producer leak; batch f6187ab carried her in the
+            # mythic deck). Unmodeled clause variants get an 'unmodeled:'
+            # key and the mana is HELD — never silently unrestricted.
+            from mtg.helpers import parse_mana_spend_restriction
+            _spend_key = parse_mana_spend_restriction(ability.text)
             mana_match = re.search(r'add (\w+) mana', text)
             if mana_match:
                 count_word = mana_match.group(1)
@@ -1133,20 +1144,46 @@ class PlaneswalkerManager:
                     if c in mana_cost.upper():
                         color = c
                         break
-                if 'spend this mana only to cast dragon spells' in text:
+                if _spend_key:
                     player.add_restricted_mana(
-                        color, count, 'dragon_spell', source=card.name)
+                        color, count, _spend_key, source=card.name)
+                    messages.append(
+                        f"💎 Added {count} {color} mana to pool "
+                        f"(restricted: {_spend_key})")
                 else:
                     player.mana_pool[color] = (
                         player.mana_pool.get(color, 0) + count)
-                messages.append(f"💎 Added {count} {color} mana to pool")
+                    messages.append(f"💎 Added {count} {color} mana to pool")
             else:
                 # Try to parse {X}{Y} style
                 explicit_mana = re.findall(r'\{([WUBRGC])\}', ability.text)
                 if explicit_mana:
+                    # Aug 8 (R4 adversarial review #6): the word-count
+                    # multiplier landed in the engine + cog activation
+                    # branches but not in THIS third parser — Chandra,
+                    # Heart of Fire's "−9: ... Add six {R}." (live in three
+                    # decks) still added ONE {R}. Anchored to the matched
+                    # span (the Undermountain lesson: an unanchored count
+                    # regex reaches into conditional later clauses), and
+                    # only for a single-symbol add.
+                    _word_counts = {'two': 2, 'three': 3, 'four': 4,
+                                    'five': 5, 'six': 6, 'seven': 7,
+                                    'eight': 8}
+                    _m_word = re.search(
+                        r'add ((?:two|three|four|five|six|seven|eight)) '
+                        r'\{[wubrgc]\}', text)
+                    if _m_word and len(explicit_mana) == 1:
+                        explicit_mana = (explicit_mana
+                                         * _word_counts[_m_word.group(1)])
                     for m in explicit_mana:
-                        player.mana_pool[m] = player.mana_pool.get(m, 0) + 1
-                    messages.append(f"💎 Added {', '.join(explicit_mana)} mana to pool")
+                        if _spend_key:
+                            player.add_restricted_mana(
+                                m, 1, _spend_key, source=card.name)
+                        else:
+                            player.mana_pool[m] = player.mana_pool.get(m, 0) + 1
+                    suffix = f" (restricted: {_spend_key})" if _spend_key else ""
+                    messages.append(
+                        f"💎 Added {', '.join(explicit_mana)} mana to pool{suffix}")
         # === DRAW CARDS (unconditional) ===
         elif re.search(r'draw (\d+|a|two|three) cards?', text):
             draw_match = re.search(r'draw (\d+|a|two|three) cards?', text)
