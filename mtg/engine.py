@@ -58,6 +58,16 @@ from mtg import events
 from mtg import triggers as _triggers_bus_registration  # noqa: F401
 from mtg.rules_engine import RulesEngine
 
+# Aug 9 audit (C-F1-1): self-target clause detection for the detrimental-cast
+# opponent-inference gate. Module scope so the pin imports and shares THIS
+# object (a test that re-expresses the regex is a comment, not a test).
+# Bounded at 0-3 adjective words between 'target' and the type word — an
+# unbounded [^.]*? span crossed "you don't control" phrases (Calix) and
+# defender descriptions (Soul Snare) in the deck-cache sweep.
+_SELF_TARGET_CLAUSE_RE = re.compile(
+    r"\btarget\s+(?:[\w'-]+\s+){0,3}"
+    r"(?:creature|permanent|artifact|enchantment|land)s?\s+you control\b")
+
 # Optional: visual board renderer
 try:
     from board_visual import render_game_board, render_player_hand
@@ -1464,34 +1474,54 @@ class GameEngine:
                         f"(the exiled card was not cast)")
         return messages
     def _queue_async_trigger(self, game: GameState, source_card: Card, trigger_text: str,
-                             trigger_type: str, controller_name: str, context: str = "") -> None:
+                             trigger_type: str, controller_name: str, context: str = "",
+                             occurrence_key: Optional[str] = None) -> bool:
         """Enqueue a sync-context trigger for async Tier 3 resolution.
 
         trigger_type is a short tag ("etb", "upkeep", "end_step", "dies", "ltb",
         "attack", "saga", "creature_enters", "trigger") used for dedup within a
         single drain cycle and for the [QUEUE-*] log tags.
 
-        Dedup: within a single drain cycle, the same (source_card.id, trigger_type)
-        pair won't be queued twice. Across drain cycles (e.g. next turn's upkeep)
-        the same trigger fires again, which is correct MTG behavior.
+        Dedup contract (Aug 9 audit, C-F2-2): the docstring always promised
+        "within a single drain cycle, the same (source, type) pair won't be
+        queued twice" — but the implementation deduped against the ENTIRE
+        pending queue, so two genuinely DISTINCT trigger instances between
+        drains collided and the second was silently discarded (Gadwick's
+        cast trigger lost on 2 real casts in one game, CR 603.3b; the
+        caller's log line claimed success regardless). Git history: the
+        dedup shipped inside the function's FIRST version (a4d163e) as
+        defensive design, not as a fix for an observed double-fire — so it
+        stays, discriminated:
+        - occurrence_key=None (every pre-existing call site, unchanged):
+          dedup on (source id, trigger_type) as before — correct for
+          same-EVENT re-scans.
+        - occurrence_key set: dedup on (source id, trigger_type,
+          occurrence_key) — distinct events queue distinct instances.
+        Returns True if queued, False if deduped — and the log line now
+        tells the truth either way ([QUEUE-DEDUP] on a drop).
         """
         if not hasattr(game, 'pending_async_triggers') or game.pending_async_triggers is None:
             game.pending_async_triggers = []
-        # Dedup: same source+type already pending → skip
+        # Dedup: same source+type (+occurrence when discriminated) pending → skip
         src_id = getattr(source_card, 'id', None) or source_card.name
         for existing in game.pending_async_triggers:
             esrc = existing.get('source_card')
             eid = getattr(esrc, 'id', None) or (esrc.name if esrc else None)
-            if eid == src_id and existing.get('trigger_type') == trigger_type:
-                return  # already queued this cycle
+            if (eid == src_id and existing.get('trigger_type') == trigger_type
+                    and existing.get('occurrence_key') == occurrence_key):
+                print(f"[QUEUE-DEDUP] {source_card.name} ({trigger_type}) "
+                      f"already pending — not re-queued")
+                return False
         game.pending_async_triggers.append({
             'source_card': source_card,
             'trigger_text': trigger_text,
             'trigger_type': trigger_type,
             'controller_name': controller_name,
             'context': context,
+            'occurrence_key': occurrence_key,
         })
         print(f"[QUEUE-{trigger_type.upper()}] Queued {source_card.name} for async resolution")
+        return True
 
     def queue_unhandled_dies(self, game: GameState, dead_card: Card,
                              dead_player: Player, unhandled) -> None:
@@ -2894,6 +2924,16 @@ class GameEngine:
                 success, msg = self.play_land(game, player, card)
                 print(f"[EXECUTE] play_land {card_name}: success={success}, msg={msg}")
                 if success:
+                    # Aug 9 audit (CO-3a): stamp land plays too — without it
+                    # a model-emitted follow-up {"type": "resolve"} was never
+                    # positionally paired, went to Tier 3, and executed a
+                    # FABRICATED "Mystic Sanctuary ETB" that exiled 5 cards
+                    # from the caster's own graveyard. The land's own ETB
+                    # machinery (the _handle_land_etb call below) is
+                    # authoritative.
+                    game._last_exec_cast_like = {
+                        'turn': game.turn_number, 'type': 'play_land',
+                        'card': card_name}
                     # Check land ETB triggers
                     land_etb_msgs = self._handle_land_etb(game, player, card)
                     
@@ -2964,11 +3004,17 @@ class GameEngine:
                         or ('counter target' in _o)
                     )
                     # Exclude self-targeted beneficial effects (flicker, pump,
-                    # protect — "target creature you control")
-                    _has_self_target_clause = (
-                        'target creature you control' in _o
-                        or 'target permanent you control' in _o
-                    )
+                    # protect — "target creature you control").
+                    # Aug 9 audit (C-F1-1): the two literals missed
+                    # type-restricted clauses — Restoration Angel's "target
+                    # NON-ANGEL creature you control" got the opponent
+                    # inference (latent mirror-match misfire). Bounded regex:
+                    # up to 3 adjective words between 'target' and the type;
+                    # a broader [^.]*? form over-matched by SPANNING a
+                    # "you don't control" phrase to a later "you control"
+                    # (Calix, Soul Snare — verified in the deck-cache sweep).
+                    _has_self_target_clause = bool(
+                        _SELF_TARGET_CLAUSE_RE.search(_o))
                     if _is_detrimental_targeted and not _has_self_target_clause:
                         opp = game.players[1 - game.players.index(player)]
                         action["target_controller"] = opp.name
@@ -4066,9 +4112,14 @@ class GameEngine:
                     # ignored colored requirements and multi-mana rocks. Route
                     # activation payment through the same color-aware engine as
                     # spell casting instead.
+                    # Aug 9 audit (A-1): mirror the cast path's Phyrexian
+                    # detection (mtg/spells.py '/P}' check) — without the flag
+                    # the {B/P} pip in Hex Parasite's activation cost was
+                    # neither paid with mana nor life.
                     if not player.tap_sources_for_cost(
                             mana_cost, game=game,
-                            x_value=_activation_x or 0):
+                            x_value=_activation_x or 0,
+                            pay_phyrexian_with_life='/P}' in mana_cost.upper()):
                         print(f"[ACTIVATE-CLAUDE] {perm.name}: can't pay {mana_cost}")
                         game._last_activation_failure = (
                             game.turn_number, perm.name,
@@ -5210,7 +5261,8 @@ class GameEngine:
             # lands). Plan-validate catches plans; this covers the inline
             # decide_action path.
             if (_prev_cast_like and _prev_cast_like.get('turn') == game.turn_number
-                    and _prev_cast_like.get('type') in ('cast', 'activate')):
+                    and _prev_cast_like.get('type') in ('cast', 'activate',
+                                                        'play_land')):
                 print(f"[EXECUTE] Dropped resolve positionally paired with prior "
                       f"{_prev_cast_like.get('type')} of {_prev_cast_like.get('card', '?')}: "
                       f"'{description[:80]}'")

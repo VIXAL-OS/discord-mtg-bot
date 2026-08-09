@@ -148,6 +148,11 @@ EXCEPT_BASELINE = {
     # failing must not abort the DRAW that triggered it — the draw has already
     # happened and the card is in hand. Carries maybe_reraise, so strict
     # batches and pytest still see the failure.
+    # Aug 9 (headroom accounting, no bump): _fire_transforms_into_triggers'
+    # template-dispatch barrier (carries maybe_reraise) consumed the LAST
+    # unit of headroom under this baseline — the count now sits AT 53. The
+    # next broad except in this file trips the ratchet and needs its own
+    # justified bump.
     "triggers.py": 53,
     "util.py": 6,
 }

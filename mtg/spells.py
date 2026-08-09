@@ -517,7 +517,14 @@ def _validate_cast(engine, game: GameState, player: Player, card: Card,
     # 1504535777634160680 because she "couldn't cast" Mystic Confluence in
     # her own main phase even though its bounce/draw modes were available.
     oracle_lower = (card.oracle_text or '').lower()
-    if 'counter target' in oracle_lower and 'spell' in oracle_lower:
+    # Aug 9 adversarial review (C-F2-1 wording nit): this gate also tests
+    # the REMINDER-STRIPPED oracle — Trickbind's Split Second reminder
+    # supplied 'spell' here, routing its empty-stack rejection through THIS
+    # gate's "requires a target spell" message instead of the ability-only
+    # gate's correct "activated or triggered ability" one. Bulk-swept:
+    # Trickbind is the only classification change in all of Magic.
+    _gate_oracle = helpers.strip_reminder_text(card.oracle_text or '').lower()
+    if 'counter target' in _gate_oracle and 'spell' in _gate_oracle:
         stack_has_spells = any(
             entry for entry in getattr(game, 'stack', [])
             if (hasattr(entry, 'card') and entry.card
@@ -558,16 +565,27 @@ def _validate_cast(engine, game: GameState, player: Player, card: Card,
     # for nothing — CR 601.2c says there was no legal target to begin with.
     # Voidslime/Disallow really do counter "target spell" unrestricted and
     # must keep skipping this gate.
-    if ('counter target' in oracle_lower
-            and ('activated' in oracle_lower or 'triggered' in oracle_lower)
-            and ('spell' not in oracle_lower
-                 or 'legendary spell' in oracle_lower)):
+    # Aug 9 audit (C-F2-1): test the REMINDER-STRIPPED oracle — Trickbind's
+    # Split Second reminder ("As long as this SPELL is on the stack, players
+    # can't cast SPELLS...") contains 'spell', which made the whole gate
+    # condition False and let Trickbind counter a creature SPELL at a
+    # spell-only stack (game_1535590382417612871; the standing watch row).
+    # Family-swept: only Trickbind's classification changes; Tale's End's
+    # "legendary spell" phrase is outside parens and survives the strip.
+    # Scoped to the two counter gates — the modal detection and every other
+    # test in _validate_cast read the unstripped oracle_lower and are
+    # correct. (_gate_oracle is computed once above the counter-target-spell
+    # gate, which now shares it.)
+    if ('counter target' in _gate_oracle
+            and ('activated' in _gate_oracle or 'triggered' in _gate_oracle)
+            and ('spell' not in _gate_oracle
+                 or 'legendary spell' in _gate_oracle)):
         stack_has_ability = any(
             not getattr(entry, 'is_spell', True)
             and not getattr(entry, 'countered', False)
             for entry in getattr(game, 'stack', []))
         stack_has_legal_spell = False
-        if 'legendary spell' in oracle_lower:
+        if 'legendary spell' in _gate_oracle:
             stack_has_legal_spell = any(
                 getattr(entry, 'is_spell', True)
                 and not getattr(entry, 'countered', False)
@@ -577,7 +595,7 @@ def _validate_cast(engine, game: GameState, player: Player, card: Card,
         if (not stack_has_ability and not stack_has_legal_spell
                 and not card.is_creature()):
             _need = ("a target activated or triggered ability"
-                     if 'legendary spell' not in oracle_lower
+                     if 'legendary spell' not in _gate_oracle
                      else "a target ability or LEGENDARY spell")
             return ((False, f"{card.name} requires {_need} on the stack", []),
                     _cast_from_graveyard, target)
@@ -2385,7 +2403,7 @@ async def _dispatch_resolution(engine, game: GameState, player: Player,
             except Exception as e:
                 print(f"[ADVENTURE] SpellResolver error for {card.adventure_name}: {e}")
         if not adv_msgs:
-            # Fallback: try resolve_effect via Claude API
+            # Fallback: try resolve_effect via Tier 3 (LLM)
             if engine.rules.client:
                 try:
                     effect_msgs, _ = await engine.rules.resolve_effect(
@@ -2634,7 +2652,7 @@ async def _dispatch_resolution(engine, game: GameState, player: Player,
         elif not effect_messages:
             has_complex_effect = True  # No resolver available, try Tier 3
 
-        # Tier 3: Claude API fallback for complex/unparseable instant/sorcery effects
+        # Tier 3: LLM fallback for complex/unparseable instant/sorcery effects
         if has_complex_effect and card.oracle_text and not getattr(card, '_spell_resolved', False):
             try:
                 print(f"[SPELL-TIER3] Using resolve_effect for {card.name}")
@@ -2660,13 +2678,13 @@ async def _dispatch_resolution(engine, game: GameState, player: Player,
                 )
                 if resolve_actions:
                     effect_messages = resolve_msgs
-                    print(f"[SPELL-TIER3] {card.name} resolved via Claude API: {len(resolve_actions)} actions")
+                    print(f"[SPELL-TIER3] {card.name} resolved via Tier 3: {len(resolve_actions)} actions")
                     # Track resolved spell to prevent AI double-resolution
                     if not hasattr(game, '_recently_resolved_spells'):
                         game._recently_resolved_spells = set()
                     game._recently_resolved_spells.add(card.name)
                 else:
-                    print(f"[SPELL-TIER3] {card.name}: Claude API returned no actions")
+                    print(f"[SPELL-TIER3] {card.name}: Tier 3 returned no actions")
                     # [AUTOPLAY-JUDGE] Mirror the console suppression on Discord side:
                     # if Tier 3 produced no state change, strip the raw "complex effect"
                     # placeholder that SpellResolver emitted so players don't see a bare
@@ -5349,13 +5367,24 @@ def resolve_special_effects(engine, game: GameState, player: Player, card: Card,
                     target_owner.library.pop(0)
                     revealed.entered_this_turn = True
                     revealed.summoning_sick = True if revealed.is_creature() else False
-                    # Planeswalkers enter with starting loyalty (CR 306.5b)
-                    if revealed.is_planeswalker() and hasattr(revealed, 'loyalty') and revealed.loyalty:
+                    # Planeswalkers enter with starting loyalty (CR 306.5b).
+                    # Aug 9 audit (B-1): this wrote `current_loyalty`, an
+                    # attribute NOTHING reads — the SBA reads loyalty_counters
+                    # (defaults 0), so a Chaos-Warped planeswalker died to
+                    # PLANESWALKER_ZERO_LOYALTY on entry. Owner is
+                    # target_owner (the permanent enters under its OWNER's
+                    # control), so the Jeska commander-cast bonus is credited
+                    # to the right player.
+                    if revealed.is_planeswalker():
+                        from mtg.helpers import loyalty_from_commander_casts
                         try:
-                            revealed.current_loyalty = int(revealed.loyalty)
-                            print(f"[CHAOS-WARP] {revealed.name} enters with {revealed.current_loyalty} starting loyalty")
+                            _base = int(revealed.loyalty or 0)
                         except (ValueError, TypeError):
-                            pass
+                            _base = 0
+                        revealed.loyalty_counters = _base + loyalty_from_commander_casts(
+                            game, target_owner, revealed)
+                        print(f"[CHAOS-WARP] {revealed.name} enters with "
+                              f"{revealed.loyalty_counters} starting loyalty")
                     target_owner.battlefield.append(revealed)
                     messages.append(f"🌍 {revealed.name} enters the battlefield under {target_owner.name}'s control!")
                 else:

@@ -1758,6 +1758,24 @@ def splice_matches_spell(subtype_phrase: str, type_line: str) -> bool:
                if part.strip())
 
 
+def strip_reminder_text(oracle_text: str) -> str:
+    """`oracle_text` with parenthetical reminder text removed — for LOGIC
+    gates, not display.
+
+    Aug 9 audit (C-F2-1): Trickbind's Split Second reminder ("As long as
+    this SPELL is on the stack, players can't cast SPELLS...") contains the
+    word 'spell', which self-disabled the ability-only-counter gate — a
+    Trickbind cast at a spell-only stack countered a creature SPELL
+    (CR 601.2c: no legal target existed). Reminder text is never rules
+    text (CR 207.2), so gates that classify a card by its printed words
+    must test the stripped form. Deliberately NOT sanitize_oracle_for_
+    display (that flattens newlines and truncates — a display contract).
+    """
+    if not oracle_text:
+        return oracle_text or ""
+    return re.sub(r'\([^)]*\)', ' ', oracle_text)
+
+
 def strip_splice_line(oracle_text: str) -> str:
     """`oracle_text` without its "Splice onto ..." line.
 

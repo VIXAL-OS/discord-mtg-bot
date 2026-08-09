@@ -1609,23 +1609,6 @@
       ]
     },
     {
-      "key": "ravager of the fells",
-      "name": "Ravager of the Fells",
-      "event": "etb",
-      "description": "When this transforms into Ravager of the Fells, create a 2/2 green Wolf creature token",
-      "actions": [
-        {
-          "action": "create_token",
-          "player": "$controller",
-          "name": "Wolf",
-          "power": 2,
-          "toughness": 2,
-          "types": "Creature — Wolf",
-          "count": 1
-        }
-      ]
-    },
-    {
       "key": "recruiter of the guard",
       "name": "Recruiter of the Guard",
       "event": "etb",

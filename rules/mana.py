@@ -508,10 +508,16 @@ class ManaPaymentValidator:
                 else:
                     generic_needed += gen_amount
             elif sym.phyrexian and sym.phyrexian_color:
-                # Phyrexian: pay with color OR 2 life
+                # Phyrexian: pay with color OR 2 life.
+                # Aug 9 adversarial review (A-1 residual 1): the life
+                # threshold here must MATCH the payer's policy
+                # (tap_sources_for_cost pays life only at self.life > 4) —
+                # the old `life_total - life_to_pay > 2` advertised the life
+                # option at life 3-4 where the payer then declined it, a
+                # doomed-gate window (advertised-castable, unpayable).
                 if test_pool.get(sym.phyrexian_color) > 0:
                     test_pool.spend(sym.phyrexian_color)
-                elif allow_phyrexian_life and life_total - life_to_pay > 2:
+                elif allow_phyrexian_life and life_total - life_to_pay > 4:
                     life_to_pay += 2
                 else:
                     return False, f"Not enough {sym.phyrexian_color.name.lower()} mana (Phyrexian)"

@@ -2772,7 +2772,13 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                 # CR 601.2c). Gate on the source's own oracle text; stay
                 # permissive only when the oracle is unknown (legacy/Tier-3
                 # callers that don't thread _source_oracle).
-                _ca_oracle = (action.get('_source_oracle') or '').lower()
+                # Aug 9 audit (C-F2-1): strip REMINDER text before the test —
+                # Trickbind's Split Second reminder contains 'spell', which
+                # let this fallback counter a creature SPELL (the resolution
+                # half of the same gap the cast gate had).
+                from mtg.helpers import strip_reminder_text
+                _ca_oracle = strip_reminder_text(
+                    action.get('_source_oracle') or '').lower()
                 if _ca_oracle and 'spell' not in _ca_oracle:
                     return (f"🚫 Counter ability fizzles — no triggered/"
                             f"activated abilities on the stack")

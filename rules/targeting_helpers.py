@@ -854,6 +854,15 @@ def _parse_target_restriction_from_oracle(card):
             'permanents': TargetType.PERMANENT,
             'spell': TargetType.SPELL,
             'spells': TargetType.SPELL,
+            # Aug 9 adversarial review (CO-2 refutation #1): without this
+            # token the sweep could only ever add the broad PERMANENT —
+            # NONLAND_PERMANENT came exclusively from the PRIMARY-phrase
+            # parse, so a card whose FIRST target phrase is something else
+            # (Archmage's Charm: "target spell"; Hullbreaker Horror:
+            # "target spell you don't control") never carried it, the
+            # subsumption below couldn't fire, and a LAND passed both
+            # gates. 'nonland' now contributes the restricted type itself.
+            'nonland': TargetType.NONLAND_PERMANENT,
         }
         for phrase_match in re.finditer(r'target\s+([^.;]{1,200})', stripped):
             phrase = phrase_match.group(1)
@@ -868,6 +877,28 @@ def _parse_target_restriction_from_oracle(card):
                 # enough to span "and" / "or" / commas.
                 if word in ('then', 'when', 'whenever', 'if', 'unless'):
                     break
+        # Aug 9 audit (CO-2, CRITICAL): in "target NONLAND permanent" the
+        # word-tokenizer sees 'permanent' as its own token and adds the
+        # broad PERMANENT type next to NONLAND_PERMANENT. _check_type_match
+        # is an OR over target_types, so a LAND passed — Into the Roil
+        # bounced Academy Ruins (24 nonland-restricted cards in the deck
+        # cache share the clause, and the same parser feeds the CR 608.2b
+        # resolution re-check). Drop the broad type UNLESS a separate
+        # unqualified "target ... permanent" phrase exists (Teferi Hero's
+        # -8 emblem, Beast Within-class), verified over 27 cards: 17
+        # corrected, 10 controls unchanged.
+        # Aug 9 adversarial review (CO-2 refutation #2): the old lookahead
+        # (?!nonland\b) guarded only the position immediately after
+        # 'target ' — the lazy middle then consumed the word 'nonland'
+        # itself, so "target spell or nonland permanent" (Commit // Memory)
+        # read as an UNQUALIFIED permanent phrase and kept the broad type.
+        # Tempered class: 'nonland' may not appear ANYWHERE in the span.
+        if (TargetType.NONLAND_PERMANENT in all_types
+                and TargetType.PERMANENT in all_types
+                and not re.search(
+                    r"target\s+(?:(?!nonland\b)[a-z\s,/'-]){0,40}?\bpermanents?\b",
+                    stripped)):
+            all_types.discard(TargetType.PERMANENT)
         if all_types:
             restriction.target_types = all_types
         return restriction

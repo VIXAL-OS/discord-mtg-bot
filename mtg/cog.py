@@ -808,7 +808,7 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
         Reports how the engine will handle each card's effects:
           ✅ template — fast, card-specific (Tier 1.5)
           ✅ pattern  — fast, oracle-text regex (Tier 1.5)
-          ⚠️ tier3    — slower, uses Claude API (~2s, costs tokens)
+          ⚠️ tier3    — slower, uses the Tier-3 LLM (~2s, costs tokens)
 
         Usage:
             !coverage              - Your loaded deck (via !mydeck)
@@ -2223,7 +2223,11 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
                 await ctx.send(f"❌ **{card.name}** needs a creature you control to equip.")
                 return
             mana_cost = ability.get('mana_cost', '')
-            if mana_cost and not player.tap_sources_for_cost(mana_cost, game=game):
+            # Aug 9 audit (A-1): Phyrexian pips in activation costs — mirror
+            # the cast path's '/P}' detection (the manual-path twin).
+            if mana_cost and not player.tap_sources_for_cost(
+                    mana_cost, game=game,
+                    pay_phyrexian_with_life='/P}' in mana_cost.upper()):
                 await ctx.send(f"❌ Cannot pay {mana_cost} to equip **{card.name}**.")
                 return
             msg = self.engine.rules._execute_action_on_state(game, {
@@ -2285,7 +2289,12 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
         # Validation only proved the cost was affordable; actually tap the
         # sources here for every non-Equip activated ability.
         mana_cost = ability.get('mana_cost', '')
-        if mana_cost and not player.tap_sources_for_cost(mana_cost, game=game):
+        # Aug 9 audit (A-1): Phyrexian pips in activation costs — mirror the
+        # cast path's '/P}' detection (the manual-path twin of engine.py's
+        # AI activation payment).
+        if mana_cost and not player.tap_sources_for_cost(
+                mana_cost, game=game,
+                pay_phyrexian_with_life='/P}' in mana_cost.upper()):
             await ctx.send(f"❌ Cannot pay {mana_cost} to activate **{card.name}**.")
             return
 
@@ -2870,7 +2879,7 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
             except Exception as e:
                 print(f"[ACTIVATE-XMAGE] Error for {card.name}: {e}")
 
-        # === TIER 3: Claude API fallback for complex effects ===
+        # === TIER 3: LLM fallback for complex effects ===
         if not effect_resolved:
             try:
                 effect_desc = resolved_effect if x_value is not None else ability['effect']
@@ -2883,9 +2892,9 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
                 if resolve_actions:
                     messages.extend(resolve_msgs)
                     effect_resolved = True
-                    print(f"[ACTIVATE-RESOLVE] {card.name} ability resolved via Claude API: {len(resolve_actions)} actions")
+                    print(f"[ACTIVATE-RESOLVE] {card.name} ability resolved via Tier 3: {len(resolve_actions)} actions")
                 else:
-                    # Claude API returned no actions — fall back to manual
+                    # Tier 3 returned no actions — fall back to manual
                     messages.append(f"📜 Effect: *{ability['effect']}*")
                     messages.append(f"*(Manual resolution may be needed - use `!judge` for complex effects)*")
                     game.last_unresolved_effect = {
@@ -2894,7 +2903,7 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
                         'controller': player.name,
                     }
             except Exception as e:
-                print(f"[ACTIVATE-RESOLVE] Error resolving {card.name} ability via Claude API: {e}")
+                print(f"[ACTIVATE-RESOLVE] Error resolving {card.name} ability via Tier 3: {e}")
                 messages.append(f"📜 Effect: *{ability['effect']}*")
                 messages.append(f"*(Manual resolution may be needed - use `!judge` for complex effects)*")
                 game.last_unresolved_effect = {

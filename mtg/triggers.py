@@ -543,17 +543,19 @@ def _check_creature_etb_triggers_sync(engine, game: GameState, entering_player: 
             )
             has_creature_enters = (
                 _is_scourge_dragon_trigger or
-                ("whenever another creature" in oracle_lower and "enters" in oracle_lower) or
-                ("whenever a creature" in oracle_lower and "enters" in oracle_lower) or
-                ("whenever a nontoken creature" in oracle_lower and "enters" in oracle_lower) or
-                # Aug 3, 2026: the three literals above enumerate phrasings and
-                # miss any that carries an adjective between the article and
-                # "creature" — Anafenza, Kin-Tree Spirit says "Whenever another
-                # NONTOKEN creature you control enters" and was never collected
-                # at all, so her bolster never fired once. This alternative is
-                # purely ADDITIVE (same sentence, any adjectives), so it can
-                # only ever collect more watchers, never fewer than the
-                # literals already did.
+                # Aug 9 audit (A-2): the old bare-substring literals
+                # ("whenever a creature" in oracle AND "enters" in oracle)
+                # matched ACROSS sentences — Species Specialist ("As this
+                # creature enters, choose a creature type." + "Whenever a
+                # creature of the chosen type DIES...") was collected as an
+                # enters-watcher and drew a card on every unrelated creature
+                # entry (4 unearned draws in one game; Bastion of
+                # Remembrance and Massacre Wurm were mis-collected the same
+                # way). The period-scoped regex below (added Aug 3 for
+                # Anafenza) is the sole detector now: a full-Scryfall sweep
+                # (38,416 cards) found 113 legacy-only matches — every one a
+                # dies/attacks/deals/blocks trigger, ZERO real
+                # enters-watchers lost — and 42 additive gains.
                 bool(re.search(r'whenever (?:a|another)\b[^.]*?\bcreature\b'
                                r'[^.]*?\benters\b', oracle_lower))
             )
@@ -1532,11 +1534,21 @@ async def _check_cast_triggers(engine, game: GameState, caster: Player, card: Ca
                     found_card.summoning_sick = False  # Non-creatures don't have summoning sickness
                     found_card.entered_this_turn = True
                     found_card._from_cascade = True
-                    if found_card.is_planeswalker() and hasattr(found_card, 'loyalty') and found_card.loyalty:
+                    # Aug 9 audit (B-1): this wrote `current_loyalty`, an
+                    # attribute NOTHING reads — the SBA reads loyalty_counters
+                    # (defaults 0), so a cascaded Liliana of the Veil entered
+                    # at 0 loyalty and died to PLANESWALKER_ZERO_LOYALTY
+                    # before her first activation (CR 306.8). The
+                    # commander-cast helper covers Jeska-class printed-0
+                    # walkers (short-circuits to 0 for everyone else).
+                    if found_card.is_planeswalker():
+                        from mtg.helpers import loyalty_from_commander_casts
                         try:
-                            found_card.current_loyalty = int(found_card.loyalty)
+                            _base = int(found_card.loyalty or 0)
                         except (ValueError, TypeError):
-                            pass
+                            _base = 0
+                        found_card.loyalty_counters = _base + loyalty_from_commander_casts(
+                            game, caster, found_card)
                     caster.battlefield.append(found_card)
                     messages.append(f"  → **{found_card.name}** enters the battlefield")
                     # Register static effects (anthems, keyword grants, etc.)
@@ -2010,7 +2022,8 @@ async def _check_cast_triggers(engine, game: GameState, caster: Player, card: Ca
                         else:
                             target_player = game.players[1 - caster_idx]
                         actual = engine.rules._apply_noncombat_damage_to_player(game, target_player, dmg, bf_card.name)
-                        messages.append(f"⚡ {bf_card.name} deals {actual} damage to {target_player.name}")
+                        messages.append(f"⚡ {bf_card.name} deals {actual} damage to "
+                                        f"{target_player.name} (life: {max(0, target_player.life)})")
                         executed_trigger = True
 
 
@@ -2135,10 +2148,28 @@ async def _check_cast_triggers(engine, game: GameState, caster: Player, card: Ca
                     # per CR 603.2, then discarded unexecuted). Queue it for
                     # Tier-3 auto-resolve like other unhandled trigger classes.
                     if hasattr(engine, '_queue_async_trigger'):
-                        engine._queue_async_trigger(
+                        # Aug 9 audit (C-F2-2): discriminate by the CASTING
+                        # EVENT — two different casts before a drain are two
+                        # distinct trigger instances (CR 603.3b). Gadwick's
+                        # cast trigger was silently dropped on 2 real casts
+                        # in one game because the queue-wide dedup saw only
+                        # (source, type). The caller also printed "queued"
+                        # unconditionally — honest now.
+                        # Aug 9 adversarial review (C-F2-2 residual): the
+                        # bare id:turn key collided for the SAME card object
+                        # cast twice in one turn (adventure both halves,
+                        # escape/flashback recast, commander recast — the
+                        # slice-4a multiplicity note). The caster's own
+                        # per-turn cast counter discriminates those.
+                        _occ = (f"{getattr(card, 'id', card.name)}:"
+                                f"{game.turn_number}:"
+                                f"{getattr(caster, 'spells_cast_this_turn', 0)}")
+                        _queued = engine._queue_async_trigger(
                             game, bf_card, trigger_text, "cast_trigger", caster.name,
-                            context=f"{caster.name} cast {card.name}")
-                        print(f"[CAST-TRIGGER-UNHANDLED] {bf_card.name} queued for Tier 3 auto-resolve")
+                            context=f"{caster.name} cast {card.name}",
+                            occurrence_key=_occ)
+                        if _queued:
+                            print(f"[CAST-TRIGGER-UNHANDLED] {bf_card.name} queued for Tier 3 auto-resolve")
                 # Emit resolve log at the actual moment of effect execution so
                 # post-batch console-log audits see the CR-correct order
                 # (trigger detection → trigger resolution → spell resolution).
@@ -2352,7 +2383,8 @@ async def _check_cast_triggers(engine, game: GameState, caster: Player, card: Ca
                         # "each opponent" = the caster (opponent of the controller)
                         target_player = caster
                         actual = engine.rules._apply_noncombat_damage_to_player(game, target_player, dmg, bf_card.name)
-                        messages.append(f"⚡ {bf_card.name} deals {actual} damage to {target_player.name}")
+                        messages.append(f"⚡ {bf_card.name} deals {actual} damage to "
+                                        f"{target_player.name} (life: {max(0, target_player.life)})")
                 else:
                     # Generic opponent-cast trigger — try template library first
                     opp_trigger_resolved = False
@@ -2730,11 +2762,15 @@ def _check_enchantment_etb_watchers(engine, game: GameState, controller: Player,
             continue
         oracle = bf_card.oracle_text or ''
         ol = oracle.lower()
+        # Aug 9 audit (A-2 sibling): the old pair of checks ("whenever an
+        # enchantment" anywhere + "enters" anywhere) could match across two
+        # different sentences — the Species Specialist cross-sentence class.
+        # Sentence-scope the detection; constellation keeps its keyword path
+        # (its printed trigger reads "this or another enchantment", which
+        # the article regex deliberately doesn't cover).
         if ('constellation' not in ol
-                and 'whenever an enchantment' not in ol
-                and 'whenever another enchantment' not in ol):
-            continue
-        if 'enchantment' in ol and 'enters' not in ol and 'constellation' not in ol:
+                and not re.search(
+                    r'whenever an(?:other)? enchantment\b[^.]*?\benters\b', ol)):
             continue
         # "another enchantment" excludes the entering card itself.
         if 'another enchantment' in ol and bf_card.id == entered_card.id:
@@ -3917,6 +3953,66 @@ def _check_attack_triggers_sync(engine, game: GameState, attacker_card: Card, at
     return messages, unhandled
 
 
+def _fire_transforms_into_triggers(engine, game: GameState, controller: Player,
+                                   card: Card) -> List[str]:
+    """Dispatch the NEW face's "transforms into <this face>" trigger (CR 603.3).
+
+    Aug 9 audit (C-F4-2): every transform site called card.transform() and
+    appended a purely cosmetic message — no trigger machinery ran, so
+    Huntmaster of the Fells' "enters OR TRANSFORMS INTO" trigger (and every
+    werewolf's transform trigger) fired only on the initial cast, never on
+    a flip. Bounds that are load-bearing:
+    - ONLY "transforms into" sentences are dispatched (CR 712.1 —
+      transforming is not entering; the sentence, not the whole oracle, is
+      passed so no other paragraph can resolve).
+    - The sentence must name THIS face (each face's trigger names itself).
+    - Called exactly once per transform() call; the Tier-3 queue fallback
+      carries a per-transform occurrence_key so a re-scan can't double-queue.
+    """
+    messages: List[str] = []
+    oracle = card.oracle_text or ''
+    m = re.search(r'((?:whenever|when)\b[^.]*?\btransforms into\b[^.]*\.)',
+                  oracle, re.IGNORECASE)
+    if not m:
+        return messages
+    sentence = m.group(1)
+    if card.name.lower() not in sentence.lower():
+        return messages
+    resolved = False
+    if HAS_EFFECT_TEMPLATES:
+        try:
+            lib = get_effect_library()
+            opponent = next(
+                (p for p in game.players if p is not controller), controller)
+            ctx = build_game_context(game, controller, opponent, card=card)
+            actions, explanation = lib.resolve_etb(
+                card_name=card.name, oracle_text=sentence,
+                controller=controller.name, opponent=opponent.name,
+                game_context=ctx)
+            if actions is not None:
+                resolved = True
+                for action in actions:
+                    if action.get("action") == "no_action":
+                        continue
+                    msg = engine.rules._execute_action_on_state(game, action)
+                    if msg:
+                        messages.append(f"⚡ {card.name}: {msg}")
+                print(f"[TRANSFORM-TRIGGER] {card.name}: resolved via template")
+        except Exception as e:
+            print(f"[TRANSFORM-TRIGGER] Error for {card.name}: {e}")
+            from mtg.util import maybe_reraise
+            maybe_reraise(e)
+    if not resolved and hasattr(engine, '_queue_async_trigger'):
+        _occ = (f"transform:{getattr(card, 'id', card.name)}:"
+                f"{game.turn_number}:{card.is_transformed}")
+        if engine._queue_async_trigger(
+                game, card, sentence, "transform", controller.name,
+                context=f"{card.name} just transformed",
+                occurrence_key=_occ):
+            print(f"[TRANSFORM-TRIGGER] {card.name}: queued for Tier 3")
+    return messages
+
+
 def _check_day_night_and_werewolf_transforms(engine, game: GameState) -> List[str]:
     """Check for day/night transitions and werewolf transform triggers at upkeep."""
     messages = []
@@ -3953,10 +4049,14 @@ def _check_day_night_and_werewolf_transforms(engine, game: GameState) -> List[st
                         old_name = card.name
                         card.transform()
                         messages.append(f"🔄 **{old_name}** transforms into **{card.name}** (it is now day)")
+                        messages.extend(_fire_transforms_into_triggers(
+                            engine, game, player, card))
                     elif not game.is_day and not card.is_transformed:
                         old_name = card.name
                         card.transform()
                         messages.append(f"🔄 **{old_name}** transforms into **{card.name}** (it is now night)")
+                        messages.extend(_fire_transforms_into_triggers(
+                            engine, game, player, card))
     # Classic werewolf transform triggers (non-daybound)
     opponent_idx = 1 - game.active_player_index
     opponent = game.players[opponent_idx]
@@ -3981,6 +4081,8 @@ def _check_day_night_and_werewolf_transforms(engine, game: GameState) -> List[st
                     old_name = card.name
                     card.transform()
                     messages.append(f"🐺 **{old_name}** transforms into **{card.name}**! (no spells cast last turn)")
+                    messages.extend(_fire_transforms_into_triggers(
+                        engine, game, player, card))
             elif (card.is_transformed
                     and 'at the beginning of each upkeep' in oracle_lower
                     and 'two or more spells' in oracle_lower):
@@ -3988,6 +4090,8 @@ def _check_day_night_and_werewolf_transforms(engine, game: GameState) -> List[st
                     old_name = card.name
                     card.transform()
                     messages.append(f"🐺 **{old_name}** transforms back into **{card.name}**! (2+ spells cast last turn)")
+                    messages.extend(_fire_transforms_into_triggers(
+                        engine, game, player, card))
             elif (card.is_transformed
                     and 'at the beginning of each upkeep' in back_oracle_lower
                     and 'two or more spells' in back_oracle_lower):
@@ -3995,6 +4099,8 @@ def _check_day_night_and_werewolf_transforms(engine, game: GameState) -> List[st
                     old_name = card.name
                     card.transform()
                     messages.append(f"🐺 **{old_name}** transforms back into **{card.name}**! (2+ spells cast last turn)")
+                    messages.extend(_fire_transforms_into_triggers(
+                        engine, game, player, card))
     return messages
 
 
@@ -4965,7 +5071,17 @@ def _handle_land_etb(engine, game: GameState, player: Player, card: Card) -> Lis
     if not messages and oracle:
         # Skip lands whose ETB was already handled by _check_enters_tapped
         # (shocklands, checklands, fastlands, etc. — "pay 2 life" / "enters tapped unless")
-        already_handled = (
+        # Aug 9 audit (CO-3b): a land can carry BOTH a tapped-condition AND a
+        # real ETB trigger — Mystic Sanctuary ("This land enters tapped
+        # unless you control three or more other Islands." + "When this land
+        # enters untapped, ...") was swallowed by the checkland exclusion,
+        # so its registered template never fired and the model improvised a
+        # fabricated resolve instead. A "when ... enters" trigger sentence
+        # exempts the land from already_handled; plain checklands (no
+        # trigger clause) stay excluded.
+        _has_own_etb_trigger = bool(
+            re.search(r'when\b[^.]*\benters\b', oracle))
+        already_handled = not _has_own_etb_trigger and (
             ("you may pay 2 life" in oracle and "enters tapped" in oracle) or
             ("enters tapped unless" in oracle) or
             ("enters the battlefield tapped unless" in oracle) or
@@ -4981,6 +5097,16 @@ def _handle_land_etb(engine, game: GameState, player: Player, card: Card) -> Lis
                 has_etb = True
             elif "as" in oracle and "enters" in oracle:
                 has_etb = True
+
+        # Aug 9 audit (CO-3b): "When this land enters UNTAPPED, ..."
+        # (Mystic Sanctuary) — the trigger's intervening condition is the
+        # entry state. A tapped entry (fewer than 3 other Islands) must not
+        # fire it (CR 603.4); the mirror error of never firing it at all.
+        if (has_etb and card.tapped
+                and re.search(r'when\b[^.]*\benters untapped', oracle)):
+            print(f"[LAND-ETB] {card.name} entered TAPPED — its "
+                  f"'enters untapped' trigger does not fire")
+            has_etb = False
 
         if has_etb:
             # Tier 1.5: Try template library FIRST (handles Temple scry, Obscura Storefront, etc.)

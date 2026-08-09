@@ -1220,11 +1220,20 @@ class EffectTemplateLibrary:
                     # (the fallback below keeps the spell from blanking).
                     _bounce = ctx.get('best_opponent_creature')
                     if not _bounce:
+                        # Aug 9 adversarial review (B-2): filter like the
+                        # primary key this falls back from.
+                        _ct = ctx.get('_can_target')
+                        _opp_pl = ctx.get('_opponent_player')
                         for c in (ctx.get('opponent_battlefield') or []):
                             _tl = (getattr(c, 'type_line', '') or '').lower()
-                            if 'land' not in _tl:
-                                _bounce = getattr(c, 'name', None)
-                                break
+                            if 'land' in _tl:
+                                continue
+                            if getattr(c, '_phased_out', False):
+                                continue
+                            if _ct is not None and not _ct(c, _opp_pl):
+                                continue
+                            _bounce = getattr(c, 'name', None)
+                            break
                     if _bounce:
                         actions.append({"action": "move_card", "card": _bounce,
                                         "from_zone": "battlefield",
@@ -2007,32 +2016,80 @@ class EffectTemplateLibrary:
             two colors, not three.
             """
             bound = int(ctx.get('colors_spent') or 0)
-            name = (ctx.get('explicit_target_name')
-                    or ctx.get('best_opponent_nonland') or '')
-            if not name:
-                return [{"action": "no_action",
-                         "reason": "No valid nonland permanent to exile with "
-                                   "Prismatic Ending"}]
-            # Verify the chosen target is actually within the bound. The
-            # target's mana value is on the ctx snapshot when available;
-            # without it, decline rather than exile something too big.
-            mv = ctx.get('explicit_target_mv')
-            if mv is None:
-                for _p in (ctx.get('opponent_battlefield') or []):
+
+            # Aug 9 audit (B-2): the old guard was `if mv is not None and
+            # mv > bound` — a None mv skipped the bound entirely, and mv
+            # was ALWAYS None on the auto-pick path (explicit_target_mv is
+            # only set by the explicit-target branches, and the fallback
+            # read the then-producer-less opponent_battlefield key). An
+            # MV-3 Liliana was exiled with colors_spent=2 — structurally
+            # impossible for the two-color caster (CR 702.100a). Now: gate
+            # the PICK, never exile on unknown mv, and DECLINE an
+            # over-bound declared target (the Abrupt Decay precedent — no
+            # silent retargeting).
+            def _mv_of(name_lc):
+                # Aug 9 adversarial review: scan BOTH battlefields — an
+                # own-side declared target is legal for "target nonland
+                # permanent" and used to decline as "unknown mana value".
+                for _p in (list(ctx.get('opponent_battlefield') or [])
+                           + list(ctx.get('controller_battlefield') or [])):
                     _n = _p.get('name') if isinstance(_p, dict) else getattr(_p, 'name', '')
-                    if _n and _n.lower() == name.lower():
-                        mv = (_p.get('cmc') if isinstance(_p, dict)
-                              else getattr(_p, 'cmc', None))
-                        break
-            if mv is not None and int(mv or 0) > bound:
+                    if _n and _n.lower() == name_lc:
+                        return (_p.get('cmc') if isinstance(_p, dict)
+                                else getattr(_p, 'cmc', None))
+                return None
+
+            explicit = ctx.get('explicit_target_name') or ''
+            if explicit:
+                mv = ctx.get('explicit_target_mv')
+                if mv is None:
+                    mv = _mv_of(explicit.lower())
+                if mv is None or int(mv or 0) > bound:
+                    return [{"action": "no_action",
+                             "reason": (f"Prismatic Ending exiles mana value "
+                                        f"{bound} or less ({bound} color(s) "
+                                        f"of mana spent) — {explicit} "
+                                        f"{'has unknown mana value' if mv is None else f'is mana value {int(mv or 0)}'}")}]
+                return [{"action": "move_card", "card": explicit,
+                         "from_zone": "battlefield", "to_zone": "exile",
+                         "player": ctx.get('explicit_target_owner') or opp}]
+
+            # Auto-pick: highest-value LEGAL candidate (nonland, known mv,
+            # mv <= bound) from the opponent's battlefield.
+            # Aug 9 adversarial review (B-2): the raw loop lost the
+            # _can_target legality filter its best_opponent_* predecessors
+            # had — a hexproof or phased-out creature was picked and the
+            # action layer then blocked it (cost paid, effect lost, plus a
+            # misleading shield message where the pre-fix code declined
+            # cleanly). Filter like the keys this loop falls back from.
+            _ct = ctx.get('_can_target')
+            _opp_pl = ctx.get('_opponent_player')
+            best_name, best_mv = None, -1
+            for _p in (ctx.get('opponent_battlefield') or []):
+                _n = _p.get('name') if isinstance(_p, dict) else getattr(_p, 'name', '')
+                _tl = (_p.get('type_line') if isinstance(_p, dict)
+                       else getattr(_p, 'type_line', '')) or ''
+                _mv = (_p.get('cmc') if isinstance(_p, dict)
+                       else getattr(_p, 'cmc', None))
+                _is_land = (_p.is_land() if hasattr(_p, 'is_land')
+                            else 'land' in _tl.lower())
+                if (not _n or _is_land or _mv is None
+                        or int(_mv or 0) > bound):
+                    continue
+                if getattr(_p, '_phased_out', False):
+                    continue
+                if _ct is not None and not _ct(_p, _opp_pl):
+                    continue
+                if int(_mv or 0) > best_mv:
+                    best_name, best_mv = _n, int(_mv or 0)
+            if not best_name:
                 return [{"action": "no_action",
-                         "reason": (f"Prismatic Ending exiles mana value "
-                                    f"{bound} or less ({bound} color(s) of "
-                                    f"mana spent) — {name} is mana value "
-                                    f"{int(mv or 0)}")}]
-            return [{"action": "move_card", "card": name,
+                         "reason": (f"Prismatic Ending: no nonland permanent "
+                                    f"with mana value {bound} or less to "
+                                    f"exile")}]
+            return [{"action": "move_card", "card": best_name,
                      "from_zone": "battlefield", "to_zone": "exile",
-                     "player": ctx.get('explicit_target_owner') or opp}]
+                     "player": opp}]
 
         # --- Prismatic Ending: exile nonland permanent with MV <= colors spent ---
         # Aug 3: the converge CONDITION was ignored entirely — the template
@@ -6604,11 +6661,23 @@ class EffectTemplateLibrary:
             if not target:
                 # Real card text: any permanent — fall back to an opponent
                 # LAND when the board is lands-only.
+                # Aug 9 adversarial review (B-2): filter like the primary
+                # keys — an untargetable/phased pick made the destroy fail
+                # at the action layer while the UNLINKED search still ran,
+                # granting a free ramp land (the CO-4 linkage class). An
+                # illegal-only board declines cleanly again.
+                _ct = ctx.get('_can_target')
+                _opp_pl = ctx.get('_opponent_player')
                 for perm in (ctx.get('opponent_battlefield') or []):
                     nm = perm.get('name') if isinstance(perm, dict) else getattr(perm, 'name', None)
-                    if nm:
-                        target = nm
-                        break
+                    if not nm:
+                        continue
+                    if getattr(perm, '_phased_out', False):
+                        continue
+                    if _ct is not None and not _ct(perm, _opp_pl):
+                        continue
+                    target = nm
+                    break
             if not target:
                 return [{"action": "no_action", "reason": "Opponent controls no permanents"}]
             return [
@@ -7603,17 +7672,19 @@ class EffectTemplateLibrary:
         # Inventors' Fair — at upkeep, IF you control 3+ artifacts, gain 1 life
         # Oracle: "At the beginning of your upkeep, if you control three or more artifacts, you gain 1 life."
         def _inventors_fair_gen(ctrl, opp, ctx):
-            bf = ctx.get('battlefield', [])
-            artifact_count = 0
-            if bf:
-                for c in bf:
-                    if isinstance(c, dict) and c.get('controller', '') == ctrl:
-                        types_str = c.get('types', '') or c.get('type_line', '') or ''
-                        if 'artifact' in types_str.lower():
-                            artifact_count += 1
-            else:
-                # Also try the explicit count if surfaced by build_game_context
-                artifact_count = ctx.get('controller_artifact_count', 0)
+            # Aug 9 audit (CO-1): the old branches read ctx['battlefield']
+            # and ctx['controller_artifact_count'] — NEITHER key has a
+            # producer anywhere in the tree, so artifact_count was ALWAYS 0
+            # and the upkeep life-gain could never fire (Mox Tantalite on
+            # the battlefield, "only 0 artifact(s)" every upkeep,
+            # game_1535586432385687572). Count from controller_battlefield
+            # (real Card objects, populated by build_game_context),
+            # mirroring the WORKING tutor gate in mtg/helpers.py
+            # activated_ability_restriction_failure exactly.
+            artifact_count = sum(
+                1 for c in (ctx.get('controller_battlefield') or [])
+                if 'artifact' in (getattr(c, 'type_line', '') or '').lower()
+                and not getattr(c, '_phased_out', False))
             if artifact_count < 3:
                 return [{"action": "no_action",
                          "reason": f"Inventors' Fair: only {artifact_count} artifact(s) — needs 3+"}]
@@ -7806,19 +7877,49 @@ class EffectTemplateLibrary:
         # =====================================================================
 
 
-        # Huntmaster of the Fells (day side) — ETB / transform-in trigger
-        # Apr 30 audit: previous template returned no_action with "use !fix"
-        # guidance that leaked into Discord. Now actually fires the trigger:
-        # deal 2 damage to opponent, gain 2 life. The day/night transform itself
-        # is still tracked elsewhere; this template covers the ETB-like effect.
+        # Huntmaster of the Fells (day side) — ETB / transform-in trigger.
+        # Aug 9 audit (C-F4-1): the Apr 30 rewrite implemented the WRONG
+        # FACE's effect from memory — "deal 2 damage to target opponent"
+        # belongs to RAVAGER of the Fells' transform trigger. Huntmaster's
+        # printed trigger (cache-verified): "create a 2/2 green Wolf
+        # creature token and you gain 2 life." Qwen took 2 phantom damage
+        # and Rick never got his Wolf (game_1535582267429101618). The
+        # Ravager face gets its own entry only WITH the transform-into
+        # dispatch (C-F4-2) — a template that can't fire is the
+        # dead-registration class.
         self._add_card("huntmaster of the fells", EffectTemplate(
             name="Huntmaster of the Fells",
-            description="When Huntmaster of the Fells enters or transforms into Huntmaster, deal 2 damage to target opponent and gain 2 life",
+            description="When Huntmaster of the Fells enters or transforms into Huntmaster, create a 2/2 green Wolf token and gain 2 life",
             action_generator=lambda ctrl, opp, ctx: [
-                {"action": "deal_damage", "amount": 2,
-                 "target_player": ctx.get('explicit_target_player') or ctx.get('explicit_target_name') or opp},  # B-2 (Aug 7): player key first
+                {"action": "create_token", "player": ctrl, "name": "Wolf",
+                 "power": 2, "toughness": 2, "types": "Creature — Wolf",
+                 "colors": ["G"], "count": 1},
                 {"action": "gain_life", "player": ctrl, "amount": 2},
             ],
+        ))
+
+        # Ravager of the Fells (night side) — "Whenever this creature
+        # transforms into Ravager of the Fells, it deals 2 damage to target
+        # opponent or planeswalker and 2 damage to up to one target
+        # creature." Reachable only via the transform-into dispatch
+        # (C-F4-2, mtg/triggers.py) — registered WITH it, per the
+        # dead-registration rule. The old JSON entry for this key created a
+        # Wolf (the two faces' effects were SWAPPED in both registries).
+        def _gen_ravager_of_the_fells(ctrl, opp, ctx):
+            actions = [{"action": "deal_damage", "amount": 2,
+                        "target_player": ctx.get('explicit_target_player') or opp}]
+            _best = ctx.get('best_opponent_creature')
+            if _best:
+                # "up to one target creature" — take it when one exists
+                actions.append({"action": "deal_damage", "amount": 2,
+                                "target_card": _best,
+                                "target_controller": opp})
+            return actions
+
+        self._add_card("ravager of the fells", EffectTemplate(
+            name="Ravager of the Fells",
+            description="When this transforms into Ravager of the Fells, deal 2 damage to target opponent and 2 to up to one target creature",
+            action_generator=_gen_ravager_of_the_fells,
         ))
 
         # =================================================================
@@ -8279,7 +8380,25 @@ class EffectTemplateLibrary:
         return actions
 
     def _daretti_weld(self, ctrl, opp, ctx) -> List[Dict]:
-        """Daretti -2: Sacrifice an artifact, return an artifact from graveyard to battlefield."""
+        """Daretti -2: Sacrifice an artifact. IF YOU DO, return an artifact
+        from your graveyard to the battlefield.
+
+        Aug 9 audit (CO-4): both actions were emitted unconditionally — the
+        action list has no conditional linkage, so with no artifact to
+        sacrifice the reanimate ran anyway (a free 11/11 infect Blightsteel
+        Colossus, game_1535567121029931081). The Gatekeeper kicked-gate
+        precedent: check the "if you do" condition HERE, where the ctx is.
+        Loyalty stays spent either way (costs paid, ability fizzles).
+        """
+        _bf = ctx.get('controller_battlefield') or []
+        _has_own_artifact = any(
+            'artifact' in (getattr(c, 'type_line', '') or '').lower()
+            and not getattr(c, '_phased_out', False)
+            for c in _bf)
+        if not _has_own_artifact:
+            return [{"action": "no_action",
+                     "reason": "Daretti -2: no artifact to sacrifice — "
+                               "\"if you do\" fails, nothing returns"}]
         return [
             {"action": "sacrifice_permanent", "player": ctrl,
              "type_filter": "artifact", "reason": "Daretti -2: sacrifice an artifact"},
@@ -8848,6 +8967,22 @@ class EffectTemplateLibrary:
         """Bounce best nonland permanent opponent controls (Into the Roil, Chain of Vapor, etc.)."""
         # Prefer explicit target, then best creature, then any nonland
         target = ctx.get('explicit_target_name') or ctx.get('best_opponent_creature') or ctx.get('best_opponent_nonland')
+        # Aug 9 audit (CO-2 second net): a declared LAND slipped the old
+        # cast gate and this template bounced it (Into the Roil → Academy
+        # Ruins). The gate fix upstream makes this unreachable with a land
+        # declared; the guard stays as defense in depth — decline rather
+        # than bounce a land for a "nonland permanent" spell.
+        if target:
+            _all_bf = list(ctx.get('controller_battlefield') or [])
+            _opp_pl = ctx.get('_opponent_player')
+            if _opp_pl is not None:
+                _all_bf += list(getattr(_opp_pl, 'battlefield', []) or [])
+            for _c in _all_bf:
+                if (getattr(_c, 'name', None) == target
+                        and 'land' in (getattr(_c, 'type_line', '') or '').lower()):
+                    return [{"action": "no_action",
+                             "reason": f"{target} is a land — this spell "
+                                       f"targets nonland permanents only"}]
         if target:
             actions = [{"action": "move_card", "card": target,
                         "from_zone": "battlefield", "to_zone": "hand", "player": opp}]
@@ -10103,7 +10238,7 @@ class EffectTemplateLibrary:
                      if 'artifact' in (getattr(c, 'type_line', '') or '').lower()]
         if not artifacts:
             return [{"action": "no_action",
-                     "reason": "Glissa: no artifact card in your graveyard"}]
+                     "reason": "no artifact card in your graveyard to return"}]
 
         def _mv(c):
             try:
@@ -11155,6 +11290,13 @@ def build_game_context(game, player, opponent, card=None, entering_creature=None
     ctx['controller_graveyard'] = player.graveyard
     ctx['controller_hand'] = player.hand
     ctx['controller_battlefield'] = player.battlefield
+    # Aug 9 audit (B-2/CO-1 class): opponent_battlefield was READ at three
+    # template sites (Prismatic Ending's mv fallback, the Mystic Confluence
+    # bounce fallback, Assassin's Trophy's lands-only fallback) and written
+    # NOWHERE — all three fallbacks were dead (Trophy's was itself an Aug-7
+    # documented fix that never executed). All three treat it as a fallback
+    # after best_opponent_* keys, so making it live is strictly additive.
+    ctx['opponent_battlefield'] = opponent.battlefield
     ctx['opponent_hand'] = opponent.hand
 
     # Player object reference (for templates that need to check optional-cost
@@ -11194,6 +11336,16 @@ def build_game_context(game, player, opponent, card=None, entering_creature=None
             return legal
         except Exception:
             return True  # Permissive on errors
+
+    # Aug 9 adversarial review (B-2 refutation): the raw opponent_battlefield
+    # fallbacks (Prismatic auto-pick, Assassin's Trophy lands-only, Mystic
+    # Confluence bounce) fall back FROM _can_target-filtered keys, so on a
+    # non-empty board their only new firing condition was the ILLEGAL one
+    # (hexproof/phased picks — cost-paid-effect-lost at the action layer,
+    # and Trophy's unlinked search granted a free ramp land). Export the
+    # closure so the fallbacks filter the same way; synthetic ctx without
+    # it stays permissive.
+    ctx['_can_target'] = _can_target
 
     # Best opponent creature (highest power) — use get_effective_power for accuracy
     # Skips creatures with hexproof/protection from the source spell

@@ -3315,6 +3315,18 @@ class Player:
                 # "Not enough snow mana" even with Snow-Covered Forest in
                 # play because this function ignored {S} symbols entirely.
                 snow_count += 1
+            elif getattr(sym, 'phyrexian', False) and sym.phyrexian_color:
+                # Aug 9 audit (A-1): an UNPAID Phyrexian symbol must demand
+                # its color. A phyrexian ManaSymbol sets only phyrexian_color
+                # (color is None), so it matched NO branch of this chain and
+                # contributed zero to total_cost — Hex Parasite's {B/P}
+                # activation cost was free (no mana, no life), and a
+                # Phyrexian CAST at life <= 4 (the life-payment block above
+                # declines) was equally free. Reached only when the symbol
+                # is not in phyrexian_symbols_paid (life declined or
+                # unaffordable): CR 107.4c — pay the color or 2 life.
+                key = sym.phyrexian_color.value
+                color_needs[key] = color_needs.get(key, 0) + 1
 
         # Calculate generic mana needed
         # {S} symbols count toward the total mana requirement — they need

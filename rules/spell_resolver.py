@@ -95,10 +95,22 @@ class SpellResolver:
         return self.effect_executor.parse_effects(card.oracle_text)
     
     def get_targets_needed(self, card, effects: List[Effect]) -> List[TargetRestriction]:
-        """Determine what targets a spell needs."""
-        restrictions = []
+        """Determine what targets a spell needs.
+
+        Aug 9 audit (B-4): the pattern list produced OVERLAPPING restrictions
+        for ONE printed target — Snakeskin Veil's "target creature you
+        control" matched both the bare `target creature` pattern AND the
+        `target creature you control` pattern, so the AUTO branch in
+        cast_and_resolve picked a target PER restriction: the unrestricted
+        one preferred the OPPONENT's same-named creature, and the executor
+        then applied the effect to BOTH (a +1/+1 counter on the opponent's
+        Tatyova as well as the caster's — CR 601.2c). Matches that overlap
+        by SPAN are one printed target: keep the LONGEST (most specific).
+        Genuinely multi-target spells ("target creature and target player")
+        have disjoint spans and keep both.
+        """
         oracle = card.oracle_text.lower() if card.oracle_text else ""
-        
+
         # Look for target phrases in oracle text
         target_patterns = [
             (r"target (creature|permanent|player|planeswalker|artifact|enchantment|land)", None),
@@ -107,16 +119,26 @@ class SpellResolver:
             (r"target creature (you control|an opponent controls)", None),
             (r"target (attacking|blocking|tapped|untapped) creature", None),
         ]
-        
-        # Find all target references
+
+        # Find all target references WITH spans, then dedup overlaps.
+        spans: List[Tuple[int, int, str]] = []
         for pattern, _ in target_patterns:
-            matches = re.finditer(pattern, oracle)
-            for match in matches:
-                target_text = match.group(0)
-                restriction = TargetTextParser.parse(target_text)
-                restrictions.append(restriction)
-        
-        return restrictions
+            for match in re.finditer(pattern, oracle):
+                spans.append((match.start(), match.end(), match.group(0)))
+        spans.sort(key=lambda s: (s[0], -(s[1] - s[0])))
+        kept: List[Tuple[int, int, str]] = []
+        for start, end, text in spans:
+            replaced = False
+            for i, (ks, ke, kt) in enumerate(kept):
+                if start < ke and ks < end:  # overlap = same printed target
+                    if (end - start) > (ke - ks):
+                        kept[i] = (start, end, text)
+                    replaced = True
+                    break
+            if not replaced:
+                kept.append((start, end, text))
+
+        return [TargetTextParser.parse(text) for _, _, text in kept]
     
     def get_legal_targets(self, game, player, restriction: TargetRestriction) -> List[Tuple[Any, str]]:
         """Get all legal targets for a restriction."""

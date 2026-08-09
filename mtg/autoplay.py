@@ -701,7 +701,7 @@ async def _claude_extra_combats(cog, thread, game: GameState) -> None:
                 blocker = b_res[0]
                 if not blocker.can_block(attacker, game=game):
                     print(f"[BLOCK-INVALID] {blocker.name} cannot block "
-                          f"{attacker.name} (evasion mismatch) — skipped")
+                          f"{attacker.name} (blocking restriction: evasion/type/state) — skipped")
                     continue
                 blocker.blocking.append(attacker.id)
                 attacker.blocked_by.append(blocker.id)
@@ -1466,6 +1466,12 @@ async def _autoplay_execute_action(cog, thread, game: GameState, player_idx: int
 
         success, msg = cog.engine.play_land(game, player, card)
         if success:
+            # Aug 9 audit (CO-3a): stamp land plays for the positional
+            # resolve drop (the engine.py twin has the full story — a
+            # fabricated "Mystic Sanctuary ETB" resolve exiled 5 cards).
+            game._last_exec_cast_like = {
+                'turn': game.turn_number, 'type': 'play_land',
+                'card': card_name}
             result_msg = f"🌍 {player.name} played **{card.name}**"
             # Include shockland life payment in Discord message
             if "paid 2 life" in msg:
@@ -2459,7 +2465,8 @@ async def _autoplay_execute_action(cog, thread, game: GameState, player_idx: int
         # than the card. Any resolve immediately following a cast/activate
         # is redundant (success) or an orphan (failure) either way.
         if (_prev_cast_like and _prev_cast_like.get('turn') == game.turn_number
-                and _prev_cast_like.get('type') in ('cast', 'activate')):
+                and _prev_cast_like.get('type') in ('cast', 'activate',
+                                                        'play_land')):
             print(f"[AUTOPLAY-RESOLVE] Dropped resolve positionally paired with prior "
                   f"{_prev_cast_like.get('type')} of {_prev_cast_like.get('card', '?')} — "
                   f"the cascade already resolves its own effects: '{description[:80]}'")
@@ -3522,7 +3529,7 @@ async def _run_single_autoplay(cog, channel, game_format: str, deck1_name: str, 
                                         # (CR 509.1a/b). Mirror the guarded paths at ~727 and ~793.
                                         if not blocker.can_block(attacker, game=game):
                                             print(f"[BLOCK-INVALID] {blocker.name} cannot block "
-                                                  f"{attacker.name} (evasion mismatch) — skipped")
+                                                  f"{attacker.name} (blocking restriction: evasion/type/state) — skipped")
                                             continue
                                         blocker.blocking.append(attacker.id)
                                         attacker.blocked_by.append(blocker.id)
