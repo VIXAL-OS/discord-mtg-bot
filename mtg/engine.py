@@ -2257,6 +2257,16 @@ class GameEngine:
                 finally:
                     game._in_sba_zero_life_recheck = False
 
+        # Aug 10 deferred (C4): "whenever cards leave your graveyard" watchers
+        # (Tormod, Desecrated Tomb, Syr Konrad's third condition). This is the
+        # batch boundary: SBAs are checked when a player would receive
+        # priority (CR 704.3), which is when triggered abilities go on the
+        # stack (CR 603.3), so everything that left a graveyard since the last
+        # check is one event's worth. It runs AFTER the dies drain on purpose —
+        # a dies trigger can itself pull a card out of a graveyard.
+        from mtg.triggers import drain_graveyard_exit_triggers
+        messages.extend(drain_graveyard_exit_triggers(self, game))
+
         return messages
     
     def advance_phase(self, game: GameState) -> Tuple[Phase, List[str]]:
@@ -2809,6 +2819,17 @@ class GameEngine:
         # (Meren, Soulherder, Conjurer's Closet, Thassa, etc.)
         # This was previously only firing from advance_phase(Phase.END) which
         # end_turn() bypasses entirely. Bug found in Apr 2026 audit.
+        # Aug 10 deferred (C4): backstop drain for graveyard exits that
+        # happened on a path with no intervening state-based-action check, so
+        # nothing strands across a turn boundary. Messages go to the sanctioned
+        # cross-system display queue rather than end_turn's own return value —
+        # this is a rare fallback, not the normal path (that is
+        # check_state_based_actions).
+        from mtg.triggers import drain_graveyard_exit_triggers
+        _gy_backstop = drain_graveyard_exit_triggers(self, game)
+        if _gy_backstop:
+            game._pending_messages.extend(_gy_backstop)
+
         endstep_trigger_msgs = []
         try:
             endstep_msgs_sync, endstep_unhandled = self._check_end_step_triggers_sync(game)

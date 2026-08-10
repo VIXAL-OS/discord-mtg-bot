@@ -6591,3 +6591,376 @@ def _life_lost_subscriber(game, player=None, amount=0, source_name="", **_):
 
 
 events.subscribe(events.LIFE_LOST, _life_lost_subscriber)
+
+
+# ---------------------------------------------------------------------------
+# Aug 10 deferred (C4): "whenever cards leave your graveyard" (CR 603.2).
+#
+# THE RULES QUESTION, settled from Gatherer rulings rather than from the
+# wording — it decides the whole data structure:
+#   Tormod, the Desecrator (2020-11-10): "You create one Zombie token each
+#     time Tormod's ability RESOLVES, no matter how many cards left your
+#     graveyard."
+#   Desecrated Tomb (2018-07-13): "You create one Bat token each time
+#     Desecrated Tomb's ability TRIGGERS, no matter how many cards left your
+#     graveyard."
+#   Syr Konrad, the Grim (2019-10-04): "If one or more creatures die at the
+#     same time as Syr Konrad, ITS FIRST ABILITY TRIGGERS FOR EACH of those
+#     creatures." Konrad's three or-joined conditions are ONE ability, and
+#     that ruling reads it per-object for the dies condition; his leave
+#     condition is likewise singular ("a creature card") with no "one or
+#     more" consolidator.
+# So "one or more ..." is a real consolidator, not decoration, and a sweep of
+# all 38,416 bulk cards confirms the convention holds across the family (36
+# of ~40 carry it; the singular ones — Murktide Regent, Erebos's Titan — do
+# not). Hence: CONSOLIDATED clauses fire once per BATCH, singular clauses
+# once per CARD, and the accumulator has to expose both.
+#
+# UNDYING/PERSIST, the second unsettled question: a creature that dies and
+# returns HAS left your graveyard (both are triggered abilities — the card
+# reaches the graveyard, then the trigger returns it), so a batch containing
+# it is CR-correct. This engine models that inconsistently and we do not
+# paper over it: the destroy / destroy_all_creatures / sacrifice paths really
+# do append to the graveyard and remove again (so the trigger fires), while
+# the main SBA damage-death path (mtg/sba.py, the `continue  # Don't remove
+# from battlefield` branches) redirects battlefield->battlefield and the card
+# never touches the graveyard at all (so it does not). That is a pre-existing
+# modeling divergence, not one introduced here; routing the highest-volume
+# death path through the graveyard would change dies-trigger semantics
+# engine-wide and belongs in its own slice. The asymmetry undercounts, which
+# is the safe direction.
+#
+# SCOPE, stated rather than implied: only "leave(s) YOUR graveyard" is
+# modeled — the watcher's own controller. Erebos's Titan ("leaves AN
+# OPPONENT'S graveyard") is correctly missed by the anchored regex and is
+# not in any deck; it needs its own scope branch if it ever matters.
+# ---------------------------------------------------------------------------
+
+# The anchor requires `graveyard` ADJACENT to `leave(s)`. That is load-bearing,
+# not tidiness: 116 of the 158 bulk cards containing both words separately are
+# unearth reminder text ("...or if it would leave the BATTLEFIELD...") whose
+# oracle mentions a graveyard elsewhere, and `test_graveyard_meren` was seeded
+# with exactly that family on Aug 9. Both `leave` and `leaves` are required —
+# every "one or more cards LEAVE" card uses the plural verb, so a fixed
+# "leaves your graveyard" string misses all 34 of them.
+_GY_LEAVE_ANCHOR = re.compile(r'\bleaves?\s+your\s+graveyard\b', re.IGNORECASE)
+# A trigger word must precede the anchor, which is what keeps Microscope's
+# "(This effect ends if it leaves the graveyard.)" out — a duration clause,
+# not a trigger (it is also reminder text, so it is excluded twice over).
+_GY_LEAVE_TRIGGER_WORD = re.compile(r'\bwhen(?:ever)?\b', re.IGNORECASE)
+_GY_LEAVE_ONCE_PER_TURN = re.compile(
+    r'\bthis ability triggers only once each turn\b', re.IGNORECASE)
+_GY_LEAVE_SUBJECT = re.compile(r'(?P<types>[a-z][a-z\s/\-]*?)\bcards?\s*$',
+                               re.IGNORECASE)
+# Determiners, conjunctions and the words a comma-less condition can leave in
+# front of the subject. Deliberately NOT here: every printed TYPE word
+# (creature, artifact, instant, sorcery, land, nonland) — those are the
+# filter.
+_GY_LEAVE_STOPWORDS = frozenset({
+    'one', 'or', 'more', 'a', 'an', 'the', 'and', 'another', 'each', 'other',
+    'when', 'whenever', 'also', 'if', 'that', 'those', 'is', 'are', 'put',
+    'into', 'from', 'anywhere', 'than', 'battlefield', 'dies', 'die',
+})
+_GY_LEAVE_TOKEN = re.compile(
+    r'creates?\s+(?P<count>a|an|one|two|three|four|\d+)\s+'
+    r'(?P<tapped>tapped\s+)?'
+    r'(?P<power>\d+)/(?P<toughness>\d+)\s+'
+    r'(?P<desc>[a-z][a-z\s]*?)\s+creature\s+tokens?'
+    r'(?:\s+with\s+(?P<keywords>[a-z,\s]+?))?\s*(?:\.|$)', re.IGNORECASE)
+_GY_LEAVE_DAMAGE = re.compile(
+    r'deals?\s+(?P<amount>\d+)\s+damage\s+to\s+each\s+opponent', re.IGNORECASE)
+_GY_LEAVE_COLOR_WORDS = {'white': 'W', 'blue': 'U', 'black': 'B',
+                         'red': 'R', 'green': 'G'}
+_GY_LEAVE_WORD_COUNTS = {'a': 1, 'an': 1, 'one': 1, 'two': 2, 'three': 3,
+                         'four': 4}
+
+
+def parse_graveyard_leave_clause(line: str) -> Optional[Dict[str, Any]]:
+    """Parse one printed line into a graveyard-leave trigger clause, or None.
+
+    Returns {consolidated, types, once_per_turn, effect}. `types` is the
+    printed type filter as a list of OR-ed tokens ("artifact and/or creature
+    cards" -> ['artifact', 'creature']); an empty list means any card.
+
+    The subject is read BACKWARD from the anchor within the last
+    comma-delimited segment, because the clause is not always the first
+    condition on its line: Syr Konrad's is the third of three or-joined
+    conditions ("...dies, or a creature card is put into a graveyard..., or a
+    creature card leaves your graveyard, ...").
+    """
+    if not line:
+        return None
+    match = _GY_LEAVE_ANCHOR.search(line)
+    if not match:
+        return None
+    before = line[:match.start()]
+    if not _GY_LEAVE_TRIGGER_WORD.search(before):
+        return None
+    segment = re.split(r'[,;]', before)[-1]
+    # Cut at the LAST trigger word in the segment. Oasis of Renewal prints
+    # "When Oasis of Renewal enters and whenever a land card leaves your
+    # graveyard, ..." on one line with no comma, so without this the card's
+    # own NAME lands in the type filter — and a name that happens to contain a
+    # creature type ("Bat", "Zombie") would then match real cards.
+    trigger_words = list(_GY_LEAVE_TRIGGER_WORD.finditer(segment))
+    if trigger_words:
+        segment = segment[trigger_words[-1].end():]
+    subject = _GY_LEAVE_SUBJECT.search(segment)
+    if not subject:
+        # "...or leaves your graveyard" with no "card(s)" subject is a card
+        # talking about ITSELF (Syr Konrad's Squire) — a different, self
+        # referential trigger. Refuse rather than guess.
+        return None
+    types: List[str] = []
+    for token in re.split(r'[\s/,]+', subject.group('types') or ''):
+        token = token.strip().lower()
+        if token and token not in _GY_LEAVE_STOPWORDS:
+            types.append(token)
+    return {
+        'consolidated': bool(re.search(r'\bone or more\b', segment,
+                                       re.IGNORECASE)),
+        'types': types,
+        'once_per_turn': bool(_GY_LEAVE_ONCE_PER_TURN.search(line)),
+        # Kishla Skimmer / Thran Vigil / Kheru Goldkeeper / Attuned Hunter all
+        # print "...leave your graveyard DURING YOUR TURN". Unmodeled, that
+        # restriction over-fires on the opponent's turn, which is the forbidden
+        # direction — so it is a gate, not a note.
+        'during_your_turn': bool(
+            re.search(r'\bduring your turn\b', line[match.end():],
+                      re.IGNORECASE)),
+        'effect': line[match.end():].lstrip(' ,.').strip(),
+    }
+
+
+def graveyard_leave_type_matches(card, types: List[str]) -> bool:
+    """Does `card` satisfy a clause's printed type filter?
+
+    Negation is checked BEFORE the positive test for every token, because
+    'creature' is a substring of 'noncreature' and 'land' of 'nonland' — the
+    trap this codebase has shipped eleven times. Oasis of Renewal prints BOTH
+    "a land card leaves" and "a nonland card leaves" as separate abilities on
+    one card, so a substring matcher would fire both off a single land.
+    """
+    if not types:
+        return True
+    type_line = (getattr(card, 'type_line', '') or '').lower()
+    for token in types:
+        if token.startswith('non'):
+            base = token[3:]
+            if base and not re.search(r'\b' + re.escape(base) + r'\b', type_line):
+                return True
+        elif re.search(r'\b' + re.escape(token) + r'\b', type_line):
+            return True
+    return False
+
+
+def graveyard_leave_watcher_clauses(card) -> List[Dict[str, Any]]:
+    """Every graveyard-leave trigger clause printed on `card`."""
+    oracle = getattr(card, 'oracle_text', '') or ''
+    if 'graveyard' not in oracle.lower():
+        return []
+    from mtg.helpers import strip_reminder_text
+    text = strip_reminder_text(oracle)
+    try:
+        from rules.effect_templates import strip_activated_ability_lines
+        text = strip_activated_ability_lines(text)
+    except ImportError:
+        pass
+    clauses = []
+    for raw_line in text.split('\n'):
+        parsed = parse_graveyard_leave_clause(raw_line.strip())
+        if parsed:
+            clauses.append(parsed)
+    return clauses
+
+
+def graveyard_leave_actions(game, perm, owner, effect: str) -> Optional[List[Dict]]:
+    """JSON actions for ONE fire of a graveyard-leave clause, or None.
+
+    Deterministic Tier-1 resolution for the shapes actually printed on this
+    family — a token (Tormod's tapped Zombie, Desecrated Tomb's flying Bat)
+    and damage to each opponent (Syr Konrad). Anything else returns None so
+    the caller can escalate rather than invent an effect.
+    """
+    token = _GY_LEAVE_TOKEN.search(effect or '')
+    if token:
+        words = [w for w in re.split(r'\s+', token.group('desc').strip()) if w]
+        colors = [_GY_LEAVE_COLOR_WORDS[w.lower()] for w in words
+                  if w.lower() in _GY_LEAVE_COLOR_WORDS]
+        name = ' '.join(w for w in words
+                        if w.lower() not in _GY_LEAVE_COLOR_WORDS).title() or 'Token'
+        raw_count = (token.group('count') or 'a').lower()
+        count = (int(raw_count) if raw_count.isdigit()
+                 else _GY_LEAVE_WORD_COUNTS.get(raw_count, 1))
+        action = {
+            "action": "create_token", "player": owner.name, "name": name,
+            "power": int(token.group('power')),
+            "toughness": int(token.group('toughness')),
+            "types": f"Creature — {name}", "count": count,
+            "source": perm.name,
+        }
+        if token.group('tapped'):
+            action["tapped"] = True
+        if colors:
+            action["colors"] = ",".join(colors)
+        keywords = [k.strip().title()
+                    for k in re.split(r',|\band\b', token.group('keywords') or '')
+                    if k.strip()]
+        if keywords:
+            action["keywords"] = ",".join(keywords)
+        return [action]
+    damage = _GY_LEAVE_DAMAGE.search(effect or '')
+    if damage:
+        amount = int(damage.group('amount'))
+        return [{"action": "deal_damage", "amount": amount,
+                 "target_player": other.name, "source": perm.name}
+                for other in (getattr(game, 'players', []) or [])
+                if other is not owner]
+    return None
+
+
+def observe_graveyard_exits(game) -> None:
+    """Emit CARDS_LEFT_GRAVEYARD for every card that has left a graveyard
+    since the last observation.
+
+    This is the detector, and it is a snapshot differ rather than ~40
+    hand-wired emits at the mutation sites — see the CARDS_LEFT_GRAVEYARD
+    note in mtg/events.py for why. An ABSENT snapshot entry seeds without
+    firing: a restored (!undo) or deserialized GameState is a fresh object,
+    and its populated graveyards must not read as a mass departure.
+    """
+    snapshot = getattr(game, '_graveyard_snapshot', None)
+    if snapshot is None:
+        snapshot = {}
+        game._graveyard_snapshot = snapshot
+    for index, player in enumerate(getattr(game, 'players', []) or []):
+        current: Dict[str, Any] = {}
+        for card in list(getattr(player, 'graveyard', []) or []):
+            if getattr(card, 'is_token', False):
+                continue  # CR 111 — a token is not a card and never "leaves"
+            card_id = getattr(card, 'id', None)
+            if card_id:
+                current[card_id] = card
+        previous = snapshot.get(index)
+        snapshot[index] = current
+        if previous is None:
+            continue
+        for card_id, card in previous.items():
+            if card_id not in current:
+                events.emit(events.CARDS_LEFT_GRAVEYARD, game,
+                            card=card, owner=player)
+
+
+def _accumulate_graveyard_exit_subscriber(game, card=None, owner=None, **_):
+    """The CARDS_LEFT_GRAVEYARD subscriber — the sole appender.
+
+    Accumulate-don't-resolve, for the same reason as the slice-3b death
+    subscriber: the consumer's arithmetic is batch-level. A per-event handler
+    could not tell Tormod (once for the whole batch) from Syr Konrad (once per
+    card in it), which is exactly the distinction the rulings turn on.
+    """
+    if card is None or owner is None:
+        return
+    game._cards_left_graveyard.append((card, owner))
+
+
+events.subscribe(events.CARDS_LEFT_GRAVEYARD,
+                 _accumulate_graveyard_exit_subscriber)
+
+
+def drain_graveyard_exit_triggers(engine, game) -> List[str]:
+    """Observe, then resolve one batch of graveyard-leave triggers.
+
+    The batch boundary is "since the last drain", and the drain sits where
+    state-based actions are checked — which is when a player would receive
+    priority (CR 704.3) and therefore when triggered abilities go on the
+    stack (CR 603.3). Two genuinely separate events inside one window merge
+    into one, which UNDER-fires a consolidated watcher; that is the safe
+    direction, and the alternative (emitting per card at the mutation sites)
+    over-fires instead — a {4} delve would mint four Zombies for one event.
+    """
+    messages: List[str] = []
+    try:
+        observe_graveyard_exits(game)
+    except (AttributeError, TypeError, ValueError) as exc:
+        print(f"[GY-LEAVE] Observation failed: {exc}")
+        maybe_reraise(exc)
+        return messages
+
+    departed = list(getattr(game, '_cards_left_graveyard', []) or [])
+    game._cards_left_graveyard = []
+    if not departed or getattr(game, 'ended', False):
+        return messages
+
+    rules = getattr(game, '_rules_engine', None)
+    if rules is None:
+        print(f"[GY-LEAVE-BUS] {len(departed)} card(s) left a graveyard with "
+              f"no rules engine on the game — watchers skipped")
+        return messages
+
+    by_owner: List[Tuple[Any, List[Any]]] = []
+    for card, owner in departed:
+        if owner is None:
+            continue
+        for entry_owner, cards in by_owner:
+            if entry_owner is owner:
+                cards.append(card)
+                break
+        else:
+            by_owner.append((owner, [card]))
+
+    burst: List[str] = []
+    for owner, cards in by_owner:
+        # "your graveyard" is the WATCHER's controller, so only this owner's
+        # own battlefield is scanned.
+        for perm in list(getattr(owner, 'battlefield', []) or []):
+            for clause in graveyard_leave_watcher_clauses(perm):
+                if (clause['during_your_turn']
+                        and getattr(game, 'active_player', None) is not owner):
+                    continue
+                matching = [c for c in cards
+                            if graveyard_leave_type_matches(c, clause['types'])]
+                if not matching:
+                    continue
+                fires = 1 if clause['consolidated'] else len(matching)
+                if clause['once_per_turn']:
+                    key = str(getattr(perm, 'id', '') or perm.name)
+                    turn = getattr(game, 'turn_number', 0)
+                    if game._gy_leave_once_turn.get(key) == turn:
+                        print(f"[GY-LEAVE] {perm.name}: printed once-each-turn "
+                              f"cap already met this turn")
+                        continue
+                    game._gy_leave_once_turn[key] = turn
+                    fires = 1
+                actions = graveyard_leave_actions(game, perm, owner,
+                                                  clause['effect'])
+                if not actions:
+                    print(f"[GY-LEAVE-TRIGGER-UNHANDLED] {perm.name}: "
+                          f"{clause['effect'][:120]}")
+                    queue = getattr(engine, '_queue_async_trigger', None)
+                    if queue is not None:
+                        for card in matching[:fires]:
+                            queue(game, perm, clause['effect'], "trigger",
+                                  owner.name,
+                                  context=(f"{card.name} left "
+                                           f"{owner.name}'s graveyard"),
+                                  occurrence_key=(f"gyleave:"
+                                                  f"{getattr(perm, 'id', perm.name)}:"
+                                                  f"{getattr(card, 'id', card.name)}"))
+                    continue
+                print(f"[GY-LEAVE-TRIGGER] {perm.name} fires x{fires} "
+                      f"({len(matching)} card(s) left {owner.name}'s graveyard"
+                      f"{'; consolidated' if clause['consolidated'] else ''})")
+                for _ in range(fires):
+                    for action in actions:
+                        try:
+                            out = rules._execute_action_on_state(game, action)
+                        except (AttributeError, TypeError, ValueError,
+                                KeyError) as exc:
+                            print(f"[GY-LEAVE-TRIGGER] {perm.name} failed: {exc}")
+                            maybe_reraise(exc)
+                            continue
+                        if out:
+                            burst.append(f"⚰️ **{perm.name}**: {out}")
+    messages.extend(collapse_trigger_burst(burst))
+    return messages

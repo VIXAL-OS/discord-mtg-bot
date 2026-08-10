@@ -4794,6 +4794,23 @@ class GameState:
     # triggers dispatch. Record which permanents actually existed when each
     # death happened so returned cards do not trigger retroactively.
     _dies_source_ids_by_dead_id: dict = field(default_factory=dict, repr=False, compare=False)
+    # Aug 10 deferred (C4): "whenever cards leave your graveyard" watchers.
+    # _graveyard_snapshot is {player_index: {card_id: Card}} as of the last
+    # observation; triggers.observe_graveyard_exits diffs against it and emits
+    # CARDS_LEFT_GRAVEYARD for anything that vanished. An ABSENT entry seeds
+    # without firing, which is what makes a fresh object safe — !undo swaps in
+    # a restored GameState and save/load rebuilds one, and neither must read as
+    # "the whole graveyard just left".
+    _graveyard_snapshot: dict = field(default_factory=dict, repr=False, compare=False)
+    # (card, owner) pairs accumulated by the bus subscriber, drained as ONE
+    # batch: the batch IS the event for "one or more cards leave" (Tormod
+    # fires once no matter how many left), while per-object clauses (Syr
+    # Konrad) fire once per card in it.
+    _cards_left_graveyard: list = field(default_factory=list, repr=False, compare=False)
+    # {watcher card id: turn_number} for the printed "This ability triggers
+    # only once each turn" cap (Oasis of Renewal, Kishla Skimmer) — a THIRD
+    # firing arithmetic beyond consolidated/per-object.
+    _gy_leave_once_turn: dict = field(default_factory=dict, repr=False, compare=False)
     # Strategist rejection backoff is per game: 25 concurrent autoplay games
     # share one ClaudePlayer, so these counters must never live on the client.
     _strategy_rejection_streak: int = field(default=0, repr=False, compare=False)

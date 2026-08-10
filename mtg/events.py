@@ -213,6 +213,27 @@ COMBAT_DAMAGE_DEALT = "combat_damage_dealt"
 # end_turn for any entry whose hooks never ran — the direct-phase-set class
 # that produced the Tymna bug three times over. One clean batch gates 6b.
 PHASE_CHANGED = "phase_changed"
+# CARDS_LEFT_GRAVEYARD payload: card=<the departed Card>, owner=<the Player
+# whose graveyard it left>. Aug 10 deferred (C4) — Tormod, the Desecrator /
+# Desecrated Tomb / Syr Konrad, the Grim, none of which had a dispatcher.
+#
+# UNLIKE every other event here, this one is NOT emitted from the mutation
+# sites. It is emitted by `triggers.observe_graveyard_exits`, a snapshot
+# differ the drain runs. That is a deliberate deviation and the reason is
+# COMPLETENESS: ~36-40 code paths across nine files remove a card from a
+# graveyard (three independent counts of them disagreed, and six sites are
+# invisible to the obvious `.graveyard.remove(` grep — the generic
+# `move_card` zone_map among them). Hand-wiring that many emits is the
+# "one path lacks the chain" bug class this register keeps paying for,
+# whereas a zone-population delta is FULLY determined by comparing zone
+# contents: unlike "a creature died" (an action with a source, a controller
+# and ordering semantics), nothing about "which cards left whose graveyard"
+# needs the mutation site's context. The observer is therefore complete by
+# construction, including for sites added later — a property no call-site
+# audit can promise, and one that tests/test_aug10_c4_graveyard_exit.py
+# pins directly by mutating a graveyard list with no engine call at all.
+# Tokens are excluded at the observer (CR 111 — a token is not a card).
+CARDS_LEFT_GRAVEYARD = "cards_left_graveyard"
 # LIFE_LOST payload: player=<Player who lost life>, amount=<int>,
 # source_name=<str, may be "">. Aug 10 deferred (C2): emitted from
 # Player.record_life_loss, which is the point BOTH damage-caused and

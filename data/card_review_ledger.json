@@ -106,6 +106,11 @@
    "since_sha": "6a30802",
    "note": "Enters-with-counters fix landed AFTER this corpus; the logs show it entering with zero ice counters. Needs a fresh batch."
   },
+  "desecrated tomb": {
+   "status": "awaiting",
+   "since_sha": "3561b22",
+   "note": "Its trigger had no dispatcher at all. Now fires ONCE per batch however many cards left (Gatherer 2018-07-13), only when a CREATURE card left, and the Bat token has flying."
+  },
   "domri, anarch of bolas": {
    "status": "awaiting",
    "since_sha": "6a30802",
@@ -316,6 +321,11 @@
    "since_sha": "6a30802",
    "note": "Its combat-damage trigger now queues and its granted protection now parses - neither is in this corpus."
   },
+  "syr konrad, the grim": {
+   "status": "awaiting",
+   "since_sha": "3561b22",
+   "note": "His THIRD condition ('a creature card leaves your graveyard') had no dispatcher; only the dies condition was handled. It is singular with no 'one or more' consolidator, so it fires once PER CARD -- the 2019-10-04 ruling reads the same ability per-object for its dies condition."
+  },
   "talisman of impulse": {
    "status": "awaiting",
    "since_sha": "ac13af4",
@@ -325,6 +335,11 @@
    "status": "awaiting",
    "since_sha": "6323894",
    "note": "'Saprolings you control get +2/+2' has no 'other' and no 'creatures', so it matched no branch and registered nothing. The Aug-10 blessing-condition fix was necessary but not sufficient -- it only let execution REACH this ladder."
+  },
+  "tormod, the desecrator": {
+   "status": "awaiting",
+   "since_sha": "3561b22",
+   "note": "Its trigger had no dispatcher at all. Now fires ONCE per batch however many cards left (Gatherer 2020-11-10), and the token is the printed TAPPED 2/2 black Zombie."
   },
   "underworld sentinel": {
    "status": "verified",
