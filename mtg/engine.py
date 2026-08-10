@@ -3089,7 +3089,16 @@ class GameEngine:
                     if c.id in player.playable_from_exile:
                         player.playable_from_exile.remove(c.id)
                     c._adventure_exiled = False
-                    print(f"[IMPULSE-DRAW] AI casting {c.name} from exile")
+                    # Aug 10 audit (F6): name the mechanic. Foretell is not
+                    # impulse (CR 702.143 vs the Light-Up-the-Stage family)
+                    # and legal_actions deliberately keeps foretold cards OFF
+                    # `playable_from_exile` to keep them distinct — logging
+                    # both under one tag misdirects an audit grepping impulse
+                    # windows. Behaviour is unchanged; only the tag moves.
+                    _exile_mech = ('FORETELL-CAST'
+                                   if getattr(c, '_foretold', False)
+                                   else 'IMPULSE-DRAW')
+                    print(f"[{_exile_mech}] AI casting {c.name} from exile")
 
             # Cast from the TOP OF LIBRARY (Augur of Autumn's coven half).
             # Same pre-move-to-hand contract as the exile branch above:
@@ -4161,7 +4170,16 @@ class GameEngine:
                     if perm in player.battlefield:
                         game.unregister_static_effects(perm)
                         player.battlefield.remove(perm)
-                        player.graveyard.append(perm)
+                        # Aug 10 audit (F2): route instead of a bare append.
+                        # CR 702.83a (an unearthed permanent leaving the
+                        # battlefield is EXILED), CR 404.3 (owner's graveyard,
+                        # not the holder's) and CR 903.9a all apply to a
+                        # sacrifice exactly as they do to a destroy — this
+                        # branch and its two siblings were the last
+                        # battlefield-exit paths still appending by hand.
+                        from mtg.helpers import route_dead_permanent
+                        route_dead_permanent(game, perm, player,
+                                             reason='sacrificed as a cost')
                         sacrificed_self = True
                         print(f"[ACTIVATE-CLAUDE] Sacrificed {perm.name} as cost")
                         # June 10 audit (V15, CR 700.4): self-sacrifice IS a
@@ -4270,7 +4288,15 @@ class GameEngine:
                             sac_power_snapshot = 0
                         game.unregister_static_effects(sac_target)
                         player.battlefield.remove(sac_target)
-                        player.graveyard.append(sac_target)
+                        # Aug 10 audit (F2) — see the self-sacrifice sibling
+                        # above. Live case: an unearthed Dregscape Zombie fed
+                        # to Altar of Dementia landed in the GRAVEYARD, so it
+                        # was immediately unearthable again — a {B}-per-cycle
+                        # mill loop the strategist was actively assembling
+                        # (game 1536017757303341078).
+                        from mtg.helpers import route_dead_permanent
+                        route_dead_permanent(game, sac_target, player,
+                                             reason='sacrificed as a cost')
                         print(f"[ACTIVATE-CLAUDE] Sacrificed {sac_target.name} as cost for {perm.name}")
                         # [SACRIFICE-TRIGGER] Fire Korvold/Mayhem Devil/etc.
                         # for sacrifice-as-cost (fetchlands, Greater Gargadon-style).

@@ -2314,15 +2314,85 @@ class EffectTemplateLibrary:
             ],
         ))
 
-        # --- Goblin Rabblemaster: attack trigger creates a 1/1 Goblin
-        # token tapped and attacking, plus +1/+1 to other Goblins until EOT.
-        # game_1506623254943498252:213 escalated to Tier 3 and silently
-        # produced no state change — token never appeared.
-        #
-        # Uses pump_all_creatures with subtype + exclude_name filters (added
-        # May 20). NOTE: `pump_subtype` was a typo in an earlier draft — the
-        # action handler doesn't exist; pump_all_creatures with `subtype` is
-        # the correct path.
+        # --- Goblin Rabblemaster (Aug 10 audit) ---
+        # The JSON entry this replaces was wrong in three ways at once and
+        # the stale comment here endorsed all three. Printed text, three
+        # SEPARATE abilities:
+        #   "Other Goblin creatures you control attack each combat if able.
+        #    At the beginning of combat on your turn, create a 1/1 red Goblin
+        #      creature token with haste.
+        #    Whenever this creature attacks, IT gets +1/+0 until end of turn
+        #      for each other attacking Goblin."
+        # The old attack entry (a) minted a tapped, attacking token the ATTACK
+        # trigger does not create — a phantom third attacker every combat —
+        # (b) pumped every OTHER Goblin instead of the source, and (c) used
+        # +1/+1 instead of +1/+0 and did not scale. game_1536023731808509984.
+        # The token half belongs to beginning-of-combat and is registered
+        # under the sanctioned suffix key so it also stops taking a Tier-3
+        # call per combat and arrives in time to attack with its haste.
+        def _gen_rabblemaster_attack(ctrl, opp, ctx):
+            """+1/+0 for each OTHER attacking Goblin, on the source only."""
+            if ctx.get('damage_dealt'):
+                return []
+            name = ctx.get('attacking_name') or "Goblin Rabblemaster"
+            game_obj = ctx.get('_game')
+            battlefield = ctx.get('controller_battlefield', []) or []
+            # game.attackers is the authoritative per-combat list; a stale
+            # `.attacking` flag fired Battalion with two attackers in
+            # game_1532756674203619470, so prefer the list and keep the flag
+            # only as the no-_game fallback.
+            attacker_ids = (set(getattr(game_obj, 'attackers', None) or [])
+                            if game_obj is not None else None)
+
+            def _attacking(creature):
+                if attacker_ids is not None:
+                    return getattr(creature, 'id', None) in attacker_ids
+                return getattr(creature, 'attacking', False)
+
+            others = 0
+            for creature in battlefield:
+                if getattr(creature, 'name', '') == name:
+                    continue
+                if 'goblin' not in (getattr(creature, 'type_line', '') or '').lower():
+                    continue
+                if _attacking(creature):
+                    others += 1
+            if others <= 0:
+                return [{"action": "no_action",
+                         "reason": "Goblin Rabblemaster: no other attacking Goblins"}]
+            # `include_name` / `include_id` are the keys the handler actually
+            # reads — a plausible-looking invented key (the first draft said
+            # `name_filter`) is silently ignored, which here would have pumped
+            # the WHOLE team instead of the source. Always execute new
+            # vocabulary against real state before shipping it.
+            action = {"action": "pump_all_creatures", "player": ctrl,
+                      "include_name": name, "power": others, "toughness": 0,
+                      "source": "Goblin Rabblemaster"}
+            attacking_obj = ctx.get('_attacking_creature')
+            if attacking_obj is not None and getattr(attacking_obj, 'id', None):
+                action["include_id"] = attacking_obj.id
+            return [action]
+
+        self._add_attack_card("goblin rabblemaster", EffectTemplate(
+            name="Goblin Rabblemaster (attack)",
+            description="Gets +1/+0 until end of turn for each other attacking Goblin",
+            action_generator=_gen_rabblemaster_attack,
+        ))
+
+        # Suffix key, never the bare name: _NAME_KEYED_EVENT_TYPES covers
+        # both `beginning_combat` and `etb`, so a bare key would also mint a
+        # Goblin on Rabblemaster's own ETB — the re-fire class the suffix
+        # convention exists to prevent.
+        self._add_card("goblin rabblemaster beginningcombat", EffectTemplate(
+            name="Goblin Rabblemaster (beginning of combat)",
+            description="Create a 1/1 red Goblin creature token with haste",
+            action_generator=lambda ctrl, opp, ctx: [
+                {"action": "create_token", "player": ctrl, "name": "Goblin",
+                 "power": 1, "toughness": 1, "types": "Creature — Goblin",
+                 "count": 1, "colors": ["R"], "keywords": ["Haste"]},
+            ],
+        ))
+
         # June 10 audit (V31f): Drakuseth — the generic attack pattern only
         # captured the FIRST number of "deals 4 damage to any target and 3
         # damage to each of up to two other targets" (4 of up to 10) and
@@ -6467,12 +6537,22 @@ class EffectTemplateLibrary:
             name="Vivien Champion +1 Vigilance+Reach",
             description="Until end of turn, target creature you control gains vigilance and reach",
             action_generator=lambda ctrl, opp, ctx: (
+                # Aug 10 audit: honour the target the engine already chose.
+                # `best_own_creature` is controller_creatures[0], i.e.
+                # battlefield INSERTION order, so the grant landed on the
+                # oldest creature forever while [PW-TARGET] one line above
+                # announced a different one (game 1536000998537953280 — the
+                # two console lines contradicted each other). The Aminatou
+                # template two dozen lines up already reads
+                # explicit_target_name first; this is that unadopted fix.
                 [{"action": "grant_keywords", "player": ctrl,
-                  "target_card": ctx.get('best_own_creature', ''),
+                  "target_card": (ctx.get('explicit_target_name')
+                                  or ctx.get('best_own_creature', '')),
                   "keywords": ["Vigilance", "Reach"],
                   "duration": "end_of_turn",
                   "source": "Vivien, Champion of the Wilds"}]
-                if ctx.get('best_own_creature') else
+                if (ctx.get('explicit_target_name')
+                    or ctx.get('best_own_creature')) else
                 [{"action": "no_action",
                   "reason": "Vivien's +1 has no legal target (no creature you control)"}]
             ),

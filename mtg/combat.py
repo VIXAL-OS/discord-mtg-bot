@@ -358,6 +358,26 @@ def resolve_combat_damage(rules, game: GameState) -> List[str]:
                                 messages.append(f"💥 {_att.name} trigger: {_msg}")
                         print(f"[COMBAT-TRIGGER] {_att.name} (equipment on "
                               f"{attacker.name}): {_explanation}")
+                    elif not _equipment_charge_claims(_att):
+                        # Aug 10 audit: with no template this branch used to
+                        # fall through with NO else — no queue, no tag — so
+                        # the whole untemplated equipment combat-damage class
+                        # vanished without a trace. Sword of Light and Shadow
+                        # connected three times in
+                        # game_1536023936116981932 and its 3 life + graveyard
+                        # return never happened, invisibly: the sibling
+                        # watcher loop twelve lines up has printed
+                        # [COMBAT-WATCHER-UNHANDLED] and queued since July.
+                        # The silence was worse than the drop — no audit grep
+                        # could find it.
+                        #
+                        # Umezawa's Jitte is excluded because its charge
+                        # counters are ALREADY applied by
+                        # fire_equipped_combat_damage_counters below; queueing
+                        # it would double-fire and burn a Tier-3 call.
+                        from mtg.triggers import queue_unhandled_combat_damage
+                        queue_unhandled_combat_damage(
+                            game, _att, attacker_owner, damage_amount)
                 except Exception as e:
                     # Crash barrier mirroring the sibling attacker-loop catch;
                     # visible in strict batches via maybe_reraise.
@@ -836,6 +856,23 @@ def apply_combat_damage_to_creature(rules, game: GameState, creature: Card,
                 _dealer_id, set()).add(getattr(creature, 'id', ''))
         fire_equipped_combat_damage_counters(game, source_card)
     return amount
+
+
+_EQUIP_CHARGE_CLAIM = re.compile(
+    r'whenever equipped creature deals combat damage[^.]*?put '
+    r'(?:a|one|two|three|four|\d+) charge counters? on', re.IGNORECASE)
+
+
+def _equipment_charge_claims(equipment) -> bool:
+    """Is this equipment's combat-damage trigger already consumed by
+    fire_equipped_combat_damage_counters?
+
+    Umezawa's Jitte has no template, so the untemplated-equipment queue added
+    Aug 10 would otherwise escalate it to Tier 3 on every connect — on top of
+    the charge counters the deterministic path has already applied. Mirrors
+    that function's own parse so the two cannot drift.
+    """
+    return bool(_EQUIP_CHARGE_CLAIM.search(getattr(equipment, 'oracle_text', '') or ''))
 
 
 def fire_equipped_combat_damage_counters(game: GameState, dealer: Card) -> None:

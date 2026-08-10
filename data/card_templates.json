@@ -69,38 +69,6 @@
       ]
     },
     {
-      "key": "goblin rabblemaster",
-      "name": "Goblin Rabblemaster (attack)",
-      "event": "attack",
-      "description": "Create a 1/1 red Goblin tapped attacking; other Goblins get +1/+1 until EOT",
-      "actions": [
-        {
-          "action": "create_token",
-          "player": "$controller",
-          "name": "Goblin",
-          "power": 1,
-          "toughness": 1,
-          "types": "Creature — Goblin",
-          "count": 1,
-          "tapped": true,
-          "attacking": true,
-          "colors": [
-            "R"
-          ],
-          "attacking_player": "$opponent"
-        },
-        {
-          "action": "pump_all_creatures",
-          "player": "$controller",
-          "subtype": "Goblin",
-          "exclude": "Goblin Rabblemaster",
-          "power": 1,
-          "toughness": 1,
-          "source": "Goblin Rabblemaster attack anthem"
-        }
-      ]
-    },
-    {
       "key": "grave titan",
       "name": "Grave Titan (attack)",
       "event": "attack",

@@ -1696,6 +1696,9 @@ Respond with a JSON action. Examples:
 {"type": "suspend", "card": "Rift Bolt"}
 {"type": "foretell", "card": "Quakebringer"}
 {"type": "graveyard_activate", "card": "Angel of Sanctions", "mechanic": "embalm"}
+{"type": "crew", "vehicle": "Smuggler's Copter"}
+{"type": "companion", "card": "Lurrus of the Dream-Den"}
+{"type": "cycle", "card": "Shark Typhoon"}
 {"type": "activate", "permanent": "Chandra, Pyromaster", "ability": 0}
 {"type": "activate", "permanent": "Nicol Bolas, Dragon-God", "ability": 1}
 {"type": "resolve", "description": "Mystic Sanctuary ETB — put Counterspell on top of library"}
@@ -2676,6 +2679,8 @@ ACTION GRAMMAR:
 - {"type": "crew", "vehicle": "Smuggler's Copter"} — tap creatures with total power ≥ the crew cost; the Vehicle becomes an artifact creature until end of turn (the 🚗 hint lists candidates; crew BEFORE attacking)
 - {"type": "foretell", "card": "Quakebringer"} — pay {2} to exile it face down; cast it on a LATER turn for its (cheaper) foretell cost. The castable list marks these [FORETELL ...] and, once foretold, [FORETOLD — cast from exile]
 - {"type": "graveyard_activate", "card": "Angel of Sanctions", "mechanic": "embalm"} — embalm / eternalize / unearth a card in your GRAVEYARD (mechanic is one of those three). Sorcery speed only. The castable list marks these [EMBALM/ETERNALIZE/UNEARTH from graveyard]
+- {"type": "companion", "card": "Lurrus of the Dream-Den"} — pay {3} to move your COMPANION from the companion zone to your hand (you still have to cast it afterwards). The castable list marks it [COMPANION]
+- {"type": "cycle", "card": "Shark Typhoon"} — pay the cycling cost, discard it, draw a card. The castable list marks these [CYCLING ...]
 - {"type": "cast", "card": "Commit // Memory", "adventure": "Memory"} — cast one half of a split card. An [AFTERMATH from graveyard] half is cast from the GRAVEYARD; name the half
 - {"type": "activate", "permanent": "Chandra, Pyromaster", "ability": 0}
 - {"type": "resolve", "description": "<one short imperative clause, no reasoning>"}

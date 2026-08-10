@@ -2437,7 +2437,12 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
                 sac_target = min(sac_pool, key=_safe_power)
             game.unregister_static_effects(sac_target)
             player.battlefield.remove(sac_target)
-            player.graveyard.append(sac_target)
+            # Aug 10 audit (F2): the manual !activate twin of the two
+            # engine.py sacrifice-cost sites — same CR 702.83a / 404.3 /
+            # 903.9a routing, the documented two-paths divergence.
+            from mtg.helpers import route_dead_permanent
+            route_dead_permanent(game, sac_target, player,
+                                 reason='sacrificed as a cost')
             non_self_sacrificed = sac_target.name
             print(f"[ACTIVATE-COST] {player.name} sacrificed {sac_target.name} for {card.name}")
             # Fire sacrifice triggers (Korvold, Blood Artist, Mayhem Devil, etc.)

@@ -670,9 +670,21 @@ def auto_build_deck(pool: List[Card], deck_size: int = 40) -> Tuple[List[Card], 
     if not main_colors:
         main_colors = ['W', 'U']  # Default if pool is all colorless
 
-    # Score each card for the chosen colors
-    nonland_pool = [c for c in pool if 'land' not in (c.type_line or '').lower() or c.oracle_text]
-    land_pool = [c for c in pool if 'land' in (c.type_line or '').lower() and not c.oracle_text]
+    # Score each card for the chosen colors.
+    #
+    # Aug 10 audit (F4): the split used to read
+    #   nonland_pool = [... if 'land' not in type_line OR c.oracle_text]
+    #   land_pool    = [... if 'land' in type_line AND not c.oracle_text]
+    # so ANY land with rules text — i.e. every nonbasic land a 360-card cube
+    # contains — was classified as a SPELL. Two consequences, both visible in
+    # game 1536017666509119572, where both drafted decks came out 21 lands /
+    # 19 spells instead of 17/23: drafted lands ate the 23 nonland slots while
+    # being ranked by a spell-scoring function, and `land_pool` could only
+    # ever hold VANILLA lands (of which a cube has none), making the
+    # deck_lands_from_pool loop below dead code. A land is a land.
+    _is_land = lambda c: 'land' in (c.type_line or '').lower()
+    nonland_pool = [c for c in pool if not _is_land(c)]
+    land_pool = [c for c in pool if _is_land(c)]
 
     scored = []
     for card in nonland_pool:
@@ -685,9 +697,15 @@ def auto_build_deck(pool: List[Card], deck_size: int = 40) -> Tuple[List[Card], 
     deck_nonlands = [card for card, _ in scored[:num_nonlands]]
     sideboard_nonlands = [card for card, _ in scored[num_nonlands:]]
 
-    # Also add any special lands from the pool
+    # Also add any special lands from the pool. Now that this loop is
+    # reachable (F4) it needs the cap it never needed while dead: a seat can
+    # easily draft more than 17 lands, and without the bound `basics_needed`
+    # below goes NEGATIVE and the deck overshoots deck_size.
+    num_land_slots = deck_size - num_nonlands
     deck_lands_from_pool = []
     for land in land_pool:
+        if len(deck_lands_from_pool) >= num_land_slots:
+            break
         land_colors = _get_card_colors(land)
         if not land_colors or any(c in main_colors for c in land_colors):
             deck_lands_from_pool.append(land)

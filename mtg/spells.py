@@ -3461,6 +3461,14 @@ async def _dispatch_resolution(engine, game: GameState, player: Player,
                 # upstream of this read.)
                 card._kicked_times = 0
 
+            # Aug 10 audit (F1): the GENERIC "enters with N <type> counters
+            # on it" catch-all, deliberately LAST so the four specific parses
+            # above (X +1/+1, shield, impending time, multikicker charge) keep
+            # their own arithmetic — apply_enters_with_counters skips a
+            # counter type that is already present.
+            from mtg.helpers import apply_enters_with_counters
+            effect_messages.extend(apply_enters_with_counters(card, allow_x=True))
+
         # DEVOUR (CR 702.81) — Aug 7 confirmation-batch audit (CO-3).
         effect_messages.extend(maybe_resolve_devour(engine, game, player, card))
 
@@ -3884,6 +3892,28 @@ async def _dispatch_resolution(engine, game: GameState, player: Player,
         # must be post-copy). The only early return between the battlefield
         # append and this point is the aura fizzle, verified July 20.
         if card in player.battlefield:
+            # Aug 10 audit (CRITICAL, class): register the entering
+            # permanent's OWN statics and replacement effects BEFORE the
+            # emit, because the slice-2b subscriber runs the creature-enters
+            # watchers and those deal damage. Gisela, Blade of Goldnight
+            # entered and Warstorm Surge dealt an UNDOUBLED 5 and Purphoros
+            # an UNDOUBLED 2 (game 1536023907918680074) while the very same
+            # doubler modified combat damage correctly minutes later — the
+            # registration sat ~40 lines below. A static ability functions
+            # from the moment the permanent is on the battlefield (CR 604.3 /
+            # 611.2); its ETB triggers resolve strictly later (CR 603.3d).
+            # The noncast sibling in mtg/actions.py already registers before
+            # emitting; the cast path was the anomaly.
+            #
+            # This is a MOVE, not an addition: ReplacementEngine.add_effect
+            # is a bare append with no dedup, so leaving the later call in
+            # place would register Gisela twice and QUADRUPLE the damage.
+            game.register_static_keyword_grants(card, player.name)
+            game.register_static_pt_effects(card, player.name)
+            game.register_replacement_effects(card, player.name)
+            game.recalculate_granted_keywords()
+            game.recalculate_power_toughness()
+            card._statics_registered_on_entry = True
             events.emit(events.PERMANENT_ENTERED, game, card=card,
                         controller=player, via="cast", rules=engine.rules)
             # Slice 2b (July 21): the emit above ran the creature watcher
@@ -3920,9 +3950,14 @@ async def _dispatch_resolution(engine, game: GameState, player: Player,
                 engine, game, player, card)
             effect_messages.extend(equipment_watcher_msgs)
 
-    # [LAYERS] Register static keyword-granting abilities and recalculate
-    # [REPLACEMENT] Register replacement effects (Furnace of Rath, Rest in Peace, etc.)
-    if card in player.battlefield:
+    # [LAYERS] / [REPLACEMENT] registration MOVED above the
+    # PERMANENT_ENTERED emit (Aug 10 audit) so the entering permanent's own
+    # statics are live before its entry fires other permanents' watchers.
+    # Kept here ONLY for the paths that never reached that branch (a card
+    # that arrives on the battlefield after the emit block, e.g. a
+    # resolution-time move), and guarded so a permanent already registered
+    # above is not registered a second time — add_effect has no dedup.
+    if card in player.battlefield and not getattr(card, '_statics_registered_on_entry', False):
         game.register_static_keyword_grants(card, player.name)
         game.register_static_pt_effects(card, player.name)
         game.register_replacement_effects(card, player.name)

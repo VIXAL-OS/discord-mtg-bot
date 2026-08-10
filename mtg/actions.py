@@ -215,11 +215,17 @@ def _fire_noncast_battlefield_entry(rules, game: GameState,
     processing, is gated on engine_ref, and re-runs under Panharmonicon
     doubling; none of those should gate or duplicate the entry event.
     """
+    # Aug 10 audit (F1): the enters-with-counters clause is a replacement
+    # effect, not a trigger, so it must apply even when there is no engine
+    # ref to run trigger processing with — hence ABOVE the gate below.
+    from mtg.helpers import apply_enters_with_counters
+    entry_counter_msgs = apply_enters_with_counters(card)
+
     engine = getattr(rules, 'engine_ref', None)
     if engine is None:
-        return []
+        return entry_counter_msgs
 
-    messages: List[str] = []
+    messages: List[str] = list(entry_counter_msgs)
     oracle = card.oracle_text or ''
     if oracle:
         from mtg.triggers import _is_self_etb_trigger_paragraph
@@ -5589,33 +5595,13 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
             # death (game_1529674672545988631, free-life loop). Mirrors the
             # destroy block, counter gates included. A CZ-redirected commander
             # never reached the graveyard, so the save can't apply.
+            # Aug 10: extracted to mtg.sba.apply_death_save_on_sacrifice so the
+            # Phyrexian Tower tap-sacrifice path (which had NO save chain at
+            # all) shares one implementation instead of a fourth hand copy.
             save_msgs = []
-            if (victim.is_creature() and not getattr(victim, 'is_token', False)
-                    and not moved_to_command_zone and victim in p.graveyard):
-                _ret_label = _ret_counter = None
-                if ((victim.has_keyword('Undying')
-                     or rules._permanent_grants_undying(game, victim, p))
-                        and victim.counters.get('+1/+1', 0) == 0):
-                    _ret_label, _ret_counter = 'UNDYING', '+1/+1'
-                elif victim.has_keyword('Persist') and victim.counters.get('-1/-1', 0) == 0:
-                    _ret_label, _ret_counter = 'PERSIST', '-1/-1'
-                if _ret_label:
-                    p.graveyard.remove(victim)
-                    victim.damage_marked = 0
-                    victim.deathtouch_damage = 0
-                    victim.summoning_sick = True
-                    victim.counters[_ret_counter] = victim.counters.get(_ret_counter, 0) + 1
-                    p.battlefield.append(victim)
-                    print(f"[{_ret_label}] {victim.name} returned to battlefield with "
-                          f"{_ret_counter} counter (sacrifice)")
-                    save_msgs.append(
-                        f"♻️ {victim.name} returns with {_ret_label.lower()} ({_ret_counter} counter)!")
-                    game.register_static_keyword_grants(victim, p.name)
-                    game.register_static_pt_effects(victim, p.name)
-                    from mtg.sba import _finalize_death_save_return
-                    save_msgs.extend(_finalize_death_save_return(rules, game, p, victim, _ret_label))
-                    game.recalculate_granted_keywords()
-                    game.recalculate_power_toughness()
+            if not moved_to_command_zone:
+                from mtg.sba import apply_death_save_on_sacrifice
+                save_msgs = apply_death_save_on_sacrifice(rules, game, p, victim)
             # July 24 batch-6 anomaly (reviewer A1 #7): the Butcher of Malakir
             # template's edict lines had no source prefix while the hardcoded
             # Grave Pact/Dictate path wraps its own — a 3-edict cascade showed

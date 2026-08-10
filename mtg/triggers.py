@@ -643,6 +643,15 @@ def _check_creature_etb_triggers_sync(engine, game: GameState, entering_player: 
     # wrong order (e.g., AP's ETB destroys something NAP's ETB was about
     # to read).
     for card, _ctrl_player, _ctrl_idx in reversed(_etb_collected):
+        # Aug 10 audit: SBAs are checked between resolutions, so once one
+        # trigger in this batch has killed a player the rest must not resolve
+        # (CR 104.2a / 704.3). Without this, Terror of the Peaks took Qwen to
+        # 0 and Impact Tremors then dealt 1 more and re-announced the loss
+        # (game_1536023747067252756). The combat-damage dispatch has had this
+        # guard since Aug 2; the ETB batch loop had no `game.ended` READ at
+        # all — only writes.
+        if getattr(game, 'ended', False):
+            break
         oracle_lower = card.oracle_text.lower()
         opponent = game.players[1 - _ctrl_idx]
         player_idx = _ctrl_idx
@@ -4232,7 +4241,19 @@ def _check_upkeep_triggers_sync(engine, game: GameState) -> Tuple[List[str], Lis
             mana_per_age = sum(int(m) for m in re.findall(r'\{(\d+)\}', cu_cost_text))
             colored_per_age = sum(1 for m in re.findall(r'\{([WUBRGC])\}', cu_cost_text))
             total_per_age = mana_per_age + colored_per_age
-            total_cost = total_per_age * age if total_per_age > 0 else age  # Default {1} per age
+            # Aug 10 audit: a LIFE cumulative upkeep (CR 702.24a) has no mana
+            # symbols at all, so both sums came back 0, the `else age` default
+            # took over and Glacial Chasm's "Pay 2 life" silently degraded to
+            # `age` GENERIC MANA — 12 life owed across three upkeeps, 0 paid,
+            # while the comment below claimed a separate life path existed
+            # (it did not). game_1536023907918680074.
+            life_per_age = 0
+            _life_m = re.search(r'pay (\d+) life', cu_cost_text)
+            if _life_m and total_per_age == 0:
+                life_per_age = int(_life_m.group(1))
+            life_cost = life_per_age * age
+            total_cost = total_per_age * age if total_per_age > 0 else (
+                0 if life_per_age else age)  # Default {1} per age
 
             # Check if controller can pay
             available_mana = sum(active.available_mana_detailed().values())
@@ -4247,10 +4268,16 @@ def _check_upkeep_triggers_sync(engine, game: GameState) -> Tuple[List[str], Lis
             if 'mystic remora' in card_name_lower:
                 pay_threshold = 3
             elif 'glacial chasm' in card_name_lower:
-                # Always worth paying Glacial Chasm's life cost while
-                # damage prevention is needed — handled separately.
+                # Glacial Chasm's cost is LIFE, so the mana threshold does not
+                # apply; the life affordability gate below governs instead.
                 pay_threshold = 999
             will_pay = (available_mana >= total_cost) and (total_cost <= pay_threshold)
+            if life_cost:
+                # Aug 10 audit: without a life-aware gate the fix above turns
+                # an under-charge into a SELF-KILL — pay_threshold=999 would
+                # cheerfully pay 2, 4, 6, 8, 10 life until the controller
+                # died. Keep a real buffer and let the permanent go instead.
+                will_pay = active.life - life_cost >= 5
             if will_pay:
                 # Pay the cost (tap lands)
                 mana_to_pay = total_cost
@@ -4266,18 +4293,30 @@ def _check_upkeep_triggers_sync(engine, game: GameState) -> Tuple[List[str], Lis
                     if not rock.is_land() and not rock.tapped and active._can_produce_mana(rock):
                         rock.tapped = True
                         mana_to_pay -= 1
-                messages.append(
-                    f"⏳ {card.name}: Cumulative upkeep paid ({total_cost} mana, age {age})")
-                print(f"[UPKEEP] {card.name} cumulative upkeep: age={age}, cost={total_cost}, paid")
+                if life_cost:
+                    active.life -= life_cost
+                    messages.append(
+                        f"⏳ {card.name}: Cumulative upkeep paid ({life_cost} life, "
+                        f"age {age}) (life: {max(0, active.life)})")
+                    print(f"[UPKEEP] {card.name} cumulative upkeep: age={age}, "
+                          f"cost={life_cost} life, paid")
+                else:
+                    messages.append(
+                        f"⏳ {card.name}: Cumulative upkeep paid ({total_cost} mana, age {age})")
+                    print(f"[UPKEEP] {card.name} cumulative upkeep: age={age}, cost={total_cost}, paid")
             else:
                 # Chose not to pay (or can't) — sacrifice
                 if card in active.battlefield:
                     game.unregister_static_effects(card)
                     active.battlefield.remove(card)
                     active.graveyard.append(card)
-                reason = "can't pay" if available_mana < total_cost else "declined to pay"
+                if life_cost:
+                    reason = "declined to pay"
+                    total_cost = f"{life_cost} life"
+                else:
+                    reason = "can't pay" if available_mana < total_cost else "declined to pay"
                 messages.append(
-                    f"⏳ {card.name}: {reason} cumulative upkeep ({total_cost} mana, age {age}) — sacrificed!")
+                    f"⏳ {card.name}: {reason} cumulative upkeep ({total_cost}, age {age}) — sacrificed!")
                 print(f"[UPKEEP] {card.name} cumulative upkeep: age={age}, cost={total_cost}, {reason} -> sacrificed")
             handled = True
 
@@ -4985,6 +5024,13 @@ def _handle_land_etb(engine, game: GameState, player: Player, card: Card) -> Lis
     # Track landfall count for Omnath and similar multi-landfall cards
     player.landfall_count_this_turn += 1
     print(f"[LANDFALL] {player.name}: land #{player.landfall_count_this_turn} this turn ({card.name})")
+
+    # Aug 10 audit (F1): lands never reach the cast funnel, so the four
+    # "enters with N counters" parses there could not see Dark Depths — it
+    # entered with ZERO ice counters instead of ten, which turned a {30}
+    # unlock into a single {3} activation (game 1536023819976835212).
+    from mtg.helpers import apply_enters_with_counters
+    messages.extend(apply_enters_with_counters(card))
 
     # === SPECIFIC LAND HANDLERS ===
     

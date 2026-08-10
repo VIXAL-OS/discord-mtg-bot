@@ -1165,6 +1165,123 @@ def parse_escapes_with_counters(oracle_text):
     return _NUMBER_WORDS.get(raw, 0)
 
 
+def parse_enters_with_counters(oracle_text):
+    """Parse the generic static clause "enters with N <type> counters on it".
+
+    CR 613.1d — this is a replacement effect applied AS the permanent enters,
+    not a trigger, so `_is_self_etb_trigger_paragraph` correctly refuses it and
+    nothing downstream ever added the counters. Four SPECIFIC parses already
+    exist in the cast funnel (X +1/+1, shield, impending time, multikicker
+    charge) plus a Wishclaw hardcode; this is the catch-all for everything
+    else, and it is what the four specific ones do NOT cover.
+
+    Aug 10 audit: the whole inventory was swept before this was written (the
+    alt-cost discipline). Nine cards carry the shape; seven are already served
+    by a specific parse. The two that were not:
+      - Dark Depths ("enters with ten ice counters on it") — a LAND, so it
+        never even reached the cast funnel. It entered with ZERO, which
+        collapsed a {30} unlock into one {3} activation and then handed the
+        sacrifice trigger to Tier 3, which fabricated a 2/2 Vampire in place
+        of the printed legendary 20/20 Marit Lage (game 1536023819976835212).
+      - Astral Cornucopia ("enters with X charge counters on it") — the X
+        parse is gated on `is_creature()` AND "+1/+1 counter", so an artifact
+        with X charge counters produced nothing. Latent; never drawn in that
+        batch.
+
+    Returns a list of (count, counter_type) pairs. `count` is None for an
+    X-based clause, which the caller resolves from the card's own `_x_value`
+    / `_mana_paid` — this parser deliberately does no mana arithmetic.
+    """
+    if not oracle_text:
+        return []
+    results = []
+    pattern = (r'enters (?:the battlefield )?(?:tapped )?with '
+               r'(x|\d+|an?|one|two|three|four|five|six|seven|eight|nine|ten)'
+               r'\s+([a-z][a-z+/0-9-]*(?:\s+[a-z][a-z+/0-9-]*)?)\s+counters?\s+on\s+it'
+               # A trailing "for each ..." makes the printed number a
+               # MULTIPLIER, not a total — Everflowing Chalice reads "enters
+               # with a charge counter on it FOR EACH TIME IT WAS KICKED", so
+               # flattening it to 1 gives an unkicked Chalice a free counter.
+               # Those shapes belong to their own specific parse; refuse them
+               # here rather than guess. (Caught by the Aug-2 multikicker pin
+               # on this fix's first run — the same "for each" lesson the
+               # Glaive/Ethereal Armor work turns on.)
+               r'(?!\s+for each)')
+    for match in re.finditer(pattern, oracle_text.lower()):
+        raw, ctype = match.group(1), match.group(2).strip()
+        if raw == 'x':
+            count = None
+        elif raw.isdigit():
+            count = int(raw)
+        elif raw in ('a', 'an'):
+            count = 1
+        else:
+            count = _NUMBER_WORDS.get(raw)
+            if count is None:
+                continue
+        results.append((count, ctype))
+    return results
+
+
+def apply_enters_with_counters(card, allow_x=False):
+    """Apply any generic "enters with N <type> counters" clause to `card`.
+
+    `allow_x` gates the X-based clause (Astral Cornucopia) and defaults to
+    OFF. CR 107.3b: X is zero everywhere except on the stack, so a REANIMATED
+    Astral Cornucopia enters with no charge counters — and `_x_value` is NOT
+    cleared by `reset_battlefield_state`, so trusting it off the cast path
+    would resurrect the X from a previous cast. Only the cast funnel, which
+    stamps `_x_value` moments earlier, passes True.
+
+    "+1/+1" is deliberately outside the parser's counter-type class for the
+    same reason: all four inventory cards with "enters with X +1/+1 counters"
+    are served by the cast funnel's own X parse, and catching them here would
+    expose them to the same stale-X hazard on reanimation.
+
+    Call this at a battlefield-entry seam. It is deliberately NON-STACKING:
+    a counter type that is already present is left alone, so the four
+    specific cast-funnel parses (which run their own arithmetic and may
+    legitimately have set a different number) always win, and calling this
+    from two seams for one entry cannot double the counters. A flicker is
+    unaffected because `reset_battlefield_state` clears `counters` first
+    (CR 400.7), so the re-entering object parses fresh.
+
+    Returns a list of player-facing messages (empty when nothing applied).
+    """
+    if not getattr(card, 'oracle_text', None):
+        return []
+    parsed = parse_enters_with_counters(card.oracle_text)
+    if not parsed:
+        return []
+    if not hasattr(card, 'counters') or card.counters is None:
+        card.counters = {}
+    messages = []
+    for count, ctype in parsed:
+        if count is None:
+            if not allow_x:
+                continue
+            # X-based: prefer the value stamped at cast time, else derive it
+            # from mana actually paid. No info means no counters rather than
+            # a guessed number — the Tier-3-fabrication lesson.
+            count = getattr(card, '_x_value', None)
+            if not count:
+                paid = getattr(card, '_mana_paid', 0) or 0
+                fixed = 0
+                for chunk in re.findall(r'\{(\d+)\}', (card.mana_cost or '').upper()):
+                    fixed += int(chunk)
+                fixed += sum((card.mana_cost or '').upper().count('{%s}' % c)
+                             for c in ('W', 'U', 'B', 'R', 'G'))
+                count = max(0, paid - fixed)
+            if not count:
+                continue
+        if card.counters.get(ctype, 0):
+            continue
+        card.counters[ctype] = count
+        messages.append(f"⭕ {card.name} enters with {count} {ctype} counter(s)")
+        print(f"[ENTERS-WITH-COUNTERS] {card.name}: {count} {ctype}")
+    return messages
+
+
 def owns_card(card, player_index):
     """Does the player at `player_index` OWN this card?
 
@@ -2060,7 +2177,8 @@ def strip_combat_state(game, card):
         pass
 
 
-def route_dead_permanent(game, card, holder, to_exile=False):
+def route_dead_permanent(game, card, holder, to_exile=False,
+                         reason='mass removal'):
     """Shared zone routing for a permanent DESTROYED/removed by a MASS
     handler — the class fix for the Aug 7 batch audit's G3-1 (CRITICAL).
 
@@ -2093,7 +2211,7 @@ def route_dead_permanent(game, card, holder, to_exile=False):
         _zone_owner.command_zone.append(card)
         print(f"  [CR-903.9] Commander {card.name} redirected from "
               f"{'exile' if to_exile else 'graveyard'} → command zone "
-              f"(owner={_zone_owner.name}, mass removal)")
+              f"(owner={_zone_owner.name}, {reason})")
         return 'command_zone'
     _dest_owner = owner_of(game, card, holder)
     if to_exile:
@@ -2101,7 +2219,8 @@ def route_dead_permanent(game, card, holder, to_exile=False):
         return 'exile'
     if unearthed_leaves_to_exile(card):
         _dest_owner.exile.append(card)
-        print(f"[UNEARTH] {card.name} destroyed → exiled (CR 702.83a, mass removal)")
+        print(f"[UNEARTH] {card.name} → exiled instead of graveyard "
+              f"(CR 702.83a, {reason})")
         return 'exile'
     _dest_owner.graveyard.append(card)
     return 'graveyard'

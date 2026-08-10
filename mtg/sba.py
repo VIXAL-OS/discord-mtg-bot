@@ -310,6 +310,53 @@ def check_sba_inline_fallback(rules, game: GameState) -> List[Dict]:
     return actions
 
 
+def apply_death_save_on_sacrifice(rules, game: GameState, player: Player,
+                                  victim: Card) -> List[str]:
+    """Run the undying / persist save chain for a SACRIFICED creature.
+
+    CR 702.92 / 702.77. Extracted Aug 10, 2026: this exact block had been
+    written out by hand at the sacrifice_permanent site (July 23) while the
+    Phyrexian Tower tap-sacrifice path had NO save chain at all, so a Young
+    Wolf fed to the Tower was permanently lost while an identical Butcher
+    Ghoul dying via SBA returned in the same game (1536023914910588968).
+    That is the FOURTH member of the "one death path lacks the chain" family
+    (May 30 spell damage, June 10 single destroy, July 23 sacrifice), so the
+    chain now lives in one function instead of being copied a fourth time.
+
+    Caller contract: `victim` must already be in `player.graveyard` — a
+    commander redirected to the command zone never reaches it, and the save
+    cannot apply. Returns display messages (empty when no save fires).
+    """
+    if not (victim.is_creature() and not getattr(victim, 'is_token', False)
+            and victim in player.graveyard):
+        return []
+    label = counter_type = None
+    if ((victim.has_keyword('Undying')
+         or rules._permanent_grants_undying(game, victim, player))
+            and victim.counters.get('+1/+1', 0) == 0):
+        label, counter_type = 'UNDYING', '+1/+1'
+    elif victim.has_keyword('Persist') and victim.counters.get('-1/-1', 0) == 0:
+        label, counter_type = 'PERSIST', '-1/-1'
+    if not label:
+        return []
+    player.graveyard.remove(victim)
+    victim.damage_marked = 0
+    victim.deathtouch_damage = 0
+    victim.summoning_sick = True
+    victim.counters[counter_type] = victim.counters.get(counter_type, 0) + 1
+    player.battlefield.append(victim)
+    print(f"[{label}] {victim.name} returned to battlefield with "
+          f"{counter_type} counter (sacrifice)")
+    msgs = [f"♻️ {victim.name} returns with {label.lower()} "
+            f"({counter_type} counter)!"]
+    game.register_static_keyword_grants(victim, player.name)
+    game.register_static_pt_effects(victim, player.name)
+    msgs.extend(_finalize_death_save_return(rules, game, player, victim, label))
+    game.recalculate_granted_keywords()
+    game.recalculate_power_toughness()
+    return msgs
+
+
 def _finalize_death_save_return(rules, game: GameState, player: Player,
                                 card: Card, save_label: str) -> List[str]:
     """Shared cleanup when a death save (undying / persist) keeps a creature

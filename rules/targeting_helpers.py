@@ -183,7 +183,14 @@ def _card_to_targetable(card, ctrl_name, zone="battlefield", game=None):
 
     prot_list = []
     oracle = card.oracle_text or ''
-    prot_matches = re.findall(r'protection from (\w+(?:\s+and\s+\w+)?)', oracle.lower())
+    # Aug 10 audit: the old class was (\w+(?:\s+and\s+\w+)?), which on the
+    # standard "protection from white and from BLACK" template captures
+    # 'white and from' — the second colour was silently dropped for every
+    # card printing that wording, equipment or not. Allow the repeated
+    # "and [from] <colour>" tail; the loop below already ignores the
+    # connective words.
+    prot_matches = re.findall(
+        r'protection from (\w+(?:\s+and\s+(?:from\s+)?\w+)*)', oracle.lower())
     cmap = {"white": "W", "blue": "U", "black": "B", "red": "R", "green": "G"}
     for pt in prot_matches:
         pc = set()
@@ -901,6 +908,41 @@ def _parse_target_restriction_from_oracle(card):
             all_types.discard(TargetType.PERMANENT)
         if all_types:
             restriction.target_types = all_types
+
+        # Aug 10 audit (CRITICAL): the CONTROLLER field is taken from the
+        # FIRST "target ..." phrase only, and the caller then applies that one
+        # restriction to EVERY action a template emits. On a card whose target
+        # phrases disagree about controller that is guaranteed to be wrong for
+        # at least one action, and both directions were observed live:
+        #   - Blizzard Brawl ("target creature you control AND target creature
+        #     you don't control") took YOU from phrase 1, so the _can_target
+        #     closure rejected every opponent creature, best_opponent_creature
+        #     came back None and the template no-opped — mana and card spent
+        #     for nothing with legal targets on both sides
+        #     (game 1536023840566546562).
+        #   - Kogla ("fights up to one target creature you don't control")
+        #     took OPPONENT, so the fight's back-damage action — which
+        #     correctly targets the SOURCE — was rejected and Inferno Titan's
+        #     6 damage to Kogla silently vanished (game 1536023731808509984).
+        # CR 601.2c / 701.12a: each target has its OWN restriction. Until the
+        # caller carries per-action restrictions, the only sound shared value
+        # is ANY. This can only LOOSEN a backstop check (the template still
+        # chooses the actual targets); the status quo provably BLOCKS legal
+        # actions, which is the worse failure.
+        # Each phrase must stop at the NEXT "target", not at the sentence
+        # terminator: Blizzard Brawl's two clauses share one sentence
+        # ("...target creature you control and target creature you don't
+        # control."), so a [^.;] scan swallows the second phrase inside the
+        # first match and finditer then resumes past the period, seeing only
+        # ONE controller and missing the disagreement entirely.
+        phrase_controllers = set()
+        for phrase_match in re.finditer(
+                r'target\s+(.{1,200}?)(?=\btarget\b|[.;]|$)', stripped):
+            sub = TargetTextParser.parse('target ' + phrase_match.group(1))
+            if sub is not None:
+                phrase_controllers.add(sub.controller)
+        if len(phrase_controllers) > 1:
+            restriction.controller = ControllerRestriction.ANY
         return restriction
     except Exception as e:
         print(f"[TARGETING] _parse_target_restriction_from_oracle error: {e}")

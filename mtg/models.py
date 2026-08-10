@@ -492,6 +492,36 @@ def _restricts_combat(oracle: str, what: str) -> bool:
     return f"can't {what}" in oracle
 
 
+# Aug 10 audit: a global, controller-side "creatures you control can't attack"
+# static (Glacial Chasm). ANCHORED on the whole sentence rather than a
+# substring, because the loose test is the exact inversion this codebase has
+# now shipped seven times: an inventory sweep of all cached cards for
+# "can't attack" returns four hits, and TWO of them — Ghostly Prison and
+# Sphere of Safety ("creatures can't attack YOU unless their controller
+# pays…") — are taxes on the OPPONENT. A substring check would blank their
+# own controller's attacks instead. Port Razer's "can't attack a player it
+# has already attacked" is the fourth and is likewise not this shape.
+_CONTROLLER_ATTACK_LOCK = re.compile(
+    r"creatures you control can't attack(?:\.|$)", re.IGNORECASE)
+
+
+def _controller_forbids_attacking(game, creature) -> bool:
+    """True when a permanent the creature's controller controls prints a
+    blanket "creatures you control can't attack."."""
+    try:
+        for player in getattr(game, 'players', []) or []:
+            if creature not in player.battlefield:
+                continue
+            for permanent in player.battlefield:
+                oracle = (getattr(permanent, 'oracle_text', '') or '')
+                if _CONTROLLER_ATTACK_LOCK.search(oracle):
+                    return True
+            return False
+    except (AttributeError, TypeError):
+        return False
+    return False
+
+
 @dataclass
 class Card:
     """Represents a card in any zone."""
@@ -624,6 +654,13 @@ class Card:
     # cast (CR 702.33c). Registry-gated auto-kick (helpers.MULTIKICKER_
     # MODELED); templates read it as ctx['kicked_times']. Reset per cast.
     _kicked_times: int = field(default=0, repr=False, compare=False)
+    # Aug 10 audit: set when the cast funnel registers this permanent's
+    # statics/replacements BEFORE emitting PERMANENT_ENTERED, so the
+    # legacy registration further down the same function does not run a
+    # second time — ReplacementEngine.add_effect has no dedup, and a
+    # double registration quadruples a damage doubler. Cleared on every
+    # battlefield exit so a flicker or recast registers afresh.
+    _statics_registered_on_entry: bool = field(default=False, repr=False, compare=False)
     # Aug 3 2026: the cards spliced onto THIS spell for this cast (CR 702.46).
     # Unlike its four siblings above, which are flags read off the card being
     # cast, this holds live Card references to cards that stay in the caster's
@@ -848,6 +885,7 @@ class Card:
         # gone") with no player-visible explanation. A new object has none
         # of its old state (CR 400.7).
         self.counters = {}
+        self._statics_registered_on_entry = False
         self._reanimated_by_aura_id = None
         # Linked exile belongs to this specific battlefield object. A Scepter
         # that leaves and later returns is a new object with no imprint link.
@@ -1855,6 +1893,16 @@ class Card:
         # did not exist anywhere in the engine (the creature blocked and
         # killed a commander at six permanents, game_1535486721779568700).
         if not self._city_blessing_combat_ok(game):
+            return False
+        # Aug 10 audit (CRITICAL, game-deciding): a GLOBAL, non-Aura "creatures
+        # you control can't attack" static had no consultation point anywhere.
+        # can_attack only ever looked at attachments on the creature itself and
+        # can_attack_with only adds attack TAXES — its scan explicitly skips
+        # the attacking player's own battlefield — so Glacial Chasm's entire
+        # drawback was inert while its damage-prevention half worked. Qwen
+        # attacked out from under it for 12 commander damage and won
+        # (game_1536023907918680074). CR 508.1c.
+        if game is not None and _controller_forbids_attacking(game, self):
             return False
         return True
 
@@ -3115,6 +3163,35 @@ class Player:
                 print(f"[PHYREXIAN-TOWER] sacrifice-trigger dispatch failed: {_st_err}")
                 from mtg.util import maybe_reraise
                 maybe_reraise(_st_err)
+
+            # Aug 10 audit: the undying / persist / totem-armor / shield
+            # death-SAVE chain. This path fired dies-triggers and sacrifice
+            # triggers but never ran the save chain, so a Young Wolf fed to
+            # Phyrexian Tower was PERMANENTLY lost while an identical Butcher
+            # Ghoul dying via SBA returned correctly in the same game
+            # (game_1536023914910588968) — and the console line above it
+            # claimed "Undying/self-death trigger handled by SBA engine",
+            # which is false on this path because the creature never reaches
+            # SBA. Fourth sibling of the same family (May 30 spell damage,
+            # June 10 single destroy, Aug 3 sacrifice-as-cost).
+            try:
+                from mtg.sba import apply_death_save_on_sacrifice
+                rules_engine = getattr(game, '_rules_engine', None)
+                if rules_engine is not None:
+                    save_msgs = apply_death_save_on_sacrifice(
+                        rules_engine, game, self, victim) or []
+                    if save_msgs:
+                        pq = getattr(game, '_pending_messages', None)
+                        if pq is None:
+                            pq = []
+                            game._pending_messages = pq
+                        pq.extend(save_msgs)
+                        print(f"[PHYREXIAN-TOWER] death save returned "
+                              f"{victim.name}")
+            except (ValueError, KeyError, AttributeError, TypeError, ImportError) as _sv_err:
+                print(f"[PHYREXIAN-TOWER] death-save chain failed: {_sv_err}")
+                from mtg.util import maybe_reraise
+                maybe_reraise(_sv_err)
         return victim
 
     def _fire_tap_for_mana_bonuses(self, land_card, production: dict) -> None:
