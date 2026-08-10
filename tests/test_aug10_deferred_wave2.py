@@ -649,19 +649,37 @@ class TestGSeamTemplatesAndTiming:
         assert not res.success, (
             "no legal target for the ONLY restriction is a genuine failure")
 
-    def test_full_mode_attribution_is_still_a_flat_list(self):
-        """Honest scope guard. ExecutionContext.targets remains ONE FLAT LIST
-        consumed positionally by ~20 executors, so a surviving clause can still
-        be paired with another clause's target. Skipping a miss is strictly
-        better than fizzling, but it is NOT attribution — if this ever changes,
-        this pin should be the thing that fails and gets rewritten."""
-        from rules.effects import ExecutionContext
+    def test_mode_attribution_landed_and_the_consumers_were_updated(self):
+        """This pin used to assert that targets were STILL a flat list, and
+        said that if per-clause attribution ever landed it should be the thing
+        that fails and gets rewritten. It landed on Aug 10, so this is that
+        rewrite (deliberately not a deletion — the property it guards is still
+        worth guarding, just inverted).
+
+        Attribution lives on Effect.selected_targets rather than on the
+        context, because keying by POSITION was unsound: parse_effects returns
+        effects in pattern-declaration order while restrictions are
+        position-sorted. What must hold now is that no consumer reads the flat
+        list directly — every one goes through the accessor that prefers the
+        clause's own targets."""
         import dataclasses
-        names = {f.name for f in dataclasses.fields(ExecutionContext)}
-        assert 'targets' in names
-        assert 'targets_by_restriction' not in names, (
-            "if per-restriction targets landed, update the ~20 positional "
-            "consumers and retire this pin")
+        import inspect
+        from rules.effects import Effect, ExecutionContext
+        from rules import spell_resolver
+
+        assert 'targets' in {f.name for f in dataclasses.fields(ExecutionContext)}
+        assert 'selected_targets' in {f.name for f in dataclasses.fields(Effect)}
+        assert callable(spell_resolver._targets_for)
+
+        src = inspect.getsource(spell_resolver)
+        for line in src.split('\n'):
+            if 'ctx.targets' not in line or line.strip().startswith('#'):
+                continue
+            if 'selected_targets' in line:
+                continue   # the accessor itself — the one sanctioned reader
+            assert '_targets_for' in line, (
+                f"a Tier-2 consumer still reads the flat list directly, which "
+                f"is how a clause gets another clause's target: {line.strip()}")
 
     # --- G5 follow-up: the Moonmist exemption -----------------------------
     def test_moonmist_exempts_werewolves_from_its_own_fog(self):

@@ -398,6 +398,118 @@ class TestTier3DamageAuthority:
 
 
 # ===========================================================================
+# A1 -- per-clause target ATTRIBUTION in the Tier-2 resolver.
+#
+# ExecutionContext.targets is ONE FLAT LIST shared by the whole spell, so a
+# surviving clause could be paired with a DIFFERENT clause's target. Each
+# Effect now carries its own targets, keyed on its raw_text clause -- NOT on
+# list position, because parse_effects returns effects in pattern-declaration
+# order while restrictions are position-sorted, so an index-zip misaligns.
+# ===========================================================================
+
+class TestPerClauseAttribution:
+
+    def test_raw_text_is_the_whole_clause_not_a_truncated_match(self):
+        """Three parsers pre-set raw_text to something that is NOT the clause.
+        The variable-damage pattern ends at the word "to", so Chandra's
+        Ignition's raw_text excluded both its leading restriction and its
+        recipients -- scoping a target scan to that would find nothing."""
+        from rules.effects import EffectExecutor, EffectType
+        effects = EffectExecutor().parse_effects(
+            "Target creature you control deals damage equal to its power to "
+            "each other creature and each opponent.")
+        dmg = [e for e in effects if e.effect_type == EffectType.DAMAGE]
+        assert dmg, "the variable-damage pattern still matches"
+        assert 'target creature you control' in dmg[0].raw_text.lower(), (
+            f"raw_text must be the whole clause; got {dmg[0].raw_text!r}")
+
+    def test_the_discard_hand_marker_is_no_longer_a_fake_raw_text(self):
+        """"discards their hand" pre-set raw_text='all' -- a semantic marker,
+        not text. Nothing read it (grep-verified), and leaving it there would
+        have scoped a target scan to the literal string 'all'."""
+        from rules.effects import EffectExecutor, EffectType
+        effects = EffectExecutor().parse_effects("Target player discards their hand.")
+        disc = [e for e in effects if e.effect_type == EffectType.DISCARD]
+        assert disc and disc[0].raw_text != 'all'
+
+    def test_a_clause_gets_its_own_target_not_another_clauses(self):
+        """The attribution itself, driven through the real resolver."""
+        from rules.spell_resolver import SpellResolver, _targets_for
+        from rules.effects import ExecutionContext
+        game, _ = _engine_game()
+        rick, claude = game.players
+        mine = _make_card("My Bear", power="2", toughness="2")
+        theirs = _make_card("Their Ogre", power="3", toughness="3")
+        rick.battlefield.append(mine)
+        claude.battlefield.append(theirs)
+
+        resolver = SpellResolver(None)
+        effects = resolver.effect_executor.parse_effects(
+            "Destroy target creature an opponent controls. "
+            "Put a +1/+1 counter on target creature you control.")
+        ctx = ExecutionContext(game_state=game, source_card=None,
+                               source_controller=rick, targets=[theirs])
+        resolver._attribute_targets_to_effects(game, rick, effects, ctx)
+
+        attributed = {e.raw_text.strip()[:20]: _targets_for(e, ctx)
+                      for e in effects if e.selected_targets}
+        assert attributed, "at least one clause must be attributed"
+        for clause, targets in attributed.items():
+            if 'you control' in clause.lower():
+                assert targets == [mine], f"{clause!r} -> {targets}"
+            elif 'opponent controls' in clause.lower():
+                assert targets == [theirs], f"{clause!r} -> {targets}"
+
+    def test_an_untargeted_clause_falls_back_to_the_shared_list(self):
+        """Additive by construction: no target phrase means no attribution,
+        so mass effects and non-targeted draws behave exactly as before."""
+        from rules.spell_resolver import _targets_for
+        from rules.effects import Effect, EffectType, ExecutionContext
+        game, _ = _engine_game()
+        rick, _c = game.players
+        bear = _make_card("Bear")
+        ctx = ExecutionContext(game_state=game, source_card=None,
+                               source_controller=rick, targets=[bear])
+        plain = Effect(effect_type=EffectType.DRAW, amount=1, raw_text="Draw a card.")
+        assert _targets_for(plain, ctx) == [bear]
+
+    def test_a_DECLARED_target_is_never_overridden_by_attribution(self):
+        """Found by the suite, not by review: attributing afresh pointed a
+        spliced "any target" at a creature when the caster had DECLARED the
+        opponent's face. A declared target is the caller's choice and outranks
+        anything re-derived, so attribution runs only on the AUTO path."""
+        from rules.spell_resolver import SpellResolver, _targets_for
+        from rules.effects import ExecutionContext
+        game, _ = _engine_game()
+        rick, claude = game.players
+        theirs = _make_card("Their Ogre", power="3", toughness="3")
+        claude.battlefield.append(theirs)
+
+        resolver = SpellResolver(None)
+        effects = resolver.effect_executor.parse_effects(
+            "Glacial Ray deals 2 damage to any target.")
+        # The caller DECLARED the opponent's face; attribution would re-derive
+        # the creature. On the declared path it must not run at all.
+        ctx = ExecutionContext(game_state=game, source_card=None,
+                               source_controller=rick, targets=[claude])
+        for eff in effects:
+            assert _targets_for(eff, ctx) == [claude]
+
+        # And when it DOES run (the auto path), it would have picked the
+        # creature — which is exactly why the declared path must skip it.
+        resolver._attribute_targets_to_effects(game, rick, effects, ctx)
+        assert any(e.selected_targets == [theirs] for e in effects), (
+            "sanity: attribution really would have overridden the declaration")
+
+    def test_the_helper_survives_an_unbound_handler_call(self):
+        """The Tier-2 handlers are called unbound (self=None) by existing
+        tests, so the accessor is module-level rather than a staticmethod."""
+        from rules import spell_resolver
+        assert not hasattr(spell_resolver.SpellResolver, '_targets_for')
+        assert callable(spell_resolver._targets_for)
+
+
+# ===========================================================================
 # A1-adjacent -- the THIRD target-selection path.
 #
 # Found while verifying A1 and separable from it: mtg/cog.py's `!activate`

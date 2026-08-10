@@ -61,6 +61,16 @@ class SpellResult:
     triggered_abilities: List[str] = field(default_factory=list)
 
 
+def _targets_for(effect, ctx):
+    """This clause's own targets, else the spell-wide list (Aug 10, A1).
+
+    MODULE-level, not a staticmethod: the Tier-2 handlers are called unbound
+    (with self=None) by existing tests, so reaching this through `self.` would
+    raise AttributeError on a path that has nothing to do with targeting.
+    """
+    return getattr(effect, 'selected_targets', None) or ctx.targets
+
+
 def target_restrictions_for_text(text: str) -> List[TargetRestriction]:
     """Parse every printed target phrase in `text` into a TargetRestriction.
 
@@ -359,7 +369,31 @@ class SpellResolver:
             source_controller=player,
             targets=selected_targets,
         )
-        
+
+        # Aug 10 (A1): per-clause target ATTRIBUTION. context.targets is one
+        # flat list for the whole spell, so a surviving clause could be paired
+        # with a DIFFERENT clause's target — the batch-13 Thought Scour class,
+        # where an unconditional "Draw a card." was handed the opponent
+        # auto-targeted for the separate mill clause.
+        #
+        # Keyed on each Effect's OWN raw_text, NOT on list position, and that
+        # is load-bearing: parse_effects returns effects in PATTERN-DECLARATION
+        # order while the restriction list is POSITION-sorted, so an index-zip
+        # of the two misaligns for any card with two differently-typed clauses.
+        # (get_targets_needed's `effects` parameter is never referenced, so
+        # there is no structural link between the lists to lean on either.)
+        #
+        # An effect whose clause names no target keeps an EMPTY list and its
+        # consumer falls back to context.targets, so every non-targeted and
+        # mass effect behaves exactly as before.
+        if target is None and target_mode == TargetMode.AUTO:
+            # ONLY on the auto-selected path. A DECLARED target is the
+            # caller's choice and outranks anything re-derived here — the
+            # splice path forwards one deliberately (July 21), and attributing
+            # afresh pointed Glacial Ray's "any target" at a creature when the
+            # caster had declared the opponent's face.
+            self._attribute_targets_to_effects(game, player, effects, context)
+
         # Execute each effect
         for effect in effects:
             messages = await self._execute_effect(effect, context, game)
@@ -370,6 +404,36 @@ class SpellResolver:
         
         return result
     
+    def _attribute_targets_to_effects(self, game, player, effects, context) -> None:
+        """Give each Effect the targets its OWN clause names (Aug 10, A1).
+
+        Scopes the restriction scan to `effect.raw_text` — the clause sentence
+        parse_effects records — and reuses the SAME selection preference the
+        flat pass uses (prefer an opponent-controlled legal target), so an
+        attributed clause picks what it would have picked anyway; what changes
+        is that a DIFFERENT clause's pick can no longer leak into it.
+
+        Deliberately additive: an effect with no target phrase, or one whose
+        restriction has no legal target, keeps an empty list and falls back to
+        context.targets at the consumer. That keeps mass effects ("destroy all
+        creatures"), non-targeted draws, and every Tier-2 path that never had
+        targets behaving exactly as before.
+        """
+        for effect in effects:
+            clause = getattr(effect, 'raw_text', '') or ''
+            if not clause or 'target' not in clause.lower():
+                continue
+            attributed = []
+            for restriction in target_restrictions_for_text(clause):
+                legal = self.get_legal_targets(game, player, restriction)
+                if not legal:
+                    continue
+                opponent_side = [t for t, _d in legal
+                                 if self._is_opponent_controlled(game, player, t)]
+                attributed.append(opponent_side[0] if opponent_side else legal[0][0])
+            if attributed:
+                effect.selected_targets = attributed
+
     def _is_opponent_controlled(self, game, player, target) -> bool:
         """Check if target is controlled by an opponent."""
         player_idx = game.players.index(player) if player in game.players else 0
@@ -530,7 +594,7 @@ class SpellResolver:
         # scratch (one Lightning Bolt: 3 to a player AND a creature killed by
         # the phantom marked damage; 8 games in the June 10 batch).
         rules_engine = getattr(game, '_rules_engine', None)
-        for target in ctx.targets:
+        for target in _targets_for(effect, ctx):
             if hasattr(target, 'life') and hasattr(target, 'hand'):
                 # It's a player. Route through the engine's centralized damage
                 # path when available so replacement effects (Teferi's Protection,
@@ -664,7 +728,7 @@ class SpellResolver:
         """Execute destroy effect."""
         messages = []
         
-        for target in ctx.targets:
+        for target in _targets_for(effect, ctx):
             if hasattr(target, 'has_keyword') and target.has_keyword('Indestructible', game=game):
                 messages.append(f"⚠️ {target.name} is indestructible!")
                 continue
@@ -697,7 +761,7 @@ class SpellResolver:
         _clause_targets_player = bool(re.search(
             r'\b(target|that) (player|opponent)\b[^.]*draw', _draw_clause))
         if _clause_targets_player:
-            for target in ctx.targets:
+            for target in _targets_for(effect, ctx):
                 if hasattr(target, 'life') and hasattr(target, 'hand'):
                     player = target
                     break
@@ -721,7 +785,7 @@ class SpellResolver:
         
         # Target player or controller
         player = ctx.source_controller
-        for target in ctx.targets:
+        for target in _targets_for(effect, ctx):
             if hasattr(target, 'life') and hasattr(target, 'hand'):
                 player = target
                 break
@@ -769,7 +833,7 @@ class SpellResolver:
 
         # Target or controller
         player = ctx.source_controller
-        for target in ctx.targets:
+        for target in _targets_for(effect, ctx):
             if hasattr(target, 'life') and hasattr(target, 'hand'):
                 player = target
                 break
@@ -800,7 +864,7 @@ class SpellResolver:
         """Execute exile effect."""
         messages = []
         
-        for target in ctx.targets:
+        for target in _targets_for(effect, ctx):
             for player in game.players:
                 if target in player.battlefield:
                     player.battlefield.remove(target)
@@ -819,7 +883,7 @@ class SpellResolver:
         """Execute bounce (return to hand) effect."""
         messages = []
         
-        for target in ctx.targets:
+        for target in _targets_for(effect, ctx):
             for player in game.players:
                 if target in player.battlefield:
                     player.battlefield.remove(target)
@@ -896,7 +960,7 @@ class SpellResolver:
         """Execute pump (+X/+X) effect."""
         messages = []
         
-        for target in ctx.targets:
+        for target in _targets_for(effect, ctx):
             if hasattr(target, 'power_modifier'):
                 target.power_modifier = getattr(target, 'power_modifier', 0) + effect.power_mod
             if hasattr(target, 'toughness_modifier'):
@@ -950,7 +1014,7 @@ class SpellResolver:
                 break
         
         # Target is the opponent's creature
-        for target in ctx.targets:
+        for target in _targets_for(effect, ctx):
             if hasattr(target, 'is_creature') and target.is_creature():
                 target_creature = target
                 break
@@ -1030,7 +1094,7 @@ class SpellResolver:
         """Execute add counter effect."""
         messages = []
         
-        for target in ctx.targets:
+        for target in _targets_for(effect, ctx):
             if not hasattr(target, 'counters'):
                 target.counters = {}
             
@@ -1053,7 +1117,7 @@ class SpellResolver:
         """Execute tap effect."""
         messages = []
         
-        for target in ctx.targets:
+        for target in _targets_for(effect, ctx):
             if hasattr(target, 'tapped'):
                 target.tapped = True
                 messages.append(f"↪️ {target.name} becomes tapped")
@@ -1064,7 +1128,7 @@ class SpellResolver:
         """Execute untap effect."""
         messages = []
         
-        for target in ctx.targets:
+        for target in _targets_for(effect, ctx):
             if hasattr(target, 'tapped'):
                 target.tapped = False
                 messages.append(f"↩️ {target.name} untaps")
@@ -1078,7 +1142,7 @@ class SpellResolver:
         
         # Target or opponent
         player = None
-        for target in ctx.targets:
+        for target in _targets_for(effect, ctx):
             if hasattr(target, 'library'):
                 player = target
                 break
@@ -1104,7 +1168,7 @@ class SpellResolver:
         """Execute sacrifice effect."""
         messages = []
         
-        for target in ctx.targets:
+        for target in _targets_for(effect, ctx):
             for player in game.players:
                 if target in player.battlefield:
                     player.battlefield.remove(target)

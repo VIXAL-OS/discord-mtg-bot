@@ -94,6 +94,16 @@ class Effect:
     
     # For complex effects
     raw_text: str = ""
+
+    # Aug 10 (A1): targets belonging to THIS clause. ExecutionContext.targets
+    # is one flat list shared by the whole spell, so a surviving clause could
+    # be paired with a DIFFERENT clause's target (the batch-13 Thought Scour
+    # class: an unconditional "Draw a card." was handed the opponent
+    # auto-targeted for the separate mill clause). Populated by scoping the
+    # target-restriction scan to this effect's OWN raw_text; empty means
+    # "no targets of my own", and the consumer falls back to ctx.targets, so
+    # every non-targeted and mass effect behaves exactly as before.
+    selected_targets: List[Any] = field(default_factory=list)
     
     # Conditions
     condition: Optional[str] = None  # "if you control a Goblin"
@@ -163,7 +173,7 @@ class EffectExecutor:
             (r"draw a card", lambda m: Effect(EffectType.DRAW, amount=1)),
             (r"discards? (\d+) cards?", self._parse_discard),
             (r"discard a card", lambda m: Effect(EffectType.DISCARD, amount=1)),
-            (r"discards? their hand", lambda m: Effect(EffectType.DISCARD, amount=-1, raw_text="all")),
+            (r"discards? their hand", lambda m: Effect(EffectType.DISCARD, amount=-1)),
             
             # Mill
             # Aug 2 batch-13 (delve reviewer): Scryfall spells mill counts as
@@ -290,10 +300,16 @@ class EffectExecutor:
         )
     
     def _parse_variable_damage(self, match) -> Effect:
+        # Aug 10 (A1): raw_text is NOT pre-set here. This pattern ends at the
+        # word "to" (r'deals? damage equal to (its power|...) to'), so
+        # match.group(0) for Chandra's Ignition is "deals damage equal to its
+        # power to" — it excludes BOTH the leading "Target creature you
+        # control" restriction and the trailing recipients. Leaving it empty
+        # lets parse_effects fill in the whole clause SENTENCE, which is what
+        # per-clause target attribution scopes its scan to.
         return Effect(
             effect_type=EffectType.DAMAGE,
             amount=-1,  # Variable
-            raw_text=match.group(0)
         )
     
     def _parse_life_gain(self, match) -> Effect:
@@ -303,7 +319,9 @@ class EffectExecutor:
         return Effect(effect_type=EffectType.LIFE_LOSS, amount=int(match.group(1)))
     
     def _parse_variable_life_gain(self, match) -> Effect:
-        return Effect(effect_type=EffectType.LIFE_GAIN, amount=-1, raw_text=match.group(0))
+        # Aug 10 (A1): same truncation as _parse_variable_damage — the pattern
+        # ends at "equal to", so the pre-set raw_text carried no target phrase.
+        return Effect(effect_type=EffectType.LIFE_GAIN, amount=-1)
     
     def _parse_draw(self, match) -> Effect:
         return Effect(effect_type=EffectType.DRAW, amount=int(match.group(1)))
