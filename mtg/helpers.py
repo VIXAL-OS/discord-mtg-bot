@@ -2374,6 +2374,62 @@ def command_zone_owner(game, card, fallback):
     return fallback
 
 
+def pick_targets_for_restrictions(game, player, opponent, restrictions):
+    """Auto-pick one target per TargetRestriction. Returns (targets, misses).
+
+    Aug 10 (A1-adjacent). Extracted from mtg/cog.py's `!activate` Tier-2
+    fallback so production and its pins share ONE function — a picker reachable
+    only through an async Discord command handler is a picker nothing can pin,
+    and mutation testing duly showed the parser-level pins passing while this
+    logic was broken.
+
+    Honours the controller restriction, which is the whole point: the inline
+    version it replaces discarded the qualifier and scanned the OPPONENT's
+    battlefield unconditionally, so "target creature you control" always
+    pointed at the opponent's creature. An unqualified target still prefers
+    the opponent (an activated ability aimed at nobody in particular is
+    overwhelmingly removal), but falls back to the controller's own board
+    rather than finding nothing.
+    """
+    from rules.targeting import ControllerRestriction, TargetType
+    targets, misses = [], []
+    for restriction in restrictions:
+        types = restriction.target_types or set()
+        if TargetType.PLAYER in types:
+            targets.append(player
+                           if restriction.controller == ControllerRestriction.YOU
+                           else opponent)
+            continue
+        if restriction.controller == ControllerRestriction.YOU:
+            sides = [player]
+        elif restriction.controller == ControllerRestriction.OPPONENT:
+            sides = [opponent]
+        else:
+            sides = [opponent, player]
+        picked = None
+        for side in sides:
+            for card in getattr(side, 'battlefield', None) or []:
+                if TargetType.CREATURE in types and not card.is_creature(game):
+                    continue
+                if TargetType.ARTIFACT in types and not card.is_artifact():
+                    continue
+                if TargetType.ENCHANTMENT in types and not card.is_enchantment():
+                    continue
+                if TargetType.PLANESWALKER in types and not card.is_planeswalker():
+                    continue
+                if TargetType.LAND in types and not card.is_land():
+                    continue
+                picked = card
+                break
+            if picked is not None:
+                break
+        if picked is not None:
+            targets.append(picked)
+        else:
+            misses.append(restriction)
+    return targets, misses
+
+
 def unattach_equipment(game, equipment) -> bool:
     """Detach an Equipment from whatever it is attached to. True if it moved.
 

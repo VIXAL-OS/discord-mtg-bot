@@ -398,6 +398,146 @@ class TestTier3DamageAuthority:
 
 
 # ===========================================================================
+# A1-adjacent -- the THIRD target-selection path.
+#
+# Found while verifying A1 and separable from it: mtg/cog.py's `!activate`
+# Tier-2 fallback built its own ExecutionContext with a cruder inline regex
+# that captured only the target TYPE, discarded any controller qualifier, and
+# then scanned the OPPONENT's battlefield unconditionally -- so an activated
+# ability reading "target creature YOU CONTROL" always pointed at the
+# opponent's creature. 'planeswalker' was captured by that regex but had NO
+# branch, so those abilities silently got zero targets.
+#
+# The full A1 per-clause attribution refactor stays deferred; this is the
+# independent live bug inside its blast radius, closed by making the two paths
+# share ONE parser instead of three.
+# ===========================================================================
+
+class TestSharedTargetRestrictionParser:
+
+    def test_you_control_is_not_flattened_to_the_opponent(self):
+        from rules.spell_resolver import target_restrictions_for_text
+        from rules.targeting import ControllerRestriction, TargetType
+        restrictions = target_restrictions_for_text(
+            "Untap target creature you control.")
+        assert len(restrictions) == 1
+        assert restrictions[0].controller == ControllerRestriction.YOU
+        assert TargetType.CREATURE in restrictions[0].target_types
+
+    def test_an_opponent_controls_is_read_as_opponent(self):
+        from rules.spell_resolver import target_restrictions_for_text
+        from rules.targeting import ControllerRestriction
+        restrictions = target_restrictions_for_text(
+            "Destroy target creature an opponent controls.")
+        assert restrictions[0].controller == ControllerRestriction.OPPONENT
+
+    def test_an_unqualified_target_stays_unrestricted(self):
+        """The control -- adding controller handling must not invent a
+        restriction the card does not print."""
+        from rules.spell_resolver import target_restrictions_for_text
+        from rules.targeting import ControllerRestriction
+        restrictions = target_restrictions_for_text(
+            "Target creature gets +2/+2 until end of turn.")
+        assert restrictions[0].controller == ControllerRestriction.ANY
+
+    def test_planeswalker_is_a_recognised_target_type(self):
+        """The old inline regex captured 'planeswalker' and then had no branch
+        for it, so the ability resolved with zero targets."""
+        from rules.spell_resolver import target_restrictions_for_text
+        from rules.targeting import TargetType
+        restrictions = target_restrictions_for_text(
+            "Deal 3 damage to target planeswalker.")
+        assert TargetType.PLANESWALKER in restrictions[0].target_types
+
+    def test_one_printed_target_yields_exactly_one_restriction(self):
+        """The Aug-9 B-4 overlapping-span dedup rides along with the
+        extraction: "target creature you control" matches BOTH the bare and
+        the qualified pattern, and resolving it twice put a counter on the
+        opponent's same-named creature."""
+        from rules.spell_resolver import target_restrictions_for_text
+        assert len(target_restrictions_for_text(
+            "Put a +1/+1 counter on target creature you control.")) == 1
+
+    def test_you_control_picks_the_ACTIVATORS_creature(self):
+        """The decisive pin for the CONSUMER, not the parser. Mutation testing
+        showed the parser-level pins above passing while the picking logic was
+        still opponent-only -- a helper pinned only through direct calls is not
+        pinned into production, so the picker was extracted out of the async
+        Discord handler to be drivable at all."""
+        from mtg.helpers import pick_targets_for_restrictions
+        from rules.spell_resolver import target_restrictions_for_text
+        game, _ = _engine_game()
+        rick, claude = game.players
+        mine = _make_card("My Bear", power="2", toughness="2")
+        theirs = _make_card("Their Bear", power="2", toughness="2")
+        rick.battlefield.append(mine)
+        claude.battlefield.append(theirs)
+
+        picked, missed = pick_targets_for_restrictions(
+            game, rick, claude,
+            target_restrictions_for_text("Untap target creature you control."))
+        assert not missed
+        assert [c.name for c in picked] == ["My Bear"]
+
+    def test_an_unqualified_target_still_prefers_the_opponent(self):
+        """The control -- honouring "you control" must not flip the default."""
+        from mtg.helpers import pick_targets_for_restrictions
+        from rules.spell_resolver import target_restrictions_for_text
+        game, _ = _engine_game()
+        rick, claude = game.players
+        rick.battlefield.append(_make_card("My Bear", power="2", toughness="2"))
+        claude.battlefield.append(_make_card("Their Bear", power="2", toughness="2"))
+
+        picked, _ = pick_targets_for_restrictions(
+            game, rick, claude,
+            target_restrictions_for_text("Destroy target creature."))
+        assert [c.name for c in picked] == ["Their Bear"]
+
+    def test_a_planeswalker_target_is_actually_picked(self):
+        """The old inline regex captured 'planeswalker' with no branch, so the
+        ability resolved with ZERO targets.
+
+        A DECOY creature sits FIRST on the same battlefield deliberately: with
+        the planeswalker as the only permanent, an unfiltered pick grabs it
+        anyway and the pin passes with the type gate deleted. Mutation testing
+        caught exactly that."""
+        from mtg.helpers import pick_targets_for_restrictions
+        from rules.spell_resolver import target_restrictions_for_text
+        game, _ = _engine_game()
+        rick, claude = game.players
+        claude.battlefield.append(
+            _make_card("Decoy Bear", power="2", toughness="2"))
+        walker = _make_card("Jace, the Mind Sculptor",
+                            type_line="Legendary Planeswalker — Jace",
+                            power=None, toughness=None)
+        claude.battlefield.append(walker)
+
+        picked, missed = pick_targets_for_restrictions(
+            game, rick, claude,
+            target_restrictions_for_text("Deal 3 damage to target planeswalker."))
+        assert not missed and [c.name for c in picked] == ["Jace, the Mind Sculptor"]
+
+    def test_no_legal_target_is_reported_not_silently_dropped(self):
+        from mtg.helpers import pick_targets_for_restrictions
+        from rules.spell_resolver import target_restrictions_for_text
+        game, _ = _engine_game()
+        rick, claude = game.players
+        picked, missed = pick_targets_for_restrictions(
+            game, rick, claude,
+            target_restrictions_for_text("Untap target creature you control."))
+        assert picked == [] and len(missed) == 1
+
+    def test_the_activate_path_no_longer_has_its_own_target_regex(self):
+        """Structural: three independent parses of the same text is how the
+        controller filter went missing in the first place. Behavioural pins
+        above cover the parser; this covers the de-duplication."""
+        import mtg.cog as cog_mod
+        src = open(cog_mod.__file__, encoding='utf-8').read()
+        assert "target_restrictions_for_text" in src
+        assert "r'target (creature|permanent|player|planeswalker" not in src
+
+
+# ===========================================================================
 # H1 -- mana-tap damage, scoped PER ABILITY LINE.
 # ===========================================================================
 

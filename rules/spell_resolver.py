@@ -61,6 +61,55 @@ class SpellResult:
     triggered_abilities: List[str] = field(default_factory=list)
 
 
+def target_restrictions_for_text(text: str) -> List[TargetRestriction]:
+    """Parse every printed target phrase in `text` into a TargetRestriction.
+
+    Extracted from SpellResolver.get_targets_needed (Aug 10) so the OTHER
+    target-selection path can share it. mtg/cog.py's `!activate` Tier-2
+    fallback had its own, cruder inline regex that captured only the target
+    TYPE and discarded any controller qualifier, then scanned the OPPONENT's
+    battlefield unconditionally — so an activated ability reading "target
+    creature YOU CONTROL" always pointed at the opponent's creature. That is
+    a third independent parse of the same text; this is the one that already
+    understands controller restrictions, so it is the one to keep.
+
+    Aug 9 audit (B-4): the pattern list produces OVERLAPPING matches for ONE
+    printed target — Snakeskin Veil's "target creature you control" matches
+    both the bare `target creature` pattern AND the qualified one, so an AUTO
+    branch picking a target PER restriction chose the opponent's same-named
+    creature as well (CR 601.2c). Matches that overlap by SPAN are one printed
+    target: keep the LONGEST (most specific). Genuinely multi-target text
+    ("target creature and target player") has disjoint spans and keeps both.
+    """
+    oracle = (text or "").lower()
+    target_patterns = [
+        (r"target (creature|permanent|player|planeswalker|artifact|enchantment|land)", None),
+        (r"(any target)", None),
+        (r"target (nonblack|nonblue|nonred|nongreen|nonwhite) creature", None),
+        (r"target creature (you control|an opponent controls)", None),
+        (r"target (attacking|blocking|tapped|untapped) creature", None),
+    ]
+
+    spans: List[Tuple[int, int, str]] = []
+    for pattern, _ in target_patterns:
+        for match in re.finditer(pattern, oracle):
+            spans.append((match.start(), match.end(), match.group(0)))
+    spans.sort(key=lambda s: (s[0], -(s[1] - s[0])))
+    kept: List[Tuple[int, int, str]] = []
+    for start, end, phrase in spans:
+        replaced = False
+        for i, (ks, ke, _kt) in enumerate(kept):
+            if start < ke and ks < end:  # overlap = same printed target
+                if (end - start) > (ke - ks):
+                    kept[i] = (start, end, phrase)
+                replaced = True
+                break
+        if not replaced:
+            kept.append((start, end, phrase))
+
+    return [TargetTextParser.parse(phrase) for _, _, phrase in kept]
+
+
 class SpellResolver:
     """
     Handles spell casting and resolution.
@@ -109,36 +158,8 @@ class SpellResolver:
         Genuinely multi-target spells ("target creature and target player")
         have disjoint spans and keep both.
         """
-        oracle = card.oracle_text.lower() if card.oracle_text else ""
-
-        # Look for target phrases in oracle text
-        target_patterns = [
-            (r"target (creature|permanent|player|planeswalker|artifact|enchantment|land)", None),
-            (r"(any target)", None),
-            (r"target (nonblack|nonblue|nonred|nongreen|nonwhite) creature", None),
-            (r"target creature (you control|an opponent controls)", None),
-            (r"target (attacking|blocking|tapped|untapped) creature", None),
-        ]
-
-        # Find all target references WITH spans, then dedup overlaps.
-        spans: List[Tuple[int, int, str]] = []
-        for pattern, _ in target_patterns:
-            for match in re.finditer(pattern, oracle):
-                spans.append((match.start(), match.end(), match.group(0)))
-        spans.sort(key=lambda s: (s[0], -(s[1] - s[0])))
-        kept: List[Tuple[int, int, str]] = []
-        for start, end, text in spans:
-            replaced = False
-            for i, (ks, ke, kt) in enumerate(kept):
-                if start < ke and ks < end:  # overlap = same printed target
-                    if (end - start) > (ke - ks):
-                        kept[i] = (start, end, text)
-                    replaced = True
-                    break
-            if not replaced:
-                kept.append((start, end, text))
-
-        return [TargetTextParser.parse(text) for _, _, text in kept]
+        return target_restrictions_for_text(
+            card.oracle_text if card.oracle_text else "")
     
     def get_legal_targets(self, game, player, restriction: TargetRestriction) -> List[Tuple[Any, str]]:
         """Get all legal targets for a restriction."""

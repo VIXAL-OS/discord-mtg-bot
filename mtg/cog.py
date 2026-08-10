@@ -2837,27 +2837,30 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
                         x_value=x_value or 0,
                     )
 
-                    # Auto-select targets from opponent if needed
+                    # Auto-select targets. Aug 10 (A1-adjacent): this used to
+                    # be a THIRD, independent parse of the same text — a bare
+                    # `target (creature|permanent|...)` findall that captured
+                    # only the TYPE and discarded any controller qualifier,
+                    # then scanned the OPPONENT's battlefield unconditionally.
+                    # So an activated ability reading "target creature YOU
+                    # CONTROL" always pointed at the opponent's creature, and
+                    # 'planeswalker' was captured by the regex but had NO
+                    # branch, so those abilities silently got zero targets.
+                    # Now shares the cast path's parser, which already
+                    # understands controller restrictions (and the Aug-9
+                    # overlapping-span dedup that stops one printed target
+                    # being resolved twice).
+                    from rules.spell_resolver import target_restrictions_for_text
+                    from mtg.helpers import pick_targets_for_restrictions
                     opponent = game.players[1 - player_idx]
-                    target_patterns = re.findall(r'target (creature|permanent|player|planeswalker|artifact|enchantment)', effect_desc.lower())
-                    if target_patterns:
-                        for tp in target_patterns:
-                            if tp == 'player':
-                                exec_ctx.targets.append(opponent)
-                            elif tp in ('creature', 'permanent', 'artifact', 'enchantment'):
-                                for c in opponent.battlefield:
-                                    if tp == 'creature' and c.is_creature():
-                                        exec_ctx.targets.append(c)
-                                        break
-                                    elif tp == 'artifact' and c.is_artifact():
-                                        exec_ctx.targets.append(c)
-                                        break
-                                    elif tp == 'enchantment' and c.is_enchantment():
-                                        exec_ctx.targets.append(c)
-                                        break
-                                    elif tp == 'permanent':
-                                        exec_ctx.targets.append(c)
-                                        break
+                    _picked, _missed = pick_targets_for_restrictions(
+                        game, player, opponent,
+                        target_restrictions_for_text(effect_desc))
+                    exec_ctx.targets.extend(_picked)
+                    for _miss in _missed:
+                        print(f"[ACTIVATE-SPELL_RESOLVER] {card.name}: no legal "
+                              f"target for {sorted(t.name for t in _miss.target_types)} "
+                              f"({_miss.controller.name})")
 
                     for eff in actionable_effects:
                         eff_msgs = await self.engine.spell_resolver._execute_effect(eff, exec_ctx, game)
