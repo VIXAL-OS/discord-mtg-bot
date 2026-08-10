@@ -4889,6 +4889,16 @@ class GameState:
     # _recently_died list is reset mid-turn by the dies dispatcher, so it
     # structurally cannot answer a whole-turn question.
     _creature_died_this_turn: bool = field(default=False, repr=False, compare=False)
+    # Aug 10 2026 (G2): per-turn spell counts captured in end_turn immediately
+    # BEFORE the reset, because end-step triggers dispatch below it on that
+    # path and would otherwise evaluate an "if you didn't cast a spell this
+    # turn" intervening-if (CR 603.4) against an already-zeroed counter.
+    # TURN-STAMPED: the advance_phase path fires end-step triggers before any
+    # reset, where the live counter is authoritative, so a consumer must use
+    # the snapshot ONLY when the stamp matches the current turn — otherwise it
+    # reads a stale prior-turn value.
+    _spells_cast_snapshot_turn: int = field(default=-1, repr=False, compare=False)
+    _spells_cast_snapshot: dict = field(default_factory=dict, repr=False, compare=False)
     # Aug 7 2026 (confirmation-batch audit, A-2b/B-2): per-turn record of
     # which creature ids each dealer dealt COMBAT damage to this turn
     # (dealer card id -> set of damaged creature ids). Two consumers:

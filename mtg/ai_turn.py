@@ -1568,6 +1568,12 @@ async def execute_claude_turn(engine, game: GameState) -> List[str]:
         _, _cb_msgs = engine.advance_phase(game)  # → DECLARE_ATTACKERS
         if _cb_msgs:
             actions_taken.extend(_cb_msgs)
+        # Aug 10 deferred (G6a): drain Tier-3-queued beginning-of-combat
+        # triggers HERE, before damage (CR 508.1). Templated ones already
+        # resolve inline in advance_phase; the queued tail otherwise landed
+        # after combat. See the twin in mtg/autoplay.py — the drain
+        # snapshots-and-clears, so later drains find an empty queue.
+        actions_taken.extend(await engine.drain_pending_triggers(game))
         print(f"[EXECUTE_CLAUDE] Advanced to DECLARE_ATTACKERS")
 
     if game.phase == Phase.DECLARE_ATTACKERS and not game.ended:

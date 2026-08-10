@@ -964,6 +964,16 @@ async def _autoplay_human_turn(cog, thread, game: GameState, player_idx: int):
         _, _cb_msgs = cog.engine.advance_phase(game)  # → DECLARE_ATTACKERS
         for _m in (_cb_msgs or []):
             await cog._autoplay_send(thread, _m)
+        # Aug 10 deferred (G6a): TEMPLATED beginning-of-combat triggers resolve
+        # inline in advance_phase and are correctly ordered, but Tier-3-QUEUED
+        # ones sat in the queue until a later drain — i.e. AFTER combat damage
+        # (CR 508.1). The bug is invisible for templated cards (Luminarch
+        # Aspirant, Rabblemaster) and hits precisely the untemplated tail.
+        # Mirrors the human path in mtg/cog.py. Safe against double-firing:
+        # drain_pending_triggers snapshots and clears, so the existing later
+        # drains simply find an empty queue.
+        for _m in await cog.engine.drain_pending_triggers(game):
+            await cog._autoplay_send(thread, _m)
 
     if game.phase == Phase.DECLARE_ATTACKERS and not game.ended:
         # Aug 2 (batch-13): a fresh declaration starts from an EMPTY attacker

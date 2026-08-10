@@ -1610,22 +1610,254 @@ class EffectTemplateLibrary:
                 else [{"action": "no_action", "reason": "Petty Theft: no nonland permanent target"}]
             ),
         ))
-        # Gift of the Fae (Faerie Guidemother — instant): +1/+1 + flying EOT (target)
-        # Approximation: pump the controller's best creature; flying is granted via temp keyword
+        # Inscription of Abundance — Aug 10 deferred (G4). Kicker {2}{G};
+        # "Choose one. If this spell was kicked, choose any number instead."
+        #   1 Put two +1/+1 counters on target creature.
+        #   2 Target player gains X life, where X is the greatest power among
+        #     creatures they control.
+        #   3 Target creature you control fights target creature you don't control.
+        #
+        # A KICKED cast paid 5 mana and fizzled: the Tier-2 resolver aborts on
+        # the FIRST restriction with no legal target, and mode 2 (target PLAYER)
+        # is always legal. Resolving at Tier 1.5 short-circuits that entirely,
+        # which is the prefer-lower-tiers answer; the Tier-2 loop and its
+        # mode-attribution limits are recorded as still-open in CLAUDE.md.
+        #
+        # ctx['_modes'] is real mode-choice plumbing, not invented: it is set
+        # from the action dict at both executors, advertised in the AI grammar,
+        # and already consumed by _gen_kolaghans_command / _gen_blood_on_the_snow.
+        # ctx['kicked'] is populated as TRUTH by build_game_context (the Aug-1
+        # kicker work), so "choose any number" is gated on the real stamp.
+        def _gen_inscription_of_abundance(ctrl, opp, ctx):
+            modes = []
+            for m in (ctx.get('_modes') or []):
+                if isinstance(m, int):
+                    modes.append(m)
+                elif isinstance(m, str):
+                    modes.append({'counters': 1, 'counter': 1,
+                                  'life': 2, 'gain': 2,
+                                  'fight': 3}.get(m.lower(), 0))
+            modes = [m for m in modes if m in (1, 2, 3)]
+            if not modes:
+                modes = [2]           # the always-legal mode
+            if not ctx.get('kicked'):
+                modes = modes[:1]     # CR 700.2 — "choose one" unless kicked
+
+            own = ctx.get('best_own_creature') or ''
+            foe = ctx.get('best_opponent_creature') or ''
+            # `greatest_power` is the real ctx key and is controller-scoped,
+            # which is exactly mode 2's "greatest power among creatures THEY
+            # control" when the target is the caster.
+            gain = int(ctx.get('greatest_power', 0) or 0)
+            acts = []
+            for m in modes:
+                if m == 1 and own:
+                    acts.append({"action": "add_counters", "card": own,
+                                 "counter_type": "+1/+1", "amount": 2})
+                elif m == 2:
+                    acts.append({"action": "gain_life", "player": ctrl,
+                                 "amount": gain})
+                elif m == 3 and own and foe:
+                    # There is NO "fight" action type in the interpreter — the
+                    # established approximation is mutual damage, and this
+                    # reuses the shared helper rather than re-expressing it.
+                    acts.extend(self._fight_best_creature(
+                        ctrl, opp, ctx, resolve_target_power(ctx, own)))
+            if not acts:
+                # Every chosen mode was unsatisfiable — fall back to the mode
+                # that always has a legal target rather than fizzling the spell.
+                acts.append({"action": "gain_life", "player": ctrl, "amount": gain})
+            return acts
+
+        self._add_card("inscription of abundance", EffectTemplate(
+            name="Inscription of Abundance",
+            description="Choose one (any number if kicked): +1/+1 counters, gain life, or fight",
+            action_generator=_gen_inscription_of_abundance,
+        ))
+
+        # Moonmist — Aug 10 deferred (G5). "Transform all Humans. Prevent all
+        # combat damage that would be dealt this turn by creatures other than
+        # Werewolves and Wolves."
+        #
+        # It was reaching Tier 3 and being refused WHOLESALE by the
+        # combat-shape guard, losing BOTH halves including the transform. The
+        # guard exists to stop Tier 3 MANUFACTURING combat damage; Moonmist
+        # PREVENTS it, which is the opposite — but the existing fog carve-out is
+        # a full-string match on the bare fog sentence, and Moonmist has both a
+        # preceding sentence and a trailing qualifier. Resolving it at Tier 1.5
+        # is the prefer-lower-tiers answer and sidesteps the guard entirely.
+        #
+        # DOCUMENTED APPROXIMATION: scope="all" OVER-prevents. The printed
+        # clause exempts Werewolves and Wolves, but prevent_combat_damage
+        # supports only scope "all"/"to_you" against a player-level flag — there
+        # is no per-source-type filter in the prevention machinery. Modelling
+        # the exemption needs a source-type gate at the damage funnels, which is
+        # its own change. Stated here rather than implied, because in a werewolf
+        # deck the exemption is the point of the card.
+        def _gen_moonmist(ctrl, opp, ctx):
+            acts = []
+            for side, owner in ((ctx.get('controller_battlefield') or [], ctrl),
+                                (ctx.get('opponent_battlefield') or [], opp)):
+                for c in side:
+                    tl = (getattr(c, 'type_line', '') or '').lower()
+                    if 'human' in tl and getattr(c, 'has_transform', False):
+                        acts.append({"action": "transform_permanent",
+                                     "player": owner,
+                                     "card": getattr(c, 'name', '')})
+            acts.append({"action": "prevent_combat_damage", "scope": "all"})
+            return acts
+
+        self._add_card("moonmist", EffectTemplate(
+            name="Moonmist",
+            description="Transform all Humans, then prevent all combat damage this turn",
+            action_generator=_gen_moonmist,
+        ))
+
+        # Avabruck Caretaker — Aug 10 deferred (G6b). "At the beginning of
+        # combat on your turn, put two +1/+1 counters on another target creature
+        # you control."
+        #
+        # The recorded mechanism blamed targeting. The REAL cause is a MISSING
+        # TEMPLATE: four phrasings were probed through the live library and all
+        # returned None, so the trigger escalated to Tier 3, which picked a
+        # planeswalker — and the July-30 add_counters guard then correctly
+        # refused it, leaving a MANDATORY trigger producing nothing with a legal
+        # target on the battlefield. Resolving it deterministically removes both
+        # the wrong pick and the Tier-3 call.
+        #
+        # "another" is CR 109.5 self-exclusion, and the clause is restricted to
+        # creatures YOU control — the two things Tier 3 got wrong.
+        def _gen_avabruck_caretaker(ctrl, opp, ctx):
+            src = (ctx.get('_trigger_source') or '').lower()
+            pool = [c for c in (ctx.get('controller_battlefield') or [])
+                    if getattr(c, 'is_creature', None)
+                    and c.is_creature()
+                    and (getattr(c, 'name', '') or '').lower() != src]
+            if not pool:
+                return [{"action": "no_action",
+                         "reason": "Avabruck Caretaker: no other creature you control to target"}]
+            best = max(pool, key=lambda c: int(getattr(c, 'power', 0) or 0)
+                       if str(getattr(c, 'power', '0')).lstrip('-').isdigit() else 0)
+            return [{"action": "add_counters", "card": getattr(best, 'name', ''),
+                     "counter_type": "+1/+1", "amount": 2}]
+
+        self._add_card("avabruck caretaker", EffectTemplate(
+            name="Avabruck Caretaker",
+            description="Put two +1/+1 counters on another target creature you control",
+            action_generator=_gen_avabruck_caretaker,
+        ))
+
+        # Nightpack Ambusher — Aug 10 deferred (G2). "At the beginning of your
+        # end step, IF YOU DIDN'T CAST A SPELL THIS TURN, create a 2/2 green
+        # Wolf creature token." The intervening-if (CR 603.4) was never checked,
+        # so it made a Wolf on turns its controller had cast spells.
+        #
+        # The recorded mechanism was wrong twice: _spells_cast_last_turn is not
+        # read anywhere in the end-step scan, and it is the wrong datum anyway
+        # ("this turn", not "last turn"). The right datum is
+        # Player.spells_cast_this_turn.
+        #
+        # The REAL mechanism is that the condition was INEXPRESSIBLE: the card
+        # had been migrated into data/card_templates.json, which by contract
+        # holds only action lists constant apart from $controller/$opponent
+        # substitution. A conditional card cannot live there, and its JSON
+        # description described behaviour its actions did not implement. That
+        # entry is deleted; the loader's strict collision check keeps it single.
+        #
+        # The snapshot is consulted only when its turn stamp matches, because
+        # the two dispatch paths differ: end_turn zeroes the counter BEFORE
+        # end-step triggers run, while advance_phase fires them while the live
+        # counter is still authoritative. An unstamped snapshot would be a
+        # stale prior-turn value on the advance_phase path.
+        def _gen_nightpack_ambusher(ctrl, opp, ctx):
+            game = ctx.get('_game')
+            cast = None
+            if game is not None:
+                if getattr(game, '_spells_cast_snapshot_turn', -1) == getattr(
+                        game, 'turn_number', -2):
+                    cast = (getattr(game, '_spells_cast_snapshot', {}) or {}).get(ctrl)
+            if cast is None:
+                p = ctx.get('_controller_player')
+                cast = int(getattr(p, 'spells_cast_this_turn', 0) or 0) if p else 0
+            if int(cast or 0) > 0:
+                # CR 603.4: intervening-if not met. An empty list is the
+                # sanctioned HANDLED no-op — None would mean "unhandled" and
+                # escalate to Tier 3 (the July-21 library contract).
+                print(f"[TRIGGER-TEMPLATE] Nightpack Ambusher: {ctrl} cast "
+                      f"{cast} spell(s) this turn — intervening-if not met")
+                return []
+            return [{"action": "create_token", "player": ctrl, "name": "Wolf",
+                     "power": 2, "toughness": 2,
+                     "types": "Creature — Wolf", "count": 1}]
+
+        self._add_card("nightpack ambusher", EffectTemplate(
+            name="Nightpack Ambusher",
+            description="At the beginning of your end step, if you didn't cast a spell this turn, create a 2/2 green Wolf creature token",
+            action_generator=_gen_nightpack_ambusher,
+        ))
+
+        # Gift of the Fae — the ADVENTURE half of Faerie Guidemother, {1}{W}
+        # Sorcery. Aug 10 deferred (G3): this template was written from text no
+        # printing has. Real, from the bulk's card_faces:
+        #   "Target creature gets +2/+1 and gains flying until end of turn."
+        # It was emitting +1/+1 (wrong amount) via an unnarrowed
+        # pump_all_creatures plus a grant_keywords with
+        # target="all_own_creatures" — so a SINGLE-target pump buffed the whole
+        # board and handed everyone flying, while its own comment said "pump the
+        # controller's best creature".
+        #
+        # pump_all_creatures narrows to one permanent via `card` (its
+        # include_name filter) and grants keywords in the same action, so no new
+        # action vocabulary is needed. player="all" because the printed clause is
+        # a bare "target creature" with no controller restriction — scoping to
+        # the controller would silently miss a declared opponent target, and a
+        # silent no-op is the failure class this codebase keeps paying for.
         self._add_card("gift of the fae", EffectTemplate(
             name="Gift of the Fae",
-            description="Target creature gets +1/+1 and gains flying until end of turn",
+            description="Target creature gets +2/+1 and gains flying until end of turn",
             action_generator=lambda ctrl, opp, ctx: (
                 [
-                    {"action": "pump_all_creatures", "player": ctrl,
-                     "power": 1, "toughness": 1,
+                    {"action": "pump_all_creatures", "player": "all",
+                     "power": 2, "toughness": 1,
+                     "card": (ctx.get('explicit_target_name')
+                              or ctx.get('best_own_creature') or ''),
+                     "keywords": ["Flying"],
                      "source": "Gift of the Fae"},
-                    {"action": "grant_keywords", "player": ctrl,
-                     "target": "all_own_creatures",
-                     "keywords": ["Flying"]},
                 ]
-                if ctx.get('controller_creature_count', 0) > 0
-                else [{"action": "no_action", "reason": "Gift of the Fae: no creature to pump"}]
+                if (ctx.get('explicit_target_name') or ctx.get('best_own_creature'))
+                else [{"action": "no_action",
+                       "reason": "Gift of the Fae: no creature to target"}]
+            ),
+        ))
+        # On Alert — the ADVENTURE half of Silverflame Squire, {2}{W} Instant.
+        # Aug 10 deferred (G3): same class, worse. Real printed text:
+        #   "Target creature gets +2/+2 until end of turn. Untap it."
+        # The template described "Up to two target Knights get +2/+1" — text no
+        # printing has — emitted +2/+1 to EVERY creature its controller
+        # controlled, and dropped the untap entirely.
+        #
+        # It lived in data/card_templates.json, which by the migrator's rule
+        # holds only FIXED action lists (constant apart from $controller /
+        # $opponent). A target-dependent action cannot be expressed there, so
+        # the entry was deleted and it moves here. The loader's strict
+        # collision check enforces that it is in exactly one place.
+        self._add_card("on alert", EffectTemplate(
+            name="On Alert",
+            description="Target creature gets +2/+2 until end of turn. Untap it",
+            action_generator=lambda ctrl, opp, ctx: (
+                [
+                    {"action": "pump_all_creatures", "player": "all",
+                     "power": 2, "toughness": 2,
+                     "card": (ctx.get('explicit_target_name')
+                              or ctx.get('best_own_creature') or ''),
+                     "source": "On Alert"},
+                    {"action": "untap",
+                     "card": (ctx.get('explicit_target_name')
+                              or ctx.get('best_own_creature') or '')},
+                ]
+                if (ctx.get('explicit_target_name') or ctx.get('best_own_creature'))
+                else [{"action": "no_action",
+                       "reason": "On Alert: no creature to target"}]
             ),
         ))
         # Usher to Safety (Shepherd of the Flock — instant): return your creature to hand
@@ -6247,6 +6479,69 @@ class EffectTemplateLibrary:
             action_generator=self._chandra_tod_plus1,
         )
 
+        # (Nightpack Ambusher's end-step template lives with the other
+        # generator-style card templates, not here — it is not a PW ability.)
+
+        # Arlinn Kord — Aug 10 deferred (G1). Her [0] made the Wolf and NEVER
+        # transformed her, so the back face was unreachable all game.
+        #
+        # The recorded mechanism blamed the day/night routine in mtg/triggers.py;
+        # a fix there would have been DEAD CODE. Arlinn has neither
+        # daybound/nightbound nor an upkeep transform trigger — her transform is
+        # an explicit instruction inside a LOYALTY ability, and both the action
+        # vocabulary and the execution path already existed. The only gap was
+        # that nothing emitted a transform action for this card.
+        #
+        # A full-Scryfall sweep finds EXACTLY two loyalty abilities printing
+        # "Transform" in all of Magic, and both are Arlinn's — so a named fix is
+        # proportionate and no pattern is warranted. The finding named only the
+        # [0]; the back face's [-1] transforms her too.
+        #
+        # THE KEYS USE FULL FACE NAMES DELIBERATELY: resolve_pw_ability matches
+        # with `key_pw in pw_key`, a SUBSTRING test, so a bare "arlinn" would
+        # match both faces and could fire the wrong ability's template.
+        #
+        # `ctx['_source_card'].name` rather than a literal, for two reasons: the
+        # back face prints the SHORTENED "Transform Arlinn." which no name lookup
+        # would resolve, and transform_permanent matches on the CURRENT
+        # battlefield name, which differs per face.
+        #
+        # transform_permanent (not the bare transform action) because only it
+        # unregisters and re-registers static/replacement effects around the
+        # face swap.
+        # `player` is REQUIRED by the handler (`if not player: return None`),
+        # so omitting it makes the whole action a silent no-op — the missing-key
+        # class. Verified by executing against the real handler, not by reading
+        # the emit.
+        def _arlinn_transform_action(ctrl, ctx):
+            src = ctx.get('_source_card')
+            name = getattr(src, 'name', '') if src is not None else ''
+            return ([{"action": "transform_permanent",
+                      "player": ctrl, "card": name}]
+                    if name else [])
+
+        self._pw_ability_templates[("arlinn kord", "create a 2/2 green wolf")] = EffectTemplate(
+            name="Arlinn Kord 0",
+            description="Create a 2/2 green Wolf creature token, then transform Arlinn Kord",
+            action_generator=lambda ctrl, opp, ctx: (
+                [{"action": "create_token", "player": ctrl, "name": "Wolf",
+                  "power": 2, "toughness": 2,
+                  "types": "Creature — Wolf", "count": 1}]
+                + _arlinn_transform_action(ctrl, ctx)
+            ),
+        )
+        self._pw_ability_templates[("arlinn, embraced by the moon", "deals 3 damage")] = EffectTemplate(
+            name="Arlinn, Embraced by the Moon -1",
+            description="Arlinn deals 3 damage to any target, then transforms",
+            action_generator=lambda ctrl, opp, ctx: (
+                [{"action": "deal_damage", "amount": 3,
+                  "target_card": ctx.get('explicit_target_name'),
+                  "target_controller": opp}]
+                if ctx.get('explicit_target_name')
+                else [{"action": "deal_damage", "amount": 3, "target_player": opp}]
+            ) + _arlinn_transform_action(ctrl, ctx),
+        )
+
         # Chandra, Flamecaller 0: "Create two 3/1 red Elemental creature tokens
         # with haste. Exile them at the beginning of the next end step."
         self._pw_ability_templates[("chandra, flamecaller", "3/1 red elemental")] = EffectTemplate(
@@ -6879,6 +7174,39 @@ class EffectTemplateLibrary:
                 description="Deal damage to each opponent",
                 action_generator=lambda ctrl, opp, ctx: [
                     {"action": "deal_damage", "amount": int(ctx['_match'].group(1)), "target_player": opp},
+                ],
+            )
+        )
+
+        # --- "you draw a card and you lose N life" (COMBINED) ---
+        # Aug 10 deferred (G7). Ob Nixilis Reignited's "+1: You draw a card and
+        # you lose 1 life" had NO pattern for the draw half — the partial below
+        # is the only registered pattern in the whole library that matches the
+        # string, and the loop returns on first match, so nine activations
+        # resolved as pure drawback.
+        #
+        # POSITION IS LOAD-BEARING IN BOTH DIRECTIONS: it must sit BELOW the
+        # dies-scoped Dark Prophecy pattern (which is more specific) and ABOVE
+        # this partial, or it never wins. Same shape as the documented
+        # Anguished Unmaking / Dark Prophecy compound-clause fixes.
+        #
+        # `^`-anchored so it cannot fire on a card that merely CONTAINS the
+        # phrase mid-sentence. Safe for loyalty abilities because
+        # parse_abilities stores only the post-colon remainder, so the text
+        # starts at "you draw...". Draw FIRST, then lose: the order matters for
+        # an empty-library race and for a lethal life total.
+        # 97 bulk cards print this shape; 4 are in the cache, of which
+        # Phyrexian Arena has a name key and Dark Prophecy its own earlier
+        # pattern, so this newly reaches Ob Nixilis and Asylum Visitor.
+        self._add_pattern(
+            r"^you draw a card and you lose (\d+) life",
+            EffectTemplate(
+                name="Draw a card and lose life",
+                description="Draw a card, then lose life",
+                action_generator=lambda ctrl, opp, ctx: [
+                    {"action": "draw_cards", "player": ctrl, "amount": 1},
+                    {"action": "lose_life", "player": ctrl,
+                     "amount": int(ctx['_match'].group(1))},
                 ],
             )
         )

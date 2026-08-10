@@ -1298,23 +1298,6 @@
       ]
     },
     {
-      "key": "nightpack ambusher",
-      "name": "Nightpack Ambusher",
-      "event": "etb",
-      "description": "At end step, if you cast no spells this turn, create a 2/2 green Wolf token",
-      "actions": [
-        {
-          "action": "create_token",
-          "player": "$controller",
-          "name": "Wolf",
-          "power": 2,
-          "toughness": 2,
-          "types": "Creature — Wolf",
-          "count": 1
-        }
-      ]
-    },
-    {
       "key": "obscura storefront",
       "name": "Obscura Storefront",
       "event": "etb",
@@ -1361,21 +1344,6 @@
           "action": "draw_cards",
           "player": "$controller",
           "amount": 1
-        }
-      ]
-    },
-    {
-      "key": "on alert",
-      "name": "On Alert",
-      "event": "etb",
-      "description": "Up to two target Knights get +2/+1 until end of turn",
-      "actions": [
-        {
-          "action": "pump_all_creatures",
-          "player": "$controller",
-          "power": 2,
-          "toughness": 1,
-          "source": "On Alert"
         }
       ]
     },

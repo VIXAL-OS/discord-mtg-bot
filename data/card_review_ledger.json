@@ -209,6 +209,46 @@
       "since_sha": "6323894",
       "note": "'Other colorless creatures' was mangled into a nonexistent subtype ('colorles') and matched nobody. Colour-absence is now a real predicate."
     },
+    "arlinn kord": {
+      "status": "awaiting",
+      "since_sha": "1ef33d9",
+      "note": "Her [0] made the Wolf and never transformed her, so the back face was unreachable. BOTH faces now emit transform_permanent (the [-1] transforms her too). Fixed after the corpus."
+    },
+    "nightpack ambusher": {
+      "status": "awaiting",
+      "since_sha": "1ef33d9",
+      "note": "TWO separate fixes now pending verification: the compound subtype anthem (registered nothing) AND the end-step intervening-if (CR 603.4 — made a Wolf on turns its controller cast spells). Watch both."
+    },
+    "silverflame squire": {
+      "status": "awaiting",
+      "since_sha": "1ef33d9",
+      "note": "Its adventure half On Alert was +2/+1 board-wide with no untap; now single-target +2/+2 plus the untap. Also needed the adventure path to start forwarding the declared target at all."
+    },
+    "faerie guidemother": {
+      "status": "awaiting",
+      "since_sha": "1ef33d9",
+      "note": "Its adventure half Gift of the Fae was +1/+1 board-wide with team-wide flying; now single-target +2/+1 with flying."
+    },
+    "moonmist": {
+      "status": "awaiting",
+      "since_sha": "1ef33d9",
+      "note": "Was refused wholesale by the combat-shape guard, losing the transform AND the fog. Now a Tier-1.5 template. KNOWN APPROXIMATION: scope=all over-prevents — the printed Werewolf/Wolf exemption is unmodelled, so do NOT mark verified on a game where werewolves attacked."
+    },
+    "avabruck caretaker": {
+      "status": "awaiting",
+      "since_sha": "1ef33d9",
+      "note": "Its beginning-of-combat trigger drained after combat damage AND targeted a planeswalker. Both fixed (drain ordering at the AI call sites; a real template). Fixed after the corpus."
+    },
+    "ob nixilis reignited": {
+      "status": "awaiting",
+      "since_sha": "1ef33d9",
+      "note": "The [+1] dropped its draw and resolved only the life loss. Combined pattern added. Also newly reaches Asylum Visitor, which had no name key."
+    },
+    "inscription of abundance": {
+      "status": "awaiting",
+      "since_sha": "1ef33d9",
+      "note": "A kicked cast paid 5 mana and fizzled. Now a Tier-1.5 modal generator reading ctx['_modes'] + ctx['kicked']. The Tier-2 loop that caused it is still unfixed for OTHER modal spells — only this card is routed around it."
+    },
     "cast down": {
       "status": "awaiting",
       "since_sha": "6323894",

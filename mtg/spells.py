@@ -2380,7 +2380,18 @@ async def _dispatch_resolution(engine, game: GameState, player: Player,
                 opp_idx_adv = 1 - (game.players.index(player) if player in game.players else 0)
                 opp_adv = game.players[opp_idx_adv]
                 lib_adv = get_effect_library()
-                ctx_adv = build_game_context(game, player, opp_adv, card=adventure_card)
+                # Aug 10 deferred (G3): the adventure branch was the ONLY
+                # resolution builder not forwarding the declared target — both
+                # siblings (the split half above, and the main nonpermanent
+                # path below) pass explicit_target=target. Without it
+                # build_game_context never writes explicit_target_name/_id, so
+                # EVERY adventure half fell back to a heuristic pick — for the
+                # targeted ones (On Alert, Gift of the Fae) that is plain
+                # battlefield insertion order, and no template on this path
+                # could honor a declared target no matter how it was written.
+                ctx_adv = build_game_context(game, player, opp_adv,
+                                             card=adventure_card,
+                                             explicit_target=target)
                 adv_actions, adv_desc = lib_adv.resolve_etb(
                     card_name=card.adventure_name,
                     oracle_text=card.adventure_text or '',
@@ -2658,6 +2669,15 @@ async def _dispatch_resolution(engine, game: GameState, player: Player,
                 # Match case-insensitively so the suffix marker (lowercase "_(complex effect, ...)_")
                 # still triggers Tier 3 escalation while keeping the user-visible text clean.
                 has_complex_effect = any("complex effect" in m.lower() for m in effect_messages)
+                # Aug 10 deferred (G4): a FAILED Tier-2 resolution must still
+                # reach Tier 3. result.success was ignored entirely, and a
+                # failure emits a ⚠️ warning that carries no "complex effect"
+                # marker — so the spell counted as RESOLVED, mana spent, no
+                # effect, no fallback. Observed on a kicked Inscription of
+                # Abundance, whose target-player mode was always legal while
+                # the resolver aborted on the first unsatisfiable restriction.
+                if not getattr(result, 'success', True):
+                    has_complex_effect = True
             except Exception as e:
                 print(f"[SPELL_RESOLVER] Error resolving {card.name}: {e}")
                 # June 10 audit (C4): this barrier masked an UnboundLocalError

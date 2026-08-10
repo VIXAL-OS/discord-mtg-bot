@@ -2698,6 +2698,19 @@ class GameEngine:
         # the active player was reset, so instants a player cast during their
         # OPPONENT's turn stayed on the books and were later miscounted as
         # spells cast "during their own turn".
+        # Aug 10 deferred (G2): end-step triggers dispatch BELOW this reset on
+        # the end_turn path, so by the time an "if you didn't cast a spell this
+        # turn" intervening-if (CR 603.4, Nightpack Ambusher) is evaluated the
+        # counter is already 0 and the condition always reads as met. Snapshot
+        # it here, TURN-STAMPED: the other dispatch path (advance_phase) fires
+        # end-step triggers before any reset, where the live counter is correct,
+        # and an unstamped snapshot would be a STALE prior-turn value there.
+        # Consumers must use the snapshot only when the stamp matches.
+        game._spells_cast_snapshot_turn = game.turn_number
+        game._spells_cast_snapshot = {
+            _p.name: int(getattr(_p, 'spells_cast_this_turn', 0) or 0)
+            for _p in game.players
+        }
         for _p in game.players:
             _p.spells_cast_this_turn = 0
             _p.noncreature_spells_cast_this_turn = 0  # Reset for Esper Sentinel
