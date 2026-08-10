@@ -933,6 +933,70 @@ def fire_equipped_combat_damage_counters(game: GameState, dealer: Card) -> None:
             pass
 
 
+def apply_noncombat_damage_to_creature(rules, game: GameState, creature: Card,
+                                        amount: int, source_name: str = "",
+                                        source_id: str = "",
+                                        source_controller: str = "",
+                                        source_controller_player=None):
+    """Apply NONCOMBAT damage to a creature. Returns (final_amount, messages).
+
+    The creature twin of apply_noncombat_damage_to_player, and deliberately
+    NOT apply_combat_damage_to_creature: that one stamps is_combat_damage=True,
+    which is wrong for a burn spell or a mass-damage sorcery and is load-bearing
+    in both directions — Solphim's registration gates on `not ev.is_combat_damage`
+    (it would wrongly fire), and any combat-only replacement would wrongly apply.
+    Aug 10 card-targeted wave: the MASS DAMAGE handler in mtg/spells.py did
+    `c.damage_marked += dmg` raw, so Furnace of Rath / Gisela / Torbran / Insult
+    // Injury / Fiery Emancipation / Angrath's Marauders were ALL silently
+    inert against every board wipe — defeating the replacement_chain deck's
+    whole premise — while the "and each player" half four lines below already
+    routed correctly.
+
+    Does the three things every noncombat creature-damage site needs: run the
+    replacement chain, mark the damage, and fire the damaged-creature trigger
+    scan (CR 603.2 — "whenever a source deals damage to this creature" is not
+    combat-only; Phyrexian Obliterator vs a board wipe).
+    """
+    if amount <= 0:
+        return 0, []
+    if HAS_REPLACEMENT_ENGINE and game._replacement_engine and game._replacement_engine.effects:
+        from mtg.helpers import damage_source_colors
+        creature_controller_name = ""
+        if hasattr(creature, '_find_controller'):
+            ctrl = creature._find_controller(game)
+            if ctrl is not None:
+                creature_controller_name = getattr(ctrl, 'name', "") or ""
+        event = GameEvent(
+            event_type=EventType.DAMAGE,
+            affected_player=creature_controller_name,
+            affected_object=getattr(creature, 'id', ''),
+            affected_object_name=creature.name,
+            amount=amount,
+            source_name=source_name,
+            source_id=source_id,
+            source_controller=source_controller or "",
+            source_colors=damage_source_colors(
+                game, source_name=source_name, source_id=source_id),
+            is_combat_damage=False,
+        )
+        final = game._replacement_engine.process_event_sync(event)
+        if final.is_prevented:
+            print(f"  [REPLACEMENT-APPLY] Noncombat creature damage prevented: "
+                  f"{source_name} → {creature.name} ({', '.join(final.replacement_chain)})")
+            return 0, []
+        if final.amount != amount:
+            print(f"  [REPLACEMENT-APPLY] Noncombat creature damage modified: "
+                  f"{amount} → {final.amount} ({', '.join(final.replacement_chain)})")
+        amount = final.amount
+    if amount <= 0:
+        return 0, []
+    creature.damage_marked = getattr(creature, 'damage_marked', 0) + amount
+    from mtg.triggers import scan_damaged_creature
+    msgs = scan_damaged_creature(rules, game, creature, amount,
+                                 source_controller_player) or []
+    return amount, msgs
+
+
 def apply_noncombat_damage_to_player(rules, game: GameState, player: 'PlayerState',
                                        amount: int, source_name: str = "",
                                        source_id: str = "",

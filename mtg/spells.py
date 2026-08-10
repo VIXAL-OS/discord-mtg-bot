@@ -5878,13 +5878,23 @@ def resolve_special_effects(engine, game: GameState, player: Player, card: Card,
         hit_count = 0
         should_tap = "tap those creatures" in oracle or "tap them" in oracle
 
+        from mtg.combat import apply_noncombat_damage_to_creature
         for p in game.players:
             if p == player:
                 continue  # Only opponent's creatures
             for c in list(p.battlefield):
                 all_kws = [kw.lower() for kw in (c.keywords or [])] + [kw.lower() for kw in (c.temp_keywords or [])]
-                if c.is_creature() and 'flying' in all_kws:
-                    c.damage_marked += dmg
+                # Aug 10: is_creature(game) — without `game` this bypasses the
+                # devotion type-flip gate (CR 207.4), so a below-threshold god
+                # reads as a creature (the June-10 D4 class).
+                if c.is_creature(game) and 'flying' in all_kws:
+                    _dealt, _tmsgs = apply_noncombat_damage_to_creature(
+                        engine.rules, game, c, dmg, source_name=card.name,
+                        source_id=getattr(card, 'id', ''),
+                        source_controller=player.name,
+                        source_controller_player=player)
+                    if _tmsgs:
+                        messages.extend(_tmsgs)
                     if should_tap:
                         c.tapped = True
                     hit_count += 1
@@ -5904,11 +5914,76 @@ def resolve_special_effects(engine, game: GameState, player: Player, card: Card,
     if mass_dmg_match:
         dmg = int(mass_dmg_match.group(1))
         hit_count = 0
+        # Aug 10 card-targeted wave: route through the noncombat creature funnel
+        # so damage REPLACEMENTS apply (Furnace of Rath, Gisela's halving,
+        # Torbran, Fiery Emancipation, Insult // Injury...). The raw
+        # `damage_marked +=` here made every doubler silently inert against
+        # every board wipe, while the "and each player" half below already
+        # routed correctly. is_creature(game) for the devotion type-flip gate.
+        from mtg.combat import apply_noncombat_damage_to_creature
+        _damaged_ids = set()
         for p in game.players:
             for c in list(p.battlefield):
-                if c.is_creature():
-                    c.damage_marked += dmg
+                if c.is_creature(game):
+                    _dealt, _tmsgs = apply_noncombat_damage_to_creature(
+                        engine.rules, game, c, dmg, source_name=card.name,
+                        source_id=getattr(card, 'id', ''),
+                        source_controller=player.name,
+                        source_controller_player=player)
+                    if _tmsgs:
+                        messages.extend(_tmsgs)
+                    if _dealt > 0:
+                        _damaged_ids.add(getattr(c, 'id', ''))
                     hit_count += 1
+        # "If a creature dealt damage this way would die this turn, exile it
+        # instead" (Anger of the Gods, Crush the Weak, Yamabushi's Storm,
+        # Underworld Fires — 4 of the 16 printed members of the family reach
+        # this branch; the rest are single-target and resolve elsewhere).
+        #
+        # CR 700.4: an exiled creature never DIES, so its dies-triggers must not
+        # fire. Live evidence was a Hangarback Walker minting Thopters off a
+        # death that per the rules never happened.
+        #
+        # Registered inline, where the damaged set is already in hand, because
+        # scan_oracle_for_replacements is a PERMANENT-ENTRY hook — a sorcery
+        # never reaches it, so an _NAMED_CARD_REPLACEMENTS entry would be dead
+        # code. The generic _REPLACEMENT_PATTERNS is deliberately untouched:
+        # dropping its "graveyard" requirement to reach this text newly matches
+        # 55 further bulk cards and would register each as an UNSCOPED,
+        # permanent death->exile replacement — strictly worse than silence.
+        #
+        # Gated on the whole printed phrase, so the other cache cards in this
+        # branch (Blasphemous Act, Kozilek's Return, Star of Extinction) are
+        # untouched. The turn clamp self-expires with no cleanup pass, mirroring
+        # register_turn_damage_doubler.
+        if _damaged_ids and 'would die this turn, exile it instead' in oracle:
+            _rep_engine = getattr(game, 'replacement_engine', None)
+            if _rep_engine is not None:
+                try:
+                    from rules.replacement import (
+                        ReplacementEffect as _AngerReplacement,
+                        EventType as _AngerEvent,
+                    )
+                    _turn = game.turn_number
+                    _sid = f"{card.name}_turn{_turn}_exile_instead"
+                    _rep_engine.add_effect(_AngerReplacement(
+                        id=_sid, source_name=card.name, source_id=_sid,
+                        controller=player.name,
+                        replaces_event=_AngerEvent.DEATH,
+                        condition_text=(f"{card.name}: creatures it damaged are "
+                                        f"exiled instead of dying this turn"),
+                        replacement_type="exile_instead",
+                        new_destination="exile",
+                        condition=(lambda ev, _g=game, _t=_turn,
+                                   _s=frozenset(_damaged_ids): (
+                                       _g.turn_number == _t
+                                       and ev.to_zone == "graveyard"
+                                       and ev.affected_object in _s)),
+                    ))
+                    print(f"[REPLACEMENT] {card.name}: creatures damaged this "
+                          f"way are exiled instead of dying (turn {_turn})")
+                except ImportError:
+                    pass
         messages.append(f"🔥 {card.name} deals {dmg} damage to each creature ({hit_count} hit)")
         # Also check "and each player" / "and each planeswalker"
         if "each player" in oracle:

@@ -647,7 +647,26 @@ class TargetTextParser:
         for pattern, color in color_map.items():
             if pattern in text:
                 restriction.colors_excluded.add(color)
-        
+
+        # Supertype exclusions (CR 205.4a). Aug 10 deferred (H2): Cast Down
+        # prints "Destroy target NONLEGENDARY creature" and that restriction was
+        # parsed nowhere — types_excluded has been declared and consumed since
+        # the field was added, and simply never written by anything. Every other
+        # piece already exists: TargetValidator._check_type_requirements
+        # iterates types_excluded, Targetable.is_type resolves against
+        # supertypes, and _card_to_targetable already fills 'legendary' from the
+        # type line — so this one line reaches BOTH the cast-time gate and the
+        # CR 608.2b resolution re-check.
+        #
+        # Whole-word, and deliberately so: 'legendary' is a substring of
+        # 'nonlegendary', the trap this codebase has shipped eleven times.
+        # 'nonbasic' is the obvious sibling and _card_to_targetable already
+        # populates 'basic' — left out because no inventory card needs it and
+        # untested surface is not free. This is the extension point.
+        if re.search(r'\bnonlegendary\b', text):
+            restriction.types_excluded.add('legendary')
+
+
         # Power/toughness restrictions
         power_match = re.search(r"power (\d+) or (less|greater)", text)
         if power_match:

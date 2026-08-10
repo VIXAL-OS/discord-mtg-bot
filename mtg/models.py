@@ -508,6 +508,52 @@ _CONTROLLER_ATTACK_LOCK = re.compile(
 _CARD_KINDS = ('enchantment', 'artifact', 'creature', 'land',
                'planeswalker', 'instant', 'sorcery')
 
+# CR 205.4a — the complete supertype list. Matched against the type line so
+# the layers engine can evaluate supertype-qualified effects (Narfi's "Other
+# snow and Zombie creatures you control"). Deliberately exhaustive-and-small:
+# a supertype is a closed set, unlike subtypes.
+_SUPERTYPES = ('basic', 'legendary', 'ongoing', 'snow', 'world', 'host')
+
+# The UNQUALIFIED "creatures you control get +N/+N" anthem, for the inline
+# compute-on-read fallback in _get_anthem_power/toughness_bonus.
+#
+# Aug 10 card-targeted wave (B): the pattern was unanchored, so ANY adjective
+# in front was swallowed and the anthem broadcast to every creature —
+# Full Moon's Rise ("Werewolf creatures you control get +1/+0") and Instigator
+# Gang ("Attacking creatures you control get +1/+0") each buffed the whole
+# board. Three creatures died at toughness 2 that should have survived at 3.
+# The registration ladder in register_static_pt_effects had the identical
+# hole; both are fixed, and they are mutually exclusive per creature (the
+# inline path runs only when the layers engine has no P/T effect at all —
+# get_effective_power's _has_layers_pt_effect gate).
+#
+# THE ANCHOR IS A FIXED-WIDTH NEGATIVE LOOKBEHIND, and the width is the whole
+# point: it inspects the two characters before "creatures" and rejects a
+# lowercase-or-hyphen followed by a space ("werewolf ", "attacking ",
+# "non-human ", "other "). It still matches at string start, after "\n", and
+# — decisively — after ", ": Beastmaster Ascension prints "...has seven or
+# more quest counters on it, creatures you control get +5/+5" and registers
+# CORRECTLY today, so a `^`/`\n`/`\.\s` anchor would silently kill it.
+# (Python re rejects variable-width lookbehind, so this cannot be widened
+# into an alternation without restructuring.)
+_ANTHEM_INLINE_RE = (
+    r'(?<![a-z-] )(?:other )?creature(?:\s+token)?s you control get \+(\d+)/\+(\d+)')
+
+# The same anchor for the layers REGISTRATION ladder's unqualified clause.
+# Module-scope so a pin can exercise the real object rather than re-expressing
+# it (a mirrored predicate is a comment, not a test).
+#
+# Honest scope note, in the spirit of the July-26 CR 601.2f clamp: with the
+# subtype branch above it generalized, this anchor is DEFENCE IN DEPTH rather
+# than load-bearing for anything in the current inventory — every qualifier
+# shape measured in the deck JSONs is now claimed by an earlier branch, so
+# mutation-reverting this anchor alone changes no card's behaviour today. It
+# stays because the ladder's ORDER is what makes that true, and a future
+# reorder or a narrowed subtype branch would silently hand the qualified
+# clauses back to own_all. Pinned directly rather than end-to-end for exactly
+# that reason.
+_ANTHEM_OWN_ALL_RE = r'(?<![a-z-] )creatures you control get \+(\d+)/\+(\d+)'
+
 # "gets +N/+M for each <X> you control" on an Aura or Equipment.
 #
 # Aug 10 deferred (A3): the aura reader's kind alternation was a literal
@@ -1568,7 +1614,7 @@ class Card:
                         # Covers: "creatures you control", "creature tokens you
                         # control", "other creature tokens you control"
                         # (Intangible Virtue, Phantom General)
-                        for m in _re.finditer(r'(?:other )?creature(?:\s+token)?s you control get \+(\d+)/\+(\d+)', sent):
+                        for m in _re.finditer(_ANTHEM_INLINE_RE, sent):
                             # "creature tokens" only applies to tokens
                             if 'creature token' in m.group() and not getattr(self, 'is_token', False):
                                 continue
@@ -1626,7 +1672,7 @@ class Card:
                     # June 10 audit (V18): static-sentence filter — see
                     # _get_anthem_power_bonus for rationale (Castle Embereth).
                     for sent in self._anthem_static_sentences(oracle):
-                        for m in _re.finditer(r'(?:other )?creature(?:\s+token)?s you control get \+(\d+)/\+(\d+)', sent):
+                        for m in _re.finditer(_ANTHEM_INLINE_RE, sent):
                             if 'creature token' in m.group() and not getattr(self, 'is_token', False):
                                 continue
                             bonus += int(m.group(2))
@@ -5155,6 +5201,21 @@ class GameState:
             # Stonehoof-style keyword grants silently never applied. Let other_match
             # (the dedicated "other creatures you control" path) handle it.
             subtype_match = None  # colors / "other" handled by their own paths
+        # Aug 10 deferred (E1): "Other PERMANENTS you control have
+        # indestructible" (Avacyn, Angel of Hope) matched no pattern here at
+        # all, so Akroma died under her to a board wipe. The grant ladder was
+        # creature-shaped end to end.
+        #
+        # The clause-initial anchor is load-bearing, not decorative. Unanchored,
+        # this newly reaches Avacyn's Memorial ("legendary permanents you
+        # control have..."), Invasion of Pyrulea ("transformed ...") and
+        # Dawnglade Regent ("As long as you're the monarch, ..."), and would
+        # grant each unconditionally to EVERY permanent — an inversion.
+        # Declining those is an under-count, which is the direction this
+        # codebase prefers.
+        perm_match = re.search(
+            r'(?:(?<=^)|(?<=\n)|(?<=\. ))(other )?permanents you control have (.+?)(?:\.|$)',
+            oracle)
         # Pattern: "Other creatures you control have <keywords>"
         # Pattern: "Creatures you control have <keywords>"
         other_match = re.search(r'other creatures you control have (.+?)(?:\.|$)', oracle)
@@ -5174,15 +5235,21 @@ class GameState:
             other_match = None
             subtype_match = None
 
-        match = auras_match or subtype_match or other_match or all_match
+        match = auras_match or subtype_match or other_match or all_match or perm_match
         is_other_only = other_match is not None and subtype_match is None
         is_aura_only = auras_match is not None
         is_subtype_only = subtype_match is not None and auras_match is None
+        # A permanents-scoped grant only wins when no narrower clause matched.
+        is_perm_only = (perm_match is not None and auras_match is None
+                        and subtype_match is None and other_match is None
+                        and all_match is None)
         power_threshold = int(power_cond_match.group(1)) if power_cond_match else 0
 
         if match:
             # subtype_match.group(2) holds the keyword text; others use group(1)
-            if is_subtype_only:
+            if is_perm_only:
+                keyword_text = perm_match.group(2)
+            elif is_subtype_only:
                 keyword_text = match.group(2)
             elif power_cond_match:
                 keyword_text = power_cond_match.group(2)
@@ -5196,7 +5263,10 @@ class GameState:
                                    ' '.join(w.capitalize() for w in kw.split()))
 
             if granted:
-                if is_aura_only:
+                if is_perm_only:
+                    applies_to = (("other " if perm_match.group(1) else "")
+                                  + "permanents you control")
+                elif is_aura_only:
                     applies_to = "auras you control"
                 elif is_subtype_only:
                     # Format matches applies_to_permanent's subtype regex:
@@ -5453,10 +5523,40 @@ class GameState:
         # subtype is followed by the word "creatures" (e.g. "non-Human creatures
         # you control"). Must come before generic patterns so the more-specific
         # filter wins.
+        # Aug 10 card-targeted wave (B). Two generalizations, both measured
+        # against the deck inventory before being written:
+        #   * "other" is now OPTIONAL. Full Moon's Rise prints "Werewolf
+        #     creatures you control get +1/+0" and Tendershoot Dryad prints
+        #     "Saprolings you control get +2/+2" — neither says "other", so both
+        #     fell past this branch into the unanchored own_all and buffed the
+        #     ENTIRE board. When the clause omits "other" the source is NOT
+        #     excluded, so the captured group is threaded into applies_to
+        #     rather than "other" being hardcoded as it was before.
+        #   * the qualifier may be a LIST — "Other Wolves and Werewolves you
+        #     control" (Nightpack Ambusher), "Other snow and Zombie creatures
+        #     you control" (Narfi). A single [a-z]+ matched neither, so Narfi
+        #     leaked to own_all and Nightpack registered nothing at all.
+        # Order is load-bearing: this must stay BELOW the color branch, or
+        # "White creatures you control" registers as subtype "white" and
+        # matches nobody.
         subtype_anthem = re.search(
-            r'other (non-)?([a-z]+)(?: creatures?)? you control get \+(\d+)/\+(\d+)',
+            r'(other )?(non-)?([a-z]+(?:\s+and\s+[a-z]+)*)'
+            r'(?: creatures?)? you control get \+(\d+)/\+(\d+)',
             static_oracle,
         )
+        # Combat-state qualifiers ("Attacking/Blocking creatures you control")
+        # are NOT subtypes and cannot be expressed as an applies_to string:
+        # LayeredPermanent.to_dict (rules/layers.py) carries no attacking key,
+        # calculate_characteristics is called with game_state=None, and
+        # create_anthem_effect sets no filter_fn. Registering "attackings you
+        # control" would match nobody silently. Decline with a greppable
+        # breadcrumb instead — under-applying is the safe direction, and it is
+        # strictly better than the pre-Aug-10 behaviour of buffing the whole
+        # board. See CLAUDE.md for the two implementation shapes.
+        if subtype_anthem and subtype_anthem.group(3) in ('attacking', 'blocking'):
+            print(f"[LAYERS] Skipping combat-state anthem (needs combat state, "
+                  f"not modelled): {card.name}")
+            return
         # Skip subtype pathway when the match is really "other creatures" — that
         # is a card TYPE, not a subtype, and needs the generic "other creatures
         # you control" clause (which applies_to_permanent handles via its
@@ -5464,21 +5564,24 @@ class GameState:
         # under the subtype branch, where applies_to_permanent tries to match
         # "creatures" as a subtype on every creature, finds nothing, and
         # silently applies to no one.
-        if subtype_anthem and subtype_anthem.group(2) in ("creature", "creatures"):
+        if subtype_anthem and subtype_anthem.group(3) in ("creature", "creatures"):
             subtype_anthem = None
         if subtype_anthem:
-            negation = subtype_anthem.group(1)  # "non-" or None
-            sub_word = subtype_anthem.group(2)
+            is_other = bool(subtype_anthem.group(1))
+            negation = subtype_anthem.group(2)  # "non-" or None
+            sub_words = [w.strip() for w in
+                         re.split(r'\s+and\s+', subtype_anthem.group(3)) if w.strip()]
             # Normalize a trailing plural "s" so the base subtype word matches
             # what's stored on cards (case-insensitive). "wolves" has no trailing
             # "s" after this (Wolves has irregular plural), "humans" -> "human".
-            if sub_word.endswith("s") and len(sub_word) > 1:
-                sub_word = sub_word[:-1]
-            p_val, t_val = int(subtype_anthem.group(3)), int(subtype_anthem.group(4))
+            sub_words = [w[:-1] if (w.endswith("s") and len(w) > 1) else w
+                         for w in sub_words]
+            p_val, t_val = int(subtype_anthem.group(4)), int(subtype_anthem.group(5))
+            prefix = "other " if is_other else ""
             if negation:
-                applies_to = f"other non-{sub_word} creatures you control"
+                applies_to = f"{prefix}non-{sub_words[0]} creatures you control"
             else:
-                applies_to = f"other {sub_word}s you control"
+                applies_to = f"{prefix}{' and '.join(w + 's' for w in sub_words)} you control"
             effect = create_anthem_effect(card.name, f"{card.id}_subtype", controller_name, p_val, t_val, applies_to)
             self.layers_engine.add_effect(effect)
             print(f"[LAYERS] Registered subtype anthem P/T: {card.name} -> {applies_to} +{p_val}/+{t_val}")
@@ -5491,7 +5594,9 @@ class GameState:
         # vs "creatures you control" — the more-specific one should win).
         anthem_patterns = [
             ('own_other', r'other creatures you control get \+(\d+)/\+(\d+)', "other creatures you control", False),
-            ('own_all', r'creatures you control get \+(\d+)/\+(\d+)', "creatures you control", False),
+            # Aug 10 (B): anchored — see _ANTHEM_INLINE_RE for why the anchor is a
+            # fixed-width lookbehind and why `^`/`\n` would kill Beastmaster Ascension.
+            ('own_all', _ANTHEM_OWN_ALL_RE, "creatures you control", False),
             ('opp_debuff', r'creatures (?:your opponents?|opponents?) control get -(\d+)/-(\d+)', "creatures opponents control", True),
             ('all_buff', r'all creatures get \+(\d+)/\+(\d+)', "all creatures", False),
             # Board-wide negative anthem: "Creatures get -1/-1" / "All creatures get
@@ -5595,10 +5700,18 @@ class GameState:
                 # game._rules_engine — a getattr chain whose happy
                 # path never existed.
                 card_subtypes = [t.lower() for t in (card.get_creature_types() or [])]
+                # Aug 10 deferred (B): base_supertypes was never populated, so
+                # LayeredPermanent.supertypes was ALWAYS empty and any filter
+                # reading it silently matched nobody — the same shape as the
+                # June-11 is_token finding. Narfi's "Other snow and Zombie
+                # creatures you control" needs the snow SUPERTYPE to resolve.
+                card_supertypes = [s for s in _SUPERTYPES
+                                   if s in (card.type_line or '').lower()]
                 lp = LayeredPermanent(
                     id=card.id, name=card.name, controller=player.name,
                     owner=player.name, base_types=["creature"],
                     base_subtypes=card_subtypes,
+                    base_supertypes=card_supertypes,
                     base_colors=card_colors,
                     base_abilities=list(getattr(card, 'keywords', []) or []),
                     base_power=base_p, base_toughness=base_t,
@@ -5759,6 +5872,18 @@ class GameState:
                         continue
                 except Exception:
                     continue
+
+            # Aug 10 deferred (E1): permanents-scoped grants (Avacyn, Angel of
+            # Hope) must be checked BEFORE the creature branch and must NOT
+            # carry an is_creature() gate — granting indestructible to an
+            # artifact, enchantment or land is the entire point. The strings
+            # are disjoint, so the order is for clarity, not correctness.
+            if "permanents you control" in applies_to:
+                if effect.controller != controller_name:
+                    continue
+                if "other" in applies_to and card.id == effect.source_id:
+                    continue
+                return True
 
             if "creatures you control" in applies_to:
                 if not card.is_creature():

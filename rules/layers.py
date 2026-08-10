@@ -158,7 +158,13 @@ class ContinuousEffect:
             stripped = applies_to[6:] if is_other else applies_to
             # Pattern like "<subtype>s you control" or "<subtype>s opponents control"
             import re as _re
-            m = _re.match(r'([a-z]+)s? (you control|opponents? control)$', stripped)
+            # Aug 10 card-targeted wave (B): the qualifier may be a LIST —
+            # "wolves and werewolves you control" (Nightpack Ambusher),
+            # "snow and zombies you control" (Narfi). A single [a-z]+ matched
+            # neither, so both fell through to the generic creature branch
+            # (Narfi buffed the whole board; Nightpack registered nothing).
+            m = _re.match(r'((?:[a-z]+ and )*[a-z]+)s? (you control|opponents? control)$',
+                          stripped)
             if m:
                 candidate = m.group(1)
                 # Exclude card TYPES (not subtypes) so clauses like
@@ -177,22 +183,43 @@ class ContinuousEffect:
         if subtype_match:
             sub_word, ctrl_word = subtype_match
             subtypes = [s.lower() for s in permanent.get('subtypes', [])]
-            # The upstream regex greedily captures the plural form
-            # (e.g. "dragons you control" -> sub_word="dragons"). MTG subtypes are
-            # stored singular ("Dragon"), so try several singular candidates before
-            # giving up. Covers regular plurals + common irregular -ves plurals
-            # (wolves->wolf, elves->elf, werewolves->werewolf, knives->knife).
-            candidates = [sub_word]
-            if sub_word.endswith('ves'):
-                candidates.append(sub_word[:-3] + 'f')
-                candidates.append(sub_word[:-3] + 'fe')
-            if sub_word.endswith('ies'):
-                candidates.append(sub_word[:-3] + 'y')
-            if sub_word.endswith('es'):
-                candidates.append(sub_word[:-2])
-            if sub_word.endswith('s'):
-                candidates.append(sub_word[:-1])
-            if not any(c in subtypes for c in candidates):
+            supertypes = [s.lower() for s in permanent.get('supertypes', [])]
+            colors = permanent.get('colors') or []
+
+            def _one_qualifier_matches(word: str) -> bool:
+                """Does `word` describe this permanent?
+
+                Aug 10: a qualifier in this construction is not always a
+                creature subtype. Narfi prints "Other snow and Zombie
+                creatures you control" — `snow` is a SUPERTYPE — and Kozilek
+                prints "Other colorless creatures you control", which is a
+                colour ABSENCE. Both were previously mangled into a
+                nonexistent subtype and matched nobody.
+                """
+                if word == 'colorless':
+                    return not colors
+                # The upstream regex greedily captures the plural form
+                # (e.g. "dragons you control" -> "dragons"). MTG subtypes are
+                # stored singular ("Dragon"), so try several singular
+                # candidates. Covers regular plurals + common irregular -ves
+                # plurals (wolves->wolf, elves->elf, werewolves->werewolf).
+                cands = [word]
+                if word.endswith('ves'):
+                    cands.append(word[:-3] + 'f')
+                    cands.append(word[:-3] + 'fe')
+                if word.endswith('ies'):
+                    cands.append(word[:-3] + 'y')
+                if word.endswith('es'):
+                    cands.append(word[:-2])
+                if word.endswith('s'):
+                    cands.append(word[:-1])
+                return any(c in subtypes or c in supertypes for c in cands)
+
+            # A list ("wolves and werewolves") is a UNION: a permanent
+            # qualifies if it matches ANY member (CR — "Wolves and Werewolves
+            # you control" means each creature that is a Wolf or a Werewolf).
+            words = [w.strip() for w in sub_word.split(' and ') if w.strip()]
+            if not any(_one_qualifier_matches(w) for w in words):
                 return False
             if "you control" in ctrl_word:
                 return permanent.get('controller') == self.controller

@@ -31,6 +31,14 @@ invents cards).
 
 What counts as "reviewed"
 -------------------------
+A game whose id CLAUDE.md cites, MINUS anything data/card_review_ledger.json
+puts back. The bare game-membership inference over-credits three ways — a
+reviewer does not check every card in a game, a card can be present with its
+ability never firing, and a card fixed in the same session was reviewed
+against logs that PREDATE the fix — so the ledger carries per-card
+verified / unexercised / awaiting statuses and the last two return to the
+pool. See that file for the contract.
+
 A game whose id CLAUDE.md cites. That is the audit trail of what a reviewer
 was actually pointed at. It is a FLOOR: earlier waves named archetypes in
 prose without always citing ids, so true coverage is a little higher and the
@@ -58,6 +66,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LOGS = os.path.join(ROOT, 'logs')
 CACHE = os.path.join(ROOT, 'data', 'card_data_cache.json')
 DOC = os.path.join(ROOT, 'CLAUDE.md')
+LEDGER = os.path.join(ROOT, 'data', 'card_review_ledger.json')
 
 # Live play signals. Each must name a card that DID something, not one that
 # was merely legal or merely in a deck list.
@@ -72,6 +81,15 @@ _PLAY_PATTERNS = (
 def _load_cache_names():
     with io.open(CACHE, encoding='utf-8') as fh:
         return set(json.load(fh))
+
+
+def _load_ledger():
+    """Reviewer-supplied per-card status; see the file's own _README."""
+    try:
+        with io.open(LEDGER, encoding='utf-8') as fh:
+            return {k.lower(): v for k, v in json.load(fh).get('cards', {}).items()}
+    except (OSError, ValueError):
+        return {}
 
 
 def _reviewed_game_ids():
@@ -160,8 +178,19 @@ def main():
         frequency.update(cards)
 
     # Credit is corpus-wide; only the denominator is scoped.
-    seen_in_reviewed = seen_anywhere & reviewed_cards
-    never = seen_anywhere - reviewed_cards
+    #
+    # The bare inference "appeared in a game a reviewer read, therefore
+    # checked" OVER-CREDITS three ways: a reviewer does not check every card
+    # in a game; a card can be present all game with its ability never firing;
+    # and a card FIXED in the same session was reviewed against logs that
+    # PREDATE the fix, so the corpus shows the broken behaviour. The ledger
+    # lets a reviewer put those back — an `unexercised` or `awaiting` card
+    # returns to the pool no matter how many reviewed games it appeared in.
+    ledger = _load_ledger()
+    put_back = {name for name, entry in ledger.items()
+                if entry.get('status') in ('unexercised', 'awaiting')}
+    seen_in_reviewed = (seen_anywhere & reviewed_cards) - put_back
+    never = (seen_anywhere - reviewed_cards) | (seen_anywhere & put_back)
     scope = f' (batch {args.sha})' if args.sha else ''
     reviewed_here = sum(1 for g in per_game if g in reviewed_ids)
 
@@ -171,7 +200,14 @@ def main():
     print(f'  distinct cards seen IN PLAY  : {len(seen_anywhere)}')
     print(f'  ...inside a REVIEWED game    : {len(seen_in_reviewed)} '
           f'({100.0 * len(seen_in_reviewed) / max(1, len(seen_anywhere)):.1f}%)')
+    _unex = sum(1 for n in seen_anywhere
+                if ledger.get(n, {}).get('status') == 'unexercised')
+    _await = sum(1 for n in seen_anywhere
+                 if ledger.get(n, {}).get('status') == 'awaiting')
     print(f'  NEVER under a reviewer       : {len(never)}')
+    print(f'    ...of which put back by the ledger:')
+    print(f'      unexercised (ability never fired) : {_unex}')
+    print(f'      awaiting    (fix postdates corpus): {_await}')
     print()
     print(f'--- top {args.top} never-reviewed cards, by how often they hit play ---')
     for name, count in sorted(((n, frequency[n]) for n in never),

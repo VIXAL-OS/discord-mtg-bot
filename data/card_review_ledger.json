@@ -1,0 +1,253 @@
+{
+  "_README": [
+    "Per-card review status, consumed by tools/card_coverage.py.",
+    "",
+    "The index's default inference — 'this card appeared in a game a reviewer",
+    "read, therefore it is checked' — OVER-CREDITS in three ways, and this",
+    "file is how a reviewer corrects it:",
+    "",
+    "  1. A reviewer does not check every card in a game. Only the ones named",
+    "     in the prompt, plus whatever they trip over.",
+    "  2. A card can be present all game with its relevant ability never",
+    "     firing (Mutavault played as a land and never animated; Grim Haruspex",
+    "     out while nothing died). Nothing was verified.",
+    "  3. A card FIXED in the same session was reviewed against logs that",
+    "     PREDATE the fix. The corpus shows the broken behaviour, so the fix",
+    "     itself is unverified until a fresh batch runs.",
+    "",
+    "Statuses:",
+    "  verified   - live evidence, in a corpus at or after `since_sha`, that",
+    "               the card behaved per its printed text. Retired from the",
+    "               pool. Include what was checked, because 'I saw the tag' is",
+    "               not the same as 'I verified the semantics'.",
+    "  unexercised- present in a reviewed game but the ability in question",
+    "               never fired. STAYS in the pool.",
+    "  awaiting   - a fix landed AFTER the corpus that was reviewed. STAYS in",
+    "               the pool until a batch at or after `since_sha` is read.",
+    "",
+    "Keys are lowercase card names, matching data/card_data_cache.json."
+  ],
+
+  "cards": {
+    "insult // injury": {
+      "status": "verified",
+      "since_sha": "6a30802",
+      "note": "Both halves; aftermath zone gate correct in BOTH directions (rejected from hand, cast from graveyard); two-target split resolved. Its invisibility to MASS damage is the mass-damage handler's defect, not this card's."
+    },
+    "underworld sentinel": {
+      "status": "verified",
+      "since_sha": "6a30802",
+      "note": "Attack trigger exiled a creature card from the graveyard with the dies-trigger link. The apparent self-exile was a Feldon TOKEN attacking while the real card was the exiled object."
+    },
+    "vile entomber": {
+      "status": "verified",
+      "since_sha": "6a30802",
+      "note": "ETB tutor to the correct zone (graveyard, not hand); deathtouch body present."
+    },
+    "angrath's marauders": {
+      "status": "verified",
+      "since_sha": "6a30802",
+      "note": "x2 on its controller's sources and correctly controller-GATED - the opponent's damage back was undoubled."
+    },
+    "furnace of rath": {
+      "status": "verified",
+      "since_sha": "6a30802",
+      "note": "Correctly symmetric; the caster's own Comet Storm was doubled against himself. The May-30 house-rule removal stayed fixed."
+    },
+    "elesh norn, grand cenobite": {
+      "status": "verified",
+      "since_sha": "6a30802",
+      "note": "Both halves, correct sign and scope, and she excludes herself."
+    },
+    "reaper from the abyss": {
+      "status": "verified",
+      "since_sha": "6a30802",
+      "note": "Morbid intervening-if correctly declined on five separate end steps (CR 603.4)."
+    },
+    "gatekeeper of malakir": {
+      "status": "verified",
+      "since_sha": "6a30802",
+      "note": "Kicker intervening-if correct on both a hand cast and a reanimated entry; entered tapped under Authority of the Consuls."
+    },
+    "sengir vampire": {
+      "status": "verified",
+      "since_sha": "6a30802",
+      "note": "Dies-trigger premise gate correct five times. Its 4 damage failing to kill was Selfless Spirit's indestructible, not a defect - the reviewer's closest false positive."
+    },
+    "elspeth's nightmare": {
+      "status": "verified",
+      "since_sha": "6a30802",
+      "note": "All three chapters plus the CR 704.5s sacrifice."
+    },
+    "reckless waif": {
+      "status": "verified",
+      "since_sha": "6a30802",
+      "note": "Full classic werewolf cycle: transformed, back face declined correctly on later upkeeps, attacked at back-face P/T."
+    },
+    "shepherd of the flock": {
+      "status": "verified",
+      "since_sha": "6a30802",
+      "note": "Adventure cost selection exemplary - creature half failed for mana, adventure cost used instead, exile tracked, creature half re-offered. Printed-target width is a separate MINOR."
+    },
+
+    "grim haruspex": {
+      "status": "unexercised",
+      "note": "Cast and attacked in two games; no nontoken creature its controller owned died while it was out, so the draw trigger never fired."
+    },
+    "mutavault": {
+      "status": "unexercised",
+      "note": "Played as a land; the {1} animation was never offered or activated. The manland behavioural signal is absent, not disproven."
+    },
+    "captivating vampire": {
+      "status": "unexercised",
+      "note": "Its own P/T is correct and its ANTHEM was the subject of a fix, but the control-stealing tap ability was never activated."
+    },
+    "crypt of agadeem": {
+      "status": "unexercised",
+      "note": "Entered tapped correctly in two games; the {2},{T} scaling ability was never activated, so the arithmetic is untested."
+    },
+    "magus of the coffers": {
+      "status": "unexercised",
+      "note": "Both activation refusals were correct; the scaling arithmetic is untested."
+    },
+    "gravecrawler": {
+      "status": "unexercised",
+      "note": "Cast and attacked at printed power; never in a graveyard, so cast-from-graveyard is untested."
+    },
+    "bloodline keeper": {
+      "status": "unexercised",
+      "note": "Cast, cost-reduced, activated, token entered and attacked - but the token's FLYING was never tested (no untapped blockers)."
+    },
+    "archon of sun's grace": {
+      "status": "unexercised",
+      "note": "Static grant registered; constellation never had an enchantment enter after it."
+    },
+    "charcoal diamond": {
+      "status": "unexercised",
+      "note": "Entered tapped correctly; the mana ability was never activated."
+    },
+    "battlefield forge": {
+      "status": "unexercised",
+      "note": "NOT VERIFIABLE from logs - [MANA-ENGINE] does not name the sources it taps, so the pain-land damage cannot be confirmed either way."
+    },
+    "boros signet": {
+      "status": "unexercised",
+      "note": "Same as Battlefield Forge - the tap is invisible in the logs."
+    },
+    "hypnotic sprite": {
+      "status": "unexercised",
+      "note": "Creature half verified; Mesmeric Glare (the adventure half) was never cast."
+    },
+    "bant panorama": {
+      "status": "unexercised",
+      "note": "Played, and correctly refused its sac-search with no mana - but the search itself never ran."
+    },
+
+    "dark depths": {
+      "status": "awaiting",
+      "since_sha": "6a30802",
+      "note": "Enters-with-counters fix landed AFTER this corpus; the logs show it entering with zero ice counters. Needs a fresh batch."
+    },
+    "glaive of the guildpact": {
+      "status": "awaiting",
+      "since_sha": "6a30802",
+      "note": "for-each multiplier fix postdates the corpus."
+    },
+    "goblin rabblemaster": {
+      "status": "awaiting",
+      "since_sha": "6a30802",
+      "note": "Attack trigger rewritten and the token half re-homed to beginning-of-combat, both after the corpus."
+    },
+    "sword of light and shadow": {
+      "status": "awaiting",
+      "since_sha": "6a30802",
+      "note": "Its combat-damage trigger now queues and its granted protection now parses - neither is in this corpus."
+    },
+    "glacial chasm": {
+      "status": "awaiting",
+      "since_sha": "6a30802",
+      "note": "Attack lock and life cumulative upkeep both fixed after the corpus."
+    },
+    "avacyn, angel of hope": {
+      "status": "awaiting",
+      "since_sha": "6323894",
+      "note": "The 'Other permanents you control have indestructible' grant is now IMPLEMENTED (registration pattern + a has_granted_keyword branch with no is_creature gate). Fixed after every corpus that exists, so still awaiting. NOTE the deferred half: recalculate_granted_keywords still skips non-creatures, so the NON-creature side of the grant (artifacts/enchantments/lands) is not yet populated on _granted_keywords."
+    },
+
+    "anger of the gods": {
+      "status": "awaiting",
+      "since_sha": "6323894",
+      "note": "Its 'exile it instead' death replacement now registers inline at resolution, and mass damage now routes through the replacement engine at all. Both postdate every corpus. Watch that an undying/persist creature it damaged is still wrongly RETURNED rather than exiled -- the SBA save branches run above the replacement check (pre-existing, same for RIP/Leyline)."
+    },
+    "full moon's rise": {
+      "status": "awaiting",
+      "since_sha": "6323894",
+      "note": "Its Werewolf-only anthem was buffing the whole board; the qualifier is now honored. Fixed after the corpus."
+    },
+    "instigator gang": {
+      "status": "awaiting",
+      "since_sha": "6323894",
+      "note": "Its Attacking-only anthem was buffing the whole board. Now DECLINES with a breadcrumb rather than registering -- correct only in the safe direction; the buff itself is still unmodelled."
+    },
+    "nightpack ambusher": {
+      "status": "awaiting",
+      "since_sha": "6323894",
+      "note": "Its compound 'Other Wolves and Werewolves' anthem registered NOTHING; subtype lists are now supported. Its end-step intervening-if is a SEPARATE unfixed finding (G2)."
+    },
+    "narfi, betrayer king": {
+      "status": "awaiting",
+      "since_sha": "6323894",
+      "note": "'Other snow and Zombie creatures' leaked to the unqualified anthem and buffed the whole board. Needed both the subtype-list support and base_supertypes threading, which was never populated at all."
+    },
+    "tendershoot dryad": {
+      "status": "awaiting",
+      "since_sha": "6323894",
+      "note": "'Saprolings you control get +2/+2' has no 'other' and no 'creatures', so it matched no branch and registered nothing. The Aug-10 blessing-condition fix was necessary but not sufficient -- it only let execution REACH this ladder."
+    },
+    "kozilek, the broken reality": {
+      "status": "awaiting",
+      "since_sha": "6323894",
+      "note": "'Other colorless creatures' was mangled into a nonexistent subtype ('colorles') and matched nobody. Colour-absence is now a real predicate."
+    },
+    "cast down": {
+      "status": "awaiting",
+      "since_sha": "6323894",
+      "note": "Its 'nonlegendary' restriction was parsed nowhere (types_excluded was declared and consumed but never written). Latent in the reviewed corpus -- the observed target was legal -- so a fresh batch is needed to see it bite."
+    },
+    "xenagos, the reveler": {
+      "status": "awaiting",
+      "since_sha": "6a30802",
+      "note": "X-from-board fix postdates the corpus."
+    },
+    "domri, anarch of bolas": {
+      "status": "awaiting",
+      "since_sha": "6a30802",
+      "note": "Disjunction fix postdates the corpus."
+    },
+    "reanimate": {
+      "status": "awaiting",
+      "since_sha": "6a30802",
+      "note": "Declared-target skip phrase fixed after the corpus; 45 of 49 casts failed in it."
+    },
+    "phyrexian negator": {
+      "status": "awaiting",
+      "since_sha": "6a30802",
+      "note": "Passive damaged-trigger seam fixed after the corpus."
+    },
+    "ill-tempered loner": {
+      "status": "awaiting",
+      "since_sha": "6a30802",
+      "note": "Now reaches the unhandled queue, but its damage-back effect still has no deterministic branch."
+    },
+    "killing wave": {
+      "status": "awaiting",
+      "since_sha": "6a30802",
+      "note": "The cross-game dedupe that cancelled it was fixed after the corpus."
+    },
+    "vampire nighthawk": {
+      "status": "awaiting",
+      "since_sha": "6a30802",
+      "note": "Its own keywords are verified, but the subtype anthem it should RECEIVE was fixed after the corpus."
+    }
+  }
+}
