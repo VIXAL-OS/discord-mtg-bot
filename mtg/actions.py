@@ -614,24 +614,19 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                     if not legal:
                         print(f"[TARGETING] Damage to player blocked: {player.name} — {reason}")
                         return f"🛡️ {amount} damage to **{player.name}** blocked ({reason})"
-                # Damage prevention flag (Teferi's Protection, Fog, etc.)
-                from mtg.helpers import damage_prevention_disabled, player_has_prevent_all_static
-                _prevent_flag = getattr(player, '_damage_prevented', False)
-                if _prevent_flag:
-                    expires = getattr(player, '_damage_prevented_expires_turn', float('inf'))
-                    if game.turn_number >= expires:
-                        player._damage_prevented = False
-                        _prevent_flag = False
-                        print(f"  [DAMAGE-PREVENTED] Expired for {player.name}")
-                if _prevent_flag or player_has_prevent_all_static(player):
-                    if damage_prevention_disabled(game):
-                        print(f"  [DAMAGE-PREVENTED] Overridden for {player.name} — "
-                              f"damage can't be prevented this turn (Insult // Injury)")
-                    else:
-                        print(f"  [DAMAGE-PREVENTED] {source_name} → {player.name}: {amount} damage prevented")
-                        return f"🛡️ {amount} damage to **{player.name}** prevented"
+                # Damage prevention. Aug 10 (A2): shared predicate. This action
+                # is the generic damage path (abilities, Tier 3, templates), so
+                # it is NOT combat damage — a Fog must not blank it, Teferi's
+                # Protection must.
+                from mtg.helpers import damage_prevented_for
+                _prevented, _ = damage_prevented_for(game, player, None,
+                                                     is_combat=False,
+                                                     allow_static=True)
+                if _prevented:
+                    print(f"  [DAMAGE-PREVENTED] {source_name} → {player.name}: {amount} damage prevented")
+                    return f"🛡️ {amount} damage to **{player.name}** prevented"
                 player.life -= amount
-                player.record_life_loss(amount)
+                player.record_life_loss(amount, game=game)
                 rules.log_event(f"Dealt {amount} damage to {player.name}")
                 # May 7 audit fix #6: when source is a burn spell (Lava Spike,
                 # Shard Volley, Lightning Bolt), prefix the line with 🔥 + name
@@ -753,7 +748,7 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                     print(f"  [REPLACEMENT-APPLY] Life loss modified: {amount} → {final.amount}")
                 amount = final.amount
             player.life -= amount
-            player.record_life_loss(amount)
+            player.record_life_loss(amount, game=game)
             rules.log_event(f"{player.name} loses {amount} life")
             # May 16 audit: console mirror — symmetric with [LIFE-GAIN]. Was
             # missing, so Bastion of Remembrance ETB drains, Thoughtseize
@@ -1321,6 +1316,26 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                     to_list.insert(0, card)
                 else:
                     to_list.append(card)
+                # Aug 10 deferred (D): a creature moving battlefield -> graveyard
+                # through THIS action never reached the CREATURE_DIED bus, so
+                # every dies trigger was skipped — Blood Artist / Zulaport
+                # drains, Korvold, Meren experience. Tier 3 fabricated exactly
+                # this shape (a move_card "kill" for Goblin Bombardment's 1
+                # damage against an undamaged 5/4) and it landed in the
+                # aristocrats deck, where dies triggers are the whole point.
+                # Every legitimate death handler in this file calls the queue
+                # as a SEPARATE step after its own zone routing (destroy at
+                # ~3323, sacrifice_permanent at ~5595, the wipes after
+                # route_dead_permanent); move_card called neither. Fixing it
+                # here rather than guarding one card family means any FUTURE
+                # emitter of this shape is visible to the bus too. Verified no
+                # double-fire: the only shipped move_card battlefield->graveyard
+                # call is Marit Lage's Slumber sacrificing itself, a noncreature
+                # that the is_creature() gate excludes.
+                if (from_zone.lower() == 'battlefield'
+                        and actual_to_zone == 'graveyard'
+                        and card.is_creature(game)):
+                    _queue_deaths_3a(game, [(card, player)])
                 entry_trigger_msgs = []
                 # [LAYERS] Register if entering battlefield, recalculate either way
                 if actual_to_zone == 'battlefield':
@@ -2406,7 +2421,17 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
         result = find_card_on_battlefield(action.get("card", ""))
         if result:
             card, owner = result
-            card.tapped = False
+            # Aug 10 (C3): route through the shared helper so an untap OUTSIDE
+            # the untap step (Seedborn Muse, Twiddle, Thousand-Year Elixir)
+            # also fires "becomes untapped" watchers. The helper's transition
+            # check is what stops an already-untapped target from firing one.
+            from mtg.helpers import untap_permanent
+            if untap_permanent(card):
+                from mtg.triggers import fire_becomes_untapped_triggers
+                for _m in fire_becomes_untapped_triggers(game, [(card, owner)]):
+                    if not hasattr(game, '_pending_messages'):
+                        game._pending_messages = []
+                    game._pending_messages.append(_m)
             return f"↪️ Untapped **{card.name}**"
 
     # ---- ANIMATE LAND / ARTIFACT (Sylvan Awakening, Living Lands, Awaken,
@@ -3502,6 +3527,9 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
             # Also set the flag as belt-and-suspenders (replacement engine may
             # not catch all damage paths, e.g., noncombat damage via lose_life)
             p._damage_prevented = True
+            # Aug 10 (A2): Teferi's Protection is ALL damage, not just combat
+            # — explicit so the shared gate can tell it from a Fog.
+            p._damage_prevented_combat_only = False
             # Expires at caster's next untap (1 full turn cycle in multiplayer)
             p._damage_prevented_expires_turn = game.turn_number + len(game.players)
             # Teferi's Protection also locks the life total so non-damage
@@ -4321,6 +4349,10 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
             for p in game.players:
                 p._damage_prevented = True
                 p._damage_prevented_except_subtypes = list(except_subtypes)
+                # Aug 10 (A2): these cards prevent COMBAT damage only. Marking
+                # it stops a Fog reaching burn spells while leaving Teferi's
+                # Protection (prevent_all_damage) all-damage.
+                p._damage_prevented_combat_only = True
                 # Expires at end of turn (next player's untap)
                 p._damage_prevented_expires_turn = game.turn_number + 1
             print(f"[FOG] All combat damage prevented this turn{_exempt_note}")
@@ -4330,6 +4362,7 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
             if p:
                 p._damage_prevented = True
                 p._damage_prevented_except_subtypes = list(except_subtypes)
+                p._damage_prevented_combat_only = True  # Aug 10 (A2)
                 p._damage_prevented_expires_turn = game.turn_number + 1
                 print(f"[FOG] Combat damage to {p.name} prevented this turn{_exempt_note}")
                 return f"🌫️ Combat damage to {p.name} is prevented this turn{_exempt_note}"

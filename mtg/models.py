@@ -2083,6 +2083,22 @@ class Card:
             # Flying creatures can only be blocked by flying/reach
             if attacker.has_flying() and not (self.has_flying() or self.has_reach()):
                 return False
+            # Aug 10 deferred (E2) — CR 702.16c: a creature with protection
+            # from a quality "can't be BLOCKED BY" creatures with that quality.
+            # Note the direction, which corrects the recorded item (it cited
+            # CR 509.1b): it is the ATTACKER's protection tested against THIS
+            # candidate blocker's qualities, not the blocker's protection. The
+            # live defect was Akroma (protection from black and from red)
+            # blocked by a mono-black Butcher of Malakir. Same shape as the
+            # flying/reach line above — an attacker-side quality checked
+            # against `self`.
+            try:
+                from mtg.helpers import protection_blocks_from
+                _prot, _why = protection_blocks_from(game, attacker, self)
+                if _prot:
+                    return False
+            except ImportError:
+                pass
             # Menace requires 2+ blockers (handled elsewhere)
             # Aug 2, 2026 — LANDWALK (CR 702.14). "This creature can't be
             # blocked as long as defending player controls a <type>." It had
@@ -2345,6 +2361,15 @@ class Player:
     # Wolves"; an empty list is the unconditional Fog / Teferi's Protection
     # case and leaves the gate's behaviour unchanged.
     _damage_prevented_except_subtypes: list = field(default_factory=list, repr=False, compare=False)
+    # Aug 10 deferred (A2): ONE flag has always served two different printed
+    # effects — prevent_combat_damage (Fog, Holy Day, Moment's Peace, Tangle,
+    # Arachnogenesis, Moonmist: "prevent all COMBAT damage") and
+    # prevent_all_damage (Teferi's Protection: all damage). The noncombat
+    # player funnel gates on the flag deliberately, for Teferi's, which meant
+    # a Fog also blanked burn spells. Extending the flag to creatures without
+    # this distinction would have propagated that over-prevention, so the two
+    # are separated here: True = combat damage only.
+    _damage_prevented_combat_only: bool = field(default=False, repr=False, compare=False)
     # Teferi's Protection: life total can't change while locked (CR 119.3-adjacent).
     _life_total_locked: bool = field(default=False, repr=False, compare=False)
     _life_total_locked_expires_turn: float = field(default=float("inf"), repr=False, compare=False)
@@ -2380,12 +2405,32 @@ class Player:
         default_factory=list, repr=False, compare=False)
 
 
-    def record_life_loss(self, amount: int) -> None:
-        """Record positive life loss for turn-scoped trigger conditions."""
+    def record_life_loss(self, amount: int, game=None, source_name: str = "") -> None:
+        """Record positive life loss for turn-scoped trigger conditions.
+
+        Aug 10 deferred (C2): this is also the LIFE_LOST emit point, mirroring
+        apply_life_gain's LIFE_GAINED gate (slice 1). Mindcrank ("Whenever an
+        opponent loses life, that player mills that many cards") had no
+        dispatcher of any kind; its own printed reminder — "(Damage causes loss
+        of life.)" — is why the emit belongs HERE rather than at a damage
+        funnel: damage and non-damage life loss both converge on this call, so
+        one emit covers both without double-counting.
+
+        `game` is optional and a site that cannot supply it simply does not
+        emit. That is an undercount, which is the safe direction, and it keeps
+        every existing caller working unchanged.
+        """
         try:
-            self.life_lost_this_turn += max(0, int(amount))
+            amount = max(0, int(amount))
         except (TypeError, ValueError):
             return
+        if amount <= 0:
+            return
+        self.life_lost_this_turn += amount
+        if game is not None:
+            from mtg import events
+            events.emit(events.LIFE_LOST, game, player=self, amount=amount,
+                        source_name=source_name)
     
     def get_zone(self, zone: Zone) -> List[Card]:
         """Get cards in a specific zone."""
@@ -3141,21 +3186,67 @@ class Player:
         return spent
     
     def _get_mana_tap_damage(self, card: Card) -> int:
-        """Get self-damage dealt when tapping a land for mana.
+        """Self-damage dealt when tapping this permanent for mana.
 
-        Some lands (Ancient Tomb, Mana Confluence, City of Brass) deal damage
-        to their controller as part of their mana ability.
-        Returns damage amount (0 for normal lands).
+        Aug 10 deferred (H1). This was a hardcoded FOUR-NAME list with no
+        oracle path, so the 8 pain lands and 8 Talismans in the inventory
+        (Adarkar Wastes, Battlefield Forge, Caves of Koilos, Karplusan Forest,
+        Llanowar Wastes, Sulfurous Springs, Underground River, Yavimaya Coast;
+        Talisman of Conviction/Curiosity/Dominance/Hierarchy/Impulse/
+        Indulgence/Progress/Resilience) all tapped for free.
+
+        SCOPED PER ABILITY LINE, which the record correctly insisted on:
+        Talisman of Impulse prints "{T}: Add {C}." and "{T}: Add {R} or {G}.
+        This artifact deals 1 damage to you." on SEPARATE lines, so a
+        whole-oracle scan charges the free colorless tap too. Only a line that
+        both produces mana and deals the damage counts.
+
+        KNOWN LIMITATION, stated rather than implied: the call sites do not
+        pass which ability line they used, and they cannot usefully — today
+        _get_mana_production collapses a Talisman to {'any': 1} and never
+        models the free {C} option at all, so the colored (damage-bearing)
+        ability is the only one the engine can pick. If production ever gains
+        the {C} option, this must take the committed color and charge only
+        when the damage-bearing line was the one used; tap_sources_for_cost
+        already computes committed_color a few lines later.
+
+        Mana Confluence is deliberately NOT here: it prints "{T}, Pay 1 life:
+        Add one mana of any color" — a life PAYMENT, not damage, so it cannot
+        be prevented or doubled and does not belong in a damage helper. It is
+        charged as a cost by the callers instead. The old list had it as
+        damage; that classification was wrong.
         """
-        name_lower = card.name.lower()
-        if 'ancient tomb' in name_lower:
-            return 2
-        if 'mana confluence' in name_lower:
-            return 1
-        if 'city of brass' in name_lower:
-            return 1
-        if 'tarnished citadel' in name_lower:
-            return 3
+        oracle = getattr(card, 'oracle_text', '') or ''
+        for raw in oracle.split('\n'):
+            line = raw.strip()
+            low = line.lower()
+            match = re.search(r'deals? (\d+) damage to you', low)
+            if not match:
+                continue
+            # Either the damage rides a mana-producing ability on this same
+            # line (Ancient Tomb, the pain lands, the Talismans) or it is a
+            # becomes-tapped trigger that fires whatever the tap was for
+            # (City of Brass).
+            if 'add ' in low or 'becomes tapped' in low:
+                return int(match.group(1))
+        return 0
+
+    def _get_mana_tap_life_cost(self, card: Card) -> int:
+        """Life paid as part of a mana ability's COST (Mana Confluence).
+
+        Aug 10 (H1): split out from _get_mana_tap_damage because the two are
+        not interchangeable — a payment can't be prevented, doubled, or
+        redirected, and now that protection and Torbran read damage, filing a
+        cost as damage is a real mislabel rather than a wording nit.
+        """
+        oracle = getattr(card, 'oracle_text', '') or ''
+        for raw in oracle.split('\n'):
+            low = raw.strip().lower()
+            if 'add ' not in low:
+                continue
+            match = re.search(r'pay (\d+) life', low.split(':')[0])
+            if match:
+                return int(match.group(1))
         return 0
 
     def _apply_sac_cost_at_tap(self, card: Card, game=None) -> Optional[Card]:
@@ -3402,6 +3493,18 @@ class Player:
             card.tapped = True
 
             # Apply self-damage for painful lands (Ancient Tomb, etc.)
+            # Aug 10 (H1): Mana Confluence prints "{T}, Pay 1 life:",
+            # a COST rather than damage. Charged here so the life total
+            # stays right while the damage helper stops mislabelling it
+            # (a payment cannot be prevented, doubled or redirected, and
+            # protection and Torbran both read damage now).
+            tap_life = self._get_mana_tap_life_cost(card)
+            if tap_life > 0:
+                self.life -= tap_life
+                self.record_life_loss(tap_life, game=game)
+                print(f"[MANA-COST] {card.name}: {self.name} pays {tap_life} life (life: {max(0, self.life)})")
+                self._pending_tap_damage_msgs.append(
+                    f"💧 {card.name}: {self.name} pays {tap_life} life (life: {max(0, self.life)})")
             tap_damage = self._get_mana_tap_damage(card)
             if tap_damage > 0:
                 self.life -= tap_damage
@@ -3937,6 +4040,18 @@ class Player:
             if id(card) in tapped_cards:
                 card.tapped = True
                 # Apply self-damage for painful lands
+                # Aug 10 (H1): Mana Confluence prints "{T}, Pay 1 life:",
+                # a COST rather than damage. Charged here so the life total
+                # stays right while the damage helper stops mislabelling it
+                # (a payment cannot be prevented, doubled or redirected, and
+                # protection and Torbran both read damage now).
+                tap_life = self._get_mana_tap_life_cost(card)
+                if tap_life > 0:
+                    self.life -= tap_life
+                    self.record_life_loss(tap_life, game=game)
+                    print(f"[MANA-COST] {card.name}: {self.name} pays {tap_life} life (life: {max(0, self.life)})")
+                    self._pending_tap_damage_msgs.append(
+                        f"💧 {card.name}: {self.name} pays {tap_life} life (life: {max(0, self.life)})")
                 tap_damage = self._get_mana_tap_damage(card)
                 if tap_damage > 0:
                     self.life -= tap_damage
@@ -4710,6 +4825,12 @@ class GameState:
     # Re-entrancy guard for "whenever you gain life" trigger resolution
     # (June 10, V26).
     _in_gain_life_triggers: bool = field(default=False, repr=False, compare=False)
+    # Re-entrancy guard for "whenever <someone> loses life" (Aug 10, C2).
+    # Not defensive: Sanguine Bond / Exquisite Blood is the classic mutual
+    # loop in exactly this family.
+    _in_life_lost_triggers: bool = field(default=False, repr=False, compare=False)
+    # Re-entrancy guard for "whenever a permanent becomes untapped" (Aug 10, C3).
+    _in_untap_triggers: bool = field(default=False, repr=False, compare=False)
     # June 10 (C3/V28): positional cast→resolve pairing stamp — set by the
     # cast/activate branches of the two action executors, consumed by their
     # resolve branches to drop redundant/orphan free-text resolves.

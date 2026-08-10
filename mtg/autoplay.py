@@ -2766,7 +2766,7 @@ async def _autoplay_resolve_pending_action(cog, thread, game: GameState):
             pay = max(0, min(player.life - 5, 10))
             if pay > 0:
                 player.life -= pay
-                player.record_life_loss(pay)
+                player.record_life_loss(pay, game=game)
                 # Store token size on the card
                 for c in player.battlefield:
                     if c.id == card_id:

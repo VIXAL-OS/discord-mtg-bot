@@ -3067,7 +3067,7 @@ def _check_dies_triggers_sync(engine, game: GameState, dying_card: Card, dying_p
         # Blood Artist / Zulaport Cutthroat: drain 1
         if card.name.lower() in ("blood artist", "zulaport cutthroat", "bastion of remembrance"):
             opp.life -= 1
-            opp.record_life_loss(1)
+            opp.record_life_loss(1, game=game)
             _log_life_change(opp, -1, f"dies trigger: {card.name}")
             # June 10 audit (V22): route the gain through the centralized
             # life-gain path so prevention statics (Erebos: "Your opponents
@@ -3108,7 +3108,7 @@ def _check_dies_triggers_sync(engine, game: GameState, dying_card: Card, dying_p
         # Syr Konrad, the Grim: deal 1 damage to each opponent
         elif card.name.lower() == "syr konrad, the grim":
             opp.life -= 1
-            opp.record_life_loss(1)
+            opp.record_life_loss(1, game=game)
             # June 10 audit (V31a): clamp the console print like the Discord
             # twin below — this was one of the two negative-life leak sites.
             print(f"[DIES-TRIGGER] Syr Konrad, the Grim: deals 1 damage to {opp.name} (life: {max(0, opp.life)})")
@@ -4237,7 +4237,7 @@ def _check_upkeep_triggers_sync(engine, game: GameState) -> Tuple[List[str], Lis
         if card.name.lower() == "phyrexian arena":
             drawn = engine.draw_cards(active, 1, game=game)
             active.life -= 1
-            active.record_life_loss(1)
+            active.record_life_loss(1, game=game)
             print(f"[UPKEEP-TRIGGER] Phyrexian Arena: {active.name} loses 1 life (life: {active.life})")
             _log_life_change(active, -1, "Phyrexian Arena")  # May 30 audit: canonical tag
             if drawn:
@@ -4315,6 +4315,8 @@ def _check_upkeep_triggers_sync(engine, game: GameState) -> Tuple[List[str], Lis
                         mana_to_pay -= 1
                 if life_cost:
                     active.life -= life_cost
+                    active.record_life_loss(life_cost, game=game,
+                                            source_name=card.name)  # Aug 10 (C2)
                     messages.append(
                         f"⏳ {card.name}: Cumulative upkeep paid ({life_cost} life, "
                         f"age {age}) (life: {max(0, active.life)})")
@@ -5378,7 +5380,7 @@ def _handle_land_etb(engine, game: GameState, player: Player, card: Card) -> Lis
                 for opp_idx, opp in enumerate(game.players):
                     if opp_idx != player_idx:
                         opp.life -= 4
-                        opp.record_life_loss(4)
+                        opp.record_life_loss(4, game=game)
                         messages.append(f"🌊 {perm.name}: Landfall #3! Deals 4 damage to {opp.name}. (life: {max(0, opp.life)})")
                         # May 23 audit (MAJOR #14): emit symmetric [SPELL-DAMAGE]
                         # tag for ledger reconciliation.
@@ -6221,6 +6223,81 @@ def fire_draw_triggers(game, drawing_player, drawn_card=None):
     return msgs
 
 
+_BECOMES_UNTAPPED_CLAUSE = re.compile(
+    r'whenever (?:a|another) (?P<what>permanent|creature|artifact|land)'
+    r'[^,.]* becomes untapped', re.IGNORECASE)
+
+
+def fire_becomes_untapped_triggers(game, untapped):
+    """"Whenever a permanent becomes untapped" watchers (CR 701.21a).
+
+    Aug 10 deferred (C3). Mesmeric Orb — "Whenever a permanent becomes
+    untapped, that permanent's controller mills a card." — is the only card in
+    the local corpus with this shape, and nothing dispatched it, so the card
+    was inert in the deck it ships in (test_escape_kroxa.json).
+
+    `untapped` is a list of (card, controller) pairs that actually
+    TRANSITIONED tapped -> untapped; helpers.untap_permanent is what decides
+    that, because a blind untap loop cannot tell an already-untapped permanent
+    from one that just became untapped.
+
+    Scans EVERY battlefield, not just the untapping player's: the watcher's
+    controller is who "you"/"that permanent's controller" resolves against,
+    and the permanent becoming untapped may belong to either player. The mill
+    is charged to the UNTAPPED PERMANENT's controller, which is what Mesmeric
+    Orb prints — not the watcher's controller.
+
+    Returns display messages.
+    """
+    msgs = []
+    rules = getattr(game, '_rules_engine', None)
+    if rules is None or not untapped:
+        return msgs
+    for watcher_owner in game.players:
+        for perm in list(getattr(watcher_owner, 'battlefield', []) or []):
+            oracle = getattr(perm, 'oracle_text', '') or ''
+            for raw in oracle.split('\n'):
+                line = re.sub(r'\([^)]*\)', '', raw).strip()
+                if re.match(r'^[+\-−]?\d+\s*:', line):
+                    continue        # loyalty ability, not a static trigger
+                match = _BECOMES_UNTAPPED_CLAUSE.search(line)
+                if not match:
+                    continue
+                what = match.group('what').lower()
+                effect = line[match.end():].lower()
+                mill = re.search(r'mills? (a|one|two|three|\d+) cards?', effect)
+                if not mill:
+                    print(f"[UNTAP-TRIGGER-UNHANDLED] {perm.name}: {line}")
+                    continue
+                _n = {'a': 1, 'one': 1, 'two': 2, 'three': 3}.get(mill.group(1))
+                if _n is None:
+                    try:
+                        _n = int(mill.group(1))
+                    except ValueError:
+                        _n = 1
+                for card, controller in untapped:
+                    if what != 'permanent':
+                        tl = (getattr(card, 'type_line', '') or '').lower()
+                        if what not in tl:
+                            continue
+                    # "that permanent's controller mills" — the untapped
+                    # permanent's controller, NOT the watcher's.
+                    try:
+                        out = rules._execute_action_on_state(game, {
+                            "action": "mill", "player": controller.name,
+                            "amount": _n})
+                    except (AttributeError, TypeError, ValueError, KeyError) as e:
+                        print(f"[UNTAP-TRIGGER] {perm.name} failed: {e}")
+                        from mtg.util import maybe_reraise
+                        maybe_reraise(e)
+                        continue
+                    print(f"[UNTAP-TRIGGER] {perm.name} fired on "
+                          f"{card.name} becoming untapped")
+                    if out:
+                        msgs.append(f"🌀 **{perm.name}**: {out}")
+    return msgs
+
+
 def queue_cast_triggers_sync(engine, game, caster, card, via: str = "sync") -> int:
     """Sync-context cast-trigger bridge (July 24, 2026 — slice 4b groundwork).
 
@@ -6432,3 +6509,85 @@ def _main_phase_bus_subscriber(game, old_phase=None, new_phase=None, via="",
 
 
 events.subscribe(events.PHASE_CHANGED, _main_phase_bus_subscriber)
+
+
+_LOSES_LIFE_CLAUSE = re.compile(
+    r'whenever (?P<who>an opponent|a player|you) loses? life', re.IGNORECASE)
+
+
+def _life_lost_subscriber(game, player=None, amount=0, source_name="", **_):
+    """"Whenever <someone> loses life" watchers (CR 603.2).
+
+    Aug 10 deferred (C2). Mindcrank — "Whenever an opponent loses life, that
+    player mills that many cards. (Damage causes loss of life.)" — had no
+    dispatcher at all, so the card was inert.
+
+    Re-entrancy guarded: a watcher whose own effect causes life loss would
+    otherwise re-enter through the same hook. That is not hypothetical for
+    this family (Sanguine Bond / Exquisite Blood is the classic mutual loop),
+    so the bound is deliberate rather than defensive.
+    """
+    rules = getattr(game, '_rules_engine', None)
+    if rules is None or player is None or amount <= 0:
+        return
+    if getattr(game, '_in_life_lost_triggers', False):
+        return
+    game._in_life_lost_triggers = True
+    try:
+        for owner in game.players:
+            for perm in list(getattr(owner, 'battlefield', []) or []):
+                oracle = getattr(perm, 'oracle_text', '') or ''
+                for raw in oracle.split('\n'):
+                    line = re.sub(r'\([^)]*\)', '', raw).strip()
+                    if re.match(r'^[+\-−]?\d+\s*:', line):
+                        continue
+                    match = _LOSES_LIFE_CLAUSE.search(line)
+                    if not match:
+                        continue
+                    who = match.group('who').lower()
+                    # Scope the watcher relative to ITS controller, not the
+                    # loser: "an opponent" means an opponent OF THE WATCHER.
+                    if who == 'an opponent' and player is owner:
+                        continue
+                    if who == 'you' and player is not owner:
+                        continue
+                    effect = line[match.end():].lower()
+                    actions = []
+                    if re.search(r'mills? that many', effect):
+                        actions.append({"action": "mill",
+                                        "player": player.name,
+                                        "amount": amount})
+                    else:
+                        _n = re.search(r'mills? (\d+) cards?', effect)
+                        if _n:
+                            actions.append({"action": "mill",
+                                            "player": player.name,
+                                            "amount": int(_n.group(1))})
+                    gain = re.search(r'you gain (that much|\d+) life', effect)
+                    if gain:
+                        _g = (amount if gain.group(1) == 'that much'
+                              else int(gain.group(1)))
+                        actions.append({"action": "gain_life",
+                                        "player": owner.name, "amount": _g})
+                    if not actions:
+                        print(f"[LIFE-LOST-TRIGGER-UNHANDLED] {perm.name}: {line}")
+                        continue
+                    for action in actions:
+                        try:
+                            out = rules._execute_action_on_state(game, action)
+                        except (AttributeError, TypeError, ValueError, KeyError) as e:
+                            print(f"[LIFE-LOST-TRIGGER] {perm.name} failed: {e}")
+                            from mtg.util import maybe_reraise
+                            maybe_reraise(e)
+                            continue
+                        if out:
+                            if not hasattr(game, '_pending_messages'):
+                                game._pending_messages = []
+                            game._pending_messages.append(f"🩸 **{perm.name}**: {out}")
+                    print(f"[LIFE-LOST-TRIGGER] {perm.name} fired on "
+                          f"{player.name} losing {amount}")
+    finally:
+        game._in_life_lost_triggers = False
+
+
+events.subscribe(events.LIFE_LOST, _life_lost_subscriber)

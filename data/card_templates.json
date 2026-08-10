@@ -867,16 +867,17 @@
       "key": "heart's desire",
       "name": "Heart's Desire",
       "event": "etb",
-      "description": "Create a 1/1 white Human creature token named Heart's Desire",
+      "description": "Create a 1/1 white Human creature token",
       "actions": [
         {
           "action": "create_token",
           "player": "$controller",
-          "name": "Heart's Desire",
+          "name": "Human",
           "power": 1,
           "toughness": 1,
           "types": "Creature — Human",
-          "count": 1
+          "count": 1,
+          "colors": "W"
         }
       ]
     },

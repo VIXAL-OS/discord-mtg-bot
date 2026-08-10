@@ -79,6 +79,16 @@ _ATTACK_TRIGGER_CLAUSE_RE = re.compile(
 _COMBAT_SHAPED_RE = re.compile(
     r'\b(attack(?:s|ing|ed)?|combat damage|deals? lethal|'
     r'deal lethal damage|for lethal)\b')
+# Aug 10 deferred (D): an effect whose ENTIRE printed instruction is dealing
+# damage. FULL match by construction — the guard that consumes it refuses a
+# direct kill/exile from such an effect (CR 704.5g says state-based actions
+# decide lethality, not the resolver), and a full anchor is what makes that
+# refusal have no legitimate counterexample. Module scope so the pin drives
+# THIS object rather than re-expressing it — a mirrored predicate is a comment,
+# not a test (this project has shipped that mistake repeatedly).
+_DAMAGE_ONLY_EFFECT = re.compile(
+    r'^[^.]*?\bdeals?\s+(?:\d+|x|that much)\s+damage\s+to\s+[^.]*?\.?\s*$',
+    re.IGNORECASE)
 
 
 def is_combat_shaped_resolve(effect_description: str) -> bool:
@@ -1036,6 +1046,29 @@ Respond with ONLY the JSON object, no markdown, no backticks, no preamble."""
                 # lives HERE and not in the add_counters handler because that
                 # handler legitimately serves non-creatures (charge counters
                 # on artifacts, loyalty, lore, +1/+1 on a Vehicle).
+                # Aug 10 deferred (D): DAMAGE AUTHORITY. Tier 3 resolved Goblin
+                # Bombardment's "deals 1 damage to any target" by emitting a
+                # move_card battlefield->graveyard for an UNDAMAGED 5/4 — it
+                # decided lethality itself instead of dealing damage and
+                # letting CR 704.5g decide. Anchored on a FULL match of the
+                # effect text, deliberately, not a substring: an ability whose
+                # ENTIRE printed effect is "deal N damage" cannot legitimately
+                # require a direct kill, so there is no counterexample to
+                # misfire on. A COMPOUND ability (a damage clause plus a real
+                # destroy clause) does not full-match and passes ungoverned —
+                # that is under-refusal, which is the safe direction here and
+                # matches this file's refuse-only-when-certain convention.
+                if action_type in ("destroy", "exile", "sacrifice_permanent") \
+                        or (action_type == "move_card"
+                            and str(action.get("to_zone", "")).lower()
+                            in ("graveyard", "exile")):
+                    if _DAMAGE_ONLY_EFFECT.match(_guard_desc.strip()):
+                        print(f"[RESOLVE-REFUSED] {action_type} from an effect "
+                              f"whose only printed instruction is damage — "
+                              f"lethality is decided by state-based actions "
+                              f"(CR 704.5g), not by the resolver")
+                        continue
+
                 if (action_type == "add_counters"
                         and 'target creature' in _guard_desc.lower()
                         and action.get("card")):

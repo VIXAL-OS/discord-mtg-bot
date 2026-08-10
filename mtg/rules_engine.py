@@ -337,6 +337,17 @@ class RulesEngine:
             if _aff > 0:
                 _red += _aff
                 _red_src = list(_red_src) + [f"affinity for {_aff_phrase}"]
+            # Aug 10 (F1): a spell that discounts ITSELF longhand (Blasphemous
+            # Act, Embercleave). Joins the SAME budget as affinity and the
+            # static reducers, which is what stops them double-applying. Wiring
+            # the pre-gate matters as much as the payment stage: without it the
+            # AI is never offered the card at all (Blasphemous Act was rejected
+            # for mana four turns running, then paid 9 for a 3-mana spell).
+            from mtg.helpers import compute_self_cost_reduction
+            _self_red, _self_dom = compute_self_cost_reduction(game, player, card)
+            if _self_red > 0:
+                _red += _self_red
+                _red_src = list(_red_src) + [f"self-reduction per {_self_dom}"]
             if _red > 0:
                 reduced = re.sub(
                     r'\{(\d+)\}',
@@ -737,8 +748,20 @@ class RulesEngine:
         if getattr(player, '_life_total_locked', False):
             player._life_total_locked = False
 
+        # Aug 10 deferred (C3): this loop — not GameEngine.untap_all — is where
+        # the untap step actually happens. untap_all runs immediately after it
+        # from end_turn, and advance_phase calls this WITHOUT untap_all at all,
+        # so this is the only site that always runs. Two things follow:
+        # `_skip_next_untap` (Icebreaker Kraken) is honoured here for the first
+        # time (the blind `tapped = False` below used to untap the permanent
+        # before untap_all's skip check could see it), and the tapped ->
+        # untapped TRANSITION is captured so "becomes untapped" watchers
+        # (Mesmeric Orb) can fire.
+        from mtg.helpers import untap_permanent
+        _became_untapped = []
         for card in player.battlefield:
-            card.tapped = False
+            if untap_permanent(card):
+                _became_untapped.append((card, player))
             # Clear summoning sickness for creatures that were sick
             if card.is_creature() and card.summoning_sick:
                 card.summoning_sick = False
@@ -753,6 +776,14 @@ class RulesEngine:
             if card.blocked_by:
                 card.blocked_by = []
         
+        if _became_untapped:
+            from mtg.triggers import fire_becomes_untapped_triggers
+            _msgs = fire_becomes_untapped_triggers(game, _became_untapped)
+            if _msgs:
+                if not hasattr(game, '_pending_messages'):
+                    game._pending_messages = []
+                game._pending_messages.extend(_msgs)
+
         # Reset land count and landfall tracking
         player.lands_played_this_turn = 0
         player.landfall_count_this_turn = 0
@@ -916,7 +947,7 @@ class RulesEngine:
         if "you may pay 2 life" in oracle and "enters tapped" in oracle:
             if player.life > 4:
                 player.life -= 2
-                player.record_life_loss(2)
+                player.record_life_loss(2, game=game)
                 etb_msg = f" (paid 2 life — life: {player.life})"
                 print(f"[SHOCKLAND] {player.name} pays 2 life for {card.name} (life: {player.life})")
             else:

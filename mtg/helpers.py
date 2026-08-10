@@ -1141,6 +1141,63 @@ def player_has_prevent_all_static(player):
     return False
 
 
+def damage_prevented_for(game, player, source_card, is_combat: bool,
+                         allow_static: bool = True):
+    """Is damage to `player` (or to a permanent they control) prevented?
+
+    Aug 10 deferred (A2). Extracted so the CREATURE funnels can consult the
+    same prevention the PLAYER funnels always have. Before this, flag-based
+    prevention was read only at the two player funnels, so under a Fog the
+    blockers still died — the whole "damage is prevented this turn" half of
+    every fog was missing for permanents.
+
+    Returns (prevented: bool, reason: str). Reason is "" when not prevented.
+
+    Two scoping rules are load-bearing, and both correct the recorded
+    mechanism rather than following it:
+
+    `is_combat` — ONE flag has always served two printed effects.
+    prevent_combat_damage (Fog, Holy Day, Moment's Peace, Constant Mists,
+    Tangle, Arachnogenesis, Spore Frog, Dawn Charm, Moonmist) prevents COMBAT
+    damage; prevent_all_damage (Teferi's Protection) prevents all damage and
+    sets the flag as belt-and-suspenders behind its real replacement effect.
+    The noncombat player funnel gates on the flag deliberately, FOR Teferi's —
+    which meant a Fog also blanked burn spells to the face. Honouring
+    `_damage_prevented_combat_only` keeps Teferi's noncombat coverage exactly
+    as it was and stops a fog reaching noncombat damage, in either funnel.
+
+    `allow_static` — MUST be False for creatures. player_has_prevent_all_static
+    matches "prevent all damage that would be dealt to YOU"; Glacial Chasm and
+    Solitary Confinement (cache-verified) say exactly that and say nothing
+    about creatures. Consulting it from a creature funnel would make their
+    controller's whole board immune to all damage — the opposite of the cards.
+
+    Still unmodelled, and deliberately not smuggled in here: creature-scoped
+    preventions that never touch this flag at all (Iroas, God of Victory's
+    "prevent all damage that would be dealt to attacking creatures you
+    control") and fixed-amount shields (Eiganjo Castle, Shield of the Realm).
+    Those are a different primitive with no implementation anywhere.
+    """
+    if player is None:
+        return False, ""
+    prevent_flag = getattr(player, '_damage_prevented', False)
+    if prevent_flag:
+        expires = getattr(player, '_damage_prevented_expires_turn', float('inf'))
+        if getattr(game, 'turn_number', 0) >= expires:
+            player._damage_prevented = False
+            prevent_flag = False
+    if prevent_flag and getattr(player, '_damage_prevented_combat_only', False) \
+            and not is_combat:
+        prevent_flag = False
+    if prevent_flag and prevention_exempts_source(player, source_card):
+        return False, f"{getattr(source_card, 'name', '?')} is EXEMPT"
+    if not (prevent_flag or (allow_static and player_has_prevent_all_static(player))):
+        return False, ""
+    if damage_prevention_disabled(game):
+        return False, "overridden — damage can't be prevented this turn"
+    return True, "prevented"
+
+
 def prevention_exempts_source(player, source_card) -> bool:
     """Does an active prevention effect EXEMPT this damage source?
 
@@ -1866,6 +1923,88 @@ def compute_affinity_reduction(player, card):
                if p is not card and _affinity_matches(p, phrase)), phrase
 
 
+# Aug 10 deferred (F1) — SELF cost reduction written out longhand, e.g.
+# Blasphemous Act's "This spell costs {1} less to cast for each creature on
+# the battlefield." The recorded mechanism named a true property that is NOT
+# the cause: compute_cost_reduction's battlefield-only scan and its
+# `perm is card` skip are both real, but its regex is anchored on
+# "spell(s) you cast" and cannot match "this spell costs" under ANY zone —
+# and even a match would give a flat -1 instead of -N-per-thing.
+_SELF_COST_REDUCTION_RE = re.compile(
+    r'this spell costs \{(?P<amt>\d+)\} less to cast for each '
+    r'(?P<domain>[^.\n]+)', re.IGNORECASE)
+
+
+def _self_reduction_count(game, player, card, domain: str):
+    """How many things the counting domain names, or None if unmodelled.
+
+    A REGISTRY, deliberately, not a general parser: refusing an unmodelled
+    domain with a breadcrumb is strictly better than over-applying a discount
+    to a cost the player then cannot pay. Covers the whole deck inventory —
+    a bulk sweep finds 181 cards with this shape but only four in any deck
+    (Icebreaker Kraken, Embercleave, Emrakul the Promised End, Blasphemous
+    Act), and Kraken's is inside its own Affinity reminder text.
+    """
+    domain = ' '.join(domain.lower().split())
+    if domain.startswith('creature on the battlefield'):
+        # is_creature(game=game), not bare is_creature() — a devotion-gated
+        # god below threshold is not a creature (the documented D4 class).
+        return sum(1 for p in game.players
+                   for c in (p.active_battlefield()
+                             if hasattr(p, 'active_battlefield')
+                             else getattr(p, 'battlefield', []) or [])
+                   if c is not card and c.is_creature(game))
+    if domain.startswith('attacking creature you control'):
+        return sum(1 for c in getattr(player, 'battlefield', []) or []
+                   if c is not card and getattr(c, 'attacking', False))
+    if domain.startswith('card type among cards in your graveyard'):
+        types = set()
+        for c in getattr(player, 'graveyard', []) or []:
+            head = (getattr(c, 'type_line', '') or '').split('—')[0]
+            types.update(w.lower() for w in head.split()
+                         if w.lower() in ('artifact', 'creature', 'enchantment',
+                                          'instant', 'land', 'planeswalker',
+                                          'sorcery', 'battle'))
+        return len(types)
+    return None
+
+
+def compute_self_cost_reduction(game, player, card):
+    """(amount, domain) for a spell that discounts ITSELF, else (0, None).
+
+    Reads the card's OWN oracle after strip_reminder_text. Icebreaker Kraken
+    prints "Affinity for snow lands (This spell costs {1} less to cast for each
+    snow land you control.)" — the identical shape, INSIDE a parenthetical,
+    already fully handled by compute_affinity_reduction.
+
+    HONEST SCOPE, established by mutation testing rather than assumed: for the
+    CURRENT registry that strip is DEFENCE IN DEPTH, not the load-bearing
+    guard. Removing it does not change Kraken's answer, because the registry
+    independently refuses affinity's domains ("snow land you control" is not
+    modelled) and an unmodelled domain returns (0, None) anyway. The strip
+    stays because a future registry entry that collides with an affinity
+    domain WOULD double-apply without it, and it costs nothing — but the
+    property that actually holds today is "the registry refuses it", and
+    saying otherwise would claim a guarantee this does not provide.
+
+    The caller must still clamp to the generic portion (CR 601.2f) and share
+    the SAME reduction budget as affinity and the static reducers, which is
+    what stops the two composing into a double discount.
+    """
+    oracle = strip_reminder_text(getattr(card, 'oracle_text', '') or '')
+    match = _SELF_COST_REDUCTION_RE.search(oracle)
+    if not match:
+        return 0, None
+    domain = match.group('domain').strip()
+    count = _self_reduction_count(game, player, card, domain)
+    if count is None:
+        print(f"[COST-REDUCTION] {getattr(card, 'name', '?')}: counting domain "
+              f"'{domain}' is not modelled — declining the self-reduction "
+              f"rather than guessing")
+        return 0, None
+    return int(match.group('amt')) * count, domain
+
+
 # Converge counts COLORS of mana spent (CR 702.100a). Colorless is not a
 # color, so {C} and generic mana paid by a colorless source never count.
 _REAL_COLORS = ('W', 'U', 'B', 'R', 'G')
@@ -2233,6 +2372,159 @@ def command_zone_owner(game, card, fallback):
     except (TypeError, ValueError):
         pass
     return fallback
+
+
+def unattach_equipment(game, equipment) -> bool:
+    """Detach an Equipment from whatever it is attached to. True if it moved.
+
+    Aug 10 deferred (F2). Sunforger's ability costs "{R}{W}, Unattach this
+    Equipment" and 'unattach' was recognised as a cost keyword by NEITHER
+    activation path (grep-confirmed: zero hits in mtg/engine.py or mtg/cog.py),
+    so the clause was silently dropped — the mana was charged, the Equipment
+    stayed attached, and the ability was activatable while UNATTACHED.
+
+    ORDERING IS LOAD-BEARING HERE, which is why this ships with the cost and
+    not after it: Sunforger today is a dead card that burns {R}{W}, and
+    implementing the tutor-and-free-cast WITHOUT the unattach cost would turn
+    it into a repeatable free-instant engine, once per turn, forever.
+
+    Mirrors the two-field mutation the CR 704.5n SBA detach already performs
+    (mtg/sba.py), plus the P/T recalculation that site relies on a later sweep
+    for — an ability cost has no such sweep guaranteed to follow it.
+    """
+    if equipment is None or not getattr(equipment, 'attached_to', None):
+        return False
+    target_id = equipment.attached_to
+    equipment.attached_to = None
+    found = game.find_card_global(target_id) if hasattr(game, 'find_card_global') else None
+    if found and found[0] is not None:
+        holder = found[0]
+        if equipment.id in (getattr(holder, 'attachments', None) or []):
+            holder.attachments.remove(equipment.id)
+    if hasattr(game, 'recalculate_power_toughness'):
+        game.recalculate_power_toughness()
+    print(f"[UNATTACH] {equipment.name} unattached as an activation cost")
+    return True
+
+
+def protection_blocks_from(game, protected_card, source_card):
+    """Does `protected_card`'s protection apply to `source_card`? (bool, why).
+
+    Aug 10 deferred (E2). Protection was consulted at exactly ONE seam
+    (rules/targeting_helpers._card_to_targetable's prot_list, whose own comment
+    says so), i.e. TARGETING only — so Akroma, protection from black and from
+    red, was blocked by a mono-black Butcher of Malakir and killed by a RED
+    Blasphemous Act.
+
+    The recorded item cited CR 509.1b; the operative rule for the observed
+    event is CR 702.16c, and the direction matters: a creature with protection
+    from a quality "can't be BLOCKED BY" creatures with that quality. Akroma
+    was ATTACKING, so it is the ATTACKER's protection tested against the
+    BLOCKER's qualities — not the other way round, which is the natural
+    mistake and would have put the check on the wrong card.
+
+    Reuses the existing parse (printed clauses PLUS the Aug-10 A5
+    equipment/aura grant scan) so the two cannot drift.
+    """
+    try:
+        from rules.targeting_helpers import _card_to_targetable
+    except ImportError:
+        return False, ""
+    if protected_card is None or source_card is None:
+        return False, ""
+    try:
+        prot = getattr(_card_to_targetable(protected_card, game), 'protection', None)
+    except (AttributeError, TypeError, ValueError):
+        return False, ""
+    if not prot:
+        return False, ""
+    colors = set(spell_colors_from_cost(
+        getattr(source_card, 'mana_cost', '') or '') or [])
+    if not colors:
+        colors = set(getattr(source_card, 'colors', None) or [])
+    head = (getattr(source_card, 'type_line', '') or '').split('—')[0].lower()
+    types = {t for t in ('artifact', 'creature', 'enchantment', 'land',
+                         'planeswalker', 'instant', 'sorcery') if t in head}
+    try:
+        cmc = int(getattr(source_card, 'cmc', 0) or 0)
+    except (TypeError, ValueError):
+        cmc = 0
+    for ability in prot:
+        blocked, why = ability.blocks_targeting_from(colors, types, cmc, "", "")
+        if blocked:
+            return True, why
+    return False, ""
+
+
+def protection_prevents_damage(game, creature, source_card=None,
+                               source_name: str = "", source_id: str = ""):
+    """CR 702.16e — damage from a source with the protected-from quality is
+    prevented. (bool, why).
+
+    The damage half of E2, unblocked once the Aug-10 mass-damage fix routed
+    board wipes through the replacement engine. A live card object is used
+    when the caller has one; otherwise colours are resolved the way Torbran's
+    gate resolves them (by name/id across battlefield, stack, graveyard and
+    exile), because a burn spell has already left the stack by the time its
+    damage applies — which is exactly the Akroma-killed-by-a-red-
+    Blasphemous-Act case.
+
+    UNMODELLED, deliberately, and not smuggled in here: CR 702.16 also stops
+    a protected permanent being enchanted, equipped or attached, and makes an
+    already-attached Aura fall off (704.5m). Only targeting (pre-existing),
+    blocking and damage are covered.
+    """
+    if creature is None:
+        return False, ""
+    if source_card is not None:
+        return protection_blocks_from(game, creature, source_card)
+    colors = damage_source_colors(game, source_name=source_name,
+                                  source_id=source_id)
+    if not colors:
+        return False, ""
+    try:
+        from rules.targeting_helpers import _card_to_targetable
+        prot = getattr(_card_to_targetable(creature, game), 'protection', None)
+    except (ImportError, AttributeError, TypeError, ValueError):
+        return False, ""
+    for ability in (prot or ()):
+        blocked, why = ability.blocks_targeting_from(set(colors), set(), 0, "", "")
+        if blocked:
+            return True, why
+    return False, ""
+
+
+def untap_permanent(card) -> bool:
+    """Untap one permanent. Returns True only if it actually TRANSITIONED.
+
+    Aug 10 deferred (C3). Two things live here rather than at the call sites:
+
+    1. `_skip_next_untap` (Icebreaker Kraken / Frozen Aether: "doesn't untap
+       during its controller's next untap step"). That check used to exist
+       ONLY in GameEngine.untap_all — which runs immediately AFTER
+       RulesEngine.on_untap_step, whose own loop did a blind
+       `card.tapped = False` with no skip check at all. So by the time
+       untap_all looked, the permanent was already untapped and the skip was
+       a no-op: the mechanic has been silently dead in the only path that
+       runs it. Centralising the check is what revives it.
+
+    2. The tapped -> untapped TRANSITION, which is what "becomes untapped"
+       (CR 701.21a, Mesmeric Orb) actually means. An already-untapped
+       permanent does not become untapped, so a blind loop cannot tell the
+       difference — and untap_all's `was_tapped` local, which the recorded
+       fix proposed to use, is dead on arrival for exactly this reason: it
+       reads False for every card on every real invocation because
+       on_untap_step untapped them a moment earlier.
+    """
+    if getattr(card, '_skip_next_untap', False):
+        card._skip_next_untap = False
+        print(f"[UNTAP] {card.name} skips this untap "
+              f"(don't-untap-next-step flag)")
+        return False
+    if not getattr(card, 'tapped', False):
+        return False
+    card.tapped = False
+    return True
 
 
 def strip_combat_state(game, card):

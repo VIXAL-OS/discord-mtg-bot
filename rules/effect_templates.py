@@ -1860,15 +1860,33 @@ class EffectTemplateLibrary:
                        "reason": "On Alert: no creature to target"}]
             ),
         ))
-        # Usher to Safety (Shepherd of the Flock — instant): return your creature to hand
+        # Usher to Safety (Shepherd of the Flock — instant adventure half).
+        # Aug 10 deferred (H3): printed text is "Return target PERMANENT you
+        # control to its owner's hand" (cache-verified; it lives in card_faces,
+        # which is why a top-level name search makes it look absent). The
+        # narrowing was here in the TEMPLATE, not in the handler —
+        # bounce_own_permanent is already permanent-general (its _type_ok only
+        # narrows when type_filter == "creature", and nothing passes one), so
+        # patching the handler would have been a no-op. The pick chain now
+        # spans every permanent type: best_own_flickerable covers
+        # creature/land/artifact, best_own_creature is the creature fallback
+        # when flickerable skipped the sole ETB target, and
+        # best_own_noncreature covers enchantments (it excludes lands, which
+        # flickerable already has). All three are produced by
+        # build_game_context — checked, because an unproduced ctx key is the
+        # producer-less-key class that has shipped five times here.
         self._add_card("usher to safety", EffectTemplate(
             name="Usher to Safety",
-            description="Return target creature you control to its owner's hand",
+            description="Return target permanent you control to its owner's hand",
             action_generator=lambda ctrl, opp, ctx: (
                 [{"action": "bounce_own_permanent", "player": ctrl,
-                  "card": ctx.get('best_own_flickerable') or ctx.get('best_own_creature') or ''}]
-                if (ctx.get('best_own_flickerable') or ctx.get('best_own_creature'))
-                else [{"action": "no_action", "reason": "Usher to Safety: no own creature to bounce"}]
+                  "card": (ctx.get('best_own_flickerable')
+                           or ctx.get('best_own_creature')
+                           or ctx.get('best_own_noncreature') or '')}]
+                if (ctx.get('best_own_flickerable') or ctx.get('best_own_creature')
+                    or ctx.get('best_own_noncreature'))
+                else [{"action": "no_action",
+                       "reason": "Usher to Safety: no permanent you control to bounce"}]
             ),
         ))
         # Chop Down (Giant Killer — instant): destroy creature with power 4+

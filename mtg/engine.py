@@ -1331,6 +1331,77 @@ class GameEngine:
                             if not hasattr(game, '_pending_messages'):
                                 game._pending_messages = []
                             game._pending_messages.append(msg)
+
+                    # Aug 10 deferred (C1): everything ELSE in this family.
+                    # The recorded headline said "no dispatcher at all"; the
+                    # truth was worse in the way this codebase keeps finding —
+                    # a two-card hardcoded elif chain with NO fallthrough, so
+                    # Smothering Tithe and Consecrated Sphinx worked and every
+                    # other card was silently inert (the Aug-8 A4 class, where
+                    # the silence is worse than the drop). Live and unhandled:
+                    # Sheoldred, the Apocalypse ("they lose 2 life",
+                    # test_devotion_erebos.json) and Mind's Eye ("you may pay
+                    # {1}. If you do, draw a card", test_replacement_chain).
+                    #
+                    # This stays HERE rather than folding into
+                    # triggers.fire_draw_triggers, deliberately: that function
+                    # is scoped to "you" ON PURPOSE (an unscoped scan
+                    # double-fired the Sphinx, four cards off one trigger),
+                    # and its re-entrancy guard is held for its whole body —
+                    # a recursive draw dispatched from inside it would see the
+                    # flag still set and silently drop EVERY draw watcher on
+                    # the new cards. Same bug class, inverted.
+                    elif 'whenever an opponent draws' in oracle_lower:
+                        _line = next(
+                            (re.sub(r'\([^)]*\)', '', ln).strip()
+                             for ln in (bf_card.oracle_text or '').split('\n')
+                             if 'whenever an opponent draws' in ln.lower()), '')
+                        _effect = _line.lower().split('draws a card', 1)[-1]
+                        _n = len(drawn)   # once per card drawn
+                        _msg = None
+                        _lose = re.search(r'(?:they|that player) loses? (\d+) life', _effect)
+                        _may_pay = re.search(r'you may pay \{(\d+)\}', _effect)
+                        if _lose:
+                            # Targets the DRAWING player specifically, not a
+                            # fan-out over "every other player" — identical in
+                            # two-player but the fan-out is not a legal general
+                            # rule (see the multiplayer note in CLAUDE.md).
+                            _amt = int(_lose.group(1)) * _n
+                            self.rules._execute_action_on_state(game, {
+                                "action": "lose_life", "player": player.name,
+                                "amount": _amt, "source": bf_card.name})
+                            _msg = (f"💀 **{bf_card.name}** — {player.name} "
+                                    f"loses {_amt} life")
+                        elif _may_pay and 'draw a card' in _effect:
+                            # Unlike Smothering Tithe (whose "may pay" the
+                            # engine uniformly DECLINES), paying here is
+                            # unconditionally good for the watcher's
+                            # controller, so it needs a real affordability
+                            # check rather than the decline shortcut.
+                            _cost = int(_may_pay.group(1))
+                            _afford = opp.one_tap_mana_total() if hasattr(
+                                opp, 'one_tap_mana_total') else 0
+                            _paid = 0
+                            for _ in range(_n):
+                                if _afford - _paid < _cost:
+                                    break
+                                _paid += _cost
+                            if _paid:
+                                _got = self.draw_cards(
+                                    opp, _paid // _cost, game=game,
+                                    suppress_opponent_draw_triggers=True)
+                                _msg = (f"👁️ **{bf_card.name}** — {opp.name} "
+                                        f"pays {{{_paid}}} and draws {len(_got)}")
+                            else:
+                                print(f"[DRAW-TRIGGER] {bf_card.name}: "
+                                      f"{opp.name} declines (can't pay)")
+                        else:
+                            print(f"[DRAW-TRIGGER-UNHANDLED] {bf_card.name}: {_line}")
+                        if _msg:
+                            print(f"[DRAW-TRIGGER] {_msg}")
+                            if not hasattr(game, '_pending_messages'):
+                                game._pending_messages = []
+                            game._pending_messages.append(_msg)
         return drawn
     
     def play_land(self, game: GameState, player: Player, card: Card) -> Tuple[bool, str]:
@@ -1916,17 +1987,18 @@ class GameEngine:
     
     def untap_all(self, player: Player):
         """Untap all permanents for a player and clear summoning sickness."""
+        # Aug 10 deferred (C3): the per-card untap (including the Icebreaker
+        # Kraken / Frozen Aether `_skip_next_untap` check that used to live
+        # here) moved into helpers.untap_permanent, so this pass and
+        # RulesEngine.on_untap_step share one implementation. The old
+        # `was_tapped` local here was dead on arrival — on_untap_step runs
+        # first from end_turn and had already untapped everything, so it read
+        # False for every card on every real invocation. "Becomes untapped"
+        # therefore dispatches from on_untap_step, not from here; by the time
+        # this pass runs nothing is still tapped, so it cannot double-fire.
+        from mtg.helpers import untap_permanent
         for card in player.battlefield:
-            was_tapped = card.tapped
-            # `_skip_next_untap` is set by Icebreaker Kraken / Frozen Aether-
-            # style effects ("don't untap during that player's next untap
-            # step"). Skip the untap once and clear the flag so this permanent
-            # untaps normally next turn.
-            if getattr(card, '_skip_next_untap', False):
-                card._skip_next_untap = False
-                print(f"[UNTAP] {card.name} skips this untap (don't-untap-next-step flag)")
-            else:
-                card.tapped = False
+            untap_permanent(card)
             # Clear summoning sickness for creatures (only creatures have it)
             if card.summoning_sick:
                 card.summoning_sick = False
@@ -2041,7 +2113,7 @@ class GameEngine:
             actual = self.rules._apply_noncombat_damage_to_player(game, target_player, amount, source_name, source_id)
         else:
             target_player.life -= amount
-            target_player.record_life_loss(amount)
+            target_player.record_life_loss(amount, game=game)
             actual = amount
 
         if (is_commander and source and actual > 0 and game
@@ -3796,6 +3868,27 @@ class GameEngine:
                 is_legal, reason = await self._validate_activation(game, player, perm)
                 if not is_legal:
                     print(f"[VALIDATE-ACTIVATE] Blocked {perm.name}: {reason}")
+                    # Aug 10 deferred (H4). This is the ONE exit in this
+                    # function whose reason nothing re-derives, so it was the
+                    # only real gap. _get_action_error's non-PW branch checks
+                    # exactly two things — "has no activated abilities" and
+                    # "is already tapped" — while _validate_activation rejects
+                    # for SORCERY SPEED, MANA, and SUMMONING SICKNESS, none of
+                    # which it can reconstruct. Those three refusals surfaced
+                    # to the model as one of the two generic messages and the
+                    # feedback loop never engaged.
+                    #
+                    # The other three unstashed exits here are deliberately
+                    # LEFT unstashed, which corrects the recorded mechanism:
+                    # "perm not found" and the PW can_activate refusal are
+                    # re-derived identically, and the PW ability-index refusal
+                    # is re-derived with STRICTLY RICHER text (it spells out
+                    # every valid index and its loyalty cost — the June 10
+                    # Ashiok retry-deadlock fix). Because a stash is consumed
+                    # BEFORE the re-derivation and wins, stashing there would
+                    # have replaced the good message with a poorer one.
+                    game._last_activation_failure = (
+                        game.turn_number, perm.name, reason)
                     return None
 
             # Handle planeswalker abilities
@@ -4356,6 +4449,27 @@ class GameEngine:
                     else:
                         return None  # Can't pay exile cost
 
+                # Aug 10 deferred (F2): "Unattach this Equipment" as an
+                # additional cost (Sunforger). 'unattach' was recognised as a
+                # cost keyword by NEITHER activation path, so the clause was
+                # silently dropped: the mana was charged, the Equipment stayed
+                # attached, and the ability was activatable while UNATTACHED.
+                # Shipped WITH the cost rather than after it on purpose —
+                # Sunforger is currently a dead card that burns {R}{W}, and
+                # adding the tutor-and-free-cast effect without this would make
+                # it a repeatable free-instant engine, once per turn, forever.
+                if 'unattach' in cost_lower:
+                    from mtg.helpers import unattach_equipment
+                    if not getattr(perm, 'attached_to', None):
+                        print(f"[ACTIVATE-COST] {perm.name} is not attached — "
+                              f"its unattach cost can't be paid (CR 601.2h)")
+                        game._last_activation_failure = (
+                            game.turn_number, perm.name,
+                            f"{perm.name} must be attached to a creature to pay "
+                            f"its 'Unattach this Equipment' cost")
+                        return None
+                    unattach_equipment(game, perm)
+
                 # Handle "Pay N life" as cost (fetchlands, Necropotence, etc.)
                 import re as _re
                 life_paid = 0  # Track for display in activation message
@@ -4364,7 +4478,7 @@ class GameEngine:
                     life_cost = int(life_match.group(1))
                     if player.life >= life_cost:  # CR 119.4: can pay as long as life >= cost
                         player.life -= life_cost
-                        player.record_life_loss(life_cost)
+                        player.record_life_loss(life_cost, game=game)
                         life_paid = life_cost
                         print(f"[ACTIVATE-COST] {player.name} pays {life_cost} life for {perm.name} (life: {player.life})")
                     else:
@@ -5139,6 +5253,51 @@ class GameEngine:
                         if _dmsg:
                             inline_msgs.append(_dmsg)
                         print(f"[ACTIVATE-CLAUDE-INLINE] {perm.name}: drew {_dn} (plain draw)")
+
+                # (d1b) Goblin Bombardment-class: "deals N damage to any
+                # target" as the ENTIRE effect. Aug 10 deferred (D): this shape
+                # reached Tier 3, which resolved it by FABRICATING a
+                # battlefield->graveyard move_card for an undamaged 5/4 —
+                # deciding lethality itself instead of dealing damage and
+                # letting CR 704.5g decide, and (because move_card never queued
+                # the death) skipping every dies trigger in the aristocrats
+                # deck it ships in. Resolving it deterministically here is the
+                # prefer-lower-tiers fix: the guard in judge.py is the net for
+                # whatever still reaches the LLM, this stops it going there.
+                # Anchored to the whole effect so compound abilities still
+                # escalate. The AI's declared target is honoured; the fallback
+                # is the opponent's face, which is what an unaimed ping means.
+                elif re.match(
+                        r'(?:[a-z\',\- ]+ )?deals? (\d+) damage to '
+                        r'(?:any target|target creature|target player|'
+                        r'target creature or player|each opponent)\.?\s*$',
+                        effect_lower2.strip()):
+                    _dmg_n = int(re.search(r'deals? (\d+) damage',
+                                           effect_lower2).group(1))
+                    _decl = _normalize_action_target(action)
+                    _dact = {"action": "deal_damage", "amount": _dmg_n,
+                             "source": perm.name,
+                             "_source_card_name": perm.name,
+                             "_source_controller": player.name}
+                    _tgt_obj = (_resolve_player_or_card_target(game, player, _decl)
+                                if _decl else None)
+                    if _tgt_obj is not None and hasattr(_tgt_obj, 'battlefield'):
+                        _dact["target_player"] = _tgt_obj.name
+                    elif _tgt_obj is not None:
+                        _dact["target_card"] = _tgt_obj.name
+                        _tc = (_tgt_obj._find_controller(game)
+                               if hasattr(_tgt_obj, '_find_controller') else None)
+                        if _tc is not None:
+                            _dact["target_controller"] = _tc.name
+                    else:
+                        _opp = next((p for p in game.players if p is not player), None)
+                        if _opp is not None:
+                            _dact["target_player"] = _opp.name
+                    _dmsg = self.rules._execute_action_on_state(game, _dact)
+                    if _dmsg:
+                        inline_msgs.append(_dmsg)
+                    print(f"[ACTIVATE-CLAUDE-INLINE] {perm.name}: dealt "
+                          f"{_dmg_n} damage (plain damage ability)")
 
                 # (d2) Shadowspear-class: "Permanents your opponents control
                 # lose <keywords> until end of turn." Aug 7 batch audit

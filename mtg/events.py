@@ -213,6 +213,15 @@ COMBAT_DAMAGE_DEALT = "combat_damage_dealt"
 # end_turn for any entry whose hooks never ran — the direct-phase-set class
 # that produced the Tymna bug three times over. One clean batch gates 6b.
 PHASE_CHANGED = "phase_changed"
+# LIFE_LOST payload: player=<Player who lost life>, amount=<int>,
+# source_name=<str, may be "">. Aug 10 deferred (C2): emitted from
+# Player.record_life_loss, which is the point BOTH damage-caused and
+# non-damage life loss converge on — Mindcrank's own reminder text, "(Damage
+# causes loss of life.)", is exactly why the emit belongs at the convergence
+# rather than at a damage funnel. Sites that cannot supply `game` do not emit
+# (an undercount, the safe direction). Consumed by the loses-life trigger scan
+# in mtg/triggers.py.
+LIFE_LOST = "life_lost"
 
 _subscribers: Dict[str, List[Callable]] = {}
 

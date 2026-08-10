@@ -1077,6 +1077,17 @@ def _compute_alt_costs(engine, game: GameState, player: Player, card: Card,
             _red_sources.append(f"affinity for {_aff_phrase} (x{_aff_amt})")
             print(f"[AFFINITY] {card.name}: -{_aff_amt} generic "
                   f"({_aff_amt} {_aff_phrase} you control)")
+        # Aug 10 (F1): the longhand self-reduction (Blasphemous Act,
+        # Embercleave) rides the SAME raw_reduction, so it inherits the
+        # CR 601.2f generic clamp below for free and cannot compose with
+        # affinity into a double discount.
+        from mtg.helpers import compute_self_cost_reduction
+        _self_amt, _self_dom = compute_self_cost_reduction(game, player, card)
+        if _self_amt:
+            raw_reduction += _self_amt
+            _red_sources.append(f"self-reduction per {_self_dom} (x{_self_amt})")
+            print(f"[COST-REDUCTION] {card.name}: -{_self_amt} generic "
+                  f"(one per {_self_dom})")
 
     total_cost = effective_cmc + additional_cost + cost_increase
     x_value_chosen = 0
@@ -1234,7 +1245,7 @@ def _compute_alt_costs(engine, game: GameState, player: Player, card: Card,
                         player.hand.remove(to_exile)
                         player.exile.append(to_exile)
                         player.life -= 1
-                        player.record_life_loss(1)
+                        player.record_life_loss(1, game=game)
                         effect_messages = [f"💫 {card.name} cast via alternate cost: exile {to_exile.name}, pay 1 life (Life: {player.life})"]
                         pay_mana = False
                         used_alternate_cost = True

@@ -918,6 +918,8 @@ class PlaneswalkerManager:
                 player_target = targets[0]
                 if hasattr(player_target, 'life'):
                     player_target.life -= 1
+                    # Aug 10 (C2): PW damage to a player is life loss too.
+                    player_target.record_life_loss(1, game=game, source_name=card.name)
                     messages.append(f"🔥 {card.name} deals 1 damage to {player_target.name} (Life: {player_target.life})")
 
                 if len(targets) > 1 and targets[1] is not None:
@@ -958,6 +960,7 @@ class PlaneswalkerManager:
             if hasattr(target, 'life') and not hasattr(target, 'type_line'):
                 # It's a player
                 target.life -= amount
+                target.record_life_loss(amount, game=game, source_name=card.name)  # Aug 10 (C2)
                 messages.append(f"🔥 {card.name} deals {amount} damage to {target.name} (Life: {target.life})")
             elif _is_pw_target:
                 # It's a planeswalker — damage removes that many loyalty counters

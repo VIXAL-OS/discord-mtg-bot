@@ -2298,6 +2298,18 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
             await ctx.send(f"❌ Cannot pay {mana_cost} to activate **{card.name}**.")
             return
 
+        # Aug 10 deferred (F2): "Unattach this Equipment" (Sunforger). The AI
+        # twin of this branch lives in mtg/engine.py — the two activation paths
+        # have a documented history of diverging, so both were done together.
+        if 'unattach' in cost_text.lower():
+            from mtg.helpers import unattach_equipment
+            if not getattr(card, 'attached_to', None):
+                await ctx.send(
+                    f"❌ **{card.name}** must be attached to a creature to pay "
+                    f"its 'Unattach this Equipment' cost.")
+                return
+            unattach_equipment(game, card)
+
         # Parse "Pay N life" additional cost (e.g. Inventors' Fair).
         life_cost_match = re.search(r'pay\s+(\d+)\s+life', cost_text, re.IGNORECASE)
         if life_cost_match:
@@ -2306,7 +2318,7 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
                 await ctx.send(f"❌ Cannot pay {life_cost} life for **{card.name}** (you have {player.life}).")
                 return
             player.life -= life_cost
-            player.record_life_loss(life_cost)
+            player.record_life_loss(life_cost, game=game)
             print(f"[ACTIVATE] {card.name}: {player.name} paid {life_cost} life (life now {player.life})")
 
         # Parse "Discard a card" as a cost (Anje Falkenrath, Wild Mongrel).
@@ -3135,7 +3147,7 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
                 return
 
             player.life -= life_to_pay
-            player.record_life_loss(life_to_pay)
+            player.record_life_loss(life_to_pay, game=game)
             # Store the paid amount on the card for later (token creation ability uses it)
             for c in player.battlefield:
                 if c.id == card_id:
@@ -4926,7 +4938,7 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
                 
                 if target:
                     target.life -= damage
-                    target.record_life_loss(damage)
+                    target.record_life_loss(damage, game=game)
                     result_msg = f"✅ Dealt {damage} damage to **{target.name}** (now at {target.life} life)"
                 else:
                     result_msg = f"❌ Couldn't find player '{target_name}'"

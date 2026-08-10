@@ -529,6 +529,11 @@ class SpellResolver:
                     )
                 else:
                     target.life -= amount
+                    # Aug 10 (C2): the fallback branch was uninstrumented.
+                    target.record_life_loss(
+                        amount, game=game,
+                        source_name=getattr(getattr(ctx, 'source_card', None),
+                                            'name', '') or '')
                     actual = amount
                     # May 16 audit: console mirror for the fallback path so
                     # batches without the rules-engine wiring still log a
@@ -749,6 +754,15 @@ class SpellResolver:
                 break
 
         player.life -= amount
+        # Aug 10 deferred (C2): THE gap that mattered. This is the live Tier-2
+        # handler for a bare "target player loses N life" — precisely the shape
+        # Mindcrank exists to catch — and it never called record_life_loss at
+        # all, so both the loses-life bus event and the existing
+        # spectacle_available consumer were blind to it whenever a non-damage
+        # loss was the only life loss in a turn.
+        player.record_life_loss(amount, game=game,
+                                source_name=getattr(
+                                    getattr(ctx, 'source_card', None), 'name', '') or '')
         # May 25 audit (F29): symmetric [LIFE-LOSS] tag — same gap as the
         # [LIFE-GAIN] above, the SpellResolver path bypasses mtg/actions.py
         # where the [LIFE-LOSS] tag was already added on May 16.
@@ -961,6 +975,7 @@ class SpellResolver:
                     for player in game.players:
                         if target_creature in player.battlefield:
                             player.life -= excess
+                            player.record_life_loss(excess, game=game)  # Aug 10 (C2)
                             messages.append(f"🦏 {excess} trample damage to {player.name}!")
                             break
             

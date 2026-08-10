@@ -624,7 +624,7 @@ def _fire_gain_life_triggers(rules, game: GameState, player: 'PlayerState',
                     if opp is player:
                         continue
                     opp.life -= amount
-                    opp.record_life_loss(amount)
+                    opp.record_life_loss(amount, game=game)
                     print(f"[GAIN-TRIGGER] {perm.name}: {opp.name} loses {amount} life → {opp.life}")
                     pq.append(f"🩸 **{perm.name}**: {opp.name} loses {amount} life (life: {max(0, opp.life)})")
             elif _re.search(r'put a \+1/\+1 counter on (?:it|this creature)', clause) \
@@ -679,36 +679,19 @@ def apply_combat_damage_to_player(rules, game: GameState, player: 'PlayerState',
     """Apply damage to a player, processing replacement effects first. Returns final amount."""
     if amount <= 0:
         return 0
-    # Damage prevention flag (Teferi's Protection, Fog, etc.)
-    from mtg.helpers import (damage_prevention_disabled,
-                             player_has_prevent_all_static,
-                             prevention_exempts_source,
-                             damage_source_colors)
-    _prevent_flag = getattr(player, '_damage_prevented', False)
-    if _prevent_flag:
-        # Check turn-based expiration (Teferi's = next untap, Fog = end of turn)
-        expires = getattr(player, '_damage_prevented_expires_turn', float('inf'))
-        if game.turn_number >= expires:
-            player._damage_prevented = False
-            _prevent_flag = False
-            print(f"  [DAMAGE-PREVENTED] Expired for {player.name} (set turn expired)")
-    # Aug 10 deferred (G5): a prevention may EXEMPT some sources (Moonmist
-    # exempts Werewolves and Wolves). Unconditional preventions carry no
-    # exemption list and are unaffected.
-    if _prevent_flag and prevention_exempts_source(player, source_card):
-        print(f"  [DAMAGE-PREVENTED] {source_card.name} is EXEMPT from the "
-              f"active prevention — damage stands")
-        _prevent_flag = False
-    # July 29 (CR 611.2c): Solitary Confinement / Glacial Chasm statics are
-    # computed live from the battlefield — no flag to go stale when the
-    # permanent leaves.
-    if _prevent_flag or player_has_prevent_all_static(player):
-        if damage_prevention_disabled(game):
-            print(f"  [DAMAGE-PREVENTED] Overridden for {player.name} — damage "
-                  f"can't be prevented this turn (Insult // Injury)")
-        else:
-            print(f"  [DAMAGE-PREVENTED] {source_card.name} → {player.name}: {amount} damage prevented")
-            return 0
+    # Damage prevention (Teferi's Protection, Fog, Glacial Chasm, Moonmist's
+    # exemption). Aug 10 (A2): the whole gate moved into helpers so the CREATURE
+    # funnels consult exactly the same predicate — one gate, no drift.
+    # allow_static=True here: "prevent all damage that would be dealt to you"
+    # IS about the player.
+    from mtg.helpers import damage_prevented_for, damage_source_colors
+    _prevented, _why = damage_prevented_for(game, player, source_card,
+                                            is_combat=is_combat, allow_static=True)
+    if _prevented:
+        print(f"  [DAMAGE-PREVENTED] {source_card.name} → {player.name}: {amount} damage prevented")
+        return 0
+    if _why:
+        print(f"  [DAMAGE-PREVENTED] {player.name}: {_why}")
     if HAS_REPLACEMENT_ENGINE and game._replacement_engine and game._replacement_engine.effects:
         # Populate source_controller so replacement effects like Fiery
         # Emancipation / Gisela / Dictate / Furnace can filter by who
@@ -756,7 +739,7 @@ def apply_combat_damage_to_player(rules, game: GameState, player: 'PlayerState',
         # but the player doesn't lose life. Continue to commander-damage tracking below.
     else:
         player.life -= amount
-        player.record_life_loss(amount)
+        player.record_life_loss(amount, game=game)
         if amount > 0:
             # May 18 audit: clamp the displayed life at 0 so a multi-creature
             # combat-damage step against a low-life player doesn't print a
@@ -810,6 +793,29 @@ def apply_combat_damage_to_creature(rules, game: GameState, creature: Card,
                                       source_has_deathtouch: bool = False) -> int:
     """Apply combat damage to a creature, processing replacement effects. Returns final amount."""
     if amount <= 0:
+        return 0
+    # Aug 10 deferred (A2): flag-based prevention was consulted ONLY at the two
+    # PLAYER funnels, so under a Fog the blockers still died. allow_static=False
+    # is load-bearing — Glacial Chasm / Solitary Confinement print "prevent all
+    # damage that would be dealt to YOU" and say nothing about creatures.
+    from mtg.helpers import damage_prevented_for
+    _ctrl = (creature._find_controller(game)
+             if hasattr(creature, '_find_controller') else None)
+    _prevented, _why = damage_prevented_for(game, _ctrl, source_card,
+                                            is_combat=True, allow_static=False)
+    if _prevented:
+        print(f"  [DAMAGE-PREVENTED] {source_card.name} → {creature.name}: "
+              f"{amount} combat damage prevented")
+        return 0
+    if _why:
+        print(f"  [DAMAGE-PREVENTED] {creature.name}: {_why} — damage stands")
+    # Aug 10 deferred (E2) — CR 702.16e.
+    from mtg.helpers import protection_prevents_damage
+    _prot, _prot_why = protection_prevents_damage(game, creature,
+                                                  source_card=source_card)
+    if _prot:
+        print(f"  [PROTECTION] {creature.name} has {_prot_why} — {amount} "
+              f"damage from {source_card.name} prevented")
         return 0
     if HAS_REPLACEMENT_ENGINE and game._replacement_engine and game._replacement_engine.effects:
         from mtg.helpers import damage_source_colors
@@ -967,6 +973,30 @@ def apply_noncombat_damage_to_creature(rules, game: GameState, creature: Card,
     """
     if amount <= 0:
         return 0, []
+    # Aug 10 deferred (A2): the creature twin of the player gate. is_combat is
+    # False here, so a Fog (combat-only) correctly does NOT reach a burn spell
+    # while Teferi's Protection still does — the distinction the shared helper
+    # exists for. allow_static=False for the same reason as the combat twin.
+    from mtg.helpers import damage_prevented_for
+    _ctrl = (creature._find_controller(game)
+             if hasattr(creature, '_find_controller') else None)
+    _prevented, _ = damage_prevented_for(game, _ctrl, None,
+                                         is_combat=False, allow_static=False)
+    if _prevented:
+        print(f"  [DAMAGE-PREVENTED] {source_name or '?'} → {creature.name}: "
+              f"{amount} noncombat damage prevented")
+        return 0, []
+    # Aug 10 deferred (E2) — CR 702.16e. THIS is the funnel the live defect ran
+    # through: Akroma (protection from black and from red) was killed by a RED
+    # Blasphemous Act. The source has already left the stack by now, which is
+    # why colours resolve by name/id across zones rather than from a card ref.
+    from mtg.helpers import protection_prevents_damage
+    _prot, _prot_why = protection_prevents_damage(
+        game, creature, source_name=source_name, source_id=source_id)
+    if _prot:
+        print(f"  [PROTECTION] {creature.name} has {_prot_why} — {amount} "
+              f"damage from {source_name or '?'} prevented")
+        return 0, []
     if HAS_REPLACEMENT_ENGINE and game._replacement_engine and game._replacement_engine.effects:
         from mtg.helpers import damage_source_colors
         creature_controller_name = ""
@@ -1019,24 +1049,16 @@ def apply_noncombat_damage_to_player(rules, game: GameState, player: 'PlayerStat
     dealt 3 instead of 5, game_1535228623240568872)."""
     if amount <= 0:
         return 0
-    # Fallback damage prevention flag (when replacement engine not available)
-    from mtg.helpers import (damage_prevention_disabled,
-                             player_has_prevent_all_static,
-                             damage_source_colors)
-    _prevent_flag = getattr(player, '_damage_prevented', False)
-    if _prevent_flag:
-        expires = getattr(player, '_damage_prevented_expires_turn', float('inf'))
-        if game.turn_number >= expires:
-            player._damage_prevented = False
-            _prevent_flag = False
-            print(f"  [DAMAGE-PREVENTED] Expired for {player.name} (set turn expired)")
-    if _prevent_flag or player_has_prevent_all_static(player):
-        if damage_prevention_disabled(game):
-            print(f"  [DAMAGE-PREVENTED] Overridden for {player.name} — damage "
-                  f"can't be prevented this turn (Insult // Injury)")
-        else:
-            print(f"  [DAMAGE-PREVENTED] {source_name} → {player.name}: {amount} noncombat damage prevented")
-            return 0
+    # Damage prevention. Aug 10 (A2): shared predicate, is_combat=False — this
+    # is where a Fog used to blank a burn spell to the face, because ONE flag
+    # served both prevent_combat_damage and prevent_all_damage. Teferi's
+    # Protection (all damage) still prevents here; a fog no longer does.
+    from mtg.helpers import damage_prevented_for, damage_source_colors
+    _prevented, _ = damage_prevented_for(game, player, None,
+                                         is_combat=False, allow_static=True)
+    if _prevented:
+        print(f"  [DAMAGE-PREVENTED] {source_name} → {player.name}: {amount} noncombat damage prevented")
+        return 0
     if HAS_REPLACEMENT_ENGINE and game._replacement_engine and game._replacement_engine.effects:
         # Try to find the controller of the source by id or name so the
         # replacement layer can filter by source_controller (Fiery
@@ -1094,7 +1116,7 @@ def apply_noncombat_damage_to_player(rules, game: GameState, player: 'PlayerStat
             print(f"  [REPLACEMENT-APPLY] Noncombat damage modified: {amount} → {final.amount} ({', '.join(final.replacement_chain)})")
         amount = final.amount
     player.life -= amount
-    player.record_life_loss(amount)
+    player.record_life_loss(amount, game=game)
     if amount > 0:
         # May 18 audit: clamp displayed life at 0 (same rationale as [COMBAT-LIFE]).
         print(f"[NONCOMBAT-LIFE] {player.name} takes {amount} noncombat damage from {source_name} (life: {max(0, player.life)})")
