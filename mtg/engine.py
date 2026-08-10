@@ -2817,9 +2817,18 @@ class GameEngine:
         # across long games).
         try:
             if hasattr(self, 'rules') and getattr(self.rules, '_resolve_dedupe', None) is not None:
+                # Aug 10 card-targeted wave: the key gained a leading
+                # thread_id (it was shared across concurrent games), so the
+                # turn now sits at index 3. The old `len(k) == 3` test would
+                # match nothing and silently wipe every entry. The pruner was
+                # ALSO cross-game — it aged out other games' keys against
+                # THIS game's turn number — so it now only touches its own.
+                _tid = int(getattr(game, 'thread_id', 0) or 0)
                 keep = {}
                 for k, v in self.rules._resolve_dedupe.items():
-                    if len(k) == 3 and k[2] >= game.turn_number - 1:
+                    if len(k) != 4:
+                        continue
+                    if k[0] != _tid or k[3] >= game.turn_number - 1:
                         keep[k] = v
                 self.rules._resolve_dedupe = keep
         except Exception:

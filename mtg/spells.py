@@ -666,7 +666,15 @@ def _validate_cast(engine, game: GameState, player: Player, card: Card,
         # Validate the target actually declared by the caller, not merely the
         # existence of some other legal target. Graveyard Auras are handled
         # above because the generic adapter is battlefield-oriented.
-        if target is not None and 'in a graveyard' not in _oracle_lower:
+        # Aug 10 card-targeted wave: the skip phrase knew only 'in a
+        # graveyard' (Animate Dead's wording) while Reanimate prints
+        # 'FROM a graveyard' — and rules/targeting.py's restriction
+        # parser accepts BOTH. So a declared Reanimate target was routed
+        # into the battlefield-oriented validator and rejected as 'not in
+        # graveyard': 45 of 49 failed casts across the batch, in 14
+        # games. Only target-less casts worked.
+        if target is not None and not any(
+                _p in _oracle_lower for _p in ('in a graveyard', 'from a graveyard')):
             declared_targets = (list(target)
                                 if isinstance(target, (list, tuple)) else [target])
             for declared_target in declared_targets:

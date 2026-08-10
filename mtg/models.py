@@ -5583,7 +5583,18 @@ class GameState:
                             card_colors.append(c)
                 # Pull subtypes (Werewolf, Wolf, Human, Soldier, etc.) so subtype-
                 # restricted anthems (Tovolar, Mikaeus, Lord of Atlantis) filter correctly.
-                card_subtypes = list(getattr(card, 'subtypes', []) or [])
+                # Aug 10 card-targeted wave (CRITICAL): `Card` has NO
+                # `subtypes` field, so this getattr always returned []
+                # and rules/layers.py rejected every permanent — every
+                # subtype-restricted anthem in the engine was inert
+                # (Captivating Vampire registered correctly and its
+                # Vampire Nighthawk still dealt 2, not 3, on four
+                # combats). Registration was right; only the READ was
+                # wrong. get_creature_types() is the real accessor,
+                # already used at eight other sites. Same class as
+                # game._rules_engine — a getattr chain whose happy
+                # path never existed.
+                card_subtypes = [t.lower() for t in (card.get_creature_types() or [])]
                 lp = LayeredPermanent(
                     id=card.id, name=card.name, controller=player.name,
                     owner=player.name, base_types=["creature"],

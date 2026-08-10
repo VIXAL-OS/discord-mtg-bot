@@ -1216,28 +1216,48 @@ def scan_damaged_creature(rules, game: GameState, damaged: Card,
     from rules.effect_templates import strip_activated_ability_lines
     d_scan = strip_activated_ability_lines(
         getattr(damaged, 'oracle_text', '') or '').lower()
-    _dm = re.search(
-        r'whenever a source deals damage to (?:this creature|'
-        + re.escape((damaged.name or '').lower())
-        + r'),\s*([^\n.]+)',
-        d_scan)
+    # Aug 10 card-targeted wave: the scan knew only the ACTIVE-voice
+    # templating ("whenever a source deals damage to this creature"), so the
+    # PASSIVE printing — "whenever this creature IS DEALT damage" — matched
+    # nothing and returned before even the unhandled-queue breadcrumb. Two
+    # cards were silently inert live: Phyrexian Negator (a {2}{B} 5/5 with no
+    # drawback at all — blocked, took damage, sacrificed nothing) and
+    # Ill-Tempered Loner (took 6 and dealt nothing back). Zero
+    # [DAMAGED-TRIGGER] lines of either kind across four games.
+    _self = r'(?:this creature|' + re.escape((damaged.name or '').lower()) + r')'
+    _dm = re.search(r'whenever a source deals damage to ' + _self
+                    + r',\s*([^\n.]+)', d_scan)
+    _passive = False
+    if not _dm:
+        _dm = re.search(r'whenever ' + _self + r' is dealt damage,\s*([^\n.]+)',
+                        d_scan)
+        _passive = bool(_dm)
     if not _dm:
         return msgs
     _deffect = _dm.group(1).strip()
     _damaged_owner = next(
         (p for p in game.players if damaged in p.battlefield), None)
-    if (source_controller is not None and re.match(
-            r"that source's controller sacrifices that many permanents",
-            _deffect)):
+    # WHO sacrifices differs between the two printings, and getting it
+    # backwards would be worse than not firing at all: Phyrexian Obliterator
+    # says "that SOURCE'S controller sacrifices", while Phyrexian Negator
+    # says only "sacrifice that many permanents" — meaning the damaged
+    # creature's OWN controller. Relaxing the regex without this split would
+    # have resolved Negator in exactly the wrong direction.
+    _sac_active = re.match(
+        r"that source's controller sacrifices that many permanents", _deffect)
+    _sac_passive = _passive and re.match(
+        r'sacrifice that many permanents', _deffect)
+    _sac_player = source_controller if _sac_active else _damaged_owner
+    if (_sac_active or _sac_passive) and _sac_player is not None:
         for _ in range(int(dmg_amount)):
             _m = rules._execute_action_on_state(game, {
                 "action": "sacrifice_permanent",
-                "player": source_controller.name,
+                "player": _sac_player.name,
                 "source": damaged.name,
                 "reason": f"{damaged.name}'s damage trigger"})
             if _m:
                 msgs.append(_m)
-        print(f"[DAMAGED-TRIGGER] {damaged.name}: {source_controller.name} "
+        print(f"[DAMAGED-TRIGGER] {damaged.name}: {_sac_player.name} "
               f"sacrifices {dmg_amount} permanent(s)")
     else:
         print(f"[DAMAGED-TRIGGER-UNHANDLED] {damaged.name}: "

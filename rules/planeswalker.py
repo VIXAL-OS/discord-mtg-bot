@@ -1139,7 +1139,32 @@ class PlaneswalkerManager:
             mana_match = re.search(r'add (\w+) mana', text)
             if mana_match:
                 count_word = mana_match.group(1)
-                count = {'one': 1, 'two': 2, 'three': 3}.get(count_word, 2)
+                # Aug 10 card-targeted wave (CRITICAL): the default was a
+                # hardcoded 2, so Xenagos, the Reveler's "+1: Add X mana ...
+                # where X is the number of creatures you control" added
+                # exactly 2 red on all five activations — including one with
+                # ZERO creatures on board, which was then spent on a {3}{R}
+                # spell. Mana from nothing (CR 106.1). Resolve X from the
+                # printed clause; refuse rather than guess when we cannot.
+                count = {'one': 1, 'two': 2, 'three': 3}.get(count_word)
+                if count is None:
+                    if count_word == 'x':
+                        _x = re.search(
+                            r'where x is the number of ([a-z ]+?) you control',
+                            text)
+                        if _x and 'creature' in _x.group(1):
+                            count = sum(1 for c in player.battlefield
+                                        if c.is_creature(game))
+                        else:
+                            count = 0
+                    else:
+                        count = 0
+                if count <= 0:
+                    messages.append(
+                        f"💎 {card.name}: adds no mana (X = 0)")
+                    return ActivationResult(
+                        success=True, messages=messages,
+                        loyalty_change=cost_value)
                 # Use the first color in the PW's mana cost as a default
                 mana_cost = card.mana_cost or ''
                 color = 'R'  # Default
@@ -1178,6 +1203,22 @@ class PlaneswalkerManager:
                     if _m_word and len(explicit_mana) == 1:
                         explicit_mana = (explicit_mana
                                          * _word_counts[_m_word.group(1)])
+                    # Aug 10 card-targeted wave (CRITICAL): this loop added
+                    # EVERY symbol it found, so Domri, Anarch of Bolas's
+                    # "+1: Add {R} or {G}." produced R *and* G — five
+                    # fabricated mana in one game, all spent. A disjunction
+                    # grants ONE mana of the caster's choice (CR 106.1); pick
+                    # the first, which matches the engine's existing
+                    # first-colour-of-the-cost convention elsewhere.
+                    # The disjunction must be BETWEEN THE MANA SYMBOLS. A bare
+                    # `' or ' in text` matched Jaya Ballard's "Spend this mana
+                    # only to cast instant OR sorcery spells" and truncated her
+                    # {R}{R}{R} to one — the substring trap, in the fix for a
+                    # substring trap. The existing R4 pin caught it.
+                    _disjunct = re.search(
+                        r'\{[wubrgc]\}\s+or\s+\{[wubrgc]\}', text)
+                    if _disjunct and len(explicit_mana) > 1 and not _m_word:
+                        explicit_mana = explicit_mana[:1]
                     for m in explicit_mana:
                         if _spend_key:
                             player.add_restricted_mana(

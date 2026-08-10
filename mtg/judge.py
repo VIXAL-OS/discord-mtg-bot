@@ -787,7 +787,18 @@ async def resolve_effect(rules, game: GameState, effect_description: str,
     # re-post. Prevents Temple/Viscera Seer scry ETBs from printing 3×
     # when the trigger fires from multiple tiers and prevents burning
     # tokens on back-to-back identical requests.
+    # Aug 10 card-targeted wave (CRITICAL): the key carried no GAME
+    # identifier while `rules` is a singleton shared by every concurrent game
+    # in the cog (one GameEngine -> one RulesEngine -> games: Dict[int,
+    # GameState]), so a turn-N resolution in one game silently cancelled the
+    # same card's resolution in EVERY other game on its turn N. Measured over
+    # the 160-game batch: all five [RESOLVE-DEDUP] fires had no genuine
+    # earlier resolve in their own log — cross-game suppression was the
+    # guard's ONLY observed effect. It cost a fully-paid Killing Wave
+    # (game_1536028980996472842, X=2, three sources tapped, no effect).
+    # Same class as the Apr-6 parallel-game strategist-memo contamination.
     dedupe_key = (
+        int(getattr(game, 'thread_id', 0) or 0),
         (source_card or "").strip().lower(),
         (effect_description or "").strip().lower(),
         int(getattr(game, 'turn_number', 0) or 0),
