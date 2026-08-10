@@ -1141,6 +1141,35 @@ def player_has_prevent_all_static(player):
     return False
 
 
+def prevention_exempts_source(player, source_card) -> bool:
+    """Does an active prevention effect EXEMPT this damage source?
+
+    Aug 10 deferred (G5). Moonmist prints "Prevent all combat damage that would
+    be dealt this turn BY CREATURES OTHER THAN WEREWOLVES AND WOLVES" — in a
+    werewolf deck that exemption is the entire point of the card, so a blanket
+    prevention is not a rounding error, it is the opposite of the effect.
+
+    The exemption rides `_damage_prevented_except_subtypes`, set alongside the
+    prevention flag by the prevent_combat_damage action. Empty/absent means an
+    unconditional prevention (Fog, Teferi's Protection), which is the common
+    case and must stay exactly as it was.
+
+    Matched against the source's creature SUBTYPES, not its whole type line: a
+    substring test against the type line would exempt "Wolf" on a card typed
+    "Werewolf" harmlessly, but would also exempt any future subtype containing
+    another as a substring. The subtype list is exact.
+    """
+    exempt = getattr(player, '_damage_prevented_except_subtypes', None)
+    if not exempt or source_card is None:
+        return False
+    getter = getattr(source_card, 'get_creature_types', None)
+    subs = [str(s).lower() for s in (getter() or [])] if callable(getter) else []
+    if not subs:
+        tl = (getattr(source_card, 'type_line', '') or '').lower()
+        subs = [w.strip() for w in tl.replace('—', '-').split('-')[-1].split()]
+    return any(str(e).lower() in subs for e in exempt)
+
+
 def parse_escapes_with_counters(oracle_text):
     """Parse the escape rider "escapes with N +1/+1 counter(s) on it".
 

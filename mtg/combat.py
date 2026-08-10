@@ -682,6 +682,7 @@ def apply_combat_damage_to_player(rules, game: GameState, player: 'PlayerState',
     # Damage prevention flag (Teferi's Protection, Fog, etc.)
     from mtg.helpers import (damage_prevention_disabled,
                              player_has_prevent_all_static,
+                             prevention_exempts_source,
                              damage_source_colors)
     _prevent_flag = getattr(player, '_damage_prevented', False)
     if _prevent_flag:
@@ -691,6 +692,13 @@ def apply_combat_damage_to_player(rules, game: GameState, player: 'PlayerState',
             player._damage_prevented = False
             _prevent_flag = False
             print(f"  [DAMAGE-PREVENTED] Expired for {player.name} (set turn expired)")
+    # Aug 10 deferred (G5): a prevention may EXEMPT some sources (Moonmist
+    # exempts Werewolves and Wolves). Unconditional preventions carry no
+    # exemption list and are unaffected.
+    if _prevent_flag and prevention_exempts_source(player, source_card):
+        print(f"  [DAMAGE-PREVENTED] {source_card.name} is EXEMPT from the "
+              f"active prevention — damage stands")
+        _prevent_flag = False
     # July 29 (CR 611.2c): Solitary Confinement / Glacial Chasm statics are
     # computed live from the battlefield — no flag to go stale when the
     # permanent leaves.

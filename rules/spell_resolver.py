@@ -286,7 +286,22 @@ class SpellResolver:
                 # Target was specified
                 selected_targets = [target] if not isinstance(target, list) else target
             elif target_mode == TargetMode.AUTO:
-                # Auto-select targets
+                # Auto-select targets.
+                #
+                # Aug 10 deferred (G4): this loop used to abort the WHOLE spell
+                # on the first restriction with no legal target. For a MODAL
+                # card that is wrong twice over — CR 601.2b/601.2c require legal
+                # targets only for the modes actually CHOSEN, and a card like
+                # Inscription of Abundance carries an always-legal
+                # target-a-player mode alongside a creature mode. A kicked cast
+                # paid 5 mana and fizzled with a legal mode available.
+                #
+                # Now: record each miss, keep going, and fail only if NOTHING
+                # was satisfiable. That is a strict improvement in both
+                # directions, because the caller also treats a failed result as
+                # "reached Tier 3" rather than "resolved" (see the
+                # result.success check in mtg/spells.py).
+                _missed = []
                 for restriction in targets_needed:
                     legal = self.get_legal_targets(game, player, restriction)
                     if legal:
@@ -297,9 +312,24 @@ class SpellResolver:
                         else:
                             selected_targets.append(legal[0][0])
                     else:
-                        result.success = False
-                        result.messages.append(f"⚠️ No legal targets for {card.name}")
-                        return result
+                        _missed.append(restriction)
+                if _missed and not selected_targets:
+                    # Nothing at all could be targeted — a real fizzle.
+                    result.success = False
+                    result.messages.append(f"⚠️ No legal targets for {card.name}")
+                    return result
+                if _missed:
+                    # Partially satisfiable: resolve what we can. NOTE the
+                    # remaining limitation, deliberately not papered over —
+                    # ExecutionContext.targets is ONE FLAT LIST consumed
+                    # positionally by ~20 executors, so a surviving clause can
+                    # still be paired with another clause's target (the Aug-2
+                    # batch-13 Thought Scour class, mitigated but not solved by
+                    # Effect.raw_text). Skipping the miss is strictly better
+                    # than fizzling the whole spell, but it is not attribution.
+                    print(f"[SPELL_RESOLVER] {card.name}: {len(_missed)} of "
+                          f"{len(targets_needed)} target restriction(s) had no "
+                          f"legal target — resolving the rest (CR 601.2c)")
         
         # Build execution context
         context = ExecutionContext(

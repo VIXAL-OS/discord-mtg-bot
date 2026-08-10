@@ -600,6 +600,128 @@ class TestGSeamTemplatesAndTiming:
         assert "getattr(result, 'success', True)" in src, (
             "the Tier-3 escalation must also trigger on a failed Tier-2 result")
 
+    # --- G4 follow-up: the Tier-2 loop itself -----------------------------
+    def test_a_partially_targetable_spell_resolves_the_rest(self):
+        """The loop aborted the WHOLE spell on the first restriction with no
+        legal target. CR 601.2c requires legal targets only for the modes
+        actually chosen, so a card carrying an always-legal mode alongside a
+        creature mode should not fizzle on an empty board."""
+        import asyncio
+        from rules.spell_resolver import SpellResolver, TargetMode
+        from mtg.rules_engine import RulesEngine
+
+        game = _make_game()
+        rick, _claude = game.players
+        rules = RulesEngine(None)
+        game._rules_engine = rules
+
+        # Restriction 1 (artifact) has NO legal target on an empty board;
+        # restriction 2 (player) is always legal.
+        card = _make_card("Probe", type_line="Instant",
+                          oracle_text="Destroy target artifact. "
+                                      "Target player gains 3 life.")
+        before = rick.life
+        res = asyncio.run(SpellResolver(rules).cast_spell(
+            game, rick, card, target=None, target_mode=TargetMode.AUTO))
+
+        assert res.success, (
+            f"a spell with ONE unsatisfiable restriction must not fizzle "
+            f"wholesale: {res.messages}")
+        assert rick.life == before + 3, (
+            f"the satisfiable half must still resolve; life {before} -> "
+            f"{rick.life}")
+
+    def test_a_fully_untargetable_spell_still_fails(self):
+        """The other direction: when NOTHING is satisfiable it is a real
+        fizzle, and the failure is what routes it to Tier 3."""
+        import asyncio
+        from rules.spell_resolver import SpellResolver, TargetMode
+        from mtg.rules_engine import RulesEngine
+
+        game = _make_game()
+        rick, _ = game.players
+        rules = RulesEngine(None)
+        game._rules_engine = rules
+        card = _make_card("Probe2", type_line="Instant",
+                          oracle_text="Destroy target artifact.")
+        res = asyncio.run(SpellResolver(rules).cast_spell(
+            game, rick, card, target=None, target_mode=TargetMode.AUTO))
+        assert not res.success, (
+            "no legal target for the ONLY restriction is a genuine failure")
+
+    def test_full_mode_attribution_is_still_a_flat_list(self):
+        """Honest scope guard. ExecutionContext.targets remains ONE FLAT LIST
+        consumed positionally by ~20 executors, so a surviving clause can still
+        be paired with another clause's target. Skipping a miss is strictly
+        better than fizzling, but it is NOT attribution — if this ever changes,
+        this pin should be the thing that fails and gets rewritten."""
+        from rules.effects import ExecutionContext
+        import dataclasses
+        names = {f.name for f in dataclasses.fields(ExecutionContext)}
+        assert 'targets' in names
+        assert 'targets_by_restriction' not in names, (
+            "if per-restriction targets landed, update the ~20 positional "
+            "consumers and retire this pin")
+
+    # --- G5 follow-up: the Moonmist exemption -----------------------------
+    def test_moonmist_exempts_werewolves_from_its_own_fog(self):
+        """"…by creatures other than Werewolves and Wolves." In a werewolf deck
+        that exemption is the point of the card, so a blanket prevention
+        inverts it. Drives the REAL combat funnel, not the helper alone."""
+        from mtg.combat import apply_combat_damage_to_player
+        from mtg.rules_engine import RulesEngine
+        from mtg.actions import execute_action_on_state
+
+        game = _make_game()
+        rick, claude = game.players
+        rules = RulesEngine(None)
+        game._rules_engine = rules
+
+        wolf = _make_card("Howlpack Alpha", type_line="Creature — Werewolf",
+                          power="3", toughness="3")
+        bear = _make_card("Grizzly Bears", type_line="Creature — Bear",
+                          power="2", toughness="2")
+        rick.battlefield.extend([wolf, bear])
+
+        execute_action_on_state(rules, game, {
+            "action": "prevent_combat_damage", "scope": "all",
+            "except_subtypes": ["Werewolf", "Wolf"]})
+
+        before = claude.life
+        dealt_bear = apply_combat_damage_to_player(rules, game, claude, 2, bear)
+        assert dealt_bear == 0 and claude.life == before, (
+            "a Bear's combat damage IS prevented")
+        dealt_wolf = apply_combat_damage_to_player(rules, game, claude, 3, wolf)
+        assert dealt_wolf == 3, (
+            f"a Werewolf is EXEMPT and its damage stands; got {dealt_wolf}")
+
+    def test_an_unconditional_fog_still_prevents_everything(self):
+        """The regression guard that matters: Fog and Teferi's Protection pass
+        no exemption list, and their behaviour must be byte-for-byte unchanged."""
+        from mtg.combat import apply_combat_damage_to_player
+        from mtg.rules_engine import RulesEngine
+        from mtg.actions import execute_action_on_state
+
+        game = _make_game()
+        rick, claude = game.players
+        rules = RulesEngine(None)
+        game._rules_engine = rules
+        wolf = _make_card("Howlpack Alpha", type_line="Creature — Werewolf",
+                          power="3", toughness="3")
+        rick.battlefield.append(wolf)
+
+        execute_action_on_state(rules, game, {
+            "action": "prevent_combat_damage", "scope": "all"})
+        assert apply_combat_damage_to_player(rules, game, claude, 3, wolf) == 0, (
+            "with no exemption list even a Werewolf is prevented")
+
+    def test_moonmist_passes_the_exemption(self):
+        acts = self._lib()._card_templates["moonmist"].action_generator(
+            "Rick", "Claude", {'controller_battlefield': [], 'opponent_battlefield': []})
+        fog = next(a for a in acts if a['action'] == 'prevent_combat_damage')
+        assert sorted(s.lower() for s in fog.get('except_subtypes', [])) == \
+            ['werewolf', 'wolf']
+
     # --- G3 prerequisite --------------------------------------------------
     def test_the_adventure_path_forwards_the_declared_target(self):
         """The adventure branch was the ONLY resolution builder not passing

@@ -1687,13 +1687,12 @@ class EffectTemplateLibrary:
         # preceding sentence and a trailing qualifier. Resolving it at Tier 1.5
         # is the prefer-lower-tiers answer and sidesteps the guard entirely.
         #
-        # DOCUMENTED APPROXIMATION: scope="all" OVER-prevents. The printed
-        # clause exempts Werewolves and Wolves, but prevent_combat_damage
-        # supports only scope "all"/"to_you" against a player-level flag — there
-        # is no per-source-type filter in the prevention machinery. Modelling
-        # the exemption needs a source-type gate at the damage funnels, which is
-        # its own change. Stated here rather than implied, because in a werewolf
-        # deck the exemption is the point of the card.
+        # The Werewolf/Wolf exemption IS modelled: prevent_combat_damage takes
+        # an opt-in except_subtypes list, and the combat gate consults
+        # helpers.prevention_exempts_source against the damage source's creature
+        # SUBTYPES. In a werewolf deck that exemption is the point of the card —
+        # a blanket prevention inverts it — so this is not an approximation
+        # worth carrying. Unconditional fogs pass no list and are unchanged.
         def _gen_moonmist(ctrl, opp, ctx):
             acts = []
             for side, owner in ((ctx.get('controller_battlefield') or [], ctrl),
@@ -1704,7 +1703,8 @@ class EffectTemplateLibrary:
                         acts.append({"action": "transform_permanent",
                                      "player": owner,
                                      "card": getattr(c, 'name', '')})
-            acts.append({"action": "prevent_combat_damage", "scope": "all"})
+            acts.append({"action": "prevent_combat_damage", "scope": "all",
+                         "except_subtypes": ["Werewolf", "Wolf"]})
             return acts
 
         self._add_card("moonmist", EffectTemplate(

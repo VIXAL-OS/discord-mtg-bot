@@ -4308,21 +4308,31 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
         # Sets a flag that _deal_combat_damage checks
         scope = action.get("scope", "all")  # "all" or "to_you"
         player_name = action.get("player", "")
+        # Aug 10 deferred (G5): opt-in source EXEMPTION. Moonmist prevents all
+        # combat damage "by creatures OTHER THAN Werewolves and Wolves" — in a
+        # werewolf deck that exemption is the point of the card, so a blanket
+        # prevention inverts it. Absent/empty keeps the unconditional Fog and
+        # Teferi's Protection behaviour byte-for-byte.
+        except_subtypes = action.get("except_subtypes") or []
+        _exempt_note = (f" (except {', '.join(except_subtypes)})"
+                        if except_subtypes else "")
         if scope == "all":
             # Prevent all combat damage for all players this turn
             for p in game.players:
                 p._damage_prevented = True
+                p._damage_prevented_except_subtypes = list(except_subtypes)
                 # Expires at end of turn (next player's untap)
                 p._damage_prevented_expires_turn = game.turn_number + 1
-            print(f"[FOG] All combat damage prevented this turn")
-            return "🌫️ All combat damage is prevented this turn!"
+            print(f"[FOG] All combat damage prevented this turn{_exempt_note}")
+            return f"🌫️ All combat damage is prevented this turn{_exempt_note}!"
         elif scope == "to_you" and player_name:
             p = find_player(player_name)
             if p:
                 p._damage_prevented = True
+                p._damage_prevented_except_subtypes = list(except_subtypes)
                 p._damage_prevented_expires_turn = game.turn_number + 1
-                print(f"[FOG] Combat damage to {p.name} prevented this turn")
-                return f"🌫️ Combat damage to {p.name} is prevented this turn"
+                print(f"[FOG] Combat damage to {p.name} prevented this turn{_exempt_note}")
+                return f"🌫️ Combat damage to {p.name} is prevented this turn{_exempt_note}"
         return None
 
     elif action_type == "grant_hand_cascade":

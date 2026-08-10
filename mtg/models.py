@@ -2340,6 +2340,11 @@ class Player:
     # against game.turn_number; inf = never expires until flag cleared).
     _damage_prevented: bool = field(default=False, repr=False, compare=False)
     _damage_prevented_expires_turn: float = field(default=float("inf"), repr=False, compare=False)
+    # Aug 10 2026 (G5): creature SUBTYPES exempt from the active prevention.
+    # Moonmist prevents combat damage "by creatures other than Werewolves and
+    # Wolves"; an empty list is the unconditional Fog / Teferi's Protection
+    # case and leaves the gate's behaviour unchanged.
+    _damage_prevented_except_subtypes: list = field(default_factory=list, repr=False, compare=False)
     # Teferi's Protection: life total can't change while locked (CR 119.3-adjacent).
     _life_total_locked: bool = field(default=False, repr=False, compare=False)
     _life_total_locked_expires_turn: float = field(default=float("inf"), repr=False, compare=False)

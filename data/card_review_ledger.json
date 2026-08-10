@@ -232,7 +232,7 @@
     "moonmist": {
       "status": "awaiting",
       "since_sha": "1ef33d9",
-      "note": "Was refused wholesale by the combat-shape guard, losing the transform AND the fog. Now a Tier-1.5 template. KNOWN APPROXIMATION: scope=all over-prevents — the printed Werewolf/Wolf exemption is unmodelled, so do NOT mark verified on a game where werewolves attacked."
+      "note": "Was refused wholesale by the combat-shape guard, losing the transform AND the fog. Now a Tier-1.5 template, and the Werewolf/Wolf exemption IS modelled (prevent_combat_damage takes except_subtypes). Verify all three: the transform fires, non-Werewolf damage is prevented, and a Werewolf's damage still lands. NOTE fogs still do not prevent damage to CREATURES at all (pre-existing, engine-wide)."
     },
     "avabruck caretaker": {
       "status": "awaiting",
