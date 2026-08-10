@@ -31,18 +31,19 @@ invents cards).
 
 What counts as "reviewed"
 -------------------------
-A game whose id CLAUDE.md cites, MINUS anything data/card_review_ledger.json
-puts back. The bare game-membership inference over-credits three ways — a
-reviewer does not check every card in a game, a card can be present with its
-ability never firing, and a card fixed in the same session was reviewed
-against logs that PREDATE the fix — so the ledger carries per-card
-verified / unexercised / awaiting statuses and the last two return to the
-pool. See that file for the contract.
+A game recorded in data/reviewed_games.json OR cited by id in CLAUDE.md,
+MINUS anything data/card_review_ledger.json puts back. The bare
+game-membership inference over-credits three ways — a reviewer does not check
+every card in a game, a card can be present with its ability never firing,
+and a card fixed in the same session was reviewed against logs that PREDATE
+the fix — so the ledger carries per-card verified / unexercised / awaiting
+statuses and the last two return to the pool. See that file for the contract.
 
-A game whose id CLAUDE.md cites. That is the audit trail of what a reviewer
-was actually pointed at. It is a FLOOR: earlier waves named archetypes in
-prose without always citing ids, so true coverage is a little higher and the
-remaining pool a little smaller than reported here.
+The JSON is the record and is where a wave's ids belong. CLAUDE.md remains a
+source because the historical waves are only recorded there, but it is a
+FLOOR: prose citation depends on a write-up happening to list its games, and
+the Aug 10 card-targeted wave (written up by finding rather than by matchup)
+cited none, which is what the JSON now fixes.
 
 Usage
 -----
@@ -67,6 +68,7 @@ LOGS = os.path.join(ROOT, 'logs')
 CACHE = os.path.join(ROOT, 'data', 'card_data_cache.json')
 DOC = os.path.join(ROOT, 'CLAUDE.md')
 LEDGER = os.path.join(ROOT, 'data', 'card_review_ledger.json')
+REVIEWED_GAMES = os.path.join(ROOT, 'data', 'reviewed_games.json')
 
 # Live play signals. Each must name a card that DID something, not one that
 # was merely legal or merely in a deck list.
@@ -93,8 +95,33 @@ def _load_ledger():
 
 
 def _reviewed_game_ids():
+    """Game ids a reviewer read: data/reviewed_games.json UNION CLAUDE.md.
+
+    Aug 10: CLAUDE.md prose was the only source, which worked solely because
+    every wave HAPPENED to be written up as a matchup ledger listing each
+    game. The card-targeted wave was written up by FINDING and cited zero
+    ids, so its twelve games read as unreviewed and this tool began
+    recommending them for re-reading — one suggestion listed nine "novel"
+    cards, seven of which were that reviewer's own findings.
+
+    Prose citation is a side effect of a formatting convention, not a record.
+    The JSON is the record; CLAUDE.md stays a source so the historical games
+    keep counting without a backfill. The read is deliberately forgiving (the
+    file is optional), which is also why its absence must be pinned — a
+    broken read looks exactly like "no games recorded".
+    """
+    ids = set()
+    try:
+        with io.open(REVIEWED_GAMES, encoding='utf-8') as fh:
+            for key in json.load(fh).get('games', {}):
+                found = re.search(r'game_(\d{15,})', key)
+                if found:
+                    ids.add(found.group(1))
+    except (OSError, ValueError):
+        pass
     with io.open(DOC, encoding='utf-8') as fh:
-        return set(re.findall(r'game_(\d{15,})', fh.read()))
+        ids.update(re.findall(r'game_(\d{15,})', fh.read()))
+    return ids
 
 
 def _cards_in_play(path, known):

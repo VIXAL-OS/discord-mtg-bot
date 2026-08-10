@@ -1,0 +1,105 @@
+{
+ "_README": [
+  "Games a reviewer actually read, keyed by game id. Consumed by",
+  "tools/card_coverage.py, which UNIONS this with the game ids cited in",
+  "CLAUDE.md prose.",
+  "",
+  "WHY THIS FILE EXISTS (Aug 10, 2026). Until now 'reviewed' was derived",
+  "purely from ids cited in CLAUDE.md, which worked only because every wave",
+  "happened to be written up as a matchup ledger listing each game. The Aug",
+  "10 CARD-TARGETED wave was written up by FINDING instead, and cited zero",
+  "ids -- so its 12 games silently read as unreviewed and the index began",
+  "recommending them for re-reading. Two of its top six suggestions were",
+  "games that wave had already read; the transform one listed nine 'novel'",
+  "cards, seven of which were that reviewer's own reported findings.",
+  "",
+  "So: prose citation is a side effect of a formatting convention, not a",
+  "record. Record ids HERE at the end of every wave, whatever shape the",
+  "write-up takes. CLAUDE.md stays a source so the 137 historical games keep",
+  "counting without a backfill.",
+  "",
+  "This does NOT track per-card status -- see data/card_review_ledger.json,",
+  "which puts individual cards back into the pool when a fix postdates the",
+  "logs (`awaiting`) or the ability never fired (`unexercised`). A game being",
+  "listed here does not mean every card in it was checked.",
+  "",
+  "confidence: `recorded` = written down at the time. `recovered` = matched",
+  "forensically after the fact against the cards each reviewer reported",
+  "findings on. Recovered entries are evidence, not proof; the note says what",
+  "the evidence was."
+ ],
+ "games": {
+  "game_1536017801742131241": {
+   "wave": "aug10-card-targeted",
+   "reviewer": "transform+adventure",
+   "confidence": "recovered",
+   "note": "9 of 11 cluster cards, incl. Xenagos, Domri, Arlinn Kord, Nightpack Ambusher, Ill-Tempered Loner, Full Moon's Rise and Instigator Gang -- that IS the reviewer's finding list."
+  },
+  "game_1536017808431783997": {
+   "wave": "aug10-card-targeted",
+   "reviewer": "transform+adventure",
+   "confidence": "recovered",
+   "note": "Domri, Ill-Tempered Loner and Moonmist; Moonmist's combat-shape refusal was a reported finding."
+  },
+  "game_1536017846792888341": {
+   "wave": "aug10-card-targeted",
+   "reviewer": "transform+adventure",
+   "confidence": "recovered",
+   "note": "6 of 8 adventure halves (Curious Pair, Faerie Guidemother, Shepherd of the Flock, Silverflame Squire, Realm-Cloaked Giant, Whitemane Lion) -- the adventure-template findings."
+  },
+  "game_1536032532485767308": {
+   "wave": "aug10-card-targeted",
+   "reviewer": "replacement-chain",
+   "confidence": "recovered",
+   "note": "Mindcrank + Mesmeric Orb + Tormod + Desecrated Tomb together -- the 'four trigger events have no dispatcher' finding, which said Tormod and Desecrated Tomb corroborated each other. Also carries Underworld Sentinel, Vile Entomber and Elspeth's Nightmare, all three on the CLEAN list."
+  },
+  "game_1536028874813743195": {
+   "wave": "aug10-card-targeted",
+   "reviewer": "replacement-chain",
+   "confidence": "recovered",
+   "note": "Avacyn + Akroma + Blasphemous Act (the indestructible-grant and protection findings) plus Goblin Bombardment (the Tier-3 fabricated destroy)."
+  },
+  "game_1536029015045841132": {
+   "wave": "aug10-card-targeted",
+   "reviewer": "replacement-chain",
+   "confidence": "recovered",
+   "note": "Anger of the Gods, Sunforger and Mind's Eye -- three separate reported findings in one game."
+  },
+  "game_1536028893306159114": {
+   "wave": "aug10-card-targeted",
+   "reviewer": "replacement-chain",
+   "confidence": "recovered",
+   "note": "Anger of the Gods + Sunforger + Furnace of Rath; Furnace is the CR 616.1 stacking case the reviewer was briefed on."
+  },
+  "game_1536017772910346330": {
+   "wave": "aug10-card-targeted",
+   "reviewer": "replacement-chain",
+   "confidence": "recovered",
+   "note": "Weakest of the twelve: Underworld Sentinel, Elspeth's Nightmare, Mindcrank and Tormod, all of which also appear in the partner_brallin/escape game. Included because the wave read exactly twelve games and exactly twelve cleared the threshold."
+  },
+  "game_1536028789891661854": {
+   "wave": "aug10-card-targeted",
+   "reviewer": "devotion+layers",
+   "confidence": "recovered",
+   "note": "Dread Cacodemon, Ob Nixilis Reignited and Phyrexian Negator together -- all three were reported findings."
+  },
+  "game_1536028975481098335": {
+   "wave": "aug10-card-targeted",
+   "reviewer": "devotion+layers",
+   "confidence": "recovered",
+   "note": "Killing Wave (the cross-game dedupe finding names a fully-paid X=2 Killing Wave that was eaten), Cast Down and Reaper from the Abyss."
+  },
+  "game_1536028980996472842": {
+   "wave": "aug10-card-targeted",
+   "reviewer": "devotion+layers",
+   "confidence": "recovered",
+   "note": "Ob Nixilis, Elesh Norn (sign and scope, on the CLEAN list) and Killing Wave."
+  },
+  "game_1536028769628983439": {
+   "wave": "aug10-card-targeted",
+   "reviewer": "devotion+layers",
+   "confidence": "recovered",
+   "note": "Ob Nixilis, Phyrexian Negator and Bloodline Keeper."
+  }
+ }
+}

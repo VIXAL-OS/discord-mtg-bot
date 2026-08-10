@@ -12,6 +12,7 @@ mechanisms in CLAUDE.md.
 import asyncio
 import json
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -297,3 +298,80 @@ class TestPassiveDamagedTrigger:
         body = src[index:index + 4000]
         assert '_passive = bool(_dm)' in body
         assert 'DAMAGED-TRIGGER-UNHANDLED' in body
+
+
+# ===========================================================================
+# The reviewed-games ledger (Aug 10, follow-up).
+#
+# "Reviewed" was derived purely from game ids cited in CLAUDE.md prose, which
+# worked only because every wave happened to be written up as a matchup ledger
+# listing each game. THIS wave was written up by finding and cited zero ids,
+# so its twelve games read as unreviewed and the index began recommending them
+# for re-reading — one suggestion listed nine "novel" cards, seven of which
+# were that reviewer's own findings.
+#
+# data/reviewed_games.json is now the record. These pins guard the silent-drop
+# failure mode: the loader swallows a missing/malformed file by design (so the
+# tool still works without it), which means a broken read looks exactly like
+# "no games recorded".
+#
+# NOTE the recovered ids are deliberately NOT re-listed in CLAUDE.md prose.
+# Duplicating the record into prose is what broke it, and it would also make
+# the first pin below vacuous — CLAUDE.md would supply the ids the JSON is
+# being tested for.
+# ===========================================================================
+
+class TestReviewedGamesLedger:
+
+    def _tool(self):
+        sys.path.insert(0, os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'tools'))
+        import card_coverage
+        return card_coverage
+
+    def test_ledger_ids_reach_the_reviewed_set(self):
+        """Decisive because these ids appear in NO other source."""
+        tool = self._tool()
+        with open(tool.REVIEWED_GAMES, encoding='utf-8') as handle:
+            recorded = list(json.load(handle)['games'])
+        assert recorded, 'the ledger is empty — nothing to verify'
+        with open(tool.DOC, encoding='utf-8') as handle:
+            prose = handle.read()
+        reviewed = tool._reviewed_game_ids()
+        checked = 0
+        for key in recorded:
+            digits = key.replace('game_', '')
+            if digits in prose:
+                continue        # also cited in prose; proves nothing here
+            assert digits in reviewed, f'{key} recorded but not counted reviewed'
+            checked += 1
+        assert checked, ('every recorded id is also in CLAUDE.md, so this pin '
+                         'cannot distinguish the two sources')
+
+    def test_claude_md_remains_a_source(self):
+        """The historical games must keep counting without a backfill.
+
+        Deliberately a subset assertion with no non-emptiness guard: the
+        PUBLIC fork's CLAUDE.md is a different, scrubbed document that cites
+        no game ids at all, so requiring some would fail there for a reason
+        that has nothing to do with the property. The pin is therefore
+        vacuous in the fork and decisive in this repo, where the historical
+        149 reviewed games are recorded nowhere else.
+        """
+        tool = self._tool()
+        with open(tool.DOC, encoding='utf-8') as handle:
+            prose_ids = set(re.findall(r'game_(\d{15,})', handle.read()))
+        assert prose_ids <= tool._reviewed_game_ids()
+
+    def test_every_recorded_key_is_a_game_id(self):
+        tool = self._tool()
+        with open(tool.REVIEWED_GAMES, encoding='utf-8') as handle:
+            data = json.load(handle)
+        for key, entry in data['games'].items():
+            assert re.fullmatch(r'game_\d{15,}', key), f'malformed key: {key}'
+            assert entry.get('wave'), f'{key} has no wave'
+            # A recovered id is an inference, not a record — it has to say so
+            # and say what the evidence was.
+            assert entry.get('confidence') in ('recorded', 'recovered')
+            if entry['confidence'] == 'recovered':
+                assert entry.get('note'), f'{key} recovered with no evidence'
