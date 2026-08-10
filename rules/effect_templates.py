@@ -6264,10 +6264,15 @@ class EffectTemplateLibrary:
         # Simplified: add RRR + draw 1 (approximates "exile 3, play one of them").
         self._pw_ability_templates[("chandra, flameshaper", "exile the top three cards")] = EffectTemplate(
             name="Chandra Flameshaper +2",
-            description="Add {R}{R}{R}, exile top 3 of library, play one (approx: draw 1)",
+            description=("Add {R}{R}{R} and exile the top card; you may "
+                         "play it (top-3 selection not modelled)"),
+            # Same C5 treatment as Vivien's -2 below — identical shape, found
+            # in the same grep. Exiles face UP (this one is not a face-down
+            # ability) and marks the card playable rather than drawing it.
             action_generator=lambda ctrl, opp, ctx: [
                 {"action": "add_mana", "player": ctrl, "color": "R", "amount": 3},
-                {"action": "draw_cards", "player": ctrl, "amount": 1},
+                {"action": "exile_top_of_library", "player": ctrl, "count": 1,
+                 "playable": True},
             ],
         )
 
@@ -6559,9 +6564,20 @@ class EffectTemplateLibrary:
         )
         self._pw_ability_templates[("vivien, champion of the wilds", "look at the top three")] = EffectTemplate(
             name="Vivien Champion -2 Exile Top",
-            description="Look at top 3, exile one face down for later casting (approx: draw 1)",
+            description=("Exile the top card face down; you may cast it "
+                         "(top-3 selection not modelled)"),
+            # Aug 10 deferred (C5): this used to resolve as a bare DRAW while
+            # the activation header rendered the full printed text, so a
+            # player read "exile one face down, castable if a creature" and
+            # then watched an unrestricted card go to hand. The impulse
+            # vocabulary now exists (exile_top_of_library + playable), so the
+            # real mechanic is modelled instead of approximated: the card
+            # goes to exile FACE DOWN (name withheld) and is castable.
+            # Unmodelled and stated rather than hidden: the top-3 look and
+            # the creature-only cast restriction.
             action_generator=lambda ctrl, opp, ctx: [
-                {"action": "draw_cards", "player": ctrl, "amount": 1},
+                {"action": "exile_top_of_library", "player": ctrl, "count": 1,
+                 "playable": True, "face_down": True},
             ],
         )
 

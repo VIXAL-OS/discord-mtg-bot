@@ -639,10 +639,13 @@ class PlaneswalkerManager:
             header_line = f"⚡ **{card.name}** activates [{cost_str}] ability"
             if ability_text:
                 header_line += f": _{ability_text}_"
-        messages = [
-            header_line,
-            f"   Loyalty: {old_loyalty} → {card.loyalty_counters}"
-        ]
+        # Aug 10 deferred (C6c): the loyalty line used to be its own LIST
+        # ELEMENT, and autoplay sends each element as a separate Discord
+        # message — so it landed as an unattributed post reading just
+        # " Loyalty: 4 → 5". Fold it into the header, which already names
+        # the planeswalker.
+        messages = [header_line
+                    + f"\n   Loyalty: {old_loyalty} → {card.loyalty_counters}"]
         messages.extend(effect_messages)
         effects_applied = effect_messages
 

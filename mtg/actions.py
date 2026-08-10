@@ -5672,6 +5672,11 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
         # CROSS-player impulse rider stays unmodeled (the denial half
         # still lands).
         _mark_playable = bool(action.get("playable", False))
+        # Aug 10 deferred (C5): opt-in face-down exile. Vivien, Champion of
+        # the Wilds exiles FACE DOWN, so naming the card in Discord is the
+        # same hidden-information leak the July 24 audit closed for
+        # Necropotence and Gonti. Console keeps the true name for audits.
+        _face_down = bool(action.get("face_down", False))
         exiled_names = []
         for _ in range(count):
             if not p.library:
@@ -5685,8 +5690,13 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
         if not exiled_names:
             return f"📚 {p.name}'s library is empty — nothing to exile"
         _play_note = " (playable this turn)" if _mark_playable else ""
+        _fd_note = " face down" if _face_down else ""
         print(f"[EXILE-TOP] {p.name} exiles from top of library: "
-              f"{', '.join(exiled_names)}{_play_note}")
+              f"{', '.join(exiled_names)}{_play_note}{_fd_note}")
+        if _face_down:
+            _n = len(exiled_names)
+            return (f"📤 {p.name} exiles {_n} card{'s' if _n != 1 else ''} "
+                    f"face down from the top of their library")
         return f"📤 Exiled **{', '.join(exiled_names)}** from the top of {p.name}'s library"
 
     elif action_type == "exile_from_stack":

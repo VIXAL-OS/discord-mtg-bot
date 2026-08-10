@@ -1165,6 +1165,60 @@ def parse_escapes_with_counters(oracle_text):
     return _NUMBER_WORDS.get(raw, 0)
 
 
+def find_aura_attach_target(game, controller, aura):
+    """Pick a legal object for an Aura entering the battlefield WITHOUT being
+    cast (CR 303.4f), or None when there is none (CR 303.4h — it then stays
+    in its current zone rather than entering unattached).
+
+    Reads the printed "Enchant <thing>" line. The fuller sibling lives inline
+    in the move_card handler in mtg/actions.py, which also knows the basic
+    land-subtype variants (Enchant Forest); this covers the shapes a
+    Chaos-Warp-style reveal can produce and returns None rather than guessing
+    when the restriction is one it does not model.
+    """
+    oracle = (getattr(aura, 'oracle_text', '') or '').lower()
+    match = re.search(r'enchant ([a-z][a-z\s]*)', oracle)
+    if not match:
+        return None
+    want = match.group(1).strip().split('\n')[0].strip()
+
+    def _eligible(card):
+        if card is aura or getattr(card, 'id', None) == getattr(aura, 'id', None):
+            return False
+        if want.startswith('creature'):
+            return card.is_creature(game)
+        if want.startswith('permanent'):
+            return True
+        if want.startswith('artifact'):
+            return card.is_artifact()
+        if want.startswith('land'):
+            return card.is_land()
+        if want.startswith('enchantment'):
+            return card.is_enchantment()
+        return False
+
+    # "Enchant creature you control" restricts the side; otherwise any
+    # battlefield object is legal. Beneficial-vs-detrimental choice is NOT
+    # modelled here — this is a legality gate, not a strategy one.
+    own_only = 'you control' in want
+    candidates = []
+    for player in game.players:
+        if own_only and player is not controller:
+            continue
+        candidates.extend(c for c in player.battlefield if _eligible(c))
+    if not candidates:
+        return None
+    # Prefer the controller's own biggest creature for a buff-shaped aura;
+    # otherwise just take the first legal object.
+    try:
+        own = [c for c in controller.battlefield if c in candidates]
+        if own:
+            return max(own, key=lambda c: c.get_effective_power(game))
+    except (AttributeError, TypeError, ValueError):
+        pass
+    return candidates[0]
+
+
 def parse_enters_with_counters(oracle_text):
     """Parse the generic static clause "enters with N <type> counters on it".
 

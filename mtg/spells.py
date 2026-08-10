@@ -2559,9 +2559,20 @@ async def _dispatch_resolution(engine, game: GameState, player: Player,
                                 # these are template-runtime errors, not
                                 # things the player can act on.
                                 _r_lower = reason.lower()
+                                # Aug 10 deferred (C6b): the marker list only
+                                # knew four phrases, so Blizzard Brawl's
+                                # internal gate string ("need a creature you
+                                # control and a target") was posted verbatim.
+                                # Generalised: anything phrased as an engine
+                                # PRECONDITION rather than a game event is a
+                                # diagnostic. (C1 fixed the Brawl condition
+                                # itself; this closes the leak class.)
                                 _is_internal = any(marker in _r_lower for marker in (
                                     "no player context", "no _player",
                                     "no context", "context missing",
+                                    "need a ", "needs a ", "requires a ",
+                                    "missing ", "unavailable", "not available",
+                                    "no game", "no _game",
                                 ))
                                 if not _is_internal:
                                     effect_messages.append(f"📋 {reason}")
@@ -3611,7 +3622,28 @@ async def _dispatch_resolution(engine, game: GameState, player: Player,
                                             game, target_name, target_ctrl, card, player.name)
                                         if not legal:
                                             print(f"[ETB-TARGET] {card.name} can't target {target_name}: {reason}")
-                                            effect_messages.append(f"⚡ {card.name}'s ETB fizzles — {target_name} {reason}")
+                                            # Aug 10 deferred (C6a): `reason`
+                                            # already BEGINS with the target's
+                                            # name ("X has wrong controller"),
+                                            # so prefixing target_name printed
+                                            # it twice: "Kogla's ETB fizzles —
+                                            # Kogla Kogla has wrong
+                                            # controller". The de-duplicating
+                                            # humaniser already existed and was
+                                            # wired at the CR 608.2b re-check
+                                            # sites but not here. Also say
+                                            # "this ability" rather than "ETB",
+                                            # since the message is per-ACTION
+                                            # and fired for a fight's second
+                                            # damage action while the fight
+                                            # itself resolved.
+                                            try:
+                                                from rules.targeting_helpers import _friendly_fizzle_reason
+                                                _friendly = _friendly_fizzle_reason(target_name, reason)
+                                            except (ImportError, TypeError, AttributeError):
+                                                _friendly = reason
+                                            effect_messages.append(
+                                                f"⚡ {card.name}: {_friendly}")
                                             continue
                                     try:
                                         msg = engine.rules._execute_action_on_state(game, action)
@@ -5420,8 +5452,50 @@ def resolve_special_effects(engine, game: GameState, player: Player, card: Card,
                             game, target_owner, revealed)
                         print(f"[CHAOS-WARP] {revealed.name} enters with "
                               f"{revealed.loyalty_counters} starting loyalty")
+                    # Aug 10 deferred (C4): an Aura may not enter unattached.
+                    # CR 303.4f — its controller chooses a legal object as it
+                    # enters; CR 303.4h — if there is none it REMAINS IN ITS
+                    # CURRENT ZONE, i.e. the library. The old code appended
+                    # it regardless and let the CR 704.5m AURA_INVALID sweep
+                    # tidy up a state that should never have existed
+                    # (game_1536023895637762078: Bear Umbra entered and died
+                    # on the spot).
+                    _is_aura = 'aura' in (revealed.type_line or '').lower()
+                    if _is_aura:
+                        _host = helpers.find_aura_attach_target(
+                            game, target_owner, revealed)
+                        if _host is None:
+                            target_owner.library.insert(0, revealed)
+                            messages.append(
+                                f"📚 {revealed.name} has no legal object to "
+                                f"enchant — it stays in the library (CR 303.4h)")
+                            print(f"[CHAOS-WARP] {revealed.name}: no legal "
+                                  f"attach target, left in library")
+                            return messages
+                        revealed.attached_to = _host.id
+                        if not getattr(_host, 'attachments', None):
+                            _host.attachments = []
+                        _host.attachments.append(revealed.id)
+                        print(f"[AURA-ETB] {revealed.name} attached to {_host.name} "
+                              f"(Chaos Warp)")
                     target_owner.battlefield.append(revealed)
                     messages.append(f"🌍 {revealed.name} enters the battlefield under {target_owner.name}'s control!")
+                    # Aug 10 deferred (C4, second half): this block called
+                    # NEITHER the noncast entry funnel NOR the bus, so a
+                    # Chaos-Warped CREATURE would enter with no self-ETB, no
+                    # Soul-Warden-class watchers and no PERMANENT_ENTERED —
+                    # latent in the observed game only because the reveal
+                    # happened to be an Aura.
+                    game.register_static_keyword_grants(revealed, target_owner.name)
+                    game.register_static_pt_effects(revealed, target_owner.name)
+                    game.register_replacement_effects(revealed, target_owner.name)
+                    events.emit(events.PERMANENT_ENTERED, game, card=revealed,
+                                controller=target_owner, via="chaos_warp",
+                                rules=engine.rules)
+                    messages.extend(helpers.drain_pending_messages(game))
+                    from mtg.actions import _fire_noncast_battlefield_entry
+                    messages.extend(_fire_noncast_battlefield_entry(
+                        engine.rules, game, target_owner, revealed) or [])
                 else:
                     messages.append(f"📚 {revealed.name} is not a permanent — stays on top")
             else:

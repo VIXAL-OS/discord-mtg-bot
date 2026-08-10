@@ -125,6 +125,68 @@ def _card_to_targeting_source(card):
     )
 
 
+_PROT_COLORS = {"white": "W", "blue": "U", "black": "B", "red": "R", "green": "G"}
+_PROT_TYPES = {"creature": "creature", "creatures": "creature",
+               "artifact": "artifact", "artifacts": "artifact",
+               "enchantment": "enchantment", "enchantments": "enchantment",
+               "instant": "instant", "instants": "instant",
+               "sorcery": "sorcery", "sorceries": "sorcery",
+               "planeswalker": "planeswalker", "planeswalkers": "planeswalker"}
+
+
+def _parse_protection(oracle):
+    """Build ProtectionAbility objects from any "protection from X" clauses.
+
+    Aug 10: the colour class used to be (\\w+(?:\\s+and\\s+\\w+)?), which on the
+    standard "protection from white and from BLACK" template captures
+    'white and from' and silently dropped the second colour for every card
+    printing that wording. The repeated "and [from] <X>" tail is allowed now;
+    connective words are ignored by the classifier below.
+    """
+    out = []
+    for phrase in re.findall(
+            r'protection from (\w+(?:\s+and\s+(?:from\s+)?\w+)*)',
+            (oracle or '').lower()):
+        colors, types, qualities = set(), set(), set()
+        for word in phrase.split():
+            if word in _PROT_COLORS:
+                colors.add(_PROT_COLORS[word])
+            elif word in _PROT_TYPES:
+                types.add(_PROT_TYPES[word])
+            elif word == 'everything':
+                qualities.add('everything')
+        if colors or types or qualities:
+            out.append(ProtectionAbility(from_colors=colors, from_types=types,
+                                         from_qualities=qualities))
+    return out
+
+
+def _attached_grant_sentences(card, game):
+    """Sentences from attached Equipment/Auras that grant abilities to `card`.
+
+    Scoped to sentences BEGINNING "equipped creature" / "enchanted creature",
+    so an Equipment that has protection ITSELF does not hand it to the bearer.
+    Battlefield-only, mirroring the CR 301.5 zone check the P/T reader learned
+    in July (an exiled Batterskull kept granting for two combats).
+    """
+    sentences = []
+    for att_id in (getattr(card, 'attachments', None) or []):
+        try:
+            found = game.find_card_global(att_id)
+        except (AttributeError, TypeError):
+            continue
+        if not found:
+            continue
+        attachment = found[0]
+        if len(found) > 2 and str(found[2]).lower().rsplit('.', 1)[-1] != 'battlefield':
+            continue
+        for sentence in re.split(r'(?<=[.\n])', attachment.oracle_text or ''):
+            head = sentence.strip().lower()
+            if head.startswith(('equipped creature', 'enchanted creature')):
+                sentences.append(sentence)
+    return sentences
+
+
 def _card_to_targetable(card, ctrl_name, zone="battlefield", game=None):
     """Convert a Card to a Targetable for the targeting validator.
 
@@ -181,27 +243,26 @@ def _card_to_targetable(card, ctrl_name, zone="battlefield", game=None):
     if granted:
         kws |= {k for k in granted if isinstance(k, str)}
 
-    prot_list = []
     oracle = card.oracle_text or ''
-    # Aug 10 audit: the old class was (\w+(?:\s+and\s+\w+)?), which on the
-    # standard "protection from white and from BLACK" template captures
-    # 'white and from' — the second colour was silently dropped for every
-    # card printing that wording, equipment or not. Allow the repeated
-    # "and [from] <colour>" tail; the loop below already ignores the
-    # connective words.
-    prot_matches = re.findall(
-        r'protection from (\w+(?:\s+and\s+(?:from\s+)?\w+)*)', oracle.lower())
-    cmap = {"white": "W", "blue": "U", "black": "B", "red": "R", "green": "G"}
-    for pt in prot_matches:
-        pc = set()
-        pq = set()
-        for w in pt.split():
-            if w in cmap:
-                pc.add(cmap[w])
-            elif w == 'everything':
-                pq.add('everything')
-        if pc or pq:
-            prot_list.append(ProtectionAbility(from_colors=pc, from_qualities=pq))
+    prot_list = _parse_protection(oracle)
+    # Aug 10 deferred (A5): protection GRANTED by attached Equipment/Auras.
+    # Nothing sourced protection from grants, so three white Auras — including
+    # an OPPONENT's Pacifism — were legally cast onto a Danitha equipped with
+    # Sword of Light and Shadow (game_1536023936116981932). CR 702.16b/e.
+    #
+    # This is the load-bearing seam: prot_list is the ONLY place protection is
+    # ever consulted. Adding 'protection' to the granted-keyword whitelist (the
+    # first-proposed fix) would not have worked — that list holds bare tokens,
+    # so 'protection' carries no colour, and `_granted_keywords` is rebuilt
+    # wholesale from a fixed 14-keyword layers whitelist that would drop it on
+    # the next recalc anyway.
+    #
+    # SCOPE, stated honestly: protection is consulted only in the targeting
+    # layer. Even now it does not prevent damage (CR 702.16e), restrict
+    # blocking (702.16c), or make an already-attached Aura fall off (704.5m).
+    if game is not None and zone == "battlefield":
+        for grant_text in _attached_grant_sentences(card, game):
+            prot_list.extend(_parse_protection(grant_text))
 
     hx = card.has_keyword('hexproof') if hasattr(card, 'has_keyword') else 'Hexproof' in kws
     sh = card.has_keyword('shroud') if hasattr(card, 'has_keyword') else 'Shroud' in kws

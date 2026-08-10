@@ -2000,6 +2000,46 @@ KNOWN_PLAN_ACTION_TYPES = frozenset({
 })
 
 
+def _wrong_zone_hint(game, player, card_name) -> str:
+    """Teaching message when a `cast` names a card that IS available, but from
+    a zone that needs a different action type.
+
+    Returns '' when the card genuinely is not anywhere reachable, so the
+    caller falls back to its plain not-in-hand message.
+    """
+    if not card_name:
+        return ''
+    from mtg.helpers import names_match, parse_graveyard_activation
+
+    wanted = str(card_name)
+    for card in (getattr(player, 'graveyard', None) or []):
+        if not names_match(getattr(card, 'name', ''), wanted):
+            continue
+        parsed = parse_graveyard_activation(getattr(card, 'oracle_text', '') or '')
+        if parsed:
+            mechanic, cost = parsed
+            return (f"'{wanted}' is in your GRAVEYARD, not your hand — {mechanic} "
+                    f"is an activated ability, not a cast (CR 702.83a). Use "
+                    f'{{"type": "graveyard_activate", "card": "{wanted}", '
+                    f'"mechanic": "{mechanic}"}} and pay {cost}.')
+        return (f"'{wanted}' is in your GRAVEYARD, not your hand. Only cards with "
+                f"flashback / escape / jump-start / aftermath can be CAST from "
+                f"there; this one cannot.")
+    for card in (getattr(player, 'companion_zone', None) or []):
+        if names_match(getattr(card, 'name', ''), wanted):
+            return (f"'{wanted}' is your COMPANION, not in your hand — pay {{3}} to "
+                    f'move it to hand first with {{"type": "companion", '
+                    f'"card": "{wanted}"}}, then cast it on a later action.')
+    for card in (getattr(player, 'exile', None) or []):
+        if names_match(getattr(card, 'name', ''), wanted):
+            if getattr(card, 'id', None) in (getattr(player, 'playable_from_exile', None) or []):
+                return ''  # castable from exile; the executor handles it
+            if getattr(card, '_foretold', False):
+                return ''  # foretold casts are handled by the exile branch
+            return (f"'{wanted}' is in EXILE and is not playable from there.")
+    return ''
+
+
 def _get_action_error(engine, game: GameState, player_index: int, action: Dict) -> str:
     """Get human-readable error for why an action failed."""
     player = game.players[player_index]
@@ -2063,6 +2103,17 @@ def _get_action_error(engine, game: GameState, player_index: int, action: Dict) 
                     print(f"[CAST] {card_name} found in command zone (AI planned as hand)")
                     break
         if not card:
+            # Aug 10 deferred (B4): a flat "not found in hand" gave the model
+            # no signal that a DIFFERENT action type was required, so it
+            # re-proposed `cast` indefinitely — 24 inline failures plus 8
+            # plan-validate rejects in one game, trying six distinct wrong
+            # JSON shapes for an offered Dregscape Zombie
+            # (game_1536017757303341078). The engine's rejection is correct
+            # per CR 702.83a; what was missing is the teaching half, exactly
+            # the C-4 stash class. Name the zone AND the right action type.
+            _hint = _wrong_zone_hint(game, player, card_name)
+            if _hint:
+                return _hint
             return f"'{card_name}' not found in hand"
 
         # [FIX] Block AI from casting suspend-only cards (Mox Tantalite, Lotus Bloom, etc.)

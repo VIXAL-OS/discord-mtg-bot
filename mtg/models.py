@@ -505,6 +505,71 @@ _CONTROLLER_ATTACK_LOCK = re.compile(
     r"creatures you control can't attack(?:\.|$)", re.IGNORECASE)
 
 
+_CARD_KINDS = ('enchantment', 'artifact', 'creature', 'land',
+               'planeswalker', 'instant', 'sorcery')
+
+# "gets +N/+M for each <X> you control" on an Aura or Equipment.
+#
+# Aug 10 deferred (A3): the aura reader's kind alternation was a literal
+# (?:enchantment|artifact|creature|land), and the equipment reader had no
+# multiplier handling at ALL, so Glaive of the Guildpact granted a flat +1/+0
+# regardless of Gate count. "Gate" is a land SUBTYPE, not one of those four
+# kinds, so lifting the aura helper verbatim would have been a no-op — which
+# is exactly why this was deferred rather than fixed inline.
+#
+# The trailing lookahead is load-bearing. Widening to arbitrary words newly
+# reaches two inventory cards with UNMODELLED restrictive clauses:
+#   Sage's Reverie      "for each Aura you control THAT'S ATTACHED to a creature"
+#   Stoneforge Masterwork "for each other creature you control THAT SHARES a type"
+# Counting those without the restriction is an OVER-count, which is worse
+# than the flat bonus they get today. A restrictive "that / that's / which"
+# tail therefore declines the multiplier entirely. Glaive's own tail is
+# " and has vigilance and menace" — a separate ability, not a restriction —
+# so it is unaffected.
+_FOR_EACH_YOU_CONTROL = re.compile(
+    r"(?:equipped|enchanted) creature gets ([+-]\d+)/([+-]\d+)"
+    r"(?:\s+for each\s+([a-z][\w'-]*(?:\s+(?:and/or|and|or)\s+[a-z][\w'-]*)*)"
+    r"\s+you control(?!\s+(?:that\b|that's|which\b)))?",
+    re.IGNORECASE)
+
+
+def _for_each_you_control_count(game, controller, kinds_text) -> int:
+    """Count permanents `controller` controls matching a "for each X" phrase.
+
+    A token that names a card KIND is matched against the whole type line; any
+    other token is treated as a SUBTYPE and matched against the part after the
+    em-dash, which is where Scryfall puts subtypes ("Land — Gate").
+    """
+    if controller is None or not kinds_text:
+        return 0
+    tokens = [t for t in re.split(r'\s+(?:and/or|and|or)\s+', kinds_text.lower())
+              if t]
+    if not tokens:
+        return 0
+    count = 0
+    for permanent in getattr(controller, 'battlefield', []) or []:
+        type_line = (getattr(permanent, 'type_line', '') or '').lower()
+        # Accept both separators, as _card_to_targetable already does: real
+        # Scryfall data uses the em dash, but hand-built cards and some older
+        # fixtures use " - ", and a subtype check that silently sees nothing
+        # is indistinguishable from "no Gates in play".
+        if '—' in type_line:
+            subtypes = type_line.split('—')[-1]
+        elif ' - ' in type_line:
+            subtypes = type_line.split(' - ')[-1]
+        else:
+            subtypes = ''
+        for token in tokens:
+            if token in _CARD_KINDS:
+                if token in type_line:
+                    count += 1
+                    break
+            elif token in subtypes:
+                count += 1
+                break
+    return count
+
+
 def _controller_forbids_attacking(game, creature) -> bool:
     """True when a permanent the creature's controller controls prints a
     blanket "creatures you control can't attack."."""
@@ -1113,6 +1178,24 @@ class Card:
                 _line = _line.strip()
                 if not _line.startswith('equipped creature get'):
                     continue
+                # Aug 10 deferred (A3): honour a "for each <X> you control"
+                # multiplier, which this reader ignored entirely — Glaive of
+                # the Guildpact granted a flat +1/+0 no matter how many Gates
+                # its controller had (zero, in the only deck that runs it, so
+                # the correct bonus was +0/+0). Shares one helper with the
+                # aura sibling so the two cannot drift again.
+                _m = _FOR_EACH_YOU_CONTROL.search(_line)
+                if _m:
+                    _sp, _st = int(_m.group(1)), int(_m.group(2))
+                    if _m.group(3):
+                        _n = _for_each_you_control_count(
+                            game, equip_card._find_controller(game), _m.group(3))
+                        p_bonus += _sp * _n
+                        t_bonus += _st * _n
+                    else:
+                        p_bonus += _sp
+                        t_bonus += _st
+                    continue
                 pt_match = re.search(r'gets?\s*([+-]\d+)/([+-]\d+)', _line)
                 if pt_match:
                     p_bonus += int(pt_match.group(1))
@@ -1435,22 +1518,17 @@ class Card:
             # and the aura applied a flat +1/+1 — the enchanted commander's
             # power froze while the artifact count grew, shifting the kill
             # turn by two in games 1514626038486007948 / 1514621744143667220.
-            for m in _re.finditer(
-                    r'enchanted creature gets ([+-]\d+)/([+-]\d+)'
-                    r'( for each ((?:enchantment|artifact|creature|land)'
-                    r'(?:\s+(?:and/or|and|or)\s+(?:enchantment|artifact|creature|land))*)'
-                    r' you control)?',
-                    oracle):
+            # Aug 10 deferred (A3): both readers now share
+            # _FOR_EACH_YOU_CONTROL / _for_each_you_control_count, so the
+            # equipment side cannot fall behind the aura side again (it had
+            # NO multiplier handling at all). Behaviour on the aura side is
+            # unchanged for the four card kinds; it additionally gains
+            # subtype counting and the restrictive-clause decline.
+            for m in _FOR_EACH_YOU_CONTROL.finditer(oracle):
                 step_p, step_t = int(m.group(1)), int(m.group(2))
                 if m.group(3):
-                    kinds = _re.findall(r'enchantment|artifact|creature|land', m.group(4))
-                    aura_ctrl = aura._find_controller(game)
-                    count = 0
-                    if aura_ctrl is not None:
-                        count = sum(
-                            1 for perm in aura_ctrl.battlefield
-                            if any(k in (getattr(perm, 'type_line', '') or '').lower()
-                                   for k in kinds))
+                    count = _for_each_you_control_count(
+                        game, aura._find_controller(game), m.group(3))
                     p_bonus += step_p * count
                     t_bonus += step_t * count
                 else:
