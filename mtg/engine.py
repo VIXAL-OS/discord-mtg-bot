@@ -4039,6 +4039,32 @@ class GameEngine:
                             'is_equip': True,
                         })
                         continue
+                    # Aug 11 audit (reviewer D, F1): CREW had no special case,
+                    # so it fell into the generic colon-split below — and
+                    # Crew's ONLY colon lives inside its own reminder text
+                    # ("Crew 1 (Tap any number of creatures you control with
+                    # total power 1 or more: This Vehicle becomes...)"). The
+                    # split produced an unpayable cost string with an unclosed
+                    # paren and an effect of "This Vehicle becomes an artifact
+                    # creature until end of turn.)", which is verbatim what
+                    # got announced as a SUCCESS while nothing was tapped and
+                    # the Vehicle never animated (game_1536549632350625852,
+                    # with zero creatures on the battlefield to crew with).
+                    # Same shape as Equip, and it routes to the shared
+                    # crew_vehicle() implementation that already existed.
+                    crew_match = re.match(r'^Crew\s+(\d+)\b', line_stripped,
+                                          re.IGNORECASE)
+                    if crew_match:
+                        abilities.append({
+                            'cost': f"Tap creatures with total power "
+                                    f"{crew_match.group(1)}+",
+                            'effect': 'This Vehicle becomes an artifact '
+                                      'creature until end of turn',
+                            'needs_tap': False,
+                            'is_crew': True,
+                            'crew_power': int(crew_match.group(1)),
+                        })
+                        continue
                     if ':' in line and not line_stripped.startswith('('):
                         parts = line.split(':', 1)
                         if len(parts) == 2:
@@ -4201,6 +4227,23 @@ class GameEngine:
 
                 # Deduct mana costs from the ability cost string
                 # Parses costs like "{1}", "{2}{G}", "{W}{U}", etc.
+                # Aug 11 audit (reviewer D, F1): CREW is not a mana ability —
+                # its cost is tapping creatures with total power >= N, which
+                # crew_vehicle() (the ONE shared implementation, used by the
+                # {"type": "crew"} action) validates and charges. Route here
+                # instead of letting an unpayable pseudo-cost fall through to
+                # the announce-only fallback, which reported SUCCESS for an
+                # activation whose cost could never have been paid.
+                if ability.get('is_crew'):
+                    from mtg.spells import crew_vehicle
+                    ok, crew_msg = crew_vehicle(game, player, perm.name)
+                    if not ok:
+                        game._last_activation_failure = (
+                            game.turn_number, perm.name, crew_msg)
+                        print(f"[CREW] {perm.name}: {crew_msg}")
+                        return None
+                    return crew_msg
+
                 cost_str = ability['cost']
                 # July 20 batch-3 audit (reviewer V5): equip-cost reducers
                 # (Auriok Steelshaper "Equip costs you pay cost {1} less")

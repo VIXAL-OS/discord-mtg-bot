@@ -7989,6 +7989,43 @@ class EffectTemplateLibrary:
             ],
         ))
 
+        # Aug 11 audit (reviewer A, F3): the templated ETB-attach clause that
+        # many Equipment print ("When this Equipment enters, attach it to
+        # target creature you control") had NO generic pattern — only the two
+        # hardcoded exceptions above and below (Hammer of Nazahn's watcher and
+        # Embercleave). Maul of the Skyclaves therefore declined at every tier
+        # ("[ETB] no actionable verb in ETB text — skipping Tier 3") and only
+        # got attached because a Hammer of Nazahn happened to be on the
+        # battlefield doing it for a different reason. Without that accident
+        # the Equipment enters unattached and the cast is wasted.
+        #
+        # A PATTERN rather than a name key, because the clause is templated
+        # and the same wording appears on a family of cards. The name-keyed
+        # entries above still win (first match), so Embercleave is unaffected.
+        self._add_pattern(
+            r"when (?:this equipment|.+?) enters,? attach it to target "
+            r"creature you control",
+            EffectTemplate(
+                name="Equipment ETB attach",
+                description=("When this Equipment enters, attach it to target "
+                             "creature you control"),
+                action_generator=self._gen_equipment_etb_attach,
+            )
+        )
+
+        # Aug 11 audit (reviewer A, F4): Knight of the White Orchid had no
+        # handler at all, so its ETB fell to Tier 3 — which got the land-count
+        # comparison BACKWARDS and searched out a Plains while its controller
+        # already had MORE lands than the opponent. Its intervening-if is
+        # CR 603.4: the ability does not even trigger unless an opponent
+        # controls more lands, so a deterministic check is the whole fix.
+        self._add_card("knight of the white orchid", EffectTemplate(
+            name="Knight of the White Orchid",
+            description=("ETB: if an opponent controls MORE lands than you, "
+                         "search your library for a Plains onto the battlefield"),
+            action_generator=self._gen_knight_of_the_white_orchid,
+        ))
+
         # Mantle of the Ancients — return all Auras/Equipment from GY to battlefield.
         # The engine's auto-attach logic handles attaching them to the enchanted creature
         # when they enter via a non-cast path (move_card graveyard→battlefield).
@@ -9602,6 +9639,50 @@ class EffectTemplateLibrary:
     # All five gate on ctx['damage_dealt'] (the Aug-1 F2 convention) so the
     # declare-time attack scan can never fire them; mtg/combat.py sets it to
     # the damage actually dealt to the player.
+
+    def _gen_equipment_etb_attach(self, ctrl, opp, ctx) -> List[Dict]:
+        """"When this Equipment enters, attach it to target creature you
+        control." The equipment's own name comes from the resolution context,
+        not the regex — the printed clause says "this Equipment", so there is
+        nothing to capture."""
+        equipment = (ctx.get('_source_name') or ctx.get('card_name')
+                     or ctx.get('source_name') or '')
+        creature = ctx.get('best_own_creature', '')
+        if not equipment or not creature:
+            # CR 603.3c: no legal creature to attach to — a handled no-op,
+            # not an escalation ([] is "handled", None is "unhandled").
+            return []
+        return [{"action": "equip", "equipment": equipment,
+                 "creature": creature, "player": ctrl}]
+
+    def _gen_knight_of_the_white_orchid(self, ctrl, opp, ctx) -> List[Dict]:
+        """CR 603.4 intervening-if: "if an opponent controls MORE lands than
+        you". Strictly more — equal land counts do NOT trigger, which is
+        exactly the case Tier 3 got backwards live (the controller had 8
+        lands to the opponent's 7 and searched anyway).
+
+        Returns [] rather than a no_action so the caller treats it as a
+        handled no-op; the library contract is None = unhandled, [] = handled
+        (the July-21 reviewer finding that made Tier 3 hallucinate).
+        """
+        def _lands(entries):
+            n = 0
+            for c in (entries or []):
+                tl = str((c.get('type_line') if isinstance(c, dict)
+                          else getattr(c, 'type_line', '')) or '').lower()
+                if 'land' in tl:
+                    n += 1
+            return n
+        mine = _lands(ctx.get('controller_battlefield'))
+        theirs = _lands(ctx.get('opponent_battlefield'))
+        if theirs <= mine:
+            print(f"[KNIGHT-ORCHID] not triggered — {ctrl} has {mine} land(s), "
+                  f"{opp} has {theirs} (CR 603.4 needs strictly more)")
+            return []
+        return [{"action": "search_library", "player": ctrl,
+                 "card_type": "Plains", "to_zone": "battlefield", "count": 1,
+                 "shuffle": True,
+                 "reason": "Knight of the White Orchid (opponent has more lands)"}]
 
     def _gen_mask_of_memory(self, ctrl, opp, ctx) -> List[Dict]:
         """Mask of Memory: draw two cards, then discard a card.
