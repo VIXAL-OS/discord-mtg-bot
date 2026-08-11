@@ -219,6 +219,7 @@ async def _resolve_combat(cog, ctx, game: GameState):
     
     game.attackers = []
     game.blockers = {}
+    game._block_triggers_fired_ids = set()
     
     # Check state-based actions (creature deaths, etc.)
     events = cog.engine.check_state_based_actions(game)
@@ -632,6 +633,7 @@ async def _claude_extra_combats(cog, thread, game: GameState) -> None:
                        via="autoplay:claude_extra_combat")
         game.attackers = []
         game.blockers = {}
+        game._block_triggers_fired_ids = set()
         attacker_names = await cog.engine.claude_ai.decide_attackers(
             game, claude_idx)
         declared = []

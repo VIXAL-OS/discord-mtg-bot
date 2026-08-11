@@ -2474,6 +2474,7 @@ class GameEngine:
                     creature.blocked_by = []
             game.attackers = []
             game.blockers = {}
+            game._block_triggers_fired_ids = set()
         
         elif game.phase == Phase.MAIN2:
             messages.append(f"2️⃣ **Main Phase 2**")
@@ -2758,6 +2759,7 @@ class GameEngine:
                 _sw_c.attacks_this_turn = 0
         game.attackers = []
         game.blockers = {}
+        game._block_triggers_fired_ids = set()
         # Unconsumed extra combats die with the turn — a Moraug/Port Razer
         # produced on one player's turn must never grant the NEXT player a
         # phantom combat (the autoplay human loop reads this at its next

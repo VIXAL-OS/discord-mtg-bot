@@ -5011,6 +5011,7 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
 
         game.attackers = []
         game.blockers = {}
+        game._block_triggers_fired_ids = set()
 
         events = self.engine.check_state_based_actions(game)
         if events:

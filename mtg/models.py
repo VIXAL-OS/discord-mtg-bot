@@ -5057,6 +5057,14 @@ class GameState:
     # (Jitte rulings: one trigger), while first-strike + regular steps are
     # two. Cleared at each resolve_combat_damage entry.
     _equip_charge_fired_ids: set = field(default_factory=set, repr=False, compare=False)
+    # Aug 11 2026 (batch audit, reviewer D F5): blocker ids whose "whenever
+    # this creature blocks" trigger has already fired THIS combat. The
+    # first-strike and regular damage steps are two resolve_combat_damage
+    # calls but ONE combat, so without this a blocking token-maker would
+    # produce two tokens. Cleared everywhere `blockers` is cleared — i.e. at
+    # each new declare-blockers, which is what makes extra combat phases
+    # (Moraug, Aurelia, Port Razer) fire their block triggers again.
+    _block_triggers_fired_ids: set = field(default_factory=set, repr=False, compare=False)
     # Aug 2 2026 (batch-13 audit): True while the Moraug consumption loop is
     # running an ADDITIONAL combat phase. Karlach, Fury of Avernus's trigger
     # carries an intervening-if ("if it's the first combat phase of the

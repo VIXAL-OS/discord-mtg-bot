@@ -366,6 +366,21 @@ def resolve_combat_damage(rules, game: GameState) -> List[str]:
     messages = []
     lifelink_healing = {0: 0, 1: 0}  # player_index -> life to gain
 
+    # Aug 11 audit (reviewer D, F5): "whenever this creature blocks" had no
+    # scan anywhere. Fired here — the one choke point every combat flows
+    # through — rather than at the five separate blocker-declaration sites
+    # across ai_turn.py and autoplay.py. Guarded so the FS step and the
+    # regular step don't both fire it (a creature blocks once per combat).
+    try:
+        from mtg.triggers import check_block_triggers
+        from mtg.util import maybe_reraise as _mr
+        messages.extend(check_block_triggers(
+            getattr(rules, 'engine_ref', None) or rules, game))
+    except Exception as e:                                   # noqa: BLE001
+        from mtg.util import maybe_reraise as _mr
+        _mr(e)
+        print(f"[BLOCK-TRIGGER] scan failed: {e}")
+
     # Aug 7 (A-2b): each resolve_combat_damage invocation is one damage
     # step (FS and regular are separate calls/events); reset the per-step
     # equipment charge-trigger dedupe so Jitte fires once per step, not

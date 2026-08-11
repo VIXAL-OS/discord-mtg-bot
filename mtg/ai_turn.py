@@ -1755,6 +1755,7 @@ async def execute_claude_turn(engine, game: GameState) -> List[str]:
                         creature.blocked_by = []
                 game.attackers = []
                 game.blockers = {}
+                game._block_triggers_fired_ids = set()
                 # Aug 2 (batch-13 follow-up): DEFER, don't discard — the
                 # autoplay main loop now runs _claude_extra_combats after
                 # execute_claude_turn returns, so grants earned in the

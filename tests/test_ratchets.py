@@ -105,7 +105,11 @@ EXCEPT_BASELINE = {
     # ManaCost-parse fallback catch moved with it (claude_player's count
     # dropped by one under its unchanged ceiling).
     "legal_actions.py": 1,
-    "combat.py": 5,
+    # combat.py 5→6 (Aug 11, block triggers): the "whenever this creature
+    # blocks" scan at the top of resolve_combat_damage. A trigger scan
+    # failing must not abort the damage step it precedes — crash barrier,
+    # logged + maybe_reraise.
+    "combat.py": 6,
     "coverage.py": 3,
     "deck_loader.py": 4,
     # engine.py 41→43 (June 10 fix sprint): C2 Tier-3 activation escalation +
@@ -153,7 +157,10 @@ EXCEPT_BASELINE = {
     # unit of headroom under this baseline — the count now sits AT 53. The
     # next broad except in this file trips the ratchet and needs its own
     # justified bump.
-    "triggers.py": 53,
+    # triggers.py 53→54 (Aug 11, block triggers): the template-library
+    # lookup inside check_block_triggers. Logged + maybe_reraise, so
+    # strict batches still see it.
+    "triggers.py": 54,
     "util.py": 6,
 }
 

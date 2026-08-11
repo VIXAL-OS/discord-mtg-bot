@@ -3708,6 +3708,180 @@ def _check_ltb_triggers_sync(engine, game: GameState, leaving_card: Card, leavin
         messages.append(msgs)
         print(f"[LTB-STEAL-RETURN] {leaving_card.name} returned {len(stolen_cards)} stolen cards")
 
+    messages.extend(_check_enchantment_to_graveyard_watchers(
+        engine, game, leaving_card, destination))
+
+    return messages
+
+
+def _is_self_block_trigger_paragraph(card: Card, paragraph: str) -> bool:
+    """Return whether *paragraph* triggers when this card BLOCKS.
+
+    Mirror of _is_self_attack_trigger_paragraph. The "attacks or blocks"
+    wording matches the ATTACK regex too (re.match anchors at the start and
+    "attacks" comes first), which is exactly why the block half was invisible:
+    the paragraph looked handled while only ever being dispatched on attack.
+    """
+    text = (paragraph or "").lower().strip()
+    text = re.sub(r"^[a-z][\w'-]*(?: [\w'-]+)? — ", "", text)
+    if not text.startswith("whenever ") or "block" not in text:
+        return False
+    full_name = re.escape((card.name or "").lower())
+    short_name = re.escape((card.name or "").split(",", 1)[0].lower())
+    subject = rf"(?:this (?:creature|permanent)|{full_name}|{short_name})"
+    return bool(re.match(
+        rf"whenever\s+{subject}\s+(?:attacks?\s+or\s+)?blocks?\b", text))
+
+
+def check_block_triggers(engine, game: GameState) -> List[str]:
+    """Fire "whenever this creature blocks" triggers for every declared blocker.
+
+    Aug 11 audit (reviewer D, F5): NO block-trigger scan existed anywhere in
+    the engine. Every other event has one — ETB, cast, dies, LTB, attack,
+    upkeep, beginning-of-combat, main-phase, end-step — and
+    `_is_self_attack_trigger_paragraph` happily matches "attacks or blocks",
+    so the paragraph looked served while being dispatched on attack only.
+    Architect of Restoration blocked in game_1536549632350625852, died, and
+    never made its 1/1 Spirit.
+
+    ONE call site, deliberately: blockers are recorded at five separate
+    `game.blockers[...] .append(...)` sites across ai_turn.py and autoplay.py,
+    and wiring a scan into each is the two-paths divergence this codebase
+    keeps paying for, multiplied by five. resolve_combat_damage is the choke
+    point every combat flows through, and at its top blockers are declared
+    and no damage has been dealt.
+
+    Documented approximation: CR 509.1 puts these triggers on the stack at
+    DECLARATION, so they resolve before the combat-damage priority window
+    rather than after it as they do here. Nothing in the inventory cares —
+    the effects are tokens and self-pumps that land before damage either way
+    — but a block trigger that produced an instant-speed decision would want
+    the earlier slot.
+    """
+    from rules.effect_templates import strip_activated_ability_lines
+    messages: List[str] = []
+    blockers_map = getattr(game, 'blockers', None) or {}
+    if not blockers_map:
+        return messages
+    # Declared field, cleared wherever `blockers` is cleared — i.e. at each
+    # new declare-blockers. The FS and regular damage steps are two calls but
+    # ONE combat, so without this a blocking token-maker makes two tokens;
+    # an extra combat phase legitimately re-fires because blockers are
+    # re-declared for it.
+    fired: set = game._block_triggers_fired_ids
+    for blocker_ids in blockers_map.values():
+        for bid in (blocker_ids or []):
+            if bid in fired:
+                continue                       # blocks once per combat
+            fired.add(bid)
+            blocker = controller = None
+            for p in game.players:
+                for c in p.battlefield:
+                    if c.id == bid:
+                        blocker, controller = c, p
+                        break
+                if blocker:
+                    break
+            if blocker is None or not blocker.oracle_text:
+                continue
+            scan = strip_activated_ability_lines(blocker.oracle_text)
+            for paragraph in scan.split('\n'):
+                if not _is_self_block_trigger_paragraph(blocker, paragraph):
+                    continue
+                opp = next((p for p in game.players if p is not controller),
+                           None)
+                acts = None
+                try:
+                    from rules.effect_templates import get_effect_library
+                    acts, _expl = get_effect_library().resolve_attack_trigger(
+                        trigger_card_name=blocker.name,
+                        trigger_oracle=blocker.oracle_text,
+                        attacking_creature_name=blocker.name,
+                        attacking_creature_power=0,
+                        controller=controller.name,
+                        opponent=(opp.name if opp else ''),
+                        game_context={},
+                    )
+                except Exception as e:                       # noqa: BLE001
+                    maybe_reraise(e)
+                    print(f"[BLOCK-TRIGGER] template lookup failed for "
+                          f"{blocker.name}: {e}")
+                if acts and any(a.get('action') != 'no_action' for a in acts):
+                    for a in acts:
+                        if a.get('action') == 'no_action':
+                            continue
+                        msg = engine.rules._execute_action_on_state(game, a)
+                        if msg:
+                            messages.append(f"🛡️ **{blocker.name}**: {msg}")
+                    print(f"[BLOCK-TRIGGER] {blocker.name} resolved on block")
+                elif hasattr(engine, '_queue_async_trigger'):
+                    engine._queue_async_trigger(
+                        game, blocker, paragraph.strip(), "blocks",
+                        controller.name,
+                        context=f"{blocker.name} blocked this combat")
+                    print(f"[BLOCK-TRIGGER-UNHANDLED] {blocker.name}: "
+                          f"{paragraph.strip()[:90]}")
+                break
+    return messages
+
+
+def _check_enchantment_to_graveyard_watchers(
+        engine, game: GameState, leaving_card: Card,
+        destination: str = "graveyard") -> List[str]:
+    """"Whenever an enchantment is put into a graveyard from the battlefield".
+
+    Aug 11 audit (reviewer A, F6): this whole trigger class had NO scan
+    anywhere in the engine. Femeref Enchantress ("...draw a card") sat on the
+    battlefield through four qualifying events in
+    game_1536546020802961548 and drew nothing — its entire card was inert.
+
+    Hooked into the LTB scan rather than given its own dispatch because that
+    scan already runs for EVERY permanent leaving the battlefield and already
+    knows the destination, which is exactly the two facts this trigger needs.
+
+    Scope, deliberately unrestricted: the printed wording is "an enchantment",
+    not "an enchantment you control", so ANY player's enchantment counts and
+    the watcher fires for its own controller. An Aura going to the graveyard
+    because its target left is still "put into a graveyard from the
+    battlefield" (CR 704.5m destroys it), so those count too — which is most
+    of what fired in the live game.
+    """
+    from rules.effect_templates import strip_activated_ability_lines
+    messages: List[str] = []
+    if (destination or "graveyard").lower() != "graveyard":
+        return messages
+    if leaving_card is None or not leaving_card.is_enchantment():
+        return messages
+    for player in game.players:
+        for watcher in list(player.battlefield):
+            if watcher is leaving_card:
+                continue
+            scan = strip_activated_ability_lines(watcher.oracle_text or '')
+            for sentence in re.split(r'(?<=[.])\s+', scan):
+                s = sentence.strip().lower()
+                if not s.startswith('whenever an enchantment'):
+                    continue
+                if not re.search(r'put into a graveyard from the battlefield',
+                                 s):
+                    continue
+                if 'draw a card' in s:
+                    msg = engine.rules._execute_action_on_state(game, {
+                        "action": "draw_cards", "player": player.name,
+                        "amount": 1})
+                    if msg:
+                        messages.append(
+                            f"🪄 **{watcher.name}**: {msg}")
+                    print(f"[ENCHANTMENT-GY] {watcher.name} fires for "
+                          f"{leaving_card.name} → graveyard")
+                elif hasattr(engine, '_queue_async_trigger'):
+                    engine._queue_async_trigger(
+                        game, watcher, sentence.strip(), "enchantment_gy",
+                        player.name,
+                        context=(f"{leaving_card.name} (an enchantment) was "
+                                 f"put into a graveyard from the battlefield"))
+                    print(f"[ENCHANTMENT-GY-UNHANDLED] {watcher.name}: "
+                          f"{sentence.strip()[:90]}")
+                break
     return messages
 
 

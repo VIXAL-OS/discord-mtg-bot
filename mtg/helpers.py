@@ -689,19 +689,54 @@ def resolve_cast_target(game, caster, card, target_name):
             if entry_name and entry_name.lower() == lowered:
                 return entry
 
-    # 2. Permanents.
-    for p in game.players:
-        found = p.find_card(target_name, Zone.BATTLEFIELD)
-        if found:
-            return found
+    # Aug 11 audit (reviewer B, F1): the graveyard step below is gated on the
+    # spell reaching a graveyard, but the BATTLEFIELD step was not gated on
+    # anything — so for a graveyard-ONLY spell a live permanent of the same
+    # name won the race and satisfied the CR 601.2c pre-cast gate. Reanimate
+    # declared at "Sram, Senior Edificer" (alive on the opponent's
+    # battlefield, never in any graveyard) was accepted at cast, the {B} and
+    # the card were spent, and it fizzled at resolution
+    # (game_1536540711770525827). The retry loop that would have found a real
+    # target never ran, because from the gate's point of view the cast was
+    # legal.
+    #
+    # Fix is an ORDERING one, not an exclusion: when the spell reaches a
+    # graveyard, look there FIRST. A spell that can target both zones
+    # ("target creature or creature card in a graveyard") still resolves to a
+    # legal object either way, so preferring the graveyard cannot make a legal
+    # cast illegal — it only stops the illegal one being accepted.
+    _reaches_graveyard = any(phrase in oracle for phrase in
+                             ('in a graveyard', 'in your graveyard',
+                              'from your graveyard', 'from a graveyard'))
 
-    # 3. Graveyards — ONLY when the spell actually reaches there, so an
+    # 2. Graveyards — ONLY when the spell actually reaches there, so an
     #    ordinary removal spell can't accidentally "target" a dead card.
-    if any(phrase in oracle for phrase in
-           ('in a graveyard', 'in your graveyard',
-            'from your graveyard', 'from a graveyard')):
+    if _reaches_graveyard:
         for p in game.players:
             found = p.find_card(target_name, Zone.GRAVEYARD)
+            if found:
+                return found
+
+    # 3. Permanents — but NOT for a spell that only reaches a graveyard.
+    #    Reordering alone was not enough: with an empty graveyard the
+    #    battlefield fallback still handed back a live permanent, which is
+    #    still an illegal target satisfying the gate. CR 601.2c wants the
+    #    cast REJECTED so the retry loop can find a real one.
+    #
+    #    "Card" means an object in another zone and "permanent" means one on
+    #    the battlefield (the Aug-3 Feldon templating rule), so a spell is
+    #    graveyard-ONLY when it reaches a graveyard and has no unqualified
+    #    battlefield-target phrase. The negative lookahead is what keeps
+    #    genuinely dual-zone wording ("target creature or creature card in a
+    #    graveyard") reaching the battlefield: there, "creature" is followed
+    #    by " or", not " card".
+    _targets_battlefield = bool(re.search(
+        r'target\s+(?:[\w-]+\s+){0,3}'
+        r'(?:creature|permanent|artifact|enchantment|land|planeswalker)\b'
+        r'(?!\s+card)', oracle))
+    if not (_reaches_graveyard and not _targets_battlefield):
+        for p in game.players:
+            found = p.find_card(target_name, Zone.BATTLEFIELD)
             if found:
                 return found
 
@@ -2277,6 +2312,36 @@ def spell_face_for_gates(card):
     index = getattr(card, 'cast_as_split_half', -1)
     texts = getattr(card, 'split_texts', None) or []
     if index is None or index < 0 or index >= len(texts):
+        # Aug 11 audit (reviewer A, F1): the ADVENTURE half has exactly the
+        # same problem and had no branch here, so every CR 601.2c gate judged
+        # the CREATURE face. `_spell_requires_targets` bails immediately on
+        # "'instant' not in tl and 'sorcery' not in tl" — Hypnotic Sprite's
+        # type line is "Creature — Faerie" — so the whole target-legality
+        # gate was SKIPPED for adventure casts. Mesmeric Glare ("Counter
+        # target spell...") was cast into an empty stack for {2}{U} and
+        # fizzled on resolution (game_1536535485969727558). The same read of
+        # card.oracle_text ("Flying") defeated _validate_cast's
+        # counterspell-with-empty-stack gate.
+        #
+        # Affects every adventure card whose half has a mandatory target.
+        # All five gate sites across the three executors already call this
+        # helper, so the branch fixes them together.
+        if (getattr(card, 'cast_as_adventure', False)
+                and getattr(card, 'adventure_text', '')):
+            from mtg.models import Card
+            return Card(
+                name=getattr(card, 'adventure_name', '') or card.name,
+                mana_cost=getattr(card, 'adventure_cost', '') or card.mana_cost,
+                # deck_loader fills adventure_type from the Scryfall face
+                # ("Instant — Adventure"). The fallback matches the
+                # established convention at mtg/models.py's spend-restriction
+                # check: an adventure half is an instant or sorcery by
+                # definition (CR 715.2a), and falling back to the CREATURE
+                # face here would silently re-open the very gate this closes.
+                type_line=(getattr(card, 'adventure_type', '')
+                           or 'Instant Sorcery — Adventure'),
+                oracle_text=card.adventure_text,
+            )
         return card
     from mtg.models import Card
     names = getattr(card, 'split_names', None) or []
