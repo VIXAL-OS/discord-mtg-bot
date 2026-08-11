@@ -6923,7 +6923,19 @@ class EffectTemplateLibrary:
         #      draw, which is a strict downgrade from the real ability
         #      (no creature filter) but produces a real state change so the
         #      loyalty isn't wasted.
-        self._pw_ability_templates[("vivien, champion of the wilds", "vigilance and reach")] = EffectTemplate(
+        # Aug 11, 2026: this key WAS "vigilance and reach" and WotC's Oracle
+        # update that morning alphabetized the pair to "reach and vigilance",
+        # which broke the substring match and dropped her +1 to Tier 3. The
+        # card-names CI caught it within hours — this is precisely the
+        # retemplating class the validator exists for, arriving via the
+        # oracle-text check rather than the pattern-drift check.
+        #
+        # Keyed on "until your next turn" now: it is the DURATION clause,
+        # which is stable under keyword reordering, and it uniquely
+        # identifies the +1 (her -2 and her static contain no such phrase).
+        # General rule for these snippet keys — never key on a list of
+        # keywords, because WotC alphabetizes those without warning.
+        self._pw_ability_templates[("vivien, champion of the wilds", "until your next turn")] = EffectTemplate(
             name="Vivien Champion +1 Vigilance+Reach",
             description="Until end of turn, target creature you control gains vigilance and reach",
             action_generator=lambda ctrl, opp, ctx: (

@@ -185,3 +185,65 @@ class TestKnightOfTheWhiteOrchidCondition:
         """CR 603.4 — "MORE lands than you" is strictly more. An off-by-one
         here is the difference between a free land and a correct no-op."""
         assert not self._resolve(mine=7, theirs=7)
+
+
+# --------------------------------------------------------------------------
+# Oracle drift — the WotC retemplating that broke a snippet key
+# --------------------------------------------------------------------------
+
+class TestPwSnippetKeysSurviveOracleDrift:
+    """Aug 11, 2026: WotC's morning Oracle update alphabetized Vivien,
+    Champion of the Wilds' +1 from "gains vigilance and reach" to "gains reach
+    and vigilance". `_pw_ability_templates` matches its key as a SUBSTRING of
+    the ability text, so the key "vigilance and reach" stopped matching and
+    her +1 silently fell through to Tier 3. The card-names CI caught it within
+    hours of the push.
+
+    This pin reads the CARD CACHE rather than hardcoding the text, so if WotC
+    reorders again the test fails here instead of only in CI — and it fails
+    for the right reason, naming the key that went stale.
+    """
+
+    def _vivien_plus_one(self):
+        import json
+        from pathlib import Path
+        cache = json.loads(
+            (Path(__file__).resolve().parent.parent
+             / "data" / "card_data_cache.json").read_text(encoding="utf-8"))
+        entry = cache.get("vivien, champion of the wilds")
+        if not entry:
+            pytest.skip("Vivien, Champion of the Wilds not in the card cache")
+        for line in (entry.get("oracle_text") or "").split("\n"):
+            if line.strip().startswith("+1:"):
+                return line.strip()
+        pytest.fail("no +1 ability found in the cached oracle text")
+
+    def test_her_plus_one_still_resolves_via_the_template(self):
+        ability = self._vivien_plus_one()
+        acts, desc = get_effect_library().resolve_pw_ability(
+            "Vivien, Champion of the Wilds", ability, "Rick", "Claude",
+            game_context={"best_own_creature": "Sram"})
+        assert acts, (
+            "her +1 resolved to nothing — the snippet key no longer matches "
+            f"the printed text. Ability text now reads: {ability!r}")
+        assert any(a.get("action") == "grant_keywords" for a in acts), (
+            f"expected the keyword grant, got {acts}")
+
+    def test_no_pw_snippet_key_is_a_keyword_LIST(self):
+        """The class, not just the instance. WotC alphabetizes keyword lists
+        without warning, so a key containing two or more keywords joined by
+        "and"/"," is a latent break. Garruk Wildspeaker's
+        "get +3/+3 and gain trample" is fine — that "and" joins a pump to a
+        keyword, not two keywords."""
+        import re
+        KW = ("flying", "first strike", "double strike", "deathtouch", "haste",
+              "hexproof", "indestructible", "lifelink", "menace", "reach",
+              "trample", "vigilance", "ward", "defender", "flash")
+        bad = []
+        for (pw, snip) in get_effect_library()._pw_ability_templates:
+            hits = [k for k in KW if re.search(rf"\b{re.escape(k)}\b", snip)]
+            if len(hits) >= 2:
+                bad.append((pw, snip, hits))
+        assert not bad, (
+            "these PW snippet keys embed a keyword LIST and will break the "
+            f"next time WotC alphabetizes it: {bad}")

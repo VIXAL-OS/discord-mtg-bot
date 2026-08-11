@@ -392,8 +392,15 @@ class TestVivienHonoursExplicitTarget:
         from rules.effect_templates import get_effect_library
 
         library = get_effect_library()
+        # Aug 11, 2026: this key was ('...', 'vigilance and reach') until
+        # WotC's Oracle update alphabetized the pair to "reach and
+        # vigilance", which broke the substring match in production. The
+        # snippet is now the DURATION clause, which is stable under keyword
+        # reordering — see TestPwSnippetKeysSurviveOracleDrift in
+        # tests/test_aug11_fix_wave2.py, which pins the key against the live
+        # card cache so the next reorder fails a test rather than only CI.
         template = library._pw_ability_templates[
-            ('vivien, champion of the wilds', 'vigilance and reach')]
+            ('vivien, champion of the wilds', 'until your next turn')]
         return template.action_generator('Rick', 'Qwen', ctx)
 
     def test_explicit_target_wins_over_battlefield_order(self):
