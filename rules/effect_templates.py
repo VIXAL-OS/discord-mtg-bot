@@ -1051,9 +1051,38 @@ class EffectTemplateLibrary:
                 make_token_action(opp, "bird_2_2", 1),
             ]
 
+        # Aug 11 audit (reviewer D, F2): 'dissipate' and 'dissolve' used to sit
+        # in the plain list below, sharing _counter_action — which emits ONLY
+        # {"action": "counter_spell"} and therefore silently dropped each
+        # card's printed rider. Dissipate's countered spell went to the
+        # graveyard instead of exile (live: game_1536545962212986881 L1372,
+        # "Counterspell was countered — goes to graveyard"), and Dissolve's
+        # Scry 1 never happened. Force of Negation was already registered with
+        # its own generator for exactly this reason; these follow it.
+        #
+        # Swept the rest of the list against the card cache: of the entries
+        # that exist there, only these two carry a rider (`counterspell` is
+        # plain and `force of will`'s alternate cost is handled in the cast
+        # pipeline, not here). The remaining names are in no deck.
+        self._add_card('dissipate', EffectTemplate(
+            name="Dissipate",
+            description="Counter target spell; exile it instead of graveyard",
+            action_generator=lambda ctrl, opp, ctx: [
+                {"action": "counter_spell", "player": ctrl,
+                 "target": "stack_top", "countered_to": "exile"}],
+        ))
+        self._add_card('dissolve', EffectTemplate(
+            name="Dissolve",
+            description="Counter target spell, then scry 1",
+            action_generator=lambda ctrl, opp, ctx: [
+                {"action": "counter_spell", "player": ctrl,
+                 "target": "stack_top"},
+                {"action": "scry", "player": ctrl, "amount": 1}],
+        ))
+
         # Plain counterspells — all use _counter_action
         COUNTERSPELLS = [
-            'counterspell', 'cancel', 'dissolve', 'dissipate', 'void shatter',
+            'counterspell', 'cancel', 'void shatter',
             'neutralize', 'absorb', 'undermine',
             'scatter to the winds',
             'sinister sabotage', "didn't say please",
@@ -5769,6 +5798,49 @@ class EffectTemplateLibrary:
                          "create an X/X Dinosaur Beast with trample (X = that damage)"),
             action_generator=self._gen_quartzwood_crasher,
         ))
+        # Aug 11 batch audit: the EQUIPMENT combat-damage tail. The Aug-10
+        # A4 fix made this class visible (it used to fall through with no
+        # queue and no tag); this batch produced the ranked backlog it was
+        # built to produce — Mask of Memory x5, Sword of Sinew and Steel x2,
+        # Sword of Feast and Famine x2, Sword of Fire and Ice x1, all
+        # connecting and resolving NOTHING (Tier 3 refuses them, correctly,
+        # via the combat-shape guard: "combat damage must happen in the
+        # combat damage step"). Templates are the prescribed lower-tier
+        # answer. mtg/combat.py resolves these by the EQUIPMENT's name via
+        # resolve_attack_trigger, and every generator gates on
+        # ctx['damage_dealt'] so a declare-time scan can never misfire them.
+        self._add_attack_card("mask of memory", EffectTemplate(
+            name="Mask of Memory",
+            description=("Equipped creature deals combat damage to a player: "
+                         "draw two cards, then discard a card"),
+            action_generator=self._gen_mask_of_memory,
+        ))
+        self._add_attack_card("sword of fire and ice", EffectTemplate(
+            name="Sword of Fire and Ice",
+            description=("Equipped creature deals combat damage to a player: "
+                         "deal 2 damage to any target and draw a card"),
+            action_generator=self._gen_sword_fire_ice,
+        ))
+        self._add_attack_card("sword of feast and famine", EffectTemplate(
+            name="Sword of Feast and Famine",
+            description=("Equipped creature deals combat damage to a player: "
+                         "that player discards a card, untap all your lands"),
+            action_generator=self._gen_sword_feast_famine,
+        ))
+        self._add_attack_card("sword of light and shadow", EffectTemplate(
+            name="Sword of Light and Shadow",
+            description=("Equipped creature deals combat damage to a player: "
+                         "gain 3 life and return a creature card from your "
+                         "graveyard to your hand"),
+            action_generator=self._gen_sword_light_shadow,
+        ))
+        self._add_attack_card("sword of sinew and steel", EffectTemplate(
+            name="Sword of Sinew and Steel",
+            description=("Equipped creature deals combat damage to a player: "
+                         "destroy up to one target planeswalker and up to one "
+                         "target artifact"),
+            action_generator=self._gen_sword_sinew_steel,
+        ))
         # (July 31 slice 5b: the "ohran frostfang" AND "tovolar, dire
         # overlord" own-connect registrations that lived here were DELETED.
         # The battlefield-watcher loop in mtg/combat.py now handles the whole
@@ -9525,6 +9597,148 @@ class EffectTemplateLibrary:
                  "name": "Dinosaur Beast", "power": dmg, "toughness": dmg,
                  "types": "Token Creature — Dinosaur Beast", "count": 1,
                  "keywords": ["trample"]}]
+
+    # --- Aug 11: the equipment combat-damage tail -------------------------
+    # All five gate on ctx['damage_dealt'] (the Aug-1 F2 convention) so the
+    # declare-time attack scan can never fire them; mtg/combat.py sets it to
+    # the damage actually dealt to the player.
+
+    def _gen_mask_of_memory(self, ctrl, opp, ctx) -> List[Dict]:
+        """Mask of Memory: draw two cards, then discard a card.
+
+        The draw is a "may" and the discard is conditional on taking it
+        ("If you do"); a card-advantage engine is always worth taking, so
+        v1 always draws — and therefore always owes the discard. Emitting
+        the discard unconditionally would be wrong if the draw were ever
+        declined, which is why the two travel together here.
+        """
+        if int(ctx.get('damage_dealt') or 0) <= 0:
+            return []
+        return [
+            {"action": "draw_cards", "player": ctrl, "amount": 2},
+            {"action": "discard", "player": ctrl, "card": "worst"},
+        ]
+
+    def _gen_sword_fire_ice(self, ctrl, opp, ctx) -> List[Dict]:
+        """Sword of Fire and Ice: 2 damage to any target, and draw a card.
+
+        "Any target" — v1 aims at the opponent's face, the same default the
+        suspend-burn and Volcanic Geyser paths take when no target is
+        declared. A trigger has no declared target to honour here (CR 603.3d
+        chooses targets as the trigger goes on the stack, and this dispatch
+        has no choice channel), so the face is the honest, always-legal pick.
+        """
+        if int(ctx.get('damage_dealt') or 0) <= 0:
+            return []
+        return [
+            {"action": "deal_damage", "amount": 2, "target_player": opp,
+             "source": "Sword of Fire and Ice"},
+            {"action": "draw_cards", "player": ctrl, "amount": 1},
+        ]
+
+    def _gen_sword_feast_famine(self, ctrl, opp, ctx) -> List[Dict]:
+        """Sword of Feast and Famine: the damaged player discards a card and
+        you untap all lands you control.
+
+        untap_lands takes a COUNT (default 2), so the count is computed from
+        the controller's actual battlefield rather than hardcoded — "all"
+        is the printed word and a fixed number would silently under-untap a
+        big board.
+        """
+        if int(ctx.get('damage_dealt') or 0) <= 0:
+            return []
+        lands = sum(1 for c in (ctx.get('controller_battlefield') or [])
+                    if 'land' in str(
+                        (c.get('type_line') if isinstance(c, dict)
+                         else getattr(c, 'type_line', '')) or '').lower())
+        actions: List[Dict] = [
+            {"action": "discard", "player": opp, "card": "worst"},
+        ]
+        if lands:
+            actions.append({"action": "untap_lands", "player": ctrl,
+                            "count": lands})
+        return actions
+
+    def _gen_sword_light_shadow(self, ctrl, opp, ctx) -> List[Dict]:
+        """Sword of Light and Shadow: gain 3 life and return up to one target
+        creature card from your graveyard to your hand.
+
+        The return is "up to one", so an empty graveyard is a legal no-op
+        (CR 601.2c does not gate optional targets) — the life still happens.
+        """
+        if int(ctx.get('damage_dealt') or 0) <= 0:
+            return []
+        actions: List[Dict] = [
+            {"action": "gain_life", "player": ctrl, "amount": 3},
+        ]
+        best = self._best_creature_in_graveyard(ctx, 'controller_graveyard')
+        if best:
+            actions.append({"action": "move_card", "card": best,
+                            "from_zone": "graveyard", "to_zone": "hand",
+                            "player": ctrl})
+        return actions
+
+    def _gen_sword_sinew_steel(self, ctrl, opp, ctx) -> List[Dict]:
+        """Sword of Sinew and Steel: destroy up to one target planeswalker
+        and up to one target artifact.
+
+        Both are "up to one" — an empty board is a legal no-op. Targets are
+        opponent-controlled by choice: the printed text is unrestricted, but
+        destroying your own permanents is never the intent, and the July-24
+        detrimental-aura precedent says pick the opponent's.
+        """
+        if int(ctx.get('damage_dealt') or 0) <= 0:
+            return []
+        actions: List[Dict] = []
+        for kind in ('planeswalker', 'artifact'):
+            victim = self._best_opponent_permanent_of_type(ctx, kind)
+            if victim:
+                actions.append({"action": "destroy", "card": victim,
+                                "target_controller": opp})
+        return actions
+
+    @staticmethod
+    def _best_creature_in_graveyard(ctx, key) -> Optional[str]:
+        best, best_mv = None, -1
+        for c in (ctx.get(key) or []):
+            tl = str((c.get('type_line') if isinstance(c, dict)
+                      else getattr(c, 'type_line', '')) or '').lower()
+            if 'creature' not in tl:
+                continue
+            nm = (c.get('name') if isinstance(c, dict)
+                  else getattr(c, 'name', None))
+            mv = (c.get('cmc') if isinstance(c, dict)
+                  else getattr(c, 'cmc', 0)) or 0
+            try:
+                mv = int(mv)
+            except (TypeError, ValueError):
+                mv = 0
+            if nm and mv > best_mv:
+                best, best_mv = nm, mv
+        return best
+
+    @staticmethod
+    def _best_opponent_permanent_of_type(ctx, kind) -> Optional[str]:
+        best, best_mv = None, -1
+        for c in (ctx.get('opponent_battlefield') or []):
+            tl = str((c.get('type_line') if isinstance(c, dict)
+                      else getattr(c, 'type_line', '')) or '').lower()
+            # `kind` is never negated in a real type line ("artifact" appears
+            # in "Artifact Creature", which is a legal target for the
+            # artifact half — no non-prefix trap here).
+            if kind not in tl:
+                continue
+            nm = (c.get('name') if isinstance(c, dict)
+                  else getattr(c, 'name', None))
+            mv = (c.get('cmc') if isinstance(c, dict)
+                  else getattr(c, 'cmc', 0)) or 0
+            try:
+                mv = int(mv)
+            except (TypeError, ValueError):
+                mv = 0
+            if nm and mv > best_mv:
+                best, best_mv = nm, mv
+        return best
 
     def _gen_wheel_of_misfortune(self, ctrl, opp, ctx) -> List[Dict]:
         """Wheel of Misfortune: each player secretly picks a number ≥ 0; the

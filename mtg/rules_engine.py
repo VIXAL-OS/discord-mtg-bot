@@ -689,28 +689,56 @@ class RulesEngine:
                 return True
         return False
 
-    def _has_totem_armor(self, creature: Card, player) -> bool:
+    @staticmethod
+    def _totem_armor_search_zones(player, game):
+        """Every battlefield an attached Aura could be sitting on.
+
+        Aug 11 audit (reviewer D, F4): an Aura that enchants an OPPONENT's
+        creature stays on its own CASTER's battlefield (cast_spell_async only
+        sets `attached_to`, it never moves the Aura across battlefields). Both
+        totem-armor helpers scanned `player.battlefield` alone, where `player`
+        is the CREATURE's controller — so a cross-controller umbra could never
+        be found and the save silently never happened. Live A/B in one game
+        (game_1536540699103854662): Snake Umbra saved Silverback Elder
+        (same controller, worked), Boar Umbra failed to save Kambal
+        (Rick's Aura on Qwen's commander). CR 702.77b is controller-agnostic.
+        """
+        if game is None or not getattr(game, 'players', None):
+            return [player]
+        # `player` first so a same-controller Aura keeps winning ties exactly
+        # as before — this widens the search, it never reorders the old hits.
+        return [player] + [p for p in game.players if p is not player]
+
+    def _has_totem_armor(self, creature: Card, player, game=None) -> bool:
         """Check if creature has an attached Aura with totem armor."""
-        for card in player.battlefield:
-            if card.is_enchantment() and 'Aura' in (card.type_line or ''):
-                if card.attached_to == creature.id:
-                    oracle = (card.oracle_text or '').lower()
-                    if 'totem armor' in oracle or 'umbra armor' in oracle:
-                        return True
+        for owner in self._totem_armor_search_zones(player, game):
+            for card in owner.battlefield:
+                if card.is_enchantment() and 'Aura' in (card.type_line or ''):
+                    if card.attached_to == creature.id:
+                        oracle = (card.oracle_text or '').lower()
+                        if 'totem armor' in oracle or 'umbra armor' in oracle:
+                            return True
         return False
 
     def _remove_totem_armor(self, creature: Card, player, game) -> Card:
-        """Remove and destroy a totem armor Aura from the creature. Returns the destroyed Aura."""
-        for card in list(player.battlefield):
-            if card.is_enchantment() and 'Aura' in (card.type_line or ''):
-                if card.attached_to == creature.id:
-                    oracle = (card.oracle_text or '').lower()
-                    if 'totem armor' in oracle or 'umbra armor' in oracle:
-                        game.unregister_static_effects(card)
-                        player.battlefield.remove(card)
-                        player.graveyard.append(card)
-                        print(f"[TOTEM-ARMOR] Destroyed {card.name} instead of {creature.name}")
-                        return card
+        """Remove and destroy a totem armor Aura from the creature. Returns the destroyed Aura.
+
+        Aug 11: searches every battlefield (see _totem_armor_search_zones) and
+        destroys the Aura into ITS OWN owner's graveyard, not the enchanted
+        creature's controller's — CR 404.3. Removing a cross-controller Aura
+        from `player.battlefield` would have raised ValueError.
+        """
+        for owner in self._totem_armor_search_zones(player, game):
+            for card in list(owner.battlefield):
+                if card.is_enchantment() and 'Aura' in (card.type_line or ''):
+                    if card.attached_to == creature.id:
+                        oracle = (card.oracle_text or '').lower()
+                        if 'totem armor' in oracle or 'umbra armor' in oracle:
+                            game.unregister_static_effects(card)
+                            owner.battlefield.remove(card)
+                            owner.graveyard.append(card)
+                            print(f"[TOTEM-ARMOR] Destroyed {card.name} instead of {creature.name}")
+                            return card
         return None
 
     def process_state_based_actions(self, game: GameState) -> List[str]:

@@ -3210,8 +3210,16 @@ class GameEngine:
                     # `playable_from_exile` to keep them distinct — logging
                     # both under one tag misdirects an audit grepping impulse
                     # windows. Behaviour is unchanged; only the tag moves.
-                    _exile_mech = ('FORETELL-CAST'
-                                   if getattr(c, '_foretold', False)
+                    #
+                    # Aug 11 audit (A-1): read the LOCAL `_was_foretold`, not
+                    # `c._foretold` — the foretell branch above clears the
+                    # persistent marker (it is consumed by this cast), ~20
+                    # lines before this line read it, so the FORETELL-CAST
+                    # branch was structurally unreachable and every foretold
+                    # cast logged as IMPULSE-DRAW. `_was_foretold` is captured
+                    # from the marker BEFORE it is cleared and survives the
+                    # failure rollback below, so it is the honest witness.
+                    _exile_mech = ('FORETELL-CAST' if _was_foretold
                                    else 'IMPULSE-DRAW')
                     print(f"[{_exile_mech}] AI casting {c.name} from exile")
 

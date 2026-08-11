@@ -100,6 +100,120 @@
    "reviewer": "devotion+layers",
    "confidence": "recovered",
    "note": "Ob Nixilis, Phyrexian Negator and Bloodline Keeper."
+  },
+  "game_1536535485969727558": {
+   "wave": "aug11-card-targeted",
+   "reviewer": "A: adventure+madness",
+   "confidence": "recorded",
+   "note": "Adventure halves, Sire of Insanity, Kitchen Imp. Found the CR 601.2c adventure target-gate gap."
+  },
+  "game_1536540723069976626": {
+   "wave": "aug11-card-targeted",
+   "reviewer": "A: death_replacement+aura_equipment",
+   "confidence": "recorded",
+   "note": "Eldrazi Conscription (annihilator not granted), Maul of the Skyclaves, Knight of the White Orchid."
+  },
+  "game_1536546020802961548": {
+   "wave": "aug11-card-targeted",
+   "reviewer": "A: sagas+stifle",
+   "confidence": "recorded",
+   "note": "Enchantress subtheme. Setessan Champion compound constellation + Femeref Enchantress unimplemented."
+  },
+  "game_1536540711770525827": {
+   "wave": "aug11-card-targeted",
+   "reviewer": "B: aura_equipment+death_replacement",
+   "confidence": "recorded",
+   "note": "Reanimate wrong-zone target accepted at cast; Bonesplitter/Holy Mantle/Vorapede undying clean."
+  },
+  "game_1536535502839091322": {
+   "wave": "aug11-card-targeted",
+   "reviewer": "B: transform+adventure",
+   "confidence": "recorded",
+   "note": "Animating Faerie: adventure Tier-3 escalation unreachable. Wandermare counter-total display."
+  },
+  "game_1536545861541036032": {
+   "wave": "aug11-card-targeted",
+   "reviewer": "B: devotion+layers",
+   "confidence": "recorded",
+   "note": "Archon of Sun's Grace, Phyrexian Obliterator damaged-trigger (both instances correct)."
+  },
+  "game_1536535454143221820": {
+   "wave": "aug11-card-targeted",
+   "reviewer": "C: stompy+transform",
+   "confidence": "recorded",
+   "note": "Arlinn Kord transform, Domri one-mana, Full Moon's Rise, Talisman of Impulse — all clean."
+  },
+  "game_1536540682896801805": {
+   "wave": "aug11-card-targeted",
+   "reviewer": "C: death_replacement+replacement",
+   "confidence": "recorded",
+   "note": "Glacial Chasm all four clauses clean; Holy Day, Thalia, Rampaging Ferocidon."
+  },
+  "game_1536545838891794432": {
+   "wave": "aug11-card-targeted",
+   "reviewer": "C: devotion+stompy",
+   "confidence": "recorded",
+   "note": "Drana CR 510.4 first-strike trigger timing (CRITICAL). Bontu's Monument claim was a FALSE POSITIVE."
+  },
+  "game_1536549632350625852": {
+   "wave": "aug11-card-targeted",
+   "reviewer": "D: madness+partner_brallin",
+   "confidence": "recorded",
+   "note": "Smuggler's Copter Crew misparse; Sire of Insanity, Reckless Wurm trample clean."
+  },
+  "game_1536545962212986881": {
+   "wave": "aug11-card-targeted",
+   "reviewer": "D: stifle+rashmi",
+   "confidence": "recorded",
+   "note": "Dissipate exile clause dropped; Tooth and Nail entwine both-modes."
+  },
+  "game_1536540699103854662": {
+   "wave": "aug11-card-targeted",
+   "reviewer": "D: death_replacement+layers",
+   "confidence": "recorded",
+   "note": "Boar Umbra cross-controller totem armor (CRITICAL); Cauldron of Souls, Reanimate clean."
+  },
+  "game_1536521598574530593": {
+   "wave": "aug11-card-targeted",
+   "reviewer": "coordinator inline sweep",
+   "confidence": "recorded",
+   "note": "Coordinator: foretell -> cast-from-exile traced (the FORETELL-CAST dead-branch finding)."
+  },
+  "game_1536521698818531428": {
+   "wave": "aug11-card-targeted",
+   "reviewer": "coordinator inline sweep",
+   "confidence": "recorded",
+   "note": "Coordinator: cascade 2/4-4/4 resolving after the loss line (the CR 104.2a finding)."
+  },
+  "game_1536535423210360994": {
+   "wave": "aug11-card-targeted",
+   "reviewer": "coordinator inline sweep",
+   "confidence": "recorded",
+   "note": "Coordinator: Tormod, the Desecrator's first live C4 fire, traced to the Zombie token."
+  },
+  "game_1536535491858530365": {
+   "wave": "aug11-card-targeted",
+   "reviewer": "coordinator inline sweep",
+   "confidence": "recorded",
+   "note": "Coordinator: Desecrated Tomb consolidating 2 departures into one Bat - the decisive C4 case."
+  },
+  "game_1536549646988615751": {
+   "wave": "aug11-card-targeted",
+   "reviewer": "coordinator inline sweep",
+   "confidence": "recorded",
+   "note": "Coordinator: Syr Konrad's un-consolidated per-object C4 fire during a fogged combat."
+  },
+  "game_1536521480832286780": {
+   "wave": "aug11-card-targeted",
+   "reviewer": "coordinator inline sweep",
+   "confidence": "recorded",
+   "note": "Coordinator: Pact of Negation failed-payment loss (one of three non-SBA game endings)."
+  },
+  "game_1536535376464969800": {
+   "wave": "aug11-card-targeted",
+   "reviewer": "coordinator inline sweep",
+   "confidence": "recorded",
+   "note": "Coordinator: Warstorm Surge lethal; adventure/Usher to Safety coverage."
   }
  }
 }

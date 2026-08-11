@@ -259,7 +259,7 @@ def check_sba_inline_fallback(rules, game: GameState) -> List[Dict]:
                     creature.deathtouch_damage = 0
                     actions.append({'type': 'shield_removed', 'card_id': creature.id, 'card_name': creature.name, 'player_index': i, 'reason': 'shield counter removed instead of destruction (deathtouch)'})
                 # [TOTEM-ARMOR] If creature has an Aura with totem armor, destroy the Aura instead
-                elif rules._has_totem_armor(creature, player):
+                elif rules._has_totem_armor(creature, player, game):
                     aura = rules._remove_totem_armor(creature, player, game)
                     creature.damage_marked = 0
                     creature.deathtouch_damage = 0
@@ -273,7 +273,7 @@ def check_sba_inline_fallback(rules, game: GameState) -> List[Dict]:
                     creature.damage_marked = 0
                     actions.append({'type': 'shield_removed', 'card_id': creature.id, 'card_name': creature.name, 'player_index': i, 'reason': 'shield counter removed instead of destruction (lethal damage)'})
                 # [TOTEM-ARMOR] If creature has an Aura with totem armor, destroy the Aura instead
-                elif rules._has_totem_armor(creature, player):
+                elif rules._has_totem_armor(creature, player, game):
                     aura = rules._remove_totem_armor(creature, player, game)
                     creature.damage_marked = 0
                     actions.append({'type': 'totem_armor', 'card_id': creature.id, 'card_name': creature.name, 'aura_name': aura.name if aura else '?', 'player_index': i, 'reason': f'totem armor ({aura.name if aura else "?"}) destroyed instead'})

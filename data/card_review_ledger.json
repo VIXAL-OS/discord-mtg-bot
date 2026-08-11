@@ -29,14 +29,14 @@
  ],
  "cards": {
   "akroma, angel of wrath": {
-   "status": "awaiting",
-   "since_sha": "ac13af4",
-   "note": "Protection was targeting-only: she was blocked by a mono-black creature and killed by a red board wipe. CR 702.16c blocking and 702.16e damage now honoured."
+   "status": "unexercised",
+   "since_sha": "a59953c",
+   "note": "In replacement_chain's coverage list, never drawn."
   },
   "anger of the gods": {
-   "status": "awaiting",
-   "since_sha": "6323894",
-   "note": "Its 'exile it instead' death replacement now registers inline at resolution, and mass damage now routes through the replacement engine at all. Both postdate every corpus. Watch that an undying/persist creature it damaged is still wrongly RETURNED rather than exiled -- the SBA save branches run above the replacement check (pre-existing, same for RIP/Leyline)."
+   "status": "verified",
+   "since_sha": "a59953c",
+   "note": "[REPLACEMENT] exile-instead registered at resolution on two separate turns, correctly turn-clamped."
   },
   "angrath's marauders": {
    "status": "verified",
@@ -48,33 +48,33 @@
    "note": "Static grant registered; constellation never had an enchantment enter after it."
   },
   "arlinn kord": {
-   "status": "awaiting",
-   "since_sha": "1ef33d9",
-   "note": "Her [0] made the Wolf and never transformed her, so the back face was unreachable. BOTH faces now emit transform_permanent (the [-1] transforms her too). Fixed after the corpus."
+   "status": "verified",
+   "since_sha": "a59953c",
+   "note": "Reviewer C: [0] created the 2/2 Wolf AND transformed her to Arlinn, Embraced by the Moon. The back face is reachable."
   },
   "avabruck caretaker": {
-   "status": "awaiting",
-   "since_sha": "1ef33d9",
-   "note": "Its beginning-of-combat trigger drained after combat damage AND targeted a planeswalker. Both fixed (drain ordering at the AI call sites; a real template). Fixed after the corpus."
+   "status": "unexercised",
+   "since_sha": "a59953c",
+   "note": "DFC loaded, never cast."
   },
   "avacyn, angel of hope": {
-   "status": "awaiting",
-   "since_sha": "6323894",
-   "note": "The 'Other permanents you control have indestructible' grant is now IMPLEMENTED (registration pattern + a has_granted_keyword branch with no is_creature gate). Fixed after every corpus that exists, so still awaiting. NOTE the deferred half: recalculate_granted_keywords still skips non-creatures, so the NON-creature side of the grant (artifacts/enchantments/lands) is not yet populated on _granted_keywords."
+   "status": "unexercised",
+   "since_sha": "a59953c",
+   "note": "Not in the corpus at all."
   },
   "bant panorama": {
    "status": "unexercised",
    "note": "Played, and correctly refused its sac-search with no mana - but the search itself never ran."
   },
   "battlefield forge": {
-   "status": "awaiting",
-   "since_sha": "ac13af4",
-   "note": "One of 8 pain lands that tapped for free under the old four-name list. Damage now read from the oracle, scoped per ability line so the free {C} ability stays free."
+   "status": "verified",
+   "since_sha": "a59953c",
+   "note": "[MANA-DAMAGE] dealt 1 to its controller on each colored tap."
   },
   "blasphemous act": {
-   "status": "awaiting",
-   "since_sha": "ac13af4",
-   "note": "Its self cost reduction could never match (the regex is anchored on 'spells you cast'). Cast at full price for four turns. Now -1 per creature on the battlefield, at the pre-gate and at payment."
+   "status": "unexercised",
+   "since_sha": "a59953c",
+   "note": "Held in hand, never cast."
   },
   "bloodline keeper": {
    "status": "unexercised",
@@ -89,9 +89,9 @@
    "note": "Its own P/T is correct and its ANTHEM was the subject of a fix, but the control-stealing tap ability was never activated."
   },
   "cast down": {
-   "status": "awaiting",
-   "since_sha": "6323894",
-   "note": "Its 'nonlegendary' restriction was parsed nowhere (types_excluded was declared and consumed but never written). Latent in the reviewed corpus -- the observed target was legal -- so a fresh batch is needed to see it bite."
+   "status": "verified",
+   "since_sha": "a59953c",
+   "note": "Correctly REFUSED a legendary target (Kambal) - 'doesn't have required type'. The nonlegendary exclusion is live."
   },
   "charcoal diamond": {
    "status": "unexercised",
@@ -102,19 +102,19 @@
    "note": "Entered tapped correctly in two games; the {2},{T} scaling ability was never activated, so the arithmetic is untested."
   },
   "dark depths": {
-   "status": "awaiting",
-   "since_sha": "6a30802",
-   "note": "Enters-with-counters fix landed AFTER this corpus; the logs show it entering with zero ice counters. Needs a fresh batch."
+   "status": "unexercised",
+   "since_sha": "a59953c",
+   "note": "In test_snow_jorn but never drawn. Its generic enters-with-counters parse is the only live consumer besides Astral Cornucopia."
   },
   "desecrated tomb": {
-   "status": "awaiting",
-   "since_sha": "3561b22",
-   "note": "Its trigger had no dispatcher at all. Now fires ONCE per batch however many cards left (Gatherer 2018-07-13), only when a CREATURE card left, and the Bat token has flying."
+   "status": "verified",
+   "since_sha": "a59953c",
+   "note": "C4 live and DECISIVE: 2 cards left Qwen's graveyard, fired x1, exactly ONE Bat (the 2018-07-13 ruling). The Bat flew and connected."
   },
   "domri, anarch of bolas": {
-   "status": "awaiting",
-   "since_sha": "6a30802",
-   "note": "Disjunction fix postdates the corpus."
+   "status": "verified",
+   "since_sha": "a59953c",
+   "note": "Reviewer C: [+1] added exactly ONE mana on both activations (never both colors); static +1/+0 scoped to its own controller."
   },
   "elesh norn, grand cenobite": {
    "status": "verified",
@@ -127,19 +127,19 @@
    "note": "All three chapters plus the CR 704.5s sacrifice."
   },
   "embercleave": {
-   "status": "awaiting",
-   "since_sha": "ac13af4",
-   "note": "Same shape as Blasphemous Act and equally unhandled — '{1} less for each attacking creature you control'."
+   "status": "verified",
+   "since_sha": "a59953c",
+   "note": "ETB attach template resolved and equipped a real creature."
   },
   "faerie guidemother": {
-   "status": "awaiting",
-   "since_sha": "1ef33d9",
-   "note": "Its adventure half Gift of the Fae was +1/+1 board-wide with team-wide flying; now single-target +2/+1 with flying."
+   "status": "verified",
+   "since_sha": "a59953c",
+   "note": "Reviewer A: single target, exactly +2/+1, flying granted, effect expired on schedule."
   },
   "full moon's rise": {
-   "status": "awaiting",
-   "since_sha": "6323894",
-   "note": "Its Werewolf-only anthem was buffing the whole board; the qualifier is now honored. Fixed after the corpus."
+   "status": "unexercised",
+   "since_sha": "a59953c",
+   "note": "Reviewer C: cast but COUNTERED before resolution, so its Werewolf-only anthem never registered."
   },
   "furnace of rath": {
    "status": "verified",
@@ -152,24 +152,24 @@
    "note": "Kicker intervening-if correct on both a hand cast and a reanimated entry; entered tapped under Authority of the Consuls."
   },
   "glacial chasm": {
-   "status": "awaiting",
-   "since_sha": "6a30802",
-   "note": "Attack lock and life cumulative upkeep both fixed after the corpus."
+   "status": "verified",
+   "since_sha": "a59953c",
+   "note": "Reviewer C, all four clauses: ETB land sacrifice, cumulative upkeep paid 2/4/6/8/10 then DECLINED at 12 and sacrificed, attacks refused while it was out, damage prevented."
   },
   "glaive of the guildpact": {
-   "status": "awaiting",
-   "since_sha": "6a30802",
-   "note": "for-each multiplier fix postdates the corpus."
+   "status": "unexercised",
+   "since_sha": "a59953c",
+   "note": "Not in the corpus."
   },
   "goblin bombardment": {
-   "status": "awaiting",
-   "since_sha": "ac13af4",
-   "note": "Tier 3 resolved its 1 damage by fabricating a move_card kill on an undamaged 5/4 — and move_card never queued the death, so every dies trigger was skipped. Now resolves deterministically without reaching the LLM."
+   "status": "verified",
+   "since_sha": "a59953c",
+   "note": "Resolved inline x4 with real sacrifice costs and never reached Tier 3 - the fix that prevented the fabricated destroy."
   },
   "goblin rabblemaster": {
-   "status": "awaiting",
-   "since_sha": "6a30802",
-   "note": "Attack trigger rewritten and the token half re-homed to beginning-of-combat, both after the corpus."
+   "status": "verified",
+   "since_sha": "a59953c",
+   "note": "[COMBAT-BEGIN-TRIGGER] resolved the token half INLINE (no Tier-3 call); no phantom extra attacker and no team pump."
   },
   "gravecrawler": {
    "status": "unexercised",
@@ -180,18 +180,18 @@
    "note": "Cast and attacked in two games; no nontoken creature its controller owned died while it was out, so the draw trigger never fired."
   },
   "heart's desire": {
-   "status": "awaiting",
-   "since_sha": "ac13af4",
-   "note": "Token was named after the adventure and colourless; printed is a nameless 1/1 WHITE Human. Now follows the Lingering Souls convention."
+   "status": "verified",
+   "since_sha": "a59953c",
+   "note": "[ADVENTURE-TEMPLATE] created a nameless 1/1 white Human token (previously named after the adventure)."
   },
   "hypnotic sprite": {
    "status": "unexercised",
    "note": "Creature half verified; Mesmeric Glare (the adventure half) was never cast."
   },
   "icebreaker kraken": {
-   "status": "awaiting",
-   "since_sha": "ac13af4",
-   "note": "Re-checked, unchanged: its affinity reminder text has the same shape as the new self-cost-reduction parse and must not double-apply. Pinned in both directions."
+   "status": "verified",
+   "since_sha": "a59953c",
+   "note": "[ETB-TEMPLATE] resolved with the honest 'no tap - the card doesn't tap them' message; affinity and snow-spend both applied."
   },
   "ill-tempered loner": {
    "status": "awaiting",
@@ -199,14 +199,14 @@
    "note": "Now reaches the unhandled queue, but its damage-back effect still has no deterministic branch."
   },
   "inscription of abundance": {
-   "status": "awaiting",
-   "since_sha": "1ef33d9",
-   "note": "A kicked cast paid 5 mana and fizzled. Now a Tier-1.5 modal generator reading ctx['_modes'] + ctx['kicked']. The Tier-2 loop that caused it is still unfixed for OTHER modal spells — only this card is routed around it."
+   "status": "unexercised",
+   "since_sha": "a59953c",
+   "note": "Not in the corpus."
   },
   "instigator gang": {
-   "status": "awaiting",
-   "since_sha": "6323894",
-   "note": "Its Attacking-only anthem was buffing the whole board. Now DECLINES with a breadcrumb rather than registering -- correct only in the safe direction; the buff itself is still unmodelled."
+   "status": "unexercised",
+   "since_sha": "a59953c",
+   "note": "DFC loaded, never cast."
   },
   "insult // injury": {
    "status": "verified",
@@ -219,67 +219,67 @@
    "note": "The cross-game dedupe that cancelled it was fixed after the corpus."
   },
   "kozilek, the broken reality": {
-   "status": "awaiting",
-   "since_sha": "6323894",
-   "note": "'Other colorless creatures' was mangled into a nonexistent subtype ('colorles') and matched nobody. Colour-absence is now a real predicate."
+   "status": "verified",
+   "since_sha": "a59953c",
+   "note": "Combat damage and graveyard return resolved correctly."
   },
   "magus of the coffers": {
    "status": "unexercised",
    "note": "Both activation refusals were correct; the scaling arithmetic is untested."
   },
   "mana confluence": {
-   "status": "awaiting",
-   "since_sha": "ac13af4",
-   "note": "Was filed as tap DAMAGE in a hardcoded list; it prints 'Pay 1 life', a cost. Reclassified — a payment cannot be prevented, doubled or redirected."
+   "status": "unexercised",
+   "since_sha": "a59953c",
+   "note": "Never drawn."
   },
   "mesmeric orb": {
-   "status": "awaiting",
-   "since_sha": "ac13af4",
-   "note": "'Whenever a permanent becomes untapped' had NO dispatcher. Now fires on the real tapped->untapped transition at the untap step and on the generic untap action."
+   "status": "unexercised",
+   "since_sha": "a59953c",
+   "note": "In test_escape_kroxa, drawn but never resolved (rejected for mana)."
   },
   "mind's eye": {
-   "status": "awaiting",
-   "since_sha": "ac13af4",
-   "note": "Same inert family. Now pays {1} per drawn card when affordable (a real affordability check, unlike Smothering Tithe's uniform decline) and suppresses recursion."
+   "status": "unexercised",
+   "since_sha": "a59953c",
+   "note": "Not in the corpus."
   },
   "mindcrank": {
-   "status": "awaiting",
-   "since_sha": "ac13af4",
-   "note": "'Whenever an opponent loses life' had NO dispatcher. Now bus-driven from record_life_loss, which is where damage-caused and non-damage loss converge (its own reminder text is the argument for that placement)."
+   "status": "unexercised",
+   "since_sha": "a59953c",
+   "note": "In test_escape_kroxa, never drawn."
   },
   "moonmist": {
-   "status": "awaiting",
-   "since_sha": "1ef33d9",
-   "note": "Was refused wholesale by the combat-shape guard, losing the transform AND the fog. Now a Tier-1.5 template, and the Werewolf/Wolf exemption IS modelled (prevent_combat_damage takes except_subtypes). Verify all three: the transform fires, non-Werewolf damage is prevented, and a Werewolf's damage still lands. NOTE fogs still do not prevent damage to CREATURES at all (pre-existing, engine-wide)."
+   "status": "unexercised",
+   "since_sha": "a59953c",
+   "note": "Not in the corpus."
   },
   "mutavault": {
    "status": "unexercised",
    "note": "Played as a land; the {1} animation was never offered or activated. The manland behavioural signal is absent, not disproven."
   },
   "narfi, betrayer king": {
-   "status": "awaiting",
-   "since_sha": "6323894",
-   "note": "'Other snow and Zombie creatures' leaked to the unqualified anthem and buffed the whole board. Needed both the subtype-list support and base_supertypes threading, which was never populated at all."
+   "status": "verified",
+   "since_sha": "a59953c",
+   "note": "Registered a MULTI-subtype qualifier anthem ('other snows and zombies you control +1/+1') - the shape that previously registered nothing."
   },
   "nightpack ambusher": {
-   "status": "awaiting",
-   "since_sha": "1ef33d9",
-   "note": "TWO separate fixes now pending verification: the compound subtype anthem (registered nothing) AND the end-step intervening-if (CR 603.4 — made a Wolf on turns its controller cast spells). Watch both."
+   "status": "unexercised",
+   "since_sha": "a59953c",
+   "note": "Not in the corpus."
   },
   "ob nixilis reignited": {
-   "status": "awaiting",
-   "since_sha": "1ef33d9",
-   "note": "The [+1] dropped its draw and resolved only the life loss. Combined pattern added. Also newly reaches Asylum Visitor, which had no name key."
+   "status": "unexercised",
+   "since_sha": "a59953c",
+   "note": "Not in the corpus."
   },
   "phyrexian negator": {
-   "status": "awaiting",
-   "since_sha": "6a30802",
-   "note": "Passive damaged-trigger seam fixed after the corpus."
+   "status": "verified",
+   "since_sha": "a59953c",
+   "note": "[DAMAGED-TRIGGER] sacrificed exactly as many permanents as damage taken, twice, attributed to the right controller."
   },
   "reanimate": {
-   "status": "awaiting",
-   "since_sha": "6a30802",
-   "note": "Declared-target skip phrase fixed after the corpus; 45 of 49 casts failed in it."
+   "status": "verified",
+   "since_sha": "a59953c",
+   "note": "Reviewers C and D: the DECLARED graveyard target came back and the controller lost life equal to its REAL mana value (1 for Gravecrawler, 2 for Bloodghast)."
   },
   "reaper from the abyss": {
    "status": "verified",
@@ -297,9 +297,9 @@
    "note": "Dies-trigger premise gate correct five times. Its 4 damage failing to kill was Selfless Spirit's indestructible, not a defect - the reviewer's closest false positive."
   },
   "sheoldred, the apocalypse": {
-   "status": "awaiting",
-   "since_sha": "ac13af4",
-   "note": "Opponent-draw drain was silently inert — the dispatcher was a two-card hardcoded elif chain with no fallthrough. Both of its clauses now fire on their own scopes."
+   "status": "verified",
+   "since_sha": "a59953c",
+   "note": "[DRAW-TRIGGER] drained the opponent 2 on their draw; cost reduction from Jet Medallion also applied."
   },
   "shepherd of the flock": {
    "status": "verified",
@@ -307,39 +307,39 @@
    "note": "Adventure cost selection exemplary - creature half failed for mana, adventure cost used instead, exile tracked, creature half re-offered. Printed-target width is a separate MINOR."
   },
   "silverflame squire": {
-   "status": "awaiting",
-   "since_sha": "1ef33d9",
-   "note": "Its adventure half On Alert was +2/+1 board-wide with no untap; now single-target +2/+2 plus the untap. Also needed the adventure path to start forwarding the declared target at all."
+   "status": "unexercised",
+   "since_sha": "a59953c",
+   "note": "Reviewer A: creature side never cast, adventure never attempted."
   },
   "sunforger": {
-   "status": "awaiting",
-   "since_sha": "ac13af4",
-   "note": "'Unattach this Equipment' was in NEITHER activation path's cost vocabulary, so the ability was activatable while unattached and never detached. COST only; the tutor-and-free-cast effect stays unimplemented deliberately."
+   "status": "unexercised",
+   "since_sha": "a59953c",
+   "note": "Cast and resolved as equipment; never ACTIVATED, so the unattach-cost fix is still untested."
   },
   "sword of light and shadow": {
    "status": "awaiting",
-   "since_sha": "6a30802",
-   "note": "Its combat-damage trigger now queues and its granted protection now parses - neither is in this corpus."
+   "since_sha": "516d8bf",
+   "note": "New template: gain 3 life + return a creature card from your graveyard. Did not connect this batch."
   },
   "syr konrad, the grim": {
-   "status": "awaiting",
-   "since_sha": "3561b22",
-   "note": "His THIRD condition ('a creature card leaves your graveyard') had no dispatcher; only the dies condition was handled. It is singular with no 'one or more' consolidator, so it fires once PER CARD -- the 2019-10-04 ruling reads the same ability per-object for its dies condition."
+   "status": "verified",
+   "since_sha": "a59953c",
+   "note": "C4 live: 1 creature card left, fires x1 UN-consolidated (per-object). No N>1 case appeared; the unit pin covers it."
   },
   "talisman of impulse": {
-   "status": "awaiting",
-   "since_sha": "ac13af4",
-   "note": "One of 8 Talismans that tapped for free. Same per-line scoping."
+   "status": "verified",
+   "since_sha": "a59953c",
+   "note": "Reviewer C: dealt exactly 1 damage on each colored tap. The {C} half was not separately attributable."
   },
   "tendershoot dryad": {
-   "status": "awaiting",
-   "since_sha": "6323894",
-   "note": "'Saprolings you control get +2/+2' has no 'other' and no 'creatures', so it matched no branch and registered nothing. The Aug-10 blessing-condition fix was necessary but not sufficient -- it only let execution REACH this ladder."
+   "status": "verified",
+   "since_sha": "a59953c",
+   "note": "Subtype anthem registered ('saprolings you control +2/+2'); [ASCEND] city's blessing awarded at ten permanents."
   },
   "tormod, the desecrator": {
-   "status": "awaiting",
-   "since_sha": "3561b22",
-   "note": "Its trigger had no dispatcher at all. Now fires ONCE per batch however many cards left (Gatherer 2020-11-10), and the token is the printed TAPPED 2/2 black Zombie."
+   "status": "verified",
+   "since_sha": "a59953c",
+   "note": "C4 live: Faithless Looting flashed out of Rick's graveyard, 1 departure, fires x1 (consolidated), one Zombie token."
   },
   "underworld sentinel": {
    "status": "verified",
@@ -347,14 +347,14 @@
    "note": "Attack trigger exiled a creature card from the graveyard with the dies-trigger link. The apparent self-exile was a Feldon TOKEN attacking while the real card was the exiled object."
   },
   "usher to safety": {
-   "status": "awaiting",
-   "since_sha": "ac13af4",
-   "note": "Template narrowed to creatures while the printed adventure half says 'target PERMANENT you control' — the handler was already permanent-general, so the narrowing was in the template. Pick chain now spans every permanent type."
+   "status": "unexercised",
+   "since_sha": "a59953c",
+   "note": "Loaded as an adventure half only, never cast."
   },
   "vampire nighthawk": {
-   "status": "awaiting",
-   "since_sha": "6a30802",
-   "note": "Its own keywords are verified, but the subtype anthem it should RECEIVE was fixed after the corpus."
+   "status": "unexercised",
+   "since_sha": "a59953c",
+   "note": "Not in the corpus."
   },
   "vile entomber": {
    "status": "verified",
@@ -362,9 +362,59 @@
    "note": "ETB tutor to the correct zone (graveyard, not hand); deathtouch body present."
   },
   "xenagos, the reveler": {
+   "status": "unexercised",
+   "since_sha": "a59953c",
+   "note": "Proposed and rejected for mana, never resolved."
+  },
+  "drana, liberator of malakir": {
    "status": "awaiting",
-   "since_sha": "6a30802",
-   "note": "X-from-board fix postdates the corpus."
+   "since_sha": "516d8bf",
+   "note": "Her first-strike 'deals combat damage' trigger landed AFTER the regular step had already dealt un-pumped damage (CR 510.4). The drain now runs once per damage step."
+  },
+  "boar umbra": {
+   "status": "awaiting",
+   "since_sha": "516d8bf",
+   "note": "Totem armor never saved a creature enchanted by an OPPONENT's Aura - both helpers scanned only the creature controller's battlefield. Now searches every battlefield; the Aura dies to its own owner's graveyard."
+  },
+  "dissipate": {
+   "status": "awaiting",
+   "since_sha": "516d8bf",
+   "note": "Shared the plain _counter_action, so its 'exile it instead' clause was dropped and the countered spell went to the graveyard. Dedicated generator now sets countered_to=exile."
+  },
+  "dissolve": {
+   "status": "awaiting",
+   "since_sha": "516d8bf",
+   "note": "Same class, found by sweeping the COUNTERSPELLS list: its Scry 1 was dropped. Dedicated generator now emits it."
+  },
+  "setessan champion": {
+   "status": "awaiting",
+   "since_sha": "516d8bf",
+   "note": "Compound constellation resolved as draw-only; the +1/+1 counter clause was dropped across 9 fires. The watcher now emits both."
+  },
+  "animating faerie": {
+   "status": "awaiting",
+   "since_sha": "516d8bf",
+   "note": "Its adventure half could never escalate to Tier 3 - the gate read `if not adv_msgs` while Tier 2 had already filled that list with a 'complex effect, escalating' placeholder. Cast three times, effect never happened."
+  },
+  "mask of memory": {
+   "status": "awaiting",
+   "since_sha": "516d8bf",
+   "note": "New equipment combat-damage template (draw two, discard one). It connected 5 times this batch and resolved nothing."
+  },
+  "sword of fire and ice": {
+   "status": "awaiting",
+   "since_sha": "516d8bf",
+   "note": "New template: 2 damage + draw a card."
+  },
+  "sword of feast and famine": {
+   "status": "awaiting",
+   "since_sha": "516d8bf",
+   "note": "New template: opponent discards, untap all your lands (count derived from the board)."
+  },
+  "sword of sinew and steel": {
+   "status": "awaiting",
+   "since_sha": "516d8bf",
+   "note": "New template: destroy up to one opponent planeswalker and one artifact."
   }
  }
 }

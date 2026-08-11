@@ -3273,7 +3273,7 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                 card.counters['shield'] -= 1
                 print(f"[SHIELD-COUNTER] {card.name}: shield removed instead of destroyed")
                 return f"🛡️ **{card.name}**'s shield counter is removed instead!"
-            if card.is_creature() and rules._has_totem_armor(card, owner):
+            if card.is_creature() and rules._has_totem_armor(card, owner, game):
                 _aura = rules._remove_totem_armor(card, owner, game)
                 print(f"[TOTEM-ARMOR] {card.name}: {_aura.name if _aura else '?'} destroyed instead")
                 return (f"🛡️ **{_aura.name if _aura else 'Umbra armor'}** is destroyed "
@@ -4698,7 +4698,7 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                     creature.counters['shield'] -= 1
                     print(f"[SHIELD-COUNTER] {creature.name}: shield removed instead of destroyed (board wipe)")
                     continue
-                if rules._has_totem_armor(creature, p):
+                if rules._has_totem_armor(creature, p, game):
                     _aura = rules._remove_totem_armor(creature, p, game)
                     print(f"[TOTEM-ARMOR] {creature.name}: {_aura.name if _aura else '?'} destroyed instead (board wipe)")
                     continue
@@ -5034,7 +5034,7 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                     c.counters['shield'] -= 1
                     print(f"[SHIELD-COUNTER] {c.name}: shield removed instead of destroyed")
                     continue
-                if rules._has_totem_armor(c, p):
+                if rules._has_totem_armor(c, p, game):
                     rules._remove_totem_armor(c, p, game)
                     continue
                 game.unregister_static_effects(c)

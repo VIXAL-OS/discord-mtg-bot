@@ -2432,7 +2432,21 @@ async def _dispatch_resolution(engine, game: GameState, player: Player,
                 adv_msgs = result.messages
             except Exception as e:
                 print(f"[ADVENTURE] SpellResolver error for {card.adventure_name}: {e}")
-        if not adv_msgs:
+        # Aug 11 audit (reviewer B, F2): this gate was a bare `if not adv_msgs`,
+        # which cannot distinguish "Tier 2 genuinely resolved it" from "Tier 2
+        # punted with a placeholder". SpellResolver returns
+        # "🧙 <text> _(complex effect, escalating)_" for anything it can't
+        # parse, so adv_msgs was non-empty and Tier 3 NEVER RAN — the message
+        # literally said "escalating" while nothing escalated. Live:
+        # game_1536535502839091322, Animating Faerie's "Bring to Life" cast
+        # three times, each producing only the placeholder; Lucky Clover never
+        # became a creature. Cost paid, effect lost, every time.
+        #
+        # The main (non-adventure) resolution path already does exactly this
+        # `has_complex_effect` check — this branch is its unfixed twin.
+        _adv_complex = any("complex effect" in (m or "").lower()
+                           for m in adv_msgs)
+        if not adv_msgs or _adv_complex:
             # Fallback: try resolve_effect via Tier 3 (LLM)
             if engine.rules.client:
                 try:
@@ -2441,6 +2455,10 @@ async def _dispatch_resolution(engine, game: GameState, player: Player,
                         card.adventure_name, player.name
                     )
                     if effect_msgs:
+                        # Drop the placeholder — Tier 3 superseded it.
+                        if _adv_complex:
+                            adv_msgs = [m for m in adv_msgs
+                                        if "complex effect" not in (m or "").lower()]
                         adv_msgs.extend(effect_msgs)
                 except Exception as e:
                     print(f"[ADVENTURE] resolve_effect error for {card.adventure_name}: {e}")

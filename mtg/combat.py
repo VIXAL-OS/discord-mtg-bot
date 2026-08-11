@@ -91,179 +91,28 @@ COMBAT_DAMAGE_SELF_PHRASE = re.compile(
     r'(?<!non)combat damage to (?:a player|an opponent)')
 
 
-def resolve_combat_damage(rules, game: GameState) -> List[str]:
+def drain_combat_damage_triggers(rules, game: GameState,
+                                 messages: List[str]) -> None:
+    """Resolve the triggers that watch combat damage, then clear the
+    accumulators. Appends player-visible lines to `messages` in place.
+
+    CALLED ONCE PER COMBAT DAMAGE STEP (Aug 11 audit, reviewer C).
+    CR 510.4 divides the damage step in two when first strike is
+    involved, and normal trigger processing happens after EACH step --
+    so a first-striker's own 'deals combat damage' trigger must resolve
+    BEFORE the regular step computes its damage. This drain used to run
+    once, after both steps, off the accumulated list: Drana, Liberator
+    of Malakir hit in the FS step and her '+1/+1 counter on each
+    attacking creature you control' landed only after Phyrexian Negator
+    and Crypt Ghast had already dealt their UNCOUNTERED base power
+    (game_1536545838891794432, reproduced across two separate combats).
+
+    Calling it twice cannot double-fire: both accumulators are cleared
+    at the end of this function, so the post-regular call sees only the
+    entries the regular step appended. The per-step model is already the
+    codebase's own -- `_equip_charge_fired_ids` is reset at the regular
+    step so Jitte's charge counters fire once per STEP, not per combat.
     """
-    Resolve combat damage with keyword abilities.
-    Returns list of messages describing what happened.
-    """
-    messages = []
-    lifelink_healing = {0: 0, 1: 0}  # player_index -> life to gain
-
-    # Aug 7 (A-2b): each resolve_combat_damage invocation is one damage
-    # step (FS and regular are separate calls/events); reset the per-step
-    # equipment charge-trigger dedupe so Jitte fires once per step, not
-    # once per game and not twice for a trample split.
-    game._equip_charge_fired_ids = set()
-
-    # Refresh layer cache before reading effective P/T. The cache is updated
-    # at 22+ sites but a stale `_layers_power_mod` was reported in the Apr 28
-    # audit (Sythis displayed power=5/2 with no visible source). Recalculating
-    # right before reading effective power is cheap and forecloses any drift.
-    try:
-        game.recalculate_power_toughness()
-    except Exception as e:
-        print(f"[COMBAT] Layer recalc failed before damage step: {e}")
-    
-    # Separate first strike damage.
-    # CR 510.5: the first-strike damage step fires if ANY attacker or
-    # blocker in combat has first strike or double strike. A vanilla
-    # attacker blocked by a double-strike blocker must still be processed
-    # in the FS step so the blocker deals damage in both steps.
-    first_strikers = []
-    regular_attackers = []
-
-    for attacker_id in game.attackers:
-        result = game.find_card_global(attacker_id)
-        if result:
-            attacker, attacker_owner, _ = result
-            attacker_has_fs_ds = attacker.has_first_strike(game=game) or attacker.has_double_strike(game=game)
-            any_blocker_has_fs_ds = False
-            for blocker_id in game.blockers.get(attacker_id, []) or []:
-                bres = game.find_card_global(blocker_id)
-                if bres and (bres[0].has_first_strike(game=game) or bres[0].has_double_strike(game=game)):
-                    any_blocker_has_fs_ds = True
-                    break
-            if attacker_has_fs_ds or any_blocker_has_fs_ds:
-                first_strikers.append((attacker, attacker_owner))
-            if not attacker.has_first_strike(game=game) or attacker.has_double_strike(game=game):
-                regular_attackers.append((attacker, attacker_owner))
-    
-    # First strike damage step
-    if first_strikers:
-        print(f"[COMBAT-STEP] FIRST-STRIKE step: {len(first_strikers)} attacker(s) with FS/DS involvement")
-        messages.append("**First Strike Damage:**")
-        fs_messages, fs_healing = rules._deal_combat_damage(game, first_strikers, is_first_strike_step=True)
-        messages.extend(fs_messages)
-        for idx, heal in fs_healing.items():
-            lifelink_healing[idx] += heal
-
-        # CR 119.3d / 702.15b: lifelink causes life gain SIMULTANEOUSLY with
-        # the damage event, BEFORE state-based actions check. Apply pending
-        # FS-step lifelink heals now so a lifelink attacker who takes lethal
-        # simultaneous damage isn't lost to SBA before his life can rebound.
-        # May 14 audit: was applied after SBA, which lost games where the
-        # lifelink would have saved the controller (Rick at 0 with lifelink
-        # attacker dealing damage that would have healed him above 0).
-        for idx, heal in list(lifelink_healing.items()):
-            if heal > 0:
-                ok, actual_heal, chain = rules._apply_life_gain(
-                    game, game.players[idx], heal, source_name="Lifelink"
-                )
-                if ok:
-                    messages.append(f"💚 {game.players[idx].name} gains {actual_heal} life (lifelink) (life: {max(0, game.players[idx].life)})")
-                    print(f"[LIFELINK] {game.players[idx].name}: +{actual_heal} life → {game.players[idx].life}")
-                else:
-                    messages.append(f"🚫 Lifelink prevented for {game.players[idx].name} ({', '.join(chain)})")
-                    print(f"[LIFELINK-PREVENTED] {game.players[idx].name}: heal={heal} chain={','.join(chain)}")
-                lifelink_healing[idx] = 0
-
-        # Check SBAs after first strike — creatures that took lethal in FS
-        # must die before the regular step so they can't swing back.
-        sba_messages = rules.process_state_based_actions(game)
-        if sba_messages:
-            print(f"[COMBAT-STEP] FIRST-STRIKE SBAs fired: {len(sba_messages)} event(s)")
-        messages.extend(sba_messages)
-    else:
-        print(f"[COMBAT-STEP] FIRST-STRIKE skipped (no FS/DS involvement)")
-
-    # CR 704.5a: a player at ≤0 life loses; if SBAs fired during the FS step
-    # ended the game, stop here — no regular damage step on a finished game.
-    # (Still apply first-strike-step lifelink — CR 119.3d, the life gain is
-    # part of the damage event that already happened — so the final scoreboard
-    # is right. Must return a plain List[str]: callers iterate `for m in msgs`,
-    # and returning a (messages, healing) tuple here once leaked the raw list
-    # and dict into a Discord combat embed.)
-    if getattr(game, 'ended', False):
-        print(f"[COMBAT-STEP] Game ended after FS step — skipping regular damage")
-        for idx, heal in lifelink_healing.items():
-            if heal > 0:
-                ok, actual_heal, chain = rules._apply_life_gain(
-                    game, game.players[idx], heal, source_name="Lifelink"
-                )
-                if ok:
-                    messages.append(f"💚 {game.players[idx].name} gains {actual_heal} life (lifelink) (life: {max(0, game.players[idx].life)})")
-                    print(f"[LIFELINK] {game.players[idx].name}: +{actual_heal} life → {game.players[idx].life}")
-        return messages
-
-    # Regular damage step
-    # BUG-10 fix: non-FS blockers always deal retaliatory damage in the regular step,
-    # even when blocking first-strikers that already dealt damage in the FS step.
-    if regular_attackers or first_strikers:
-        print(f"[COMBAT-STEP] REGULAR step: {len(regular_attackers)} regular attacker(s)")
-        # Aug 7 (A-2b): the regular step is a SEPARATE damage event from the
-        # FS step — a double-striker's Jitte legitimately fires in both
-        # (rulings). Reset the per-step dedupe at the boundary.
-        game._equip_charge_fired_ids = set()
-        _reg_header_idx = None
-        if first_strikers:
-            messages.append("**Regular Combat Damage:**")
-            _reg_header_idx = len(messages) - 1
-        # Regular attackers deal their damage normally (attackers + their blockers)
-        if regular_attackers:
-            reg_messages, reg_healing = rules._deal_combat_damage(game, regular_attackers)
-            messages.extend(reg_messages)
-            for idx, heal in reg_healing.items():
-                lifelink_healing[idx] += heal
-        # First-strikers' non-FS blockers deal retaliatory damage (skip_attacker_damage=True
-        # prevents first-strikers from dealing damage a second time — only blockers act here).
-        # Only pure-FS attackers (first strike, not double strike) need this pass:
-        # DS attackers and non-FS attackers blocked by DS creatures are already in
-        # regular_attackers and had their full combat resolved above.
-        # May 24 Tier-2 audit fix: also require attackers to actually have
-        # blockers — unblocked first-strikers have nothing to retaliate to,
-        # so running the pass was a no-op that still emitted a noisy
-        # `[COMBAT-DAMAGE] Resolving regular-step blockers-retaliation`
-        # console line that misled audit agents into thinking damage was
-        # dealt twice. Empty filter → skip the call entirely.
-        pure_fs_attackers = [
-            (a, o) for (a, o) in first_strikers
-            if a.has_first_strike(game=game) and not a.has_double_strike(game=game)
-            and bool(game.blockers.get(a.id))
-        ]
-        if pure_fs_attackers:
-            ret_messages, ret_healing = rules._deal_combat_damage(
-                game, pure_fs_attackers, is_first_strike_step=False, skip_attacker_damage=True
-            )
-            messages.extend(ret_messages)
-            for idx, heal in ret_healing.items():
-                lifelink_healing[idx] += heal
-        # June 10 audit: drop the "**Regular Combat Damage:**" header when no
-        # regular-step line followed it (all damage landed in the FS step).
-        if _reg_header_idx is not None and len(messages) == _reg_header_idx + 1:
-            messages.pop(_reg_header_idx)
-
-    # Apply lifelink from regular step BEFORE the post-damage SBA check
-    # (CR 119.3d / 702.15b — see note in FS step above). May 14 audit found
-    # a corner case where simultaneous damage + lifelink heal would have
-    # left the controller alive, but SBA fired before the heal applied.
-    for idx, heal in list(lifelink_healing.items()):
-        if heal > 0:
-            ok, actual_heal, chain = rules._apply_life_gain(
-                game, game.players[idx], heal, source_name="Lifelink"
-            )
-            if ok:
-                messages.append(f"💚 {game.players[idx].name} gains {actual_heal} life (lifelink) (life: {max(0, game.players[idx].life)})")
-                print(f"[LIFELINK] {game.players[idx].name}: +{actual_heal} life → {game.players[idx].life}")
-            else:
-                messages.append(f"🚫 Lifelink prevented for {game.players[idx].name} ({', '.join(chain)})")
-                print(f"[LIFELINK-PREVENTED] {game.players[idx].name}: heal={heal} chain={','.join(chain)}")
-            lifelink_healing[idx] = 0
-
-    # Check SBAs after regular combat damage (kills creatures with lethal damage)
-    # Without this, blockers survive combat with lethal damage marked
-    sba_messages = rules.process_state_based_actions(game)
-    messages.extend(sba_messages)
-
     # Fire combat damage triggers (Ancient Bronze Dragon, Quartzwood Crasher, etc.)
     # July 24 batch-6 anomaly (reviewer S2 #5): the SBA call above can END the
     # game (PLAYER_LOSES_ZERO_LIFE) — Brago's combat-damage trigger then ran
@@ -507,6 +356,191 @@ def resolve_combat_damage(rules, game: GameState) -> List[str]:
             messages.extend(scan_damaged_creature(
                 rules, game, damaged, dmg_amount, _src_owner))
         game._combat_damage_to_creature = []
+
+
+def resolve_combat_damage(rules, game: GameState) -> List[str]:
+    """
+    Resolve combat damage with keyword abilities.
+    Returns list of messages describing what happened.
+    """
+    messages = []
+    lifelink_healing = {0: 0, 1: 0}  # player_index -> life to gain
+
+    # Aug 7 (A-2b): each resolve_combat_damage invocation is one damage
+    # step (FS and regular are separate calls/events); reset the per-step
+    # equipment charge-trigger dedupe so Jitte fires once per step, not
+    # once per game and not twice for a trample split.
+    game._equip_charge_fired_ids = set()
+
+    # Refresh layer cache before reading effective P/T. The cache is updated
+    # at 22+ sites but a stale `_layers_power_mod` was reported in the Apr 28
+    # audit (Sythis displayed power=5/2 with no visible source). Recalculating
+    # right before reading effective power is cheap and forecloses any drift.
+    try:
+        game.recalculate_power_toughness()
+    except Exception as e:
+        print(f"[COMBAT] Layer recalc failed before damage step: {e}")
+
+    # Separate first strike damage.
+    # CR 510.5: the first-strike damage step fires if ANY attacker or
+    # blocker in combat has first strike or double strike. A vanilla
+    # attacker blocked by a double-strike blocker must still be processed
+    # in the FS step so the blocker deals damage in both steps.
+    first_strikers = []
+    regular_attackers = []
+
+    for attacker_id in game.attackers:
+        result = game.find_card_global(attacker_id)
+        if result:
+            attacker, attacker_owner, _ = result
+            attacker_has_fs_ds = attacker.has_first_strike(game=game) or attacker.has_double_strike(game=game)
+            any_blocker_has_fs_ds = False
+            for blocker_id in game.blockers.get(attacker_id, []) or []:
+                bres = game.find_card_global(blocker_id)
+                if bres and (bres[0].has_first_strike(game=game) or bres[0].has_double_strike(game=game)):
+                    any_blocker_has_fs_ds = True
+                    break
+            if attacker_has_fs_ds or any_blocker_has_fs_ds:
+                first_strikers.append((attacker, attacker_owner))
+            if not attacker.has_first_strike(game=game) or attacker.has_double_strike(game=game):
+                regular_attackers.append((attacker, attacker_owner))
+
+    # First strike damage step
+    if first_strikers:
+        print(f"[COMBAT-STEP] FIRST-STRIKE step: {len(first_strikers)} attacker(s) with FS/DS involvement")
+        messages.append("**First Strike Damage:**")
+        fs_messages, fs_healing = rules._deal_combat_damage(game, first_strikers, is_first_strike_step=True)
+        messages.extend(fs_messages)
+        for idx, heal in fs_healing.items():
+            lifelink_healing[idx] += heal
+
+        # CR 119.3d / 702.15b: lifelink causes life gain SIMULTANEOUSLY with
+        # the damage event, BEFORE state-based actions check. Apply pending
+        # FS-step lifelink heals now so a lifelink attacker who takes lethal
+        # simultaneous damage isn't lost to SBA before his life can rebound.
+        # May 14 audit: was applied after SBA, which lost games where the
+        # lifelink would have saved the controller (Rick at 0 with lifelink
+        # attacker dealing damage that would have healed him above 0).
+        for idx, heal in list(lifelink_healing.items()):
+            if heal > 0:
+                ok, actual_heal, chain = rules._apply_life_gain(
+                    game, game.players[idx], heal, source_name="Lifelink"
+                )
+                if ok:
+                    messages.append(f"💚 {game.players[idx].name} gains {actual_heal} life (lifelink) (life: {max(0, game.players[idx].life)})")
+                    print(f"[LIFELINK] {game.players[idx].name}: +{actual_heal} life → {game.players[idx].life}")
+                else:
+                    messages.append(f"🚫 Lifelink prevented for {game.players[idx].name} ({', '.join(chain)})")
+                    print(f"[LIFELINK-PREVENTED] {game.players[idx].name}: heal={heal} chain={','.join(chain)}")
+                lifelink_healing[idx] = 0
+
+        # Check SBAs after first strike — creatures that took lethal in FS
+        # must die before the regular step so they can't swing back.
+        sba_messages = rules.process_state_based_actions(game)
+        if sba_messages:
+            print(f"[COMBAT-STEP] FIRST-STRIKE SBAs fired: {len(sba_messages)} event(s)")
+        messages.extend(sba_messages)
+
+        # CR 510.4: normal SBA *and trigger* processing happens after
+        # EACH combat damage step. Without this call a first-striker's
+        # own 'deals combat damage to a player' trigger (Drana) landed
+        # after the regular step had already dealt un-pumped damage.
+        drain_combat_damage_triggers(rules, game, messages)
+    else:
+        print(f"[COMBAT-STEP] FIRST-STRIKE skipped (no FS/DS involvement)")
+
+    # CR 704.5a: a player at ≤0 life loses; if SBAs fired during the FS step
+    # ended the game, stop here — no regular damage step on a finished game.
+    # (Still apply first-strike-step lifelink — CR 119.3d, the life gain is
+    # part of the damage event that already happened — so the final scoreboard
+    # is right. Must return a plain List[str]: callers iterate `for m in msgs`,
+    # and returning a (messages, healing) tuple here once leaked the raw list
+    # and dict into a Discord combat embed.)
+    if getattr(game, 'ended', False):
+        print(f"[COMBAT-STEP] Game ended after FS step — skipping regular damage")
+        for idx, heal in lifelink_healing.items():
+            if heal > 0:
+                ok, actual_heal, chain = rules._apply_life_gain(
+                    game, game.players[idx], heal, source_name="Lifelink"
+                )
+                if ok:
+                    messages.append(f"💚 {game.players[idx].name} gains {actual_heal} life (lifelink) (life: {max(0, game.players[idx].life)})")
+                    print(f"[LIFELINK] {game.players[idx].name}: +{actual_heal} life → {game.players[idx].life}")
+        return messages
+
+    # Regular damage step
+    # BUG-10 fix: non-FS blockers always deal retaliatory damage in the regular step,
+    # even when blocking first-strikers that already dealt damage in the FS step.
+    if regular_attackers or first_strikers:
+        print(f"[COMBAT-STEP] REGULAR step: {len(regular_attackers)} regular attacker(s)")
+        # Aug 7 (A-2b): the regular step is a SEPARATE damage event from the
+        # FS step — a double-striker's Jitte legitimately fires in both
+        # (rulings). Reset the per-step dedupe at the boundary.
+        game._equip_charge_fired_ids = set()
+        _reg_header_idx = None
+        if first_strikers:
+            messages.append("**Regular Combat Damage:**")
+            _reg_header_idx = len(messages) - 1
+        # Regular attackers deal their damage normally (attackers + their blockers)
+        if regular_attackers:
+            reg_messages, reg_healing = rules._deal_combat_damage(game, regular_attackers)
+            messages.extend(reg_messages)
+            for idx, heal in reg_healing.items():
+                lifelink_healing[idx] += heal
+        # First-strikers' non-FS blockers deal retaliatory damage (skip_attacker_damage=True
+        # prevents first-strikers from dealing damage a second time — only blockers act here).
+        # Only pure-FS attackers (first strike, not double strike) need this pass:
+        # DS attackers and non-FS attackers blocked by DS creatures are already in
+        # regular_attackers and had their full combat resolved above.
+        # May 24 Tier-2 audit fix: also require attackers to actually have
+        # blockers — unblocked first-strikers have nothing to retaliate to,
+        # so running the pass was a no-op that still emitted a noisy
+        # `[COMBAT-DAMAGE] Resolving regular-step blockers-retaliation`
+        # console line that misled audit agents into thinking damage was
+        # dealt twice. Empty filter → skip the call entirely.
+        pure_fs_attackers = [
+            (a, o) for (a, o) in first_strikers
+            if a.has_first_strike(game=game) and not a.has_double_strike(game=game)
+            and bool(game.blockers.get(a.id))
+        ]
+        if pure_fs_attackers:
+            ret_messages, ret_healing = rules._deal_combat_damage(
+                game, pure_fs_attackers, is_first_strike_step=False, skip_attacker_damage=True
+            )
+            messages.extend(ret_messages)
+            for idx, heal in ret_healing.items():
+                lifelink_healing[idx] += heal
+        # June 10 audit: drop the "**Regular Combat Damage:**" header when no
+        # regular-step line followed it (all damage landed in the FS step).
+        if _reg_header_idx is not None and len(messages) == _reg_header_idx + 1:
+            messages.pop(_reg_header_idx)
+
+    # Apply lifelink from regular step BEFORE the post-damage SBA check
+    # (CR 119.3d / 702.15b — see note in FS step above). May 14 audit found
+    # a corner case where simultaneous damage + lifelink heal would have
+    # left the controller alive, but SBA fired before the heal applied.
+    for idx, heal in list(lifelink_healing.items()):
+        if heal > 0:
+            ok, actual_heal, chain = rules._apply_life_gain(
+                game, game.players[idx], heal, source_name="Lifelink"
+            )
+            if ok:
+                messages.append(f"💚 {game.players[idx].name} gains {actual_heal} life (lifelink) (life: {max(0, game.players[idx].life)})")
+                print(f"[LIFELINK] {game.players[idx].name}: +{actual_heal} life → {game.players[idx].life}")
+            else:
+                messages.append(f"🚫 Lifelink prevented for {game.players[idx].name} ({', '.join(chain)})")
+                print(f"[LIFELINK-PREVENTED] {game.players[idx].name}: heal={heal} chain={','.join(chain)}")
+            lifelink_healing[idx] = 0
+
+    # Check SBAs after regular combat damage (kills creatures with lethal damage)
+    # Without this, blockers survive combat with lethal damage marked
+    sba_messages = rules.process_state_based_actions(game)
+    messages.extend(sba_messages)
+
+    # CR 510.4 / 603.3: resolve combat-damage triggers for THIS step
+    # before the next one computes damage. See
+    # drain_combat_damage_triggers for why calling it twice is safe.
+    drain_combat_damage_triggers(rules, game, messages)
 
     # Apply lifelink (single event per controller per damage step, CR 119.3d/702.15)
     for idx, heal in lifelink_healing.items():

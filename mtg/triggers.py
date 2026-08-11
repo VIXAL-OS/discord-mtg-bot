@@ -1449,6 +1449,19 @@ async def _check_cast_triggers(engine, game: GameState, caster: Player, card: Ca
         print(f"[CASCADE] {card.name} cascading {cascade_count}x (CMC {caster_cmc})")
 
         for cascade_num in range(cascade_count):
+            # CR 104.2a: a two-player game ends the instant a player loses;
+            # nothing after that point may change the game state. A
+            # multi-cascade source (Apex Devastator = 4, Maelstrom Wanderer
+            # = 2) can kill with its FIRST hit and then keep resolving —
+            # observed live destroying a permanent, searching a land onto
+            # the battlefield, resolving a planeswalker and drawing a card
+            # after the loss line. Same gate the combat-damage dispatch
+            # (July 24) and the ETB batch loop (Aug 10, A9) already carry;
+            # this loop was the third sibling without one.
+            if getattr(game, 'ended', False):
+                print(f"[CASCADE] Game already ended — stopping after "
+                      f"{cascade_num}/{cascade_count} cascade(s) (CR 104.2a)")
+                break
             exiled_cards = []
             found_card = None
             # Exile from top until nonland with CMC < caster CMC
@@ -2810,10 +2823,26 @@ def _check_enchantment_etb_watchers(engine, game: GameState, controller: Player,
             ol)
         trigger_text = _m.group(1) if _m else ol[:160]
         if 'draw a card' in trigger_text or ('constellation' in ol and 'draw a card' in ol):
-            msg = engine.rules._execute_action_on_state(game, {
-                "action": "draw_cards", "player": controller.name, "amount": 1})
-            if msg:
-                messages.append(f"🌟 **{bf_card.name}** (constellation): {msg}")
+            # Aug 11 audit (reviewer A, F5): this branch used to emit the draw
+            # and nothing else, so a COMPOUND constellation ("put a +1/+1
+            # counter on this creature AND draw a card") resolved as draw-only.
+            # Setessan Champion fired 9 times in game_1536546020802961548 and
+            # received zero counters. Same compound-clause-drop family as
+            # Anguished Unmaking / Dark Prophecy / Ob Nixilis Reignited.
+            # A JSON template for this card exists but is keyed "etb" (self
+            # entry) — a structurally different dispatch from this
+            # another-enchantment-entered watcher, so it is never consulted.
+            _acts = []
+            if re.search(r'\+1/\+1 counter on (?:this creature|it|'
+                         + re.escape(bf_card.name.lower()) + r')', trigger_text):
+                _acts.append({"action": "add_counters", "card": bf_card.name,
+                              "counter_type": "+1/+1", "amount": 1})
+            _acts.append({"action": "draw_cards",
+                          "player": controller.name, "amount": 1})
+            for _a in _acts:
+                msg = engine.rules._execute_action_on_state(game, _a)
+                if msg:
+                    messages.append(f"🌟 **{bf_card.name}** (constellation): {msg}")
             print(f"[CONSTELLATION] {bf_card.name} fires for {entered_card.name} entering")
         elif hasattr(engine, '_queue_async_trigger'):
             engine._queue_async_trigger(

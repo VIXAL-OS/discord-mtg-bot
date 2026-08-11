@@ -139,7 +139,7 @@ def convert_sba_results(rules_results, game, rules=None):
                 # Totem armor: destroy the aura, save the creature.
                 if rules is not None and hasattr(rules, '_has_totem_armor'):
                     try:
-                        if rules._has_totem_armor(card_obj, owner):
+                        if rules._has_totem_armor(card_obj, owner, game):
                             aura = rules._remove_totem_armor(card_obj, owner, game)
                             card_obj.damage_marked = 0
                             card_obj.deathtouch_damage = 0
