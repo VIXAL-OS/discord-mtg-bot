@@ -348,6 +348,13 @@ def _validate_cast(engine, game: GameState, player: Player, card: Card,
     if card not in player.hand and not _cast_from_graveyard:
         return (False, "Card not in hand", []), False, target
 
+    _locked_face = helpers.spell_face_for_gates(card)
+    if (getattr(player, '_noncreature_cast_locked_turn', None)
+            == game.turn_number and not _locked_face.is_creature(game)):
+        return ((False, f"{player.name} can't cast noncreature spells this "
+                        "turn (Aurelia's Fury)", []),
+                _cast_from_graveyard, target)
+
     # Aftermath (CR 702.127a), Aug 3: the aftermath half may be cast ONLY from
     # the graveyard, and the other half may NOT be. Neither restriction
     # existed, so Commit // Memory could be cast as Memory straight out of
@@ -631,6 +638,15 @@ def _validate_cast(engine, game: GameState, player: Player, card: Card,
     # is castable ONLY from the graveyard, that made the half uncastable
     # anywhere. Mirrors the synthetic half-card _dispatch_resolution builds.
     _gate_card = helpers.spell_face_for_gates(card)
+    if _gate_card.name.lower() == 'decimate':
+        from mtg.helpers import decimate_target_choices
+        _decimate_targets = decimate_target_choices(
+            game, player, _gate_card)
+        if not _decimate_targets:
+            return ((False, "Decimate needs a legal artifact, creature, "
+                            "enchantment, and land target", []),
+                    _cast_from_graveyard, target)
+        card._decimate_target_ids = _decimate_targets
     if HAS_TARGETING and _spell_requires_targets(_gate_card):
         if not _find_any_valid_target(game, _gate_card, player.name):
             # Aug 8 batch audit (#12): overload carve-out. Overloading
@@ -1204,6 +1220,16 @@ def _compute_alt_costs(engine, game: GameState, player: Player, card: Card,
                     print(f"[FREE-CAST] {card.name} (MV {card_mv}) cast for free via {free_cast_source} (max MV {max_mv})")
                     break
 
+    # Aluren is a battlefield static permission/cost effect applying to all
+    # players, not a one-shot turn effect.  Additional costs remain payable.
+    if (pay_mana and card.is_creature(game) and (card.cmc or 0) <= 3
+            and any((perm.name or '').lower() == 'aluren'
+                    for pl in game.players for perm in pl.battlefield)):
+        pay_mana = False
+        free_cast_source = 'Aluren'
+        print(f"[FREE-CAST] {card.name} (MV {card.cmc or 0}) cast for free "
+              "via Aluren")
+
     # Check for alternate costs (Force of Will, Pact of Negation, etc.)
     used_alternate_cost = False
     if pay_mana and (effective_mana_cost or additional_cost > 0):
@@ -1440,6 +1466,20 @@ def _pay_costs(engine, game: GameState, player: Player, card: Card,
     cost_increase = costs.get('cost_increase', 0)
     pay_mana = costs['pay_mana']
     card._snow_mana_spent = 0
+
+    # "Without paying its mana cost" never waives additional costs (CR
+    # 118.9d).  Aluren exposes this because a low-MV commander still owes
+    # commander tax; the same correction benefits every free-cast source.
+    if (not pay_mana and additional_cost + cost_increase > 0):
+        extra = additional_cost + cost_increase
+        if not player.tap_sources_for_cost(
+                "{0}", additional_generic=extra, game=game,
+                spending_card=card):
+            return False, (f"Not enough mana to pay {extra} additional mana "
+                           f"for {card.name}"), []
+        card._mana_paid = extra
+        print(f"[ADDITIONAL-COST] {card.name}: paid {extra} generic beyond "
+              "the waived mana cost")
 
     # Pay mana cost — use color-aware tapping when mana engine is available
     if pay_mana and (effective_mana_cost or additional_cost > 0):
@@ -1847,7 +1887,7 @@ async def _await_stack_window(engine, game: GameState, player: Player,
                     if opp_idx == caster_idx:
                         continue
                     if engine.claude_ai:
-                        opp_instants = engine.claude_ai.has_instant_speed_cards(opp)
+                        opp_instants = engine.claude_ai.has_instant_speed_cards(opp, game)
                         if opp_instants:
                             # July 20: alternate-cost aware — FoW class
                             affordable = [c for c in opp_instants
@@ -1888,6 +1928,26 @@ async def _await_stack_window(engine, game: GameState, player: Player,
             try:
                 await asyncio.wait_for(stack_entry.resolution_event.wait(), timeout=resolution_timeout)
             except asyncio.TimeoutError:
+                # A priority decision is an open priority window, not a dead
+                # timer.  The previous fixed six-second timeout consumed the
+                # spell while decide_response was still awaited, then the
+                # late Counterspell tried to target an empty stack.  Let the
+                # decision/API's own bounded timeout finish first.
+                if getattr(stack_entry, '_stack_ai_decision_pending', False):
+                    print(f"[STACK-PRIORITY] {card.name}: AI response decision "
+                          "still pending at timeout — keeping stack entry live")
+                    try:
+                        await asyncio.wait_for(
+                            stack_entry.resolution_event.wait(), timeout=190.0)
+                    except asyncio.TimeoutError:
+                        print(f"[STACK-PRIORITY] {card.name}: AI response "
+                              "decision exceeded 190s — closing window")
+                    else:
+                        # The priority system resolved/countered the entry
+                        # while the decision completed.  Skip timeout cleanup.
+                        resolution_timeout = None
+                if resolution_timeout is None:
+                    pass
                 # Safety net: only auto-resolve when this entry is at the TOP of
                 # the stack (CR 608 — LIFO). If a counterspell or other later
                 # cast is sitting on top of us, the underlying spell must wait
@@ -1902,7 +1962,7 @@ async def _await_stack_window(engine, game: GameState, player: Player,
                 # at-top, and the exiled spell resolved onto the battlefield.
                 # An entry that vanished without a counter mark must never
                 # resolve; treat it as countered so the branch below unwinds it.
-                if (not stack_entry.countered
+                elif (not stack_entry.countered
                         and game.stack is not None
                         and stack_entry not in game.stack):
                     print(f"[STACK-ENTRY-VANISHED] {card.name} left the stack "

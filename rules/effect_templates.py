@@ -1677,14 +1677,18 @@ class EffectTemplateLibrary:
             # `greatest_power` is the real ctx key and is controller-scoped,
             # which is exactly mode 2's "greatest power among creatures THEY
             # control" when the target is the caster.
-            gain = int(ctx.get('greatest_power', 0) or 0)
+            _player_target = (ctx.get('explicit_target_player')
+                              if ctx.get('explicit_target_is_player') else ctrl)
+            gain = int((ctx.get('opponent_greatest_power', 0)
+                        if _player_target == opp
+                        else ctx.get('greatest_power', 0)) or 0)
             acts = []
             for m in modes:
                 if m == 1 and own:
                     acts.append({"action": "add_counters", "card": own,
                                  "counter_type": "+1/+1", "amount": 2})
                 elif m == 2:
-                    acts.append({"action": "gain_life", "player": ctrl,
+                    acts.append({"action": "gain_life", "player": _player_target,
                                  "amount": gain})
                 elif m == 3 and own and foe:
                     # There is NO "fight" action type in the interpreter — the
@@ -1695,13 +1699,90 @@ class EffectTemplateLibrary:
             if not acts:
                 # Every chosen mode was unsatisfiable — fall back to the mode
                 # that always has a legal target rather than fizzling the spell.
-                acts.append({"action": "gain_life", "player": ctrl, "amount": gain})
+                acts.append({"action": "gain_life", "player": _player_target,
+                             "amount": gain})
             return acts
 
         self._add_card("inscription of abundance", EffectTemplate(
             name="Inscription of Abundance",
             description="Choose one (any number if kicked): +1/+1 counters, gain life, or fight",
             action_generator=_gen_inscription_of_abundance,
+        ))
+
+        self._add_card("blizzard strix", EffectTemplate(
+            name="Blizzard Strix",
+            description=("Exile another target permanent, then return it at "
+                         "the beginning of the next end step"),
+            action_generator=lambda ctrl, opp, ctx: (
+                [
+                    {"action": "move_card",
+                     "card": (ctx.get('explicit_target_name') or
+                              ctx.get('best_opponent_nonland')),
+                     "from_zone": "battlefield", "to_zone": "exile",
+                     "player": (ctx.get('explicit_target_owner') or opp)},
+                    {"action": "schedule_delayed_trigger",
+                     "trigger_at": "end_step", "source": "Blizzard Strix",
+                     "actions": [{"action": "move_card",
+                                  "card": (ctx.get('explicit_target_name') or
+                                           ctx.get('best_opponent_nonland')),
+                                  "from_zone": "exile",
+                                  "to_zone": "battlefield",
+                                  "player": ctx.get('explicit_target_owner') or opp}],
+                     "once": True},
+                ] if ((ctx.get('explicit_target_name') or
+                       ctx.get('best_opponent_nonland')) and
+                      ctx.get('controller_has_other_snow_permanent')) else
+                [{"action": "no_action",
+                  "reason": "Blizzard Strix: no other permanent target"}]
+            ),
+        ))
+
+        self._add_card("killing wave", EffectTemplate(
+            name="Killing Wave",
+            description=("Each creature's controller sacrifices it unless "
+                         "they pay X life"),
+            action_generator=lambda ctrl, opp, ctx: [
+                {"action": "killing_wave", "x_value": int(
+                    ctx.get('x_value', 0) or 0), "source": "Killing Wave"}
+            ],
+        ))
+
+        self._add_card("aurelia's fury", EffectTemplate(
+            name="Aurelia's Fury",
+            description=("Deal X damage to the declared target; tap a damaged "
+                         "creature or lock a damaged player out of noncreature "
+                         "spells this turn"),
+            action_generator=lambda ctrl, opp, ctx: (
+                ([{"action": "deal_damage",
+                   "amount": int(ctx.get('x_value', 0) or 0),
+                   "target_player": ctx.get('explicit_target_player'),
+                   "source": "Aurelia's Fury"},
+                  {"action": "restrict_noncreature_casts",
+                   "player": ctx.get('explicit_target_player'),
+                   "source": "Aurelia's Fury"}]
+                 if ctx.get('explicit_target_is_player') else
+                 [{"action": "deal_damage",
+                   "amount": int(ctx.get('x_value', 0) or 0),
+                   "target_card": ctx.get('explicit_target_name'),
+                   "target_controller": ctx.get('explicit_target_owner'),
+                   "source": "Aurelia's Fury"},
+                  {"action": "tap", "card": ctx.get('explicit_target_name')}])
+                if (ctx.get('explicit_target_is_player') or
+                    ctx.get('explicit_target_name')) else
+                [{"action": "no_action",
+                  "reason": "Aurelia's Fury: no declared target"}]
+            ),
+        ))
+
+        self._add_card("decimate", EffectTemplate(
+            name="Decimate",
+            description=("Destroy target artifact, creature, enchantment, "
+                         "and land"),
+            action_generator=lambda ctrl, opp, ctx: [
+                {"action": "decimate", "player": ctrl,
+                 "source": "Decimate",
+                 "target_ids": dict(ctx.get('decimate_target_ids') or {})}
+            ],
         ))
 
         # Moonmist — Aug 10 deferred (G5). "Transform all Humans. Prevent all
@@ -12047,6 +12128,24 @@ def build_game_context(game, player, opponent, card=None, entering_creature=None
             p = 0
         greatest_power = max(greatest_power, p)
     ctx['greatest_power'] = greatest_power
+    opponent_greatest_power = 0
+    for c in opponent.battlefield:
+        if c.is_creature(game) and not getattr(c, '_phased_out', False):
+            try:
+                opponent_greatest_power = max(
+                    opponent_greatest_power, c.get_effective_power(game))
+            except (TypeError, ValueError, AttributeError):
+                try:
+                    opponent_greatest_power = max(
+                        opponent_greatest_power, int(c.power or 0))
+                except (TypeError, ValueError):
+                    pass
+    ctx['opponent_greatest_power'] = opponent_greatest_power
+    ctx['controller_has_other_snow_permanent'] = any(
+        c is not card and 'snow' in (getattr(c, 'type_line', '') or '').lower()
+        for c in player.battlefield)
+    if card is not None and getattr(card, '_decimate_target_ids', None):
+        ctx['decimate_target_ids'] = dict(card._decimate_target_ids)
     
     # Black devotion (for Gray Merchant)
     black_devotion = 0

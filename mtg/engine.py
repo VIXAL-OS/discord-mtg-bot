@@ -44,6 +44,7 @@ from mtg.deck_loader import DeckLoader
 from mtg.helpers import (
     _collapse_repeated_life_gain, _should_emit_resolve_hint,
     _normalize_pw_ability_idx, _resolve_player_or_card_target,
+    coerce_ai_string,
     exile_after_resolution_reason, get_mdfc_info, library_top_cast_types,
     is_castable_from_exile, note_miracle_on_draw, spell_face_for_gates,
     try_dredge,
@@ -810,7 +811,7 @@ class GameEngine:
                     top_stack = None
 
                 # Pre-filter: does this player have instant-speed cards?
-                instants = engine.claude_ai.has_instant_speed_cards(player)
+                instants = engine.claude_ai.has_instant_speed_cards(player, game)
                 if not instants:
                     print(f"[STACK-AI] {player_name} has no instant-speed cards — auto-pass")
                     await ps.player_action(player_name, PriorityAction.pass_priority())
@@ -837,9 +838,25 @@ class GameEngine:
                 # between "AI declined" and "AI never got asked".
                 if top_stack is not None:
                     top_stack._stack_ai_queried = True
-                decision = await engine.claude_ai.decide_response(
-                    game, player_idx, spell_name, caster_name
-                )
+                if top_stack is not None:
+                    top_stack._stack_ai_decision_pending = True
+                try:
+                    decision = await engine.claude_ai.decide_response(
+                        game, player_idx, spell_name, caster_name
+                    )
+                finally:
+                    if top_stack is not None:
+                        top_stack._stack_ai_decision_pending = False
+
+                # The resolution coroutine must never consume this entry
+                # while decide_response is awaited.  Keep a second guard here
+                # so a genuinely timed-out/cancelled decision cannot cast a
+                # late counter at an entry that has already left the stack.
+                if top_stack is not None and (
+                        top_stack.countered or top_stack not in game.stack):
+                    print(f"[STACK-AI] Response decision for {spell_name} arrived "
+                          "after its stack entry closed — discarding decision")
+                    return
 
                 if not decision:
                     print(f"[STACK-AI] {player_name} passes on {spell_name}")
@@ -960,7 +977,7 @@ class GameEngine:
         # This avoids unnecessary delays in autoplay
         any_instants = False
         for p in game.players:
-            instants = self.claude_ai.has_instant_speed_cards(p) if self.claude_ai else []
+            instants = self.claude_ai.has_instant_speed_cards(p, game) if self.claude_ai else []
             if instants:
                 # July 20: alternate-cost aware — FoW class
                 affordable = [c for c in instants
@@ -3460,6 +3477,24 @@ class GameEngine:
                 # executor copy blocking an aftermath half on the OTHER
                 # half's targeting requirement.
                 _gate_card = spell_face_for_gates(card)
+                if getattr(player, '_noncreature_cast_locked_turn', None) == game.turn_number and not _gate_card.is_creature(game):
+                    _stash_name = (card.adventure_name
+                                   if getattr(card, 'cast_as_adventure', False)
+                                   and getattr(card, 'adventure_name', None)
+                                   else card.name)
+                    game._last_cast_failure = (game.turn_number, _stash_name,
+                                               "Aurelia's Fury noncreature cast lock")
+                    return None
+                if _gate_card.name.lower() == 'decimate':
+                    from mtg.helpers import decimate_target_choices
+                    _decimate_targets = decimate_target_choices(
+                        game, player, _gate_card)
+                    if not _decimate_targets:
+                        game._last_cast_failure = (
+                            game.turn_number, card.name,
+                            "Decimate needs artifact, creature, enchantment, and land targets")
+                        return None
+                    card._decimate_target_ids = _decimate_targets
                 if HAS_TARGETING and _spell_requires_targets(_gate_card):
                     if not _find_any_valid_target(game, _gate_card, player.name):
                         print(f"[TARGETING] AI tried to cast {_gate_card.name} with no valid targets")
@@ -4840,7 +4875,14 @@ class GameEngine:
                     # Fetchlands: extract allowed subtypes from oracle text
                     allowed_subtypes = [st for st in land_subtypes if st in effect_lower]
 
-                    found_land = None
+                    # Khalni Heart Expedition is the first activated land
+                    # search in the fixtures that finds more than one card.
+                    # Keep fetchlands singular, but honor an explicit
+                    # "up to two ... land cards" effect.
+                    search_count = 2 if re.search(
+                        r'up to two\s+(?:basic\s+)?land cards?', effect_lower
+                    ) else 1
+                    found_lands = []
                     for c in player.library:
                         if c.is_land():
                             if can_get_basic and 'basic' not in (c.type_line or '').lower():
@@ -4850,8 +4892,9 @@ class GameEngine:
                                 type_lower = (c.type_line or '').lower()
                                 if not any(st in type_lower for st in allowed_subtypes):
                                     continue
-                            found_land = c
-                            break
+                            found_lands.append(c)
+                            if len(found_lands) >= search_count:
+                                break
 
                     messages = []
                     life_note = f" (paid {life_paid} life, {player.life} life)" if life_paid > 0 else ""
@@ -4860,25 +4903,30 @@ class GameEngine:
                     if exiled_self:
                         messages.append(f"📤 **{perm.name}** exiled (cost)")
 
-                    if found_land:
-                        player.library.remove(found_land)
-                        # Check land's own ETB-tapped + replacement effects, OR ability-level tapped
-                        land_tapped, land_etb_note = self.rules._check_enters_tapped(game, found_land, player)
-                        enters_tapped = ability_enters_tapped or land_tapped
-                        found_land.tapped = enters_tapped
-                        found_land.entered_this_turn = True
-                        player.battlefield.append(found_land)
-                        tapped_str = " tapped" if enters_tapped else ""
-                        # Include shockland life payment in the message
-                        etb_detail = land_etb_note if land_etb_note else ""
-                        messages.append(f"🌍 {player.name} puts {found_land.name} onto the battlefield{tapped_str}{etb_detail}")
-                        # Fire landfall triggers (Omnath, Courser of Kruphix, etc.)
-                        try:
-                            land_etb_msgs = self._handle_land_etb(game, player, found_land)
-                            if land_etb_msgs:
-                                messages.extend(land_etb_msgs)
-                        except Exception as e:
-                            print(f"[LANDFALL] Error in fetchland ETB: {e}")
+                    if found_lands:
+                        for found_land in found_lands:
+                            player.library.remove(found_land)
+                            # Check the land's own ETB replacement as well as
+                            # the search ability's "tapped" instruction.
+                            land_tapped, land_etb_note = (
+                                self.rules._check_enters_tapped(
+                                    game, found_land, player))
+                            enters_tapped = ability_enters_tapped or land_tapped
+                            found_land.tapped = enters_tapped
+                            found_land.entered_this_turn = True
+                            player.battlefield.append(found_land)
+                            tapped_str = " tapped" if enters_tapped else ""
+                            # Include shockland life payment in the message
+                            etb_detail = land_etb_note if land_etb_note else ""
+                            messages.append(f"🌍 {player.name} puts {found_land.name} onto the battlefield{tapped_str}{etb_detail}")
+                            # Each land enters separately and fires landfall.
+                            try:
+                                land_etb_msgs = self._handle_land_etb(
+                                    game, player, found_land)
+                                if land_etb_msgs:
+                                    messages.extend(land_etb_msgs)
+                            except Exception as e:
+                                print(f"[LANDFALL] Error in fetchland ETB: {e}")
                     else:
                         messages.append(f"⚠️ No matching land found in library")
 

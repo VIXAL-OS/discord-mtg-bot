@@ -163,6 +163,12 @@ class RulesEngine:
 
         # Check timing — but Flash creatures/artifacts/etc. bypass sorcery-speed restrictions
         has_flash = card.has_keyword('Flash') or (card.oracle_text and 'flash' in card.oracle_text.lower().split('\n')[0])
+        _aluren_permission = (
+            card.is_creature(game) and (card.cmc or 0) <= 3
+            and any((perm.name or '').lower() == 'aluren'
+                    for pl in game.players for perm in pl.battlefield))
+        if _aluren_permission:
+            has_flash = True
         # Madness (CR 702.35a): the cast happens as the madness trigger
         # resolves and ignores timing — a Bloodmad Vampire discarded to the
         # opponent's Wheel is castable mid-resolution, off-turn. Without
@@ -218,6 +224,8 @@ class RulesEngine:
         # ordinary mana-affordability gate below.
         if getattr(card, '_cast_via_effect', False):
             return True, "OK (cast granted by resolving effect)"
+        if _aluren_permission:
+            return True, "OK (Aluren grants flash and waives mana cost)"
 
 
         # Check for free-cast turn effect (Rishkar's Expertise, Cascade, etc.)

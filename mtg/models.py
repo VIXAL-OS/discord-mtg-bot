@@ -697,6 +697,10 @@ class Card:
     # Chosen X for the current cast. None means no caller-selected value;
     # the cast pipeline stamps the paid/defaulted value before resolution.
     _x_value: Optional[int] = field(default=None, repr=False, compare=False)
+    # Decimate's four targets are chosen during casting and must not be
+    # replaced by freshly selected permanents during resolution.
+    _decimate_target_ids: Dict[str, str] = field(
+        default_factory=dict, repr=False, compare=False)
     # Command-zone cards are temporarily moved to hand before the shared cast
     # pipeline runs. Preserve the real origin through that move. Executors
     # clear this per-cast stamp after success or failure.
@@ -2457,6 +2461,10 @@ class Player:
     _pending_tap_damage_msgs: list = field(default_factory=list, repr=False, compare=False)
     # Kessig Naturalist-class mana persists through this numbered turn.
     _retain_mana_through_turn: Optional[int] = field(
+        default=None, repr=False, compare=False)
+    # Aurelia's Fury: a player dealt damage by it cannot cast noncreature
+    # spells for the rest of that numbered turn.
+    _noncreature_cast_locked_turn: Optional[int] = field(
         default=None, repr=False, compare=False)
 
     # Cards exiled but playable this turn (Chandra 0, Outpost Siege, etc.)

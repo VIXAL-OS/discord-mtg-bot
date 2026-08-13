@@ -3631,13 +3631,19 @@ Respond with ONLY "keep" or "mulligan"."""
             print(f"Claude mulligan decision error: {e}")
             return False  # Keep by default
     
-    def has_instant_speed_cards(self, player: Player) -> List[Card]:
+    def has_instant_speed_cards(self, player: Player,
+                                game: Optional[GameState] = None) -> List[Card]:
         """Pre-filter: return instant/flash cards in hand. Empty list = auto-pass (no API call)."""
         instants = []
         for card in player.hand:
             if card.is_instant():
                 instants.append(card)
             elif card.oracle_text and 'flash' in card.oracle_text.lower():
+                instants.append(card)
+            elif (game is not None and card.is_creature(game)
+                  and (card.cmc or 0) <= 3
+                  and any(p.name.lower() == 'aluren'
+                          for pl in game.players for p in pl.battlefield)):
                 instants.append(card)
         return instants
 

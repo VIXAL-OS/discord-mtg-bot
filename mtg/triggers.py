@@ -4506,6 +4506,8 @@ def _check_upkeep_triggers_sync(engine, game: GameState) -> Tuple[List[str], Lis
                                 messages.append(
                                     f"{old_name} transforms into {perm.name} "
                                     f"(Tovolar made it night)")
+                                messages.extend(_fire_transforms_into_triggers(
+                                    engine, game, transform_player, perm))
                 for perm in list(active.battlefield):
                     type_line = (
                         getattr(perm, 'type_line', '') or '').lower()
@@ -4520,6 +4522,8 @@ def _check_upkeep_triggers_sync(engine, game: GameState) -> Tuple[List[str], Lis
                             messages.append(
                                 f"{old_name} transforms into {perm.name} "
                                 f"({source_name})")
+                            messages.extend(_fire_transforms_into_triggers(
+                                engine, game, active, perm))
                 game.recalculate_granted_keywords()
                 game.recalculate_power_toughness()
                 print(f"[UPKEEP-TRIGGER] {source_name}: night; "

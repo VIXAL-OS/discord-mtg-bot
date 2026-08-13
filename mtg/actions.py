@@ -5534,6 +5534,81 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
         result = f"ðŸŒ± {p.name} puts {names} from hand onto the battlefield"
         return result + ("\n" + "\n".join(entry_msgs) if entry_msgs else "")
 
+    elif action_type == "restrict_noncreature_casts":
+        p = find_player(action.get("player", ""))
+        if p is None:
+            return None
+        p._noncreature_cast_locked_turn = game.turn_number
+        source = action.get("source", "effect")
+        return (f"🚫 {source}: {p.name} can't cast noncreature spells "
+                "this turn")
+
+    elif action_type == "killing_wave":
+        try:
+            x_value = max(0, int(action.get("x_value", 0) or 0))
+        except (TypeError, ValueError):
+            x_value = 0
+        messages = []
+        # Each creature presents its own choice.  Autoplay deterministically
+        # pays while doing so leaves its controller above zero; otherwise it
+        # sacrifices.  X=0 therefore keeps every creature, as a legal choice.
+        for p in game.players:
+            for creature in list(p.creatures(game)):
+                if p.life > x_value:
+                    if x_value:
+                        p.life -= x_value
+                        p.record_life_loss(x_value, game=game,
+                                           source_name="Killing Wave")
+                    messages.append(
+                        f"{p.name} pays {x_value} life for **{creature.name}**")
+                    continue
+                if creature not in p.battlefield:
+                    continue
+                game.unregister_static_effects(creature)
+                p.battlefield.remove(creature)
+                from mtg.helpers import route_dead_permanent
+                destination = route_dead_permanent(
+                    game, creature, p, reason="sacrificed to Killing Wave")
+                messages.append(f"💀 {p.name} sacrifices **{creature.name}**")
+                if destination == 'graveyard':
+                    from mtg.sba import apply_death_save_on_sacrifice
+                    messages.extend(apply_death_save_on_sacrifice(
+                        rules, game, p, creature) or [])
+                messages.extend(_fire_sacrifice_triggers(
+                    rules, game, p, creature) or [])
+                from mtg.triggers import queue_death
+                queue_death(game, creature, p)
+        return "\n".join(messages) if messages else "Killing Wave: no creatures"
+
+    elif action_type == "decimate":
+        caster = find_player(action.get("player", ""))
+        if caster is None:
+            return None
+        target_ids = dict(action.get("target_ids") or {})
+        chosen = []
+        for kind in ('artifact', 'creature', 'enchantment', 'land'):
+            target_id = target_ids.get(kind)
+            found = next(
+                ((owner, permanent) for owner in game.players
+                 for permanent in owner.battlefield
+                 if permanent.id == target_id), None)
+            if found is not None:
+                chosen.append((kind, found[0], found[1]))
+        messages = []
+        destroyed_ids = set()
+        for kind, owner, permanent in chosen:
+            if permanent.id in destroyed_ids or permanent not in owner.battlefield:
+                continue
+            destroyed_ids.add(permanent.id)
+            msg = rules._execute_action_on_state(
+                game, {"action": "destroy", "card": permanent.name,
+                       "card_id": permanent.id,
+                       "_source_card_name": "Decimate",
+                       "_source_controller": caster.name})
+            if msg:
+                messages.append(msg)
+        return "\n".join(messages)
+
     elif action_type == "edict_sacrifice":
         # Each player sacrifices a creature (Plaguecrafter, Fleshbag Marauder)
         types = action.get("types", "creature")

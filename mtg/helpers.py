@@ -552,6 +552,52 @@ def coerce_ai_string(value, _depth=0):
     return ''
 
 
+def decimate_has_all_target_types(game, caster, source_card) -> bool:
+    """Return whether Decimate can choose every mandatory target class.
+
+    Uses the shared targeting adapter for legality (hexproof/protection/etc.)
+    and deliberately checks each printed target phrase independently.
+    """
+    try:
+        from rules.targeting_helpers import _validate_target_for_action
+    except ImportError:
+        _validate_target_for_action = None
+    return bool(decimate_target_choices(game, caster, source_card))
+
+
+def decimate_target_choices(game, caster, source_card):
+    """Choose and retain one legal Decimate target for each printed slot."""
+    try:
+        from rules.targeting_helpers import _validate_target_for_action
+    except ImportError:
+        _validate_target_for_action = None
+    required = ('artifact', 'creature', 'enchantment', 'land')
+    candidates = {kind: [] for kind in required}
+    for owner in getattr(game, 'players', []) or []:
+        for permanent in getattr(owner, 'battlefield', []) or []:
+            if getattr(permanent, '_phased_out', False):
+                continue
+            if _validate_target_for_action is not None:
+                legal, _ = _validate_target_for_action(
+                    game, permanent, owner, source_card, caster.name)
+                if not legal:
+                    continue
+            type_line = (getattr(permanent, 'type_line', '') or '').lower()
+            for kind in required:
+                if kind in type_line:
+                    candidates[kind].append((owner, permanent))
+    if not all(candidates.values()):
+        return {}
+    selected = {}
+    for kind, choices in candidates.items():
+        owner, permanent = max(
+            choices, key=lambda item: (
+                item[0] is not caster,
+                int(getattr(item[1], 'cmc', 0) or 0)))
+        selected[kind] = permanent.id
+    return selected
+
+
 def _resolve_player_or_card_target(game, activating_player, target_name):
     """Resolve an AI-provided target string to a Player or Card object.
 

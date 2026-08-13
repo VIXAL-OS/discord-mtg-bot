@@ -498,7 +498,15 @@ def castable_entries(game, player, mana_by_color: Dict, any_color_mana: int,
         # while its 4-mana half was affordable. You cast ONE half
         # (CR 709.3): affordable when either half is.
         _cast_cost = card.mana_cost or ""
-        if " // " in _cast_cost:
+        _aluren_free = (card.is_creature(game) and (card.cmc or 0) <= 3
+                        and any((perm.name or '').lower() == 'aluren'
+                                for pl in game.players
+                                for perm in pl.battlefield))
+        if _aluren_free:
+            add(_entry(f"{card.name} (FREE via Aluren)", card.name,
+                       "hand", {"type": "cast", "card": card.name},
+                       ["free_cast", "flash"]))
+        elif " // " in _cast_cost:
             for _half in _cast_cost.split(" // "):
                 if _check_color_castable(_half.strip(), mana_by_color,
                                          any_color_mana, total_mana):
