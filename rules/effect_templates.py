@@ -3437,6 +3437,11 @@ class EffectTemplateLibrary:
                          "entwine paid"),
             action_generator=self._gen_tooth_and_nail,
         ))
+        self._add_upkeep_card("hollowhenge overlord", EffectTemplate(
+            name="Hollowhenge Overlord",
+            description="Create one Wolf token for each Wolf or Werewolf controlled",
+            action_generator=self._gen_hollowhenge_overlord_upkeep,
+        ))
         self._add_card("trostani, selesnya's voice", EffectTemplate(
             name="Trostani, Selesnya's Voice",
             description="Whenever a creature enters, gain life equal to its toughness",
@@ -10766,9 +10771,17 @@ class EffectTemplateLibrary:
         silent-no-op class; this one uses verified vocabulary only
         (search_library, move_card)."""
         if ctx.get('entwined'):
-            return [{"action": "search_library", "player": ctrl, "count": 2,
-                     "card_type": "creature", "to_zone": "battlefield",
-                     "reason": "Tooth and Nail (entwined): 2 creatures to battlefield"}]
+            # Both modes occur once, in printed order. The second action is
+            # hand-bound, so creatures found by the first mode are not also
+            # moved to the battlefield.
+            return [
+                {"action": "search_library", "player": ctrl, "count": 2,
+                 "card_type": "creature", "to_zone": "hand",
+                 "reason": "Tooth and Nail (entwined): search two creatures to hand"},
+                {"action": "move_cards_from_hand", "player": ctrl,
+                 "count": 2, "card_type": "creature",
+                 "reason": "Tooth and Nail (entwined): put two hand creatures onto battlefield"},
+            ]
         # Un-entwined: ONE mode. Battlefield mode only when the hand holds a
         # real BOMB (power >= 4 or MV >= 5) — Aug 2 mode-choice refinement:
         # the first heuristic took ANY hand creature, so a pair of mana
@@ -10788,6 +10801,23 @@ class EffectTemplateLibrary:
         return [{"action": "search_library", "player": ctrl, "count": 2,
                  "card_type": "creature", "to_zone": "hand",
                  "reason": "Tooth and Nail: search two creature cards to hand"}]
+
+    def _gen_hollowhenge_overlord_upkeep(self, ctrl, opp, ctx) -> List[Dict]:
+        """Take a bounded resolution-time snapshot; newly created Wolves
+        cannot recursively increase the count."""
+        battlefield = list(ctx.get('controller_battlefield') or [])
+        count = sum(
+            1 for permanent in battlefield
+            if ('wolf' in (getattr(permanent, 'type_line', '') or '').lower()
+                or 'werewolf' in (getattr(permanent, 'type_line', '') or '').lower())
+        )
+        if not count:
+            return [{"action": "no_action",
+                     "reason": "Hollowhenge Overlord controls no Wolves or Werewolves"}]
+        return [{"action": "create_token", "player": ctrl, "count": count,
+                 "name": "Wolf", "power": 2, "toughness": 2,
+                 "types": "Creature — Wolf",
+                 "reason": "Hollowhenge Overlord upkeep snapshot"}]
 
     # --- Aug 2 batch-14 Tier-3 shrink: the batch's top escalations ---
     # Each of these was a real, repeated Claude-API call resolving a

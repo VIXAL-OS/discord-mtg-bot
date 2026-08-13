@@ -2223,7 +2223,11 @@ def inject_tutor_choice(action: dict, ctx: dict) -> None:
     fix: one name must never be injected into two searches). No-op when the
     template already names a card.
     """
-    if action.get("card_name"):
+    if action.get("card_name") or action.get("card_names"):
+        return
+    if ctx.get('_tutor_cards'):
+        action["card_names"] = list(ctx['_tutor_cards'])
+        ctx['_tutor_cards'] = []
         return
     dest = (action.get("to_zone") or action.get("destination") or "hand").lower()
     dest_key = {"hand": "_tutor_to_hand",
@@ -2424,6 +2428,16 @@ async def _dispatch_resolution(engine, game: GameState, player: Player,
                         print(f"[ADVENTURE-TEMPLATE] Resolved {card.adventure_name}: {adv_desc}")
             except Exception as e:
                 print(f"[ADVENTURE-TEMPLATE] Lookup failed for {card.adventure_name}: {e}")
+        if (card.name.lower() == "fae of wishes"
+                and (card.adventure_name or "").lower() == "granted"):
+            # No outside-game/sideboard object exists in this engine. This is
+            # a legal optional no-action, not a successful tutor; say so
+            # plainly and still use the normal Adventure exile transition.
+            adv_msgs = [
+                "ðŸ”® **Granted** resolves — outside-game cards are not modeled; "
+                "no card is added to hand."
+            ]
+            print("[ADVENTURE] Granted: outside-game unavailable; no action")
         if not adv_msgs and engine.spell_resolver and card.adventure_text:
             try:
                 result = await engine.spell_resolver.cast_spell(
@@ -2525,6 +2539,8 @@ async def _dispatch_resolution(engine, game: GameState, player: Player,
                     ctx['_tutor_to_hand'] = card._tutor_to_hand
                 if getattr(card, '_tutor_to_graveyard', None):
                     ctx['_tutor_to_graveyard'] = card._tutor_to_graveyard
+                if getattr(card, '_tutor_cards', None):
+                    ctx['_tutor_cards'] = list(card._tutor_cards)
                 lib = get_effect_library()
                 tmpl_actions, tmpl_explanation = lib.resolve_spell(
                     card_name=card.name,
@@ -4463,6 +4479,22 @@ def _advance_sagas(engine, game: GameState, player: Player) -> List[str]:
                   and new_lore == 2):
                 messages.extend(_resolve_restoration_chapter_two(
                     engine, game, player, card))
+            elif (card.name.lower() == "history of benalia"
+                  and new_lore == 3):
+                # Chapter III is typed: non-Knight creatures do not receive
+                # this temporary pump.  The action interpreter retains the
+                # normal EOT/layers bookkeeping.
+                result = engine.rules._execute_action_on_state(game, {
+                    "action": "pump_all_creatures", "player": player.name,
+                    "power": 2, "toughness": 1, "subtype": "Knight",
+                    "source": "History of Benalia Chapter III",
+                })
+                if result:
+                    messages.append(result)
+                # Positive EOT pumps registered in the layers engine are
+                # cached; refresh before any same-turn combat reads P/T.
+                game.recalculate_power_toughness()
+                print("[SAGA-CHAPTER] History of Benalia III: pumped Knights only")
             elif HAS_EFFECT_TEMPLATES:
                 # Try to resolve the chapter via template/tier system
                 try:

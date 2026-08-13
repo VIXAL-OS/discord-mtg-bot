@@ -879,54 +879,48 @@ def _check_creature_etb_triggers_sync(engine, game: GameState, entering_player: 
 
 def _check_meld_completion(game: 'GameState', entering_player: Player,
                            entering_creature: Card) -> List[str]:
-    """[MELD] If the entering creature completes a known meld pair, meld them.
+    """Legacy ETB hook retained as a deliberate no-op.
 
-    July 20 batch-3 audit, two bugs in the old inline block: (1) pair_set is a
-    frozenset key, and frozenset difference returns a frozenset — which has no
-    .pop(); any meld half entering crashed the whole creature-ETB scan
-    (game_1528960244212961350: Gisela, the Broken Blade). (2) The block sat
-    below the scan's "no watchers collected" early return, so meld only ran
-    when an unrelated Soul Warden-class watcher happened to be on a
-    battlefield. Extracted so every exit path of the scan runs it.
+    Gisela melds only at the beginning of her controller's end step. Other
+    pairs likewise have their own trigger/activation requirements, so generic
+    ETB melding is not rules-correct.
     """
-    messages: List[str] = []
-    entering_name = entering_creature.name if entering_creature else ""
-    if not entering_name or entering_creature not in entering_player.battlefield:
-        return messages
-    for pair_set, melded_data in MELD_PAIRS.items():
-        if entering_name not in pair_set:
-            continue
-        other_name = next(iter(pair_set - {entering_name}), None)
-        if not other_name:
-            continue
-        other_card = None
-        for c in entering_player.battlefield:
-            if c.name == other_name and c is not entering_creature:
-                other_card = c
-                break
-        if other_card:
-            game.unregister_static_effects(entering_creature)
-            game.unregister_static_effects(other_card)
-            entering_player.battlefield.remove(entering_creature)
-            entering_player.battlefield.remove(other_card)
-            entering_player.exile.append(entering_creature)
-            entering_player.exile.append(other_card)
-            melded = Card(
-                name=melded_data["name"],
-                mana_cost=melded_data.get("mana_cost", ""),
-                type_line=melded_data.get("type_line", ""),
-                oracle_text=melded_data.get("oracle_text", ""),
-                power=melded_data.get("power"),
-                toughness=melded_data.get("toughness"),
-                loyalty=melded_data.get("loyalty"),
-            )
-            melded.owner_index = entering_creature.owner_index
-            melded.entered_this_turn = True
-            entering_player.battlefield.append(melded)
-            messages.append(f"**{entering_creature.name}** and **{other_card.name}** meld into **{melded.name}**!")
-            print(f"[MELD] {entering_creature.name} + {other_card.name} -> {melded.name}")
-            break
-    return messages
+    return []
+
+
+def _meld_gisela_and_bruna(game: 'GameState', player: Player) -> List[str]:
+    """Resolve Gisela's deterministic controller-end-step meld trigger."""
+    player_idx = game.players.index(player)
+    halves = {}
+    for card in list(player.battlefield):
+        if card.name in {"Gisela, the Broken Blade", "Bruna, the Fading Light"}:
+            # The intervening condition is both own AND control.
+            if getattr(card, 'owner_index', -1) == player_idx:
+                halves.setdefault(card.name, card)
+    gisela = halves.get("Gisela, the Broken Blade")
+    bruna = halves.get("Bruna, the Fading Light")
+    if not gisela or not bruna:
+        return []
+    meld_data = MELD_PAIRS[frozenset({gisela.name, bruna.name})]
+    for half in (gisela, bruna):
+        game.unregister_static_effects(half)
+        player.battlefield.remove(half)
+        player.exile.append(half)
+    melded = Card(name=meld_data["name"], mana_cost=meld_data.get("mana_cost", ""),
+                  type_line=meld_data.get("type_line", ""),
+                  oracle_text=meld_data.get("oracle_text", ""),
+                  power=meld_data.get("power"), toughness=meld_data.get("toughness"),
+                  loyalty=meld_data.get("loyalty"))
+    melded.owner_index = player_idx
+    melded.entered_this_turn = True
+    player.battlefield.append(melded)
+    game.register_static_keyword_grants(melded, player.name)
+    game.register_static_pt_effects(melded, player.name)
+    game.recalculate_power_toughness()
+    print("[MELD] Gisela, the Broken Blade + Bruna, the Fading Light -> "
+          "Brisela, Voice of Nightmares (controller end step)")
+    return ["**Gisela, the Broken Blade** and **Bruna, the Fading Light** "
+            "meld into **Brisela, Voice of Nightmares**!"]
 
 
 def _spell_matches_cast_trigger(engine, sentence_lower: str, card: Card,
@@ -3769,8 +3763,13 @@ def check_block_triggers(engine, game: GameState) -> List[str]:
     # an extra combat phase legitimately re-fires because blockers are
     # re-declared for it.
     fired: set = game._block_triggers_fired_ids
-    for blocker_ids in blockers_map.values():
+    for attacker_id, blocker_ids in blockers_map.items():
+        attacker_result = game.find_card_global(attacker_id)
+        attacker = attacker_result[0] if attacker_result else None
         for bid in (blocker_ids or []):
+            blocker_result = game.find_card_global(bid)
+            blocker = blocker_result[0] if blocker_result else None
+            _queue_gorgon_recluse_block_destruction(game, attacker, blocker)
             if bid in fired:
                 continue                       # blocks once per combat
             fired.add(bid)
@@ -3822,6 +3821,67 @@ def check_block_triggers(engine, game: GameState) -> List[str]:
                     print(f"[BLOCK-TRIGGER-UNHANDLED] {blocker.name}: "
                           f"{paragraph.strip()[:90]}")
                 break
+    return messages
+
+
+def _is_black_creature(card: Card) -> bool:
+    """Colour test for Gorgon Recluse, including lightweight cached Cards."""
+    if card is None or 'devoid' in (getattr(card, 'oracle_text', '') or '').lower():
+        return False
+    for attr in ('colors', 'color_identity'):
+        values = getattr(card, attr, []) or []
+        if 'B' in values or 'black' in values:
+            return True
+    return '{B}' in (getattr(card, 'mana_cost', '') or '').upper()
+
+
+def _queue_gorgon_recluse_block_destruction(game: GameState, attacker: Card,
+                                            blocker: Card) -> None:
+    """Record Gorgon Recluse's exact nonblack combat counterpart by ID."""
+    if attacker is None or blocker is None:
+        return
+    gorgon = target = None
+    if blocker.name == 'Gorgon Recluse':
+        gorgon, target = blocker, attacker
+    elif attacker.name == 'Gorgon Recluse':
+        gorgon, target = attacker, blocker
+    if gorgon is None or _is_black_creature(target):
+        return
+    key = (gorgon.id, target.id)
+    fired_pairs = getattr(game, '_gorgon_recluse_fired_pairs', set())
+    if key in fired_pairs:
+        return
+    fired_pairs.add(key)
+    game._gorgon_recluse_fired_pairs = fired_pairs
+    game._end_of_combat_destructions.append({
+        'source_id': gorgon.id, 'source_name': gorgon.name,
+        'target_id': target.id, 'target_name': target.name,
+    })
+    print(f"[GORGON-RECLUSE] {gorgon.name} schedules {target.name} "
+          f"({target.id}) for end of combat")
+
+
+def drain_end_of_combat_destructions(engine, game: GameState) -> List[str]:
+    """Resolve stable-ID end-of-combat destruction after combat SBAs."""
+    pending = list(getattr(game, '_end_of_combat_destructions', []) or [])
+    game._end_of_combat_destructions = []
+    messages = []
+    rules = engine.rules if hasattr(engine, 'rules') else engine
+    for item in pending:
+        result = game.find_card_global(item['target_id'])
+        if result is None or result[2] != Zone.BATTLEFIELD:
+            print(f"[GORGON-RECLUSE] {item['target_name']} is gone; no action")
+            continue
+        target, controller, _zone = result
+        msg = rules._execute_action_on_state(game, {
+            'action': 'destroy', 'card': target.name, 'card_id': target.id,
+            'target_controller': controller.name,
+            'source': item['source_name'],
+        })
+        if msg:
+            messages.append(msg)
+        print(f"[GORGON-RECLUSE] End of combat: {item['source_name']} "
+              f"destroys {target.name} ({target.id})")
     return messages
 
 
@@ -3971,6 +4031,39 @@ def _safe_power(card: Card, game: GameState) -> int:
             return 0
 
 
+def _attack_keywords_with_attached_grants(game: GameState, attacker: Card) -> dict:
+    """Parse printed attack keywords plus attached Aura static grants.
+
+    Parameterized keywords such as ``annihilator 2`` are not represented by
+    the fixed-keyword layers whitelist.  Read the attached Aura's actual
+    static text instead, once per Aura object, and merge keyword keys rather
+    than resolving an already-found printed ability twice.
+    """
+    merged = dict(parse_attack_keywords(attacker.oracle_text or ''))
+    seen_aura_ids = set()
+    for player in game.players:
+        for aura in player.battlefield:
+            if (getattr(aura, 'id', None) in seen_aura_ids
+                    or getattr(aura, 'attached_to', None) != attacker.id
+                    or 'aura' not in (getattr(aura, 'type_line', '') or '').lower()):
+                continue
+            seen_aura_ids.add(aura.id)
+            for keyword, value in parse_attack_keywords(aura.oracle_text or '').items():
+                # A single ability is represented once even if a caller has
+                # both attachment indexes populated. Distinct keyword types
+                # remain independently available to the resolver.
+                merged.setdefault(keyword, value)
+            # Static grants are prose ("enchanted creature ... has
+            # annihilator 2"), not a bare keyword line, so the printed-card
+            # parser correctly declines them. This intentionally accepts only
+            # a grant sentence from an Aura actually attached to this attacker.
+            for match in re.finditer(
+                    r'\b(?:has|have)\b[^.\n]*?\bannihilator\s+(\d+)\b',
+                    aura.oracle_text or '', re.IGNORECASE):
+                merged.setdefault('annihilator', int(match.group(1)))
+    return merged
+
+
 def _check_attack_triggers_sync(engine, game: GameState, attacker_card: Card, attacking_player: Player) -> Tuple[List[str], List[Tuple]]:
     """Check for 'whenever [this/a creature] attacks' triggers.
 
@@ -3999,7 +4092,7 @@ def _check_attack_triggers_sync(engine, game: GameState, attacker_card: Card, at
     # attacked and the defending player sacrificed NOTHING, in the very deck
     # built around cheating her into play. Resolved deterministically here so
     # none of it costs a Tier-3 call.
-    _atk_kw = parse_attack_keywords(attacker_card.oracle_text or '')
+    _atk_kw = _attack_keywords_with_attached_grants(game, attacker_card)
     if _atk_kw:
         messages.extend(_resolve_attack_keywords(
             engine, game, attacker_card, attacking_player, opponent,
@@ -4867,6 +4960,11 @@ def _check_end_step_triggers_sync(engine, game: GameState) -> Tuple[List[str], L
     active_idx = game.active_player_index
     opponent = game.players[1 - active_idx]
 
+    # Gisela's conditional paragraph is a deterministic, controller-end-step
+    # meld. Resolve it before the generic end-step ladder so Tier 3 can never
+    # fabricate Brisela from a lone half.
+    messages.extend(_meld_gisela_and_bruna(game, active))
+
     # IMPENDING (CR 702.166a, Aug 3 2026): "At the beginning of YOUR end step,
     # remove a time counter from it." Only the active player's, which is what
     # makes the discount cost real time — a 4-counter Overlord is four of its
@@ -4911,6 +5009,9 @@ def _check_end_step_triggers_sync(engine, game: GameState) -> Tuple[List[str], L
             # Clear the flag so we don't double-process if SBA loop re-enters
             card._sneak_attack_sac = False
     for card, card_owner in all_bf_cards:
+        if card.name == "Gisela, the Broken Blade":
+            # Handled above, including the no-action lone-half case.
+            continue
         if not card.oracle_text:
             continue
         oracle_lower = card.oracle_text.lower()

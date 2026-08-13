@@ -326,7 +326,8 @@ class TestSharedCastTargetResolver:
     def test_self_pronoun_resolves_to_the_caster(self, game, make_card):
         from mtg.helpers import resolve_cast_target
         rick = game.players[0]
-        card = make_card("Lightning Helix", type_line="Instant")
+        card = make_card("Lightning Helix", type_line="Instant",
+                         oracle_text="Lightning Helix deals 3 damage to any target.")
         assert resolve_cast_target(game, rick, card, "you") is rick
 
     def test_graveyard_targets_resolve_for_graveyard_spells(self, game, make_card):

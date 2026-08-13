@@ -651,6 +651,17 @@ _OPPONENT_TARGET_WORDS = frozenset((
     'another player', 'each opponent'))
 
 
+def cast_face_allows_player_target(card) -> bool:
+    """Whether the face being cast can legally target a player."""
+    # A player label only has meaning when the actual cast face permits one.
+    # In particular, a retry saying "opponent" must not make Reanimate spend
+    # its cost and then fizzle on a Player object.
+    face = spell_face_for_gates(card)
+    oracle = (getattr(face, 'oracle_text', '') or '').lower()
+    return bool(re.search(r'\b(?:any target|target\s+(?:player|opponent))\b',
+                          oracle))
+
+
 def resolve_cast_target(game, caster, card, target_name):
     """Resolve a declared cast target string to a StackEntry, Card or Player.
 
@@ -740,10 +751,13 @@ def resolve_cast_target(game, caster, card, target_name):
             if found:
                 return found
 
-    # 4. Players, including the pronouns the AI actually emits. Deliberately
-    #    NOT the fuzzy card fallback that _resolve_player_or_card_target uses:
-    #    a card name that merely starts with a player's name must not silently
-    #    become that player.
+    # 4. Players, including the pronouns the AI actually emits.  Gate this on
+    #    the actual cast face: "opponent" is useful for Bolt, not Reanimate.
+    #    Deliberately NOT the fuzzy card fallback that
+    #    _resolve_player_or_card_target uses: a card name that merely starts
+    #    with a player's name must not silently become that player.
+    if not cast_face_allows_player_target(card):
+        return None
     if lowered in _SELF_TARGET_WORDS:
         return caster
     if lowered in _OPPONENT_TARGET_WORDS:

@@ -204,7 +204,12 @@ async def _resolve_combat(cog, ctx, game: GameState):
     if damage_msgs:
         await ctx.send("**💥 Combat Damage:**\n" + "\n".join(f"• {m}" for m in damage_msgs))
     
-    # Clear combat state
+    # Check state-based actions (creature deaths, etc.)
+    events = cog.engine.check_state_based_actions(game)
+    if events:
+        await ctx.send("\n".join(events))
+
+    # Clear combat state only after the post-damage/end-of-combat boundary.
     for attacker_id in game.attackers:
         result = game.find_card_global(attacker_id)
         if result:
@@ -220,11 +225,7 @@ async def _resolve_combat(cog, ctx, game: GameState):
     game.attackers = []
     game.blockers = {}
     game._block_triggers_fired_ids = set()
-    
-    # Check state-based actions (creature deaths, etc.)
-    events = cog.engine.check_state_based_actions(game)
-    if events:
-        await ctx.send("\n".join(events))
+    game._gorgon_recluse_fired_pairs = set()
 
     # June 11 audit: Judith's dies trigger was queued during combat but not
     # drained until after main phase 2, allowing postcombat actions before a
@@ -1446,7 +1447,7 @@ async def _autoplay_execute_action(cog, thread, game: GameState, player_idx: int
     # The LLM occasionally emits structured values where scalar fields are
     # expected. Coerce scalar fields here, while preserving real target arrays
     # for multi-target spells.
-    for _sfield in ("card", "permanent", "tutor_card", "description"):
+    for _sfield in ("card", "permanent", "tutor_card", "tutor_card2", "description"):
         if _sfield in action and not isinstance(action[_sfield], str):
             action[_sfield] = coerce_ai_string(action[_sfield])
     # June 10 audit (C3/V28): positional cast→resolve pairing. Capture the
@@ -1934,6 +1935,17 @@ async def _autoplay_execute_action(cog, thread, game: GameState, player_idx: int
         card._tutor_card = (
             str(tutor_choice).strip() if tutor_choice is not None else None
         )
+        tutor_choices = [card._tutor_card] if card._tutor_card else []
+        tutor_choice2 = action.get("tutor_card2")
+        if tutor_choice2 is not None:
+            tutor_choice2 = coerce_ai_string(tutor_choice2)
+            if tutor_choice2:
+                tutor_choices.append(tutor_choice2.strip())
+        supplied_choices = action.get("tutor_cards")
+        if isinstance(supplied_choices, (list, tuple)):
+            tutor_choices = [str(choice).strip() for choice in supplied_choices
+                             if str(choice).strip()]
+        card._tutor_cards = tutor_choices[:2]
         # Aug 7 queue item Q2a: split-destination tutors (Jarad's Orders —
         # one creature to hand, one to graveyard) discard the model's choice
         # for every search except the first; the destination-typed keys let
@@ -1956,6 +1968,7 @@ async def _autoplay_execute_action(cog, thread, game: GameState, player_idx: int
         card._tutor_card = None
         card._tutor_to_hand = None
         card._tutor_to_graveyard = None
+        card._tutor_cards = []
 
         # May 23 audit (CRITICAL #4): even when cast_spell_async returns
         # success=True, the spell may have been countered on the stack. Record
@@ -1964,6 +1977,12 @@ async def _autoplay_execute_action(cog, thread, game: GameState, player_idx: int
         game._last_cast_countered = bool(success and msg and "(countered)" in msg)
 
         if success:
+            # This is deliberately after the real cast pipeline succeeds:
+            # a same-turn or failed foretell attempt must not manufacture a
+            # success observability tag. Impulse casts remain separately tagged
+            # by their own exile permission path.
+            if _was_foretold:
+                print(f"[FORETELL-CAST] Autoplay cast {card.name} from exile")
             source = " from exile" if from_exile else (" from command zone" if from_command_zone else "")
             tax_msg = f" (paid {{{commander_tax}}} commander tax)" if commander_tax > 0 else ""
             result_msg = f"✨ {player.name} cast **{card.name}**{source}{tax_msg}"

@@ -204,9 +204,9 @@
    "note": "Not in the corpus."
   },
   "instigator gang": {
-   "status": "unexercised",
-   "since_sha": "a59953c",
-   "note": "DFC loaded, never cast."
+   "status": "awaiting",
+   "since_sha": "a49460a",
+   "note": "Live attack showed the attacking-only anthem skipped; dynamic combat-state P/T filtering now gives the front +1/+0 and transformed back +3/+0 only to attackers."
   },
   "insult // injury": {
    "status": "verified",
@@ -277,9 +277,9 @@
    "note": "[DAMAGED-TRIGGER] sacrificed exactly as many permanents as damage taken, twice, attributed to the right controller."
   },
   "reanimate": {
-   "status": "verified",
-   "since_sha": "a59953c",
-   "note": "Reviewers C and D: the DECLARED graveyard target came back and the controller lost life equal to its REAL mana value (1 for Gravecrawler, 2 for Bloodghast)."
+   "status": "awaiting",
+   "since_sha": "a49460a",
+   "note": "The sixth-cycle corpus found a player-pronoun retry accepted despite Reanimate's Oracle allowing only a creature card in a graveyard. Player targets are now face-Oracle-gated before payment."
   },
   "reaper from the abyss": {
    "status": "verified",
@@ -403,18 +403,73 @@
   },
   "sword of fire and ice": {
    "status": "awaiting",
-   "since_sha": "516d8bf",
-   "note": "New template: 2 damage + draw a card."
+   "since_sha": "a49460a",
+   "note": "Its combat-damage template remains pinned; sixth-cycle live evidence additionally found invalid explicit Equip targets consuming mana. Equip target legality now precedes payment and never auto-falls back."
   },
   "sword of feast and famine": {
    "status": "awaiting",
-   "since_sha": "516d8bf",
-   "note": "New template: opponent discards, untap all your lands (count derived from the board)."
+   "since_sha": "a49460a",
+   "note": "Its combat-damage template remains pinned; sixth-cycle live evidence additionally found invalid explicit Equip targets consuming mana. Equip target legality now precedes payment and never auto-falls back."
   },
   "sword of sinew and steel": {
    "status": "awaiting",
    "since_sha": "516d8bf",
    "note": "New template: destroy up to one opponent planeswalker and one artifact."
+  },
+  "strangleroot geist": {
+   "status": "awaiting",
+   "since_sha": "a49460a",
+   "note": "Activated self-sacrifice reached the graveyard but missed the shared undying/persist save. Both self-sac and chosen-sac activation costs now reuse the graveyard-only save helper."
+  },
+  "history of benalia": {
+   "status": "awaiting",
+   "since_sha": "a49460a",
+   "note": "Chapter III's Tier-3 action pumped non-Knights. It now resolves deterministically as +2/+1 to Knights only; chapters I/II are preserved."
+  },
+  "hollowhenge overlord": {
+   "status": "awaiting",
+   "since_sha": "a49460a",
+   "note": "The upkeep trigger hardcoded one Wolf. It now snapshots all Wolves/Werewolves controlled at resolution, including itself, without recursive token counting."
+  },
+  "gisela, the broken blade": {
+   "status": "awaiting",
+   "since_sha": "a49460a",
+   "note": "A lone Gisela reached Tier 3 and fabricated Brisela. Meld is now deterministic only at its controller's end step with both owned and controlled halves."
+  },
+  "bruna, the fading light": {
+   "status": "awaiting",
+   "since_sha": "a49460a",
+   "note": "The old deterministic meld fired on ETB. The pair now waits for Gisela's controller-end-step trigger and produces the corrected 9/10 Brisela characteristics."
+  },
+  "mantle of the ancients": {
+   "status": "awaiting",
+   "since_sha": "a49460a",
+   "note": "Its multiplier now counts every Aura/Equipment actually attached to the enchanted creature, instead of flattening the restrictive tail."
+  },
+  "sage's reverie": {
+   "status": "awaiting",
+   "since_sha": "a49460a",
+   "note": "Its multiplier now counts only Auras its controller controls that are attached to creatures."
+  },
+  "gorgon recluse": {
+   "status": "awaiting",
+   "since_sha": "a49460a",
+   "note": "The block trigger lost counterpart identity and Tier 3 destroyed an unrelated creature. It now preserves stable IDs and destroys the nonblack counterpart at true end of combat."
+  },
+  "fae of wishes": {
+   "status": "awaiting",
+   "since_sha": "a49460a",
+   "note": "Granted no longer leaks a complex-effect placeholder. With no sideboard/outside-game object, it truthfully reports unsupported no-action while preserving Adventure exile."
+  },
+  "eldrazi conscription": {
+   "status": "awaiting",
+   "since_sha": "a49460a",
+   "note": "Attached parameterized attack keywords were invisible because only printed attacker text was parsed. Attached Aura static grants now contribute annihilator without duplicating printed keywords."
+  },
+  "tooth and nail": {
+   "status": "awaiting",
+   "since_sha": "a49460a",
+   "note": "Entwine previously resolved one mode twice. It now searches up to two creatures library-to-hand, then puts up to two creatures from hand onto the battlefield, with two explicit tutor choices threaded end to end."
   }
  }
 }

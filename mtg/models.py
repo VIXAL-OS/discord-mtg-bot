@@ -716,6 +716,9 @@ class Card:
         default=None, repr=False, compare=False)
     _tutor_to_graveyard: Optional[str] = field(
         default=None, repr=False, compare=False)
+    # Multi-card tutor choice, consumed by the real search/hand handlers.
+    _tutor_cards: List[str] = field(default_factory=list, repr=False,
+                                    compare=False)
     # Aug 7 queue item Q3 (Draugr Necromancer's cast half): the death
     # redirect stamps WHO may cast this exiled card (Draugr's controller)
     # and that snow mana may be spent as any color to do it (the printed
@@ -1209,6 +1212,18 @@ class Card:
             if 'equipment' not in (equip_card.type_line or '').lower():
                 continue
             oracle = equip_card.oracle_text.lower()
+            if equip_card.name.lower() == "mantle of the ancients":
+                # Its multiplier counts attachments on this creature, not
+                # permanents controlled by Mantle's controller.
+                attached = sum(
+                    1 for owner in game.players for permanent in owner.battlefield
+                    if getattr(permanent, 'attached_to', None) == self.id
+                    and ('aura' in (getattr(permanent, 'type_line', '') or '').lower()
+                         or 'equipment' in (getattr(permanent, 'type_line', '') or '').lower())
+                )
+                p_bonus += attached
+                t_bonus += attached
+                continue
             # Aug 7 confirmation-batch audit (A-2a, CRITICAL): the old
             # whole-oracle regex matched "+2/+2" inside Umezawa's Jitte's
             # COST-GATED MODAL activated ability ("Remove a charge counter…:
@@ -1383,6 +1398,8 @@ class Card:
         # computed on read (Aug 7 batch audit C-1: both combats of the Moraug
         # turn dealt base-power damage because this clause was unimplemented).
         result += self._get_attack_count_bonus(game)
+        combat_p, _ = self._get_combat_state_anthem_bonus(game)
+        result += combat_p
         return result
 
     def get_effective_toughness(self, game=None) -> int:
@@ -1429,6 +1446,8 @@ class Card:
         # Conditional self-buff gated on controller's life (Serra Ascendant).
         _, lt_t = self._get_life_threshold_bonus(game)
         result += lt_t
+        _, combat_t = self._get_combat_state_anthem_bonus(game)
+        result += combat_t
         return result
 
     def _get_attached_auras(self, game):
@@ -1553,6 +1572,32 @@ class Card:
         import re as _re
         for aura in self._get_attached_auras(game):
             oracle = (aura.oracle_text or '').lower()
+            if aura.name.lower() == "mantle of the ancients":
+                attached = sum(
+                    1 for owner in game.players for permanent in owner.battlefield
+                    if getattr(permanent, 'attached_to', None) == self.id
+                    and ('aura' in (getattr(permanent, 'type_line', '') or '').lower()
+                         or 'equipment' in (getattr(permanent, 'type_line', '') or '').lower())
+                )
+                p_bonus += attached
+                t_bonus += attached
+                continue
+            if aura.name.lower() == "sage's reverie":
+                # Count only Auras this Aura's controller controls which are
+                # themselves attached to creatures. Other restrictive tails
+                # remain intentionally declined by the generic parser.
+                controller = aura._find_controller(game)
+                attached_auras = 0
+                if controller is not None:
+                    for permanent in controller.battlefield:
+                        if ('aura' in (getattr(permanent, 'type_line', '') or '').lower()
+                                and getattr(permanent, 'attached_to', None)):
+                            target = game.find_card_global(permanent.attached_to)
+                            if target and target[0].is_creature(game):
+                                attached_auras += 1
+                p_bonus += attached_auras
+                t_bonus += attached_auras
+                continue
             # Signed pattern covers +N/+M, -N/-M, and mixed-sign (+N/-M) auras
             # in one pass (June 10 audit, same class as the Skullclamp fix).
             # June 10 deep-dive (B7): the optional "for each <type> you
@@ -1677,6 +1722,31 @@ class Card:
                                 continue
                             bonus += int(m.group(2))
         return bonus
+
+    def _get_combat_state_anthem_bonus(self, game) -> tuple:
+        """Return static anthem bonuses gated on this creature attacking.
+
+        Combat state is intentionally absent from the layers snapshot, so an
+        unconditional layer effect would boost nonattackers. Keep this small,
+        dynamic read alongside the other dynamic P/T readers.
+        """
+        if not game or not getattr(self, 'attacking', False):
+            return (0, 0)
+        controller = self._find_controller(game)
+        if controller is None:
+            return (0, 0)
+        p_bonus = t_bonus = 0
+        import re as _re
+        for perm in controller.battlefield:
+            for sentence in self._anthem_static_sentences(
+                    (perm.oracle_text or '').lower()):
+                match = _re.search(
+                    r'\battacking creatures you control get \+(\d+)/\+(\d+)',
+                    sentence)
+                if match:
+                    p_bonus += int(match.group(1))
+                    t_bonus += int(match.group(2))
+        return p_bonus, t_bonus
 
     def _resolve_star_power(self, game) -> int:
         """Resolve */* power from oracle text (CDA). Used by get_effective_power."""
@@ -5065,6 +5135,11 @@ class GameState:
     # each new declare-blockers, which is what makes extra combat phases
     # (Moraug, Aurelia, Port Razer) fire their block triggers again.
     _block_triggers_fired_ids: set = field(default_factory=set, repr=False, compare=False)
+    # Stable-object delayed destruction for Gorgon Recluse's block trigger.
+    # This is a combat-scoped queue, drained after combat damage/SBAs and
+    # before callers clear the combat map.
+    _end_of_combat_destructions: List[Dict] = field(default_factory=list, repr=False, compare=False)
+    _gorgon_recluse_fired_pairs: set = field(default_factory=set, repr=False, compare=False)
     # Aug 2 2026 (batch-13 audit): True while the Moraug consumption loop is
     # running an ADDITIONAL combat phase. Karlach, Fury of Avernus's trigger
     # carries an intervening-if ("if it's the first combat phase of the

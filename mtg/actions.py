@@ -490,8 +490,9 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
         return None
     
     # Helper: find card on battlefield
-    def find_card_on_battlefield(card_name: str, controller: str = None) -> Optional[Tuple[Card, Player]]:
-        if not card_name:
+    def find_card_on_battlefield(card_name: str, controller: str = None,
+                                 card_id: str = None) -> Optional[Tuple[Card, Player]]:
+        if not card_name and not card_id:
             return None
         name_lower = card_name.lower()
         search_players = game.players
@@ -510,6 +511,8 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
             for c in p.battlefield:
                 if getattr(c, '_phased_out', False):
                     continue
+                if card_id and c.id == card_id:
+                    return c, p
                 cn = c.name.lower()
                 is_tok = getattr(c, 'is_token', False)
                 if cn == name_lower:
@@ -3251,7 +3254,8 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
 
     # ---- DESTROY ----
     elif action_type == "destroy":
-        result = find_card_on_battlefield(action.get("card", ""), action.get("target_controller"))
+        result = find_card_on_battlefield(action.get("card", ""), action.get("target_controller"),
+                                          action.get("card_id"))
         if result:
             card, owner = result
             # [TARGETING] Check hexproof/protection/shroud before destroying
@@ -5313,6 +5317,11 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
         card_type = action.get("card_type") or action.get("filter_type") or ""
         requested_name = (action.get("card_name") or action.get("tutor_card")
                           or "").strip().lower()
+        requested_names = action.get("card_names") or action.get("tutor_cards") or []
+        if isinstance(requested_names, str):
+            requested_names = [requested_names]
+        requested_names = [str(name).strip().lower() for name in requested_names
+                           if str(name).strip()]
         max_toughness = action.get("max_toughness")
         max_mv = action.get("max_mv")
         if max_mv is None:
@@ -5380,12 +5389,13 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
             # from a creature-only search and the engine honoring it. A
             # rejected request falls back to auto-pick, with a visible line
             # so the AI feedback loop sees the rejection.
-            named_pick = None
-            if requested_name:
+            named_picks = []
+            for requested in ([requested_name] if requested_name else []) + requested_names:
                 for lib_card in p.library:
-                    if lib_card.name.lower() == requested_name:
+                    if (lib_card.name.lower() == requested
+                            and lib_card not in named_picks):
                         if _passes_filters(lib_card) is not None:
-                            named_pick = lib_card
+                            named_picks.append(lib_card)
                         else:
                             print(f"[SEARCH-LIBRARY] rejected requested "
                                   f"'{lib_card.name}' — doesn't match the "
@@ -5398,13 +5408,13 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
             # takes the first slot; auto-picks fill the rest.
             scored = []
             for lib_card in p.library:
-                if lib_card is named_pick:
+                if lib_card in named_picks:
                     continue
                 score = _passes_filters(lib_card)
                 if score is not None:
                     scored.append((score, lib_card))
             scored.sort(key=lambda t: t[0], reverse=True)
-            chosen = ([named_pick] if named_pick else []) + [c for _, c in scored]
+            chosen = named_picks + [c for _, c in scored]
             chosen = chosen[:count]
 
             if not chosen:
@@ -5469,6 +5479,60 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                 return f"🔍 {p.name} searches library and places {names_str} on top"
             return f"🔍 {p.name} searches library and finds {names_str}"
         return None
+
+    elif action_type == "move_cards_from_hand":
+        # Typed companion to search_library for Tooth and Nail's second mode.
+        # It can only choose cards in HAND at resolution, never replay a
+        # search or reach into a library.
+        p = find_player(action.get("player", ""))
+        if p is None:
+            return None
+        try:
+            count = max(0, int(action.get("count", 1) or 1))
+        except (TypeError, ValueError):
+            count = 1
+        card_type = (action.get("card_type") or "").lower()
+        wanted = action.get("card_names") or []
+        if isinstance(wanted, str):
+            wanted = [wanted]
+        selected = []
+        for name in wanted:
+            candidate = next((c for c in p.hand
+                              if c.name.lower() == str(name).lower()
+                              and c not in selected
+                              and (not card_type or card_type in (c.type_line or '').lower())), None)
+            if candidate is not None:
+                selected.append(candidate)
+        candidates = [c for c in p.hand if c not in selected
+                      and (not card_type or card_type in (c.type_line or '').lower())]
+        candidates.sort(key=lambda c: (int(getattr(c, 'cmc', 0) or 0),
+                                       getattr(c, 'name', '')), reverse=True)
+        selected.extend(candidates[:max(0, count - len(selected))])
+        selected = selected[:count]
+        if not selected:
+            return f"ðŸŒ± {p.name} has no {card_type or 'eligible'} cards in hand"
+        entry_msgs = []
+        for chosen_card in selected:
+            p.hand.remove(chosen_card)
+            chosen_card.entered_this_turn = True
+            chosen_card.summoning_sick = True
+            p.battlefield.append(chosen_card)
+            try:
+                game.register_static_keyword_grants(chosen_card, p.name)
+                game.register_static_pt_effects(chosen_card, p.name)
+                game.register_replacement_effects(chosen_card, p.name)
+                events.emit(events.PERMANENT_ENTERED, game, card=chosen_card,
+                            controller=p, via="move_cards_from_hand", rules=rules)
+                entry_msgs.extend(_fire_noncast_battlefield_entry(
+                    rules, game, p, chosen_card))
+            except Exception as e:
+                maybe_reraise(e)
+                print(f"[MOVE-HAND] entry registration failed for {chosen_card.name}: {e}")
+        game.recalculate_granted_keywords()
+        game.recalculate_power_toughness()
+        names = ", ".join(f"**{c.name}**" for c in selected)
+        result = f"ðŸŒ± {p.name} puts {names} from hand onto the battlefield"
+        return result + ("\n" + "\n".join(entry_msgs) if entry_msgs else "")
 
     elif action_type == "edict_sacrifice":
         # Each player sacrifices a creature (Plaguecrafter, Fleshbag Marauder)

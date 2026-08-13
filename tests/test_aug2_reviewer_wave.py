@@ -368,11 +368,14 @@ class TestEntwine:
     def test_template_entwined_gets_both_modes(self):
         actions = _lib()._gen_tooth_and_nail("Rick", "Claude",
                                              {"entwined": True})
-        assert actions == [{"action": "search_library", "player": "Rick",
-                            "count": 2, "card_type": "creature",
-                            "to_zone": "battlefield",
-                            "reason": "Tooth and Nail (entwined): 2 creatures "
-                                      "to battlefield"}]
+        assert actions == [
+            {"action": "search_library", "player": "Rick", "count": 2,
+             "card_type": "creature", "to_zone": "hand",
+             "reason": "Tooth and Nail (entwined): search two creatures to hand"},
+            {"action": "move_cards_from_hand", "player": "Rick", "count": 2,
+             "card_type": "creature",
+             "reason": "Tooth and Nail (entwined): put two hand creatures onto battlefield"},
+        ]
 
     def test_template_unentwined_one_mode_only(self, make_card):
         # No creatures in hand → search to HAND, never battlefield.

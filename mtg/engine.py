@@ -2475,6 +2475,7 @@ class GameEngine:
             game.attackers = []
             game.blockers = {}
             game._block_triggers_fired_ids = set()
+            game._gorgon_recluse_fired_pairs = set()
         
         elif game.phase == Phase.MAIN2:
             messages.append(f"2️⃣ **Main Phase 2**")
@@ -2760,6 +2761,7 @@ class GameEngine:
         game.attackers = []
         game.blockers = {}
         game._block_triggers_fired_ids = set()
+        game._gorgon_recluse_fired_pairs = set()
         # Unconsumed extra combats die with the turn — a Moraug/Port Razer
         # produced on one player's turn must never grant the NEXT player a
         # phantom combat (the autoplay human loop reads this at its next
@@ -3512,6 +3514,17 @@ class GameEngine:
                     tutor_choice = tutor_choice[0] if tutor_choice else None
                 card._tutor_card = (
                     str(tutor_choice).strip() if tutor_choice else None)
+                tutor_choices = [card._tutor_card] if card._tutor_card else []
+                tutor_choice2 = action.get("tutor_card2")
+                if tutor_choice2 is not None:
+                    tutor_choice2 = coerce_ai_string(tutor_choice2)
+                    if tutor_choice2:
+                        tutor_choices.append(tutor_choice2.strip())
+                supplied_choices = action.get("tutor_cards")
+                if isinstance(supplied_choices, (list, tuple)):
+                    tutor_choices = [str(choice).strip() for choice in supplied_choices
+                                     if str(choice).strip()]
+                card._tutor_cards = tutor_choices[:2]
                 # Aug 7 queue item Q2a: destination-typed tutor choices
                 # (Jarad's Orders class) — twin of the autoplay executor.
                 for _tk, _tattr in (("tutor_to_hand", "_tutor_to_hand"),
@@ -3531,6 +3544,7 @@ class GameEngine:
                 card._tutor_card = None
                 card._tutor_to_hand = None
                 card._tutor_to_graveyard = None
+                card._tutor_cards = []
                 card._cast_from_command_zone = False
                 print(f"[EXECUTE] cast {card_name}: success={success}, msg={msg}")
                 # July 20 batch-3 audit: keep the REAL failure reason for
@@ -4131,6 +4145,21 @@ class GameEngine:
                         game.turn_number, perm.name, reason)
                     return None
 
+                # CR 601.2c / 601.2h: validate an explicitly declared Equip
+                # target before payment.  A bad explicit target is not a hint
+                # to auto-select a different creature.
+                if ability.get('is_equip') and target_name:
+                    _explicit_equip_target = player.find_card(
+                        target_name, Zone.BATTLEFIELD)
+                    if (_explicit_equip_target is None
+                            or not _explicit_equip_target.is_creature(game)):
+                        reason = (f"{perm.name} needs a creature you control "
+                                  f"to equip; '{target_name}' is not legal")
+                        print(f"[ACTIVATE-EQUIP] {reason}")
+                        game._last_activation_failure = (
+                            game.turn_number, perm.name, reason)
+                        return None
+
                 # A named target cannot belong to a mana ability.  This also
                 # prevents a hand-only Channel request from silently clamping
                 # to a same-name land's battlefield mana ability (Boseiju).
@@ -4367,10 +4396,19 @@ class GameEngine:
                         # branch and its two siblings were the last
                         # battlefield-exit paths still appending by hand.
                         from mtg.helpers import route_dead_permanent
-                        route_dead_permanent(game, perm, player,
-                                             reason='sacrificed as a cost')
+                        _self_sac_destination = route_dead_permanent(
+                            game, perm, player, reason='sacrificed as a cost')
                         sacrificed_self = True
                         print(f"[ACTIVATE-CLAUDE] Sacrificed {perm.name} as cost")
+                        # Undying/persist only sees a creature that actually
+                        # arrived in its owner's graveyard.  Command-zone and
+                        # unearth/exile replacements must not return it.
+                        if _self_sac_destination == 'graveyard':
+                            from mtg.sba import apply_death_save_on_sacrifice
+                            _save_msgs = apply_death_save_on_sacrifice(
+                                self.rules, game, player, perm)
+                            if _save_msgs:
+                                game._pending_messages.extend(_save_msgs)
                         # June 10 audit (V15, CR 700.4): self-sacrifice IS a
                         # death — this branch fired NEITHER sacrifice nor dies
                         # triggers before.
@@ -4484,9 +4522,16 @@ class GameEngine:
                         # mill loop the strategist was actively assembling
                         # (game 1536017757303341078).
                         from mtg.helpers import route_dead_permanent
-                        route_dead_permanent(game, sac_target, player,
-                                             reason='sacrificed as a cost')
+                        _chosen_sac_destination = route_dead_permanent(
+                            game, sac_target, player,
+                            reason='sacrificed as a cost')
                         print(f"[ACTIVATE-CLAUDE] Sacrificed {sac_target.name} as cost for {perm.name}")
+                        if _chosen_sac_destination == 'graveyard':
+                            from mtg.sba import apply_death_save_on_sacrifice
+                            _save_msgs = apply_death_save_on_sacrifice(
+                                self.rules, game, player, sac_target)
+                            if _save_msgs:
+                                game._pending_messages.extend(_save_msgs)
                         # [SACRIFICE-TRIGGER] Fire Korvold/Mayhem Devil/etc.
                         # for sacrifice-as-cost (fetchlands, Greater Gargadon-style).
                         # Without this, Korvold's draw side never fires when
@@ -4620,7 +4665,7 @@ class GameEngine:
                     equip_target = None
                     if target_name:
                         equip_target = player.find_card(target_name, Zone.BATTLEFIELD)
-                    if not equip_target:
+                    else:
                         # Auto-select: biggest creature without this equipment already attached
                         best_power = -1
                         for c in player.battlefield:

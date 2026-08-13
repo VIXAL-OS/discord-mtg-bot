@@ -110,7 +110,9 @@ COMMAND_ZONE_FORMATS = {"commander", "edh", "brawl", "oathbreaker"}
 
 # [MELD] Known meld pairs: frozenset({half_a, half_b}) -> melded card data
 MELD_PAIRS = {
-    frozenset({"Bruna, the Fading Light", "Gisela, the Broken Blade"}): {"name": "Brisela, Voice of Nightmares", "type_line": "Legendary Creature", "power": "9", "toughness": "10", "mana_cost": "", "oracle_text": "Flying, first strike, lifelink"},
+    # Gisela's end-step trigger is handled explicitly in triggers.py. Keep
+    # the result's correct copiable values here.
+    frozenset({"Bruna, the Fading Light", "Gisela, the Broken Blade"}): {"name": "Brisela, Voice of Nightmares", "type_line": "Legendary Creature — Eldrazi Angel", "power": "9", "toughness": "10", "mana_cost": "", "oracle_text": "Flying, first strike, vigilance, lifelink\nYour opponents can't cast spells with mana value 3 or less."},
     frozenset({"Urza, Lord Protector", "The Mightstone and Weakstone"}): {"name": "Urza, Planeswalker", "type_line": "Legendary Planeswalker", "power": None, "toughness": None, "mana_cost": "", "loyalty": "7", "oracle_text": "Planeswalker abilities"},
     frozenset({"Mishra, Claimed by Gix", "Phyrexian Dragon Engine"}): {"name": "Mishra, Lost to Phyrexia", "type_line": "Legendary Creature", "power": "9", "toughness": "9", "mana_cost": "", "oracle_text": "Trample"},
 }

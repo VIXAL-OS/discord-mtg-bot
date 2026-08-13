@@ -1655,7 +1655,7 @@ DECISION QUALITY — AVOID COMMON MISTAKES:
 - X-COST SPELLS (Walking Ballista, Hydroid Krasis, Blue Sun's Zenith): set X to a meaningful value. Casting X=0 wastes the card. If you can only afford X=1 and the effect needs more to matter, hold it.
 - DISCARD (Liliana of the Veil, Smallpox, end-step discard): when forced to discard, drop your highest-CMC unplayable card or a redundant land — never discard your only win condition or a card you can cast next turn.
 - LIFE AS A RESOURCE: at low life (≤5) treat your life total like cards in hand. Skip optional life payments (fetchlands, shocklands' 2-life option, Dark Confidant flips, Phyrexian mana) unless the payoff is decisive.
-- TUTORS (Demonic Tutor, Vampiric, Mystical): include `"tutor_card": "<exact card name>"`; name a card that wins or stabilizes immediately, not generic ramp. SPLIT-DESTINATION tutors (Jarad's Orders — one card to hand, one to graveyard): use `"tutor_to_hand": "<name>"` and `"tutor_to_graveyard": "<name>"` so each search gets its own choice (put the reanimation target in the graveyard, the enabler in hand).
+- TUTORS (Demonic Tutor, Vampiric, Mystical): include `"tutor_card": "<exact card name>"`; name a card that wins or stabilizes immediately, not generic ramp. For a two-card search such as Tooth and Nail, add `"tutor_card2": "<second exact card name>"` (or `"tutor_cards": ["name one", "name two"]`). SPLIT-DESTINATION tutors (Jarad's Orders — one card to hand, one to graveyard): use `"tutor_to_hand": "<name>"` and `"tutor_to_graveyard": "<name>"` so each search gets its own choice (put the reanimation target in the graveyard, the enabler in hand).
 - FLASHBACK GRANTERS (Snapcaster Mage, Lurrus, Past in Flames, Mizzix's Mastery): when you grant flashback to an instant/sorcery in your graveyard, follow through THIS TURN — include the flashback cast in the same plan if you have mana for both. Snapcaster {1}{U} + flashback Lightning Bolt {R} = 3 mana for 3 damage and a body. Skipping the flashback wastes the Snapcaster's whole reason to exist (granted ability ends at end of turn, the spell stays in your graveyard but unused). If you can't afford both, hold the granter for a turn you can. Same logic for Lurrus's once-per-turn permanent recursion — recur a value piece, don't waste the slot.
 - DON'T SANDBAG WHEN YOU'RE DYING (control decks especially): if your life is ≤5 and you have a body that can BLOCK in hand (Snapcaster Mage, Spell Queller, Solitude evoke, Watcher in the Mist, Reflector Mage — any flash creature, any 0-mana evoke), DEPLOY IT. Holding "for value" while taking lethal next turn is a known control-deck losing pattern. Evoke costs are FREE alternative casts — Solitude evokes for {0} and exiles a creature; Endurance evokes to shuffle graveyards; Grief evokes to discard. At 2 life vs a 4-power attacker, evoking Solitude to exile the attacker IS the play. Free spells (Force of Negation, Foil, alt-cost counterspells) are also free chumpings if cast on creatures, and free protection on your turn.
 - WHEN HOLDING REMOVAL: ask "what gets worse if I wait one turn?" If opp has lethal damage on board or a snowballing anthem (Cathar's Crusade, Sword of Feast and Famine), removal NOW is correct. If opp is empty-handed and tapped out, holding can be fine. Default to action-now over inaction.
@@ -1692,6 +1692,7 @@ Respond with a JSON action. Examples:
 {"type": "cast", "card": "Counterspell", "target": "stack_top"}
 {"type": "cast", "card": "Beanstalk Giant", "adventure": "Fertile Footsteps"}
 {"type": "cast", "card": "Demonic Tutor", "tutor_card": "Craterhoof Behemoth"}
+{"type": "cast", "card": "Tooth and Nail", "tutor_cards": ["Craterhoof Behemoth", "Avenger of Zendikar"]}
 {"type": "cast", "card": "Primal Command", "modes": [2, 4], "target": ["Sol Ring"], "tutor_card": "Craterhoof Behemoth"}
 {"type": "suspend", "card": "Rift Bolt"}
 {"type": "foretell", "card": "Quakebringer"}
@@ -1718,7 +1719,7 @@ NOTE: For adventure cards, use the "adventure" key to cast the adventure half (s
 RESPONSE FORMAT — a single JSON object with the action keys only (no "reasoning" field — keep output minimal):
 {"type": "play_land", "card": "Forest"}
 
-ONLY output cast/play cards that are listed in YOUR HAND above. A `tutor_card` is the explicit exception: it must name a real card you intend to find in your library. Do NOT invent card names.
+ONLY output cast/play cards that are listed in YOUR HAND above. A `tutor_card`, `tutor_card2`, or `tutor_cards` entry is the explicit exception: each must name a real card you intend to find in your library. Do NOT invent card names.
 
 CRITICAL: You MUST end your response with a valid JSON object. If you are uncertain what to do, output {"type": "pass"} — never output prose without JSON. A response with no JSON action will be treated as a pass automatically, wasting your turn.
 
@@ -2674,6 +2675,7 @@ ACTION GRAMMAR:
 - {"type": "play_land", "card": "Forest"}
 - {"type": "cast", "card": "Arcane Signet"}
 - {"type": "cast", "card": "Demonic Tutor", "tutor_card": "Craterhoof Behemoth"}
+- {"type": "cast", "card": "Tooth and Nail", "tutor_card": "Craterhoof Behemoth", "tutor_card2": "Avenger of Zendikar"}
 - {"type": "cast", "card": "Primal Command", "modes": [2, 4], "target": ["Sol Ring"], "tutor_card": "Craterhoof Behemoth"}
 - {"type": "suspend", "card": "Rift Bolt"} — pay the Suspend cost, exile with time counters, casts free later (the ⏳ hint lists candidates)
 - {"type": "crew", "vehicle": "Smuggler's Copter"} — tap creatures with total power ≥ the crew cost; the Vehicle becomes an artifact creature until end of turn (the 🚗 hint lists candidates; crew BEFORE attacking)

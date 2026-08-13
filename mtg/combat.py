@@ -557,6 +557,13 @@ def resolve_combat_damage(rules, game: GameState) -> List[str]:
     # drain_combat_damage_triggers for why calling it twice is safe.
     drain_combat_damage_triggers(rules, game, messages)
 
+    # Gorgon Recluse's trigger names the creature it actually blocked/was
+    # blocked by and destroys it at end of combat, after combat damage and
+    # the associated SBA sweep but before callers clear combat state.
+    from mtg.triggers import drain_end_of_combat_destructions
+    messages.extend(drain_end_of_combat_destructions(
+        getattr(rules, 'engine_ref', None) or rules, game))
+
     # Apply lifelink (single event per controller per damage step, CR 119.3d/702.15)
     for idx, heal in lifelink_healing.items():
         if heal > 0:

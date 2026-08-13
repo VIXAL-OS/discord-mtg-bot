@@ -43,7 +43,7 @@ class TestMeldPairEntry:
 
         assert gisela in rick.battlefield  # no partner -> no meld, no crash
 
-    def test_meld_completes_when_both_halves_present(self, make_game, make_card):
+    def test_meld_waits_for_controller_end_step(self, make_game, make_card):
         game = make_game()
         rick = game.players[0]
         bruna = make_card("Bruna, the Fading Light",
@@ -52,14 +52,19 @@ class TestMeldPairEntry:
         gisela = make_card("Gisela, the Broken Blade",
                            type_line="Legendary Creature — Angel Horror",
                            power="4", toughness="3")
+        bruna.owner_index = gisela.owner_index = 0
         rick.battlefield.extend([bruna, gisela])
 
         msgs, unhandled = _etb_scan(_engine(), game, rick, gisela)
+        assert [c.name for c in rick.battlefield] == [bruna.name, gisela.name]
+        assert not any("meld into" in m for m in msgs)
 
+        from mtg.triggers import _check_end_step_triggers_sync
+        end_msgs, _ = _check_end_step_triggers_sync(_engine(), game)
         names = [c.name for c in rick.battlefield]
         assert "Brisela, Voice of Nightmares" in names
         assert bruna in rick.exile and gisela in rick.exile
-        assert any("meld into" in m for m in msgs)
+        assert any("meld into" in m for m in end_msgs)
 
 
 class TestManaDamageLifeClamp:

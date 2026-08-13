@@ -214,6 +214,78 @@
    "reviewer": "coordinator inline sweep",
    "confidence": "recorded",
    "note": "Coordinator: Warstorm Surge lethal; adventure/Usher to Safety coverage."
+  },
+  "game_1536726448965156904": {
+   "wave": "aug13-sixth-cycle-card-targeted",
+   "reviewer": "A: sagas+equipment",
+   "confidence": "recorded",
+   "note": "History of Benalia III and invalid Sword equip targets."
+  },
+  "game_1536731818613805209": {
+   "wave": "aug13-sixth-cycle-card-targeted",
+   "reviewer": "A: devotion+graveyard",
+   "confidence": "recorded",
+   "note": "Card-targeted read; no accepted finding from this game."
+  },
+  "game_1536731905830035456": {
+   "wave": "aug13-sixth-cycle-card-targeted",
+   "reviewer": "A: replacement+aristocrats",
+   "confidence": "recorded",
+   "note": "Lone Gisela fabricated Brisela; deterministic timing/condition finding."
+  },
+  "game_1536726606813470722": {
+   "wave": "aug13-sixth-cycle-card-targeted",
+   "reviewer": "B: aura+equipment",
+   "confidence": "recorded",
+   "note": "Invalid Sword equip target consumed mana."
+  },
+  "game_1536726441863942274": {
+   "wave": "aug13-sixth-cycle-card-targeted",
+   "reviewer": "B: graveyard+sagas",
+   "confidence": "recorded",
+   "note": "History of Benalia comparison game resolved Knights correctly."
+  },
+  "game_1536722205721886782": {
+   "wave": "aug13-sixth-cycle-card-targeted",
+   "reviewer": "B: transform+werewolves",
+   "confidence": "recorded",
+   "note": "Hollowhenge Overlord upkeep token count flattened to one."
+  },
+  "game_1536722196955795528": {
+   "wave": "aug13-sixth-cycle-card-targeted",
+   "reviewer": "C: transform+werewolves",
+   "confidence": "recorded",
+   "note": "Instigator Gang attacking-only anthem was skipped."
+  },
+  "game_1536717894459719740": {
+   "wave": "aug13-sixth-cycle-card-targeted",
+   "reviewer": "C: graveyard+voltron",
+   "confidence": "recorded",
+   "note": "Mantle of the Ancients and Sage's Reverie restrictive multipliers flattened."
+  },
+  "game_1536735383814013000": {
+   "wave": "aug13-sixth-cycle-card-targeted",
+   "reviewer": "C: layers+replacement",
+   "confidence": "recorded",
+   "note": "Card-targeted read; no accepted finding from this game."
+  },
+  "game_1536731855829860433": {
+   "wave": "aug13-sixth-cycle-card-targeted",
+   "reviewer": "D: combat-keywords",
+   "confidence": "recorded",
+   "note": "Vorinclex untap-lock hypothesis deferred: opponent next untap was never reached."
+  },
+  "game_1536726571983839263": {
+   "wave": "aug13-sixth-cycle-card-targeted",
+   "reviewer": "D: death-replacement",
+   "confidence": "recorded",
+   "note": "Activated Strangleroot Geist sacrifice missed shared undying save."
+  },
+  "game_1536726391486156890": {
+   "wave": "aug13-sixth-cycle-card-targeted",
+   "reviewer": "D: replacement",
+   "confidence": "recorded",
+   "note": "Card-targeted read; no accepted finding from this game."
   }
  }
 }

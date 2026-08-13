@@ -2212,7 +2212,15 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
         if is_equip:
             equip_target = (player.find_card(target_name, Zone.BATTLEFIELD)
                             if target_name else None)
-            if equip_target is None:
+            # An explicit target is a choice, not a hint: reject it before
+            # payment rather than silently falling back to auto-select.
+            if target_name and (equip_target is None
+                                or not equip_target.is_creature(game)):
+                await ctx.send(
+                    f"? **{card.name}** can equip only a creature you control; "
+                    f"'{target_name}' is not legal.")
+                return
+            if not target_name:
                 candidates = [c for c in player.battlefield
                               if c.is_creature() and c.id != card.id]
                 if candidates:
@@ -2385,8 +2393,16 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
                 # [LAYERS] Unregister static effects before removal
                 game.unregister_static_effects(card)
                 player.battlefield.remove(card)
-                player.graveyard.append(card)
+                from mtg.helpers import route_dead_permanent
+                _self_sac_destination = route_dead_permanent(
+                    game, card, player, reason='sacrificed as a cost')
                 sacrificed_self = True
+                if _self_sac_destination == 'graveyard':
+                    from mtg.sba import apply_death_save_on_sacrifice
+                    _save_msgs = apply_death_save_on_sacrifice(
+                        self.engine.rules, game, player, card)
+                    if _save_msgs:
+                        game._pending_sac_trigger_msgs = _save_msgs
                 # [SACRIFICE-TRIGGER] Fire Korvold/Mayhem Devil for sac-as-cost
                 # (fetchland, Greater Gargadon, etc.) — direct removal path
                 # bypassed the sacrifice_permanent action, so Korvold's draw
@@ -2394,8 +2410,10 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
                 # message-builder a few lines below can pick them up.
                 try:
                     from mtg.actions import _fire_sacrifice_triggers
-                    game._pending_sac_trigger_msgs = _fire_sacrifice_triggers(
-                        self.engine.rules, game, player, card)
+                    game._pending_sac_trigger_msgs = (
+                        getattr(game, '_pending_sac_trigger_msgs', [])
+                        + (_fire_sacrifice_triggers(
+                            self.engine.rules, game, player, card) or []))
                 except Exception as e:
                     print(f"[SAC-TRIGGER] manual !activate sac-cost scan failed: {e}")
                     game._pending_sac_trigger_msgs = []
@@ -2453,9 +2471,16 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
             # engine.py sacrifice-cost sites — same CR 702.83a / 404.3 /
             # 903.9a routing, the documented two-paths divergence.
             from mtg.helpers import route_dead_permanent
-            route_dead_permanent(game, sac_target, player,
-                                 reason='sacrificed as a cost')
+            _chosen_sac_destination = route_dead_permanent(
+                game, sac_target, player, reason='sacrificed as a cost')
             non_self_sacrificed = sac_target.name
+            if _chosen_sac_destination == 'graveyard':
+                from mtg.sba import apply_death_save_on_sacrifice
+                _save_msgs = apply_death_save_on_sacrifice(
+                    self.engine.rules, game, player, sac_target)
+                if _save_msgs:
+                    existing = getattr(game, '_pending_sac_trigger_msgs', [])
+                    game._pending_sac_trigger_msgs = existing + _save_msgs
             print(f"[ACTIVATE-COST] {player.name} sacrificed {sac_target.name} for {card.name}")
             # Fire sacrifice triggers (Korvold, Blood Artist, Mayhem Devil, etc.)
             try:
