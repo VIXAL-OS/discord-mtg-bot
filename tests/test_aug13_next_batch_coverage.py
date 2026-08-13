@@ -4,7 +4,8 @@ Each test exercises the decision which was absent in the clean e004162
 batch, together with a control which would regress if the handler simply
 matched a card name or nearby precondition.
 """
-from pathlib import Path
+import asyncio
+from types import SimpleNamespace
 
 from conftest import _make_card, _make_game
 
@@ -67,6 +68,8 @@ class TestBlizzardStrix:
 
 class TestKillingWave:
     def test_x_one_pays_life_when_possible_and_sacrifices_at_one_life(self):
+        from rules.effect_templates import build_game_context, get_effect_library
+
         game = _make_game()
         engine = _engine(game)
         payer, cannot_pay = game.players
@@ -75,10 +78,18 @@ class TestKillingWave:
         payer.battlefield.append(payer_creature)
         cannot_pay.battlefield.append(sacrifice_creature)
         cannot_pay.life = 1
-
-        engine.rules._execute_action_on_state(
-            game, {"action": "killing_wave", "x_value": 1,
-                   "source": "Killing Wave"})
+        wave = _make_card(
+            "Killing Wave", type_line="Sorcery", mana_cost="{X}{B}",
+            oracle_text=("For each creature, its controller sacrifices it "
+                         "unless they pay X life."), power=None,
+            toughness=None)
+        wave._x_value = 1
+        ctx = build_game_context(game, payer, cannot_pay, card=wave)
+        actions, _ = get_effect_library().resolve_spell(
+            wave.name, wave.oracle_text, payer.name, cannot_pay.name, ctx)
+        assert actions == [{"action": "killing_wave", "x_value": 1,
+                            "source": "Killing Wave"}]
+        engine.rules._execute_action_on_state(game, actions[0])
 
         assert payer.life == 39
         assert payer_creature in payer.battlefield
@@ -173,6 +184,46 @@ class TestAluren:
         legal, reason = engine.rules.can_cast_spell(game, caster, small)
         assert legal, reason
 
+    def test_free_creature_is_offered_as_zero_mana_stack_response(self):
+        from mtg.claude_player import ClaudePlayer
+        from mtg.models import StackEntry
+
+        class _Messages:
+            def create(self, **_kwargs):
+                return SimpleNamespace(
+                    content=[SimpleNamespace(
+                        type="text", text="cast Aluren Adept")],
+                    usage=None)
+
+        game = _make_game()
+        caster, aluren_controller = game.players
+        aluren_controller.battlefield.append(_make_card(
+            "Aluren", type_line="Enchantment"))
+        responder = _make_card(
+            "Aluren Adept", type_line="Creature — Wizard",
+            mana_cost="{1}{U}", cmc=2,
+            oracle_text=("When Aluren Adept enters, counter target spell."))
+        caster.hand.append(responder)
+        threat = _make_card(
+            "Damnation Test", type_line="Sorcery", mana_cost="{2}{B}{B}",
+            cmc=4, oracle_text="Destroy all creatures. They can't be regenerated.",
+            power=None, toughness=None)
+        game.stack.append(StackEntry(
+            card=threat, controller_name=aluren_controller.name,
+            controller_index=1))
+        ai = ClaudePlayer(SimpleNamespace(messages=_Messages()))
+
+        response = asyncio.run(ai.decide_response(
+            game, 0, threat.name, aluren_controller.name))
+
+        assert response["type"] == "cast"
+        assert response["card"].lower() == responder.name.lower()
+        assert response["target"] == "stack_top"
+
+        aluren_controller.battlefield.clear()
+        assert asyncio.run(ai.decide_response(
+            game, 0, threat.name, aluren_controller.name)) is None
+
 
 class TestTovolarTransformDispatcher:
     def test_tovolar_dispatches_each_new_face_trigger_exactly_once(self, monkeypatch):
@@ -208,19 +259,61 @@ class TestTovolarTransformDispatcher:
 
 
 class TestStackDecisionPendingPin:
-    def test_timeout_waits_while_response_decision_is_pending(self):
-        """A compact source pin for the two cooperating async coroutines.
+    def test_timeout_waits_while_response_decision_is_pending(self, monkeypatch):
+        """The real cast coroutine keeps the spell targetable past timeout."""
+        import mtg.spells as spells
 
-        Full live priority needs a Discord/LLM client; this checks the ordering
-        which keeps the entry targetable while that client is awaited.
-        """
-        root = Path(__file__).resolve().parents[1]
-        engine_source = (root / "mtg" / "engine.py").read_text(encoding="utf-8")
-        spells_source = (root / "mtg" / "spells.py").read_text(encoding="utf-8")
-        pending = "top_stack._stack_ai_decision_pending = True"
-        assert pending in engine_source
-        assert engine_source.index(pending) < engine_source.index(
-            "await engine.claude_ai.decide_response")
-        assert "top_stack._stack_ai_decision_pending = False" in engine_source
-        assert "getattr(stack_entry, '_stack_ai_decision_pending', False)" in spells_source
-        assert "keeping stack entry live" in spells_source
+        class _Priority:
+            active_player = "Rick"
+            priority_holder = "Rick"
+            auto_pass_seconds = 1.0
+            _passes_in_succession = []
+
+            async def player_action(self, _player, _action):
+                return {"success": True,
+                        "stack_object": {"id": "pending-decision-test"}}
+
+            def remove_stack_entry_by_priority_id(self, _priority_id):
+                return None
+
+        game = _make_game()
+        engine = _engine(game)
+        caster, opponent = game.players
+        game.active_player_index = 0
+        game.is_autoplay = True
+        game.stack_enabled = True
+        game._priority_system = _Priority()
+        spell = _make_card(
+            "Pending Test Spell", type_line="Creature — Bear",
+            mana_cost="{0}", cmc=0, oracle_text="", power="2", toughness="2")
+        caster.hand.append(spell)
+        opponent.hand.append(_make_card(
+            "Counterspell", type_line="Instant", mana_cost="{0}", cmc=0,
+            oracle_text="Counter target spell.", power=None, toughness=None))
+        monkeypatch.setattr(spells, "_AUTOPLAY_INTERACTION_TIMEOUT", 0.02)
+        monkeypatch.setattr(spells, "_AI_DECISION_PENDING_TIMEOUT", 0.25)
+        observed = {}
+
+        async def finish_late():
+            while not game.stack or game.stack[-1].resolution_event is None:
+                await asyncio.sleep(0)
+            entry = game.stack[-1]
+            entry._stack_ai_decision_pending = True
+            await asyncio.sleep(0.07)
+            observed["live_after_initial_timeout"] = entry in game.stack
+            entry.countered = True
+            entry._stack_ai_decision_pending = False
+            entry.resolution_event.set()
+
+        async def scenario():
+            result, _ = await asyncio.gather(
+                spells.cast_spell_async(engine, game, caster, spell),
+                finish_late())
+            return result
+
+        success, message, _ = asyncio.run(scenario())
+        assert success
+        assert "countered" in message
+        assert observed["live_after_initial_timeout"] is True
+        assert spell in caster.graveyard
+        assert spell not in caster.battlefield

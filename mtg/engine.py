@@ -46,8 +46,8 @@ from mtg.helpers import (
     _normalize_pw_ability_idx, _resolve_player_or_card_target,
     coerce_ai_string,
     exile_after_resolution_reason, get_mdfc_info, library_top_cast_types,
-    is_castable_from_exile, note_miracle_on_draw, spell_face_for_gates,
-    try_dredge,
+    is_castable_from_exile, note_miracle_on_draw,
+    response_card_is_affordable, spell_face_for_gates, try_dredge,
 )
 from mtg.models import Card, Player, GameState, StackEntry, FormatValidator
 from mtg import events
@@ -819,8 +819,8 @@ class GameEngine:
 
                 # Check affordability (July 20: alternate-cost aware — FoW class)
                 affordable = [c for c in instants
-                              if player.can_pay_mana_cost(c.mana_cost, spending_card=c)[0]
-                              or player.can_pay_printed_alternate_cost(c)]
+                              if response_card_is_affordable(
+                                  player, c, game)]
                 if not affordable:
                     print(f"[STACK-AI] {player_name} has instants but can't afford any — auto-pass")
                     await ps.player_action(player_name, PriorityAction.pass_priority())
@@ -981,8 +981,7 @@ class GameEngine:
             if instants:
                 # July 20: alternate-cost aware — FoW class
                 affordable = [c for c in instants
-                              if p.can_pay_mana_cost(c.mana_cost, spending_card=c)[0]
-                              or p.can_pay_printed_alternate_cost(c)]
+                              if response_card_is_affordable(p, c, game)]
                 if affordable:
                     any_instants = True
                     break

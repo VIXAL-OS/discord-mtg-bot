@@ -552,6 +552,34 @@ def coerce_ai_string(value, _depth=0):
     return ''
 
 
+def is_aluren_free_cast(game, card) -> bool:
+    """Whether Aluren grants this creature its optional free cast.
+
+    Cast legality, payment, prompt advertisement, and priority-response
+    affordability must share this predicate.  The first seventh-cycle repair
+    duplicated it, and the actual response prompt drifted out of the fix.
+    """
+    if game is None or card is None:
+        return False
+    return bool(
+        card.is_creature(game)
+        and (getattr(card, 'cmc', 0) or 0) <= 3
+        and any((getattr(permanent, 'name', '') or '').lower() == 'aluren'
+                for player in game.players
+                for permanent in player.battlefield)
+    )
+
+
+def response_card_is_affordable(player, card, game) -> bool:
+    """Shared priority-window affordability, including free Aluren casts."""
+    return bool(
+        is_aluren_free_cast(game, card)
+        or player.can_pay_mana_cost(
+            card.mana_cost, spending_card=card)[0]
+        or player.can_pay_printed_alternate_cost(card)
+    )
+
+
 def decimate_has_all_target_types(game, caster, source_card) -> bool:
     """Return whether Decimate can choose every mandatory target class.
 

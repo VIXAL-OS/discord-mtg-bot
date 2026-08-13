@@ -1222,9 +1222,7 @@ def _compute_alt_costs(engine, game: GameState, player: Player, card: Card,
 
     # Aluren is a battlefield static permission/cost effect applying to all
     # players, not a one-shot turn effect.  Additional costs remain payable.
-    if (pay_mana and card.is_creature(game) and (card.cmc or 0) <= 3
-            and any((perm.name or '').lower() == 'aluren'
-                    for pl in game.players for perm in pl.battlefield)):
+    if pay_mana and helpers.is_aluren_free_cast(game, card):
         pay_mana = False
         free_cast_source = 'Aluren'
         print(f"[FREE-CAST] {card.name} (MV {card.cmc or 0}) cast for free "
@@ -1575,6 +1573,12 @@ def _pay_costs(engine, game: GameState, player: Player, card: Card,
 # anti-deadlock guarantee — it must stay finite.
 _MAX_LIFO_RESCUE_CYCLES = 12
 
+# Module constants let the real async decision race run in milliseconds in
+# behavioral tests without replacing asyncio primitives.
+_AUTOPLAY_INTERACTION_TIMEOUT = 6.0
+_AUTOPLAY_NO_INTERACTION_TIMEOUT = 0.5
+_AI_DECISION_PENDING_TIMEOUT = 190.0
+
 
 def _force_stack_above(engine, game: GameState, stack_entry,
                        effect_messages: List[str]) -> bool:
@@ -1891,8 +1895,8 @@ async def _await_stack_window(engine, game: GameState, player: Player,
                         if opp_instants:
                             # July 20: alternate-cost aware — FoW class
                             affordable = [c for c in opp_instants
-                                          if opp.can_pay_mana_cost(c.mana_cost, spending_card=c)[0]
-                                          or opp.can_pay_printed_alternate_cost(c)]
+                                          if helpers.response_card_is_affordable(
+                                              opp, c, game)]
                             if affordable:
                                 opponent_has_interaction = True
                                 instant_names = [c.name for c in affordable[:3]]
@@ -1909,7 +1913,7 @@ async def _await_stack_window(engine, game: GameState, player: Player,
                     # If the AI casts a counterspell instead, the response
                     # cast cycle adds another ~2s. 6s gives a generous
                     # safety margin without leaving idle.
-                    resolution_timeout = 6.0
+                    resolution_timeout = _AUTOPLAY_INTERACTION_TIMEOUT
                     # May 7 audit: track whether decide_response was actually
                     # queried during the priority window. If timeout fires
                     # without the AI ever being asked, we want a tagged log
@@ -1917,7 +1921,7 @@ async def _await_stack_window(engine, game: GameState, player: Player,
                     # to pass" from "AI never got the question."
                     stack_entry._stack_ai_queried = False
                 else:
-                    resolution_timeout = 0.5  # No interaction possible — resolve fast
+                    resolution_timeout = _AUTOPLAY_NO_INTERACTION_TIMEOUT
             elif game._priority_system and hasattr(game._priority_system, 'auto_pass_seconds'):
                 resolution_timeout = max(game._priority_system.auto_pass_seconds * 10, 3.0)
             # May 14 audit: if player_action rejected the cast, drop timeout
@@ -1938,10 +1942,12 @@ async def _await_stack_window(engine, game: GameState, player: Player,
                           "still pending at timeout — keeping stack entry live")
                     try:
                         await asyncio.wait_for(
-                            stack_entry.resolution_event.wait(), timeout=190.0)
+                            stack_entry.resolution_event.wait(),
+                            timeout=_AI_DECISION_PENDING_TIMEOUT)
                     except asyncio.TimeoutError:
                         print(f"[STACK-PRIORITY] {card.name}: AI response "
-                              "decision exceeded 190s — closing window")
+                              f"decision exceeded "
+                              f"{_AI_DECISION_PENDING_TIMEOUT}s — closing window")
                     else:
                         # The priority system resolved/countered the entry
                         # while the decision completed.  Skip timeout cleanup.

@@ -174,10 +174,24 @@ def test_aurelia_lock_blocks_only_noncreatures_and_expires(
     rick, opponent = game.players
     game.active_player_index = 1
     engine = _engine(game)
-    lock_message = engine.rules._execute_action_on_state(game, {
-        "action": "restrict_noncreature_casts", "player": opponent.name,
-        "source": "Aurelia's Fury",
-    })
+    fury = make_card(
+        "Aurelia's Fury", type_line="Instant", mana_cost="{X}{R}{W}",
+        oracle_text=("Aurelia's Fury deals X damage divided as you choose "
+                     "among any number of targets. Tap each creature dealt "
+                     "damage this way. Players dealt damage this way can't "
+                     "cast noncreature spells this turn."),
+        power=None, toughness=None)
+    fury._x_value = 1
+    ctx = build_game_context(
+        game, rick, opponent, card=fury, explicit_target=opponent)
+    actions, _ = get_effect_library().resolve_spell(
+        fury.name, fury.oracle_text, rick.name, opponent.name, ctx)
+    assert [action["action"] for action in actions] == [
+        "deal_damage", "restrict_noncreature_casts"]
+    messages = [engine.rules._execute_action_on_state(game, action)
+                for action in actions]
+    assert opponent.life == 39
+    lock_message = messages[1]
     assert "can't cast noncreature spells" in lock_message
 
     bolt = make_card("Shock", type_line="Instant",
@@ -203,3 +217,31 @@ def test_aurelia_lock_blocks_only_noncreatures_and_expires(
     game.turn_number += 1
     expired_rejection, _, _ = _validate_cast(engine, game, opponent, bolt, rick)
     assert expired_rejection is None
+
+
+def test_aurelia_creature_target_is_tapped_without_locking_a_player(
+        make_game, make_card):
+    game = make_game()
+    rick, opponent = game.players
+    engine = _engine(game)
+    victim = make_card("Fury Victim", type_line="Creature — Bear")
+    opponent.battlefield.append(victim)
+    fury = make_card(
+        "Aurelia's Fury", type_line="Instant", mana_cost="{X}{R}{W}",
+        oracle_text=("Aurelia's Fury deals X damage divided as you choose "
+                     "among any number of targets. Tap each creature dealt "
+                     "damage this way. Players dealt damage this way can't "
+                     "cast noncreature spells this turn."),
+        power=None, toughness=None)
+    fury._x_value = 1
+    ctx = build_game_context(
+        game, rick, opponent, card=fury, explicit_target=victim)
+    actions, _ = get_effect_library().resolve_spell(
+        fury.name, fury.oracle_text, rick.name, opponent.name, ctx)
+    assert [action["action"] for action in actions] == ["deal_damage", "tap"]
+    for action in actions:
+        engine.rules._execute_action_on_state(game, action)
+    assert victim.damage_marked == 1
+    assert victim.tapped
+    assert not hasattr(rick, '_noncreature_cast_lock_turn')
+    assert not hasattr(opponent, '_noncreature_cast_lock_turn')

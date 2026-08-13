@@ -29,7 +29,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import anthropic
 
 from mtg.constants import Phase, Zone, COMMAND_ZONE_FORMATS
-from mtg.helpers import response_text
+from mtg.helpers import is_aluren_free_cast, response_text
 from mtg.models import Card, Player, GameState
 from mtg.deck_loader import DeckLoader
 from mtg.display import GameDisplay
@@ -163,10 +163,7 @@ class RulesEngine:
 
         # Check timing — but Flash creatures/artifacts/etc. bypass sorcery-speed restrictions
         has_flash = card.has_keyword('Flash') or (card.oracle_text and 'flash' in card.oracle_text.lower().split('\n')[0])
-        _aluren_permission = (
-            card.is_creature(game) and (card.cmc or 0) <= 3
-            and any((perm.name or '').lower() == 'aluren'
-                    for pl in game.players for perm in pl.battlefield))
+        _aluren_permission = is_aluren_free_cast(game, card)
         if _aluren_permission:
             has_flash = True
         # Madness (CR 702.35a): the cast happens as the madness trigger

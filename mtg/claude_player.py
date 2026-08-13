@@ -30,7 +30,9 @@ from mtg.constants import (
     Phase, Zone, COMMAND_ZONE_FORMATS, FORMAT_DECK_SIZE,
     FORMAT_STARTING_LIFE, MANA_COLOR_IDENTITY, PHASE_NAMES, PHASE_ORDER,
 )
-from mtg.helpers import response_text
+from mtg.helpers import (
+    is_aluren_free_cast, response_card_is_affordable, response_text,
+)
 from mtg.models import Card, Player, GameState, FormatValidator
 
 # Optional: structured mana cost parser
@@ -3640,10 +3642,7 @@ Respond with ONLY "keep" or "mulligan"."""
                 instants.append(card)
             elif card.oracle_text and 'flash' in card.oracle_text.lower():
                 instants.append(card)
-            elif (game is not None and card.is_creature(game)
-                  and (card.cmc or 0) <= 3
-                  and any(p.name.lower() == 'aluren'
-                          for pl in game.players for p in pl.battlefield)):
+            elif is_aluren_free_cast(game, card):
                 instants.append(card)
         return instants
 
@@ -3750,7 +3749,7 @@ Respond with ONLY "keep" or "mulligan"."""
         Only called when the player actually has instants/flash in hand (pre-filtered).
         """
         player = game.players[player_index]
-        instants = self.has_instant_speed_cards(player)
+        instants = self.has_instant_speed_cards(player, game)
         if not instants:
             return None  # No instants — auto-pass
         # June 11 audit: the engine's pre-filter counts AFFORDABLE instants,
@@ -3762,8 +3761,8 @@ Respond with ONLY "keep" or "mulligan"."""
             # July 20: alternate-cost aware — Force of Will is castable off
             # 1 life + a blue card even at zero mana (was dead in hand).
             _affordable = [c for c in instants
-                           if player.can_pay_mana_cost(c.mana_cost, spending_card=c)[0]
-                           or player.can_pay_printed_alternate_cost(c)]
+                           if response_card_is_affordable(
+                               player, c, game)]
             if len(_affordable) < len(instants):
                 _dropped = [c.name for c in instants if c not in _affordable]
                 print(f"[STACK-AI] {player.name}: filtered unaffordable instants from "
