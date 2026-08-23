@@ -6733,7 +6733,11 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
             lib = get_effect_library()
             opp = next((pp for pp in game.players if pp != p), p)
             ctx = build_game_context(game, p, opp, card=cycle_card)
-            ctx['_cycle_x'] = int(x_value)  # Templates read X from ctx for X/X token cards
+            # Aug 23: templates read `x_value`; `_cycle_x` alone was a key
+            # nothing consumed, so a cycling template could never see the
+            # X that was actually paid.
+            ctx['_cycle_x'] = int(x_value)
+            ctx['x_value'] = int(x_value)
             # Look for "When you cycle <card>" trigger paragraph
             trigger_text = ""
             for paragraph in (cycle_card.oracle_text or '').split('\n'):
@@ -6742,8 +6746,23 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                     trigger_text = paragraph.strip()
                     break
             if trigger_text:
+                # Aug 23 audit (CRITICAL): passing the BARE card name let
+                # the name-keyed template for the card's MAIN spell answer
+                # a lookup already narrowed to the cycling trigger. Cycling
+                # Decree of Justice created a 4/4 Angel (its main spell)
+                # instead of its trigger's 1/1 Soldiers — and with X unpaid
+                # it should have created nothing at all. Same class as the
+                # Aug 10 Wrenn and Seven finding: a bare name key matches
+                # for EVERY ability of that card.
+                #
+                # A suffix key keeps a dedicated cycling template reachable
+                # (the `soulherder endstep` convention) while making the
+                # main template unreachable from here. With no suffix
+                # template the lookup falls through to oracle patterns on
+                # trigger_text, which is the right answer for a card whose
+                # cycling trigger this library does not model.
                 actions_list, explanation = lib.resolve_etb(
-                    card_name=cycle_card.name,
+                    card_name=f"{cycle_card.name} cycling",
                     oracle_text=trigger_text,
                     controller=p.name,
                     opponent=opp.name,

@@ -4492,9 +4492,24 @@ async def cast_spell_async(engine, game: GameState, player: Player, card: Card,
     if _final is not None:
         return _final
 
-    _success, _message, _effects = await _dispatch_resolution(
-        engine, game, player, card, target, effect_messages,
-        cast_trigger_msgs, player_idx)
+    # Q-J slice 1: publish which durable job owns the effect about to run,
+    # so the Tier-3 loop can persist its plan before applying it and claim
+    # each action idempotently. Found by CARD IDENTITY, never display name —
+    # two copies of one card on the stack are exactly what Q-I's exact-id
+    # work exists for. Restored rather than cleared, so a nested resolution
+    # cannot strand an outer cast's stamp. None means "no durable job"
+    # (trigger drains, manual activations) and Q-J degrades to prior
+    # behaviour there.
+    _prev_job_stamp = getattr(game, '_active_resolution_job_id', None)
+    _bind_job = ResolutionCoordinator.for_game(engine, game).find(card)
+    game._active_resolution_job_id = (
+        _bind_job.job_id if _bind_job is not None else None)
+    try:
+        _success, _message, _effects = await _dispatch_resolution(
+            engine, game, player, card, target, effect_messages,
+            cast_trigger_msgs, player_idx)
+    finally:
+        game._active_resolution_job_id = _prev_job_stamp
     # ETB templates are synchronous. If one queued a spell/card copy (most
     # notably Capricious Hellraiser), cast it now, after the ETB ability has
     # finished resolving and before control returns to the turn loop.

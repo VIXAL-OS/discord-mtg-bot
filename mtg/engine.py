@@ -1760,6 +1760,23 @@ class GameEngine:
                 print(f"[QUEUE-DEDUP] {source_card.name} ({trigger_type}) "
                       f"already pending — not re-queued")
                 return False
+        # Q-J slice 4: persist the event BEFORE it goes on the in-memory
+        # queue. pending_async_triggers holds live Card refs and is absent
+        # from to_dict(), so a save taken here used to drop the whole queue
+        # silently; the durable record is what a restore rebuilds from.
+        _event_id = ""
+        try:
+            from mtg.resolution import ResolutionCoordinator
+            _event_id = ResolutionCoordinator.for_game(self, game).record_event(
+                "trigger", source_card, controller_name=controller_name,
+                trigger_text=trigger_text, trigger_type=trigger_type,
+                context=context, occurrence_key=occurrence_key).event_id
+        except (AttributeError, TypeError, ValueError) as e:
+            # Durability is additive: a game without a coordinator (or a
+            # source with no usable identity) must still queue and fire.
+            from mtg.util import maybe_reraise
+            maybe_reraise(e)
+            print(f"[RESOLVE-EVENT] could not persist {source_card.name}: {e}")
         game.pending_async_triggers.append({
             'source_card': source_card,
             'trigger_text': trigger_text,
@@ -1767,9 +1784,30 @@ class GameEngine:
             'controller_name': controller_name,
             'context': context,
             'occurrence_key': occurrence_key,
+            'event_id': _event_id,
         })
-        print(f"[QUEUE-{trigger_type.upper()}] Queued {source_card.name} for async resolution")
+        print(f"[QUEUE-{trigger_type.upper()}] Queued {source_card.name} for async resolution"
+              f" (event={_event_id or 'NONE'})")
         return True
+
+    def _mark_deaths_dispatched(self, game: GameState, batch) -> None:
+        """Q-J slice 4: claim a death wave's durable records as it is drained.
+
+        Called at the two dispatcher sites that snapshot-and-clear
+        _recently_died, so the durable half is claimed at exactly the moment
+        the in-memory half stops existing.
+        """
+        try:
+            from mtg.resolution import ResolutionCoordinator
+            coord = ResolutionCoordinator.for_game(self, game)
+            for event in coord.undispatched_events(kind="death"):
+                if any(str(getattr(card, "id", "")) == event.source_id
+                       for card, _p in batch):
+                    coord.mark_event_dispatched(event.event_id)
+        except (AttributeError, TypeError, ValueError) as e:
+            from mtg.util import maybe_reraise
+            maybe_reraise(e)
+            print(f"[RESOLVE-EVENT] could not claim death wave: {e}")
 
     def queue_unhandled_dies(self, game: GameState, dead_card: Card,
                              dead_player: Player, unhandled) -> None:
@@ -2322,6 +2360,7 @@ class GameEngine:
             # a later wave and must not be visible to sources that died here.
             game._recently_died = []
             game._active_dies_batch = recently_died
+            self._mark_deaths_dispatched(game, recently_died)
             if game.triggers_use_stack and game.stack_enabled:
                 # Stack mode: collect all triggers and place on stack via APNAP ordering
                 all_trigger_infos = []
@@ -2738,6 +2777,7 @@ class GameEngine:
                 if recently_died and not game.ended:
                     game._recently_died = []
                     game._active_dies_batch = recently_died
+                    self._mark_deaths_dispatched(game, recently_died)
                     # May 30 audit (F-LD2): apply the same APNAP sort the SBA drain
                     # uses (engine.py ~1774) so multi-controller dies-triggers
                     # resolve NAP-first per CR 603.3b LIFO. This drain previously

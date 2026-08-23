@@ -79,6 +79,18 @@ def create_choice(
         "complete": False,
         "timed_out": False,
     }
+    # Q-J slice 3: link the choice to the resolution that opened it, so a
+    # recovered job knows it was BLOCKED on a human answer rather than
+    # merely unfinished. The link is APPEND-ONLY and "unresolved" is derived
+    # from the record's own `complete` flag — maintaining a removal list
+    # would mean catching every completion path (submit, timeout, cancel,
+    # elimination), and a missed one would strand a job forever.
+    owning_job = getattr(game, "_active_resolution_job_id", None)
+    if owning_job:
+        record["owning_job"] = str(owning_job)
+        job = game.resolution_jobs.get(str(owning_job))
+        if job is not None and choice_id not in job.unresolved_choice_ids:
+            job.unresolved_choice_ids.append(choice_id)
     game.pending_choices[choice_id] = record
     game._choice_runtime[choice_id] = {
         "future": future,

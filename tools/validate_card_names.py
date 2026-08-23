@@ -66,6 +66,12 @@ USER_AGENT = "mtg-bot-card-name-validator/1.0 (https://github.com/VIXAL-OS)"
 SYNTHETIC_SUFFIXES = (
     " endstep", " upkeep", " beginningcombat",
     " ltb", "_ltb", " sacrifice",
+    # Aug 23, 2026: the cycling-trigger key. A BARE name key answers a scoped
+    # lookup for EVERY ability of that card (the Wrenn and Seven class), so a
+    # card whose cycling trigger differs from its main spell must be keyed
+    # "<name> cycling" — Decree of Justice was resolving its main spell's
+    # Angels off a cycling trigger before that.
+    " cycling",
 )
 
 # Intentional non-card keys. Every entry needs a justifying comment.

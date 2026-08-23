@@ -416,13 +416,42 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
                 print(f"⚠️ Could not load default deck: {e}")
     
     async def _thread_send(self, thread, content=None, **kwargs):
-        """Send a message to a thread and log it to the game's Discord log."""
+        """Send a message to a thread and log it to the game's Discord log.
+
+        Q-J slice 2: a human game's visible lines go through the durable
+        narration outbox — enqueued (and persisted) BEFORE the send, acked
+        after. Omission and duplication are separate failure modes: the
+        pre-send enqueue is what survives a death mid-send, and the ack is
+        what stops recovery re-posting a line that already landed.
+
+        Autoplay is deliberately untouched: it has its own sender, and its
+        coordinator treats saves as a no-op because those games are
+        disposable diagnostics rather than a recovery contract.
+        """
         thread_id = getattr(thread, 'id', None)
         if thread_id and content:
             logger = self.game_loggers.get(thread_id)
             if logger:
                 logger.log_discord_out(str(content))
-        return await thread.send(content, **kwargs)
+        coord = entry = None
+        game = self.engine.games.get(thread_id) if thread_id else None
+        if game is not None and content and not getattr(
+                game, 'is_autoplay', False):
+            try:
+                from mtg.resolution import ResolutionCoordinator
+                coord = ResolutionCoordinator.for_game(self.engine, game)
+                entry = coord.enqueue_narration(
+                    str(content),
+                    job_id=getattr(game, '_active_resolution_job_id', None))
+            except (AttributeError, TypeError, ValueError, OSError) as exc:
+                # Narrow on purpose: a broken outbox must not silence the
+                # game, but it must not hide a real bug either.
+                coord = entry = None
+                print(f"[NARRATION] not enqueued: {exc}")
+        result = await thread.send(content, **kwargs)
+        if coord is not None and entry is not None:
+            coord.mark_narration_sent(entry.message_id)
+        return result
 
     async def _dm_choice_to_user(self, game, player_idx, record) -> bool:
         """DM one stable seat's choice inventory without a public fallback."""

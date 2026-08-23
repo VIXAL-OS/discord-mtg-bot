@@ -4935,6 +4935,110 @@ class ResolutionTargetRef:
 
 
 @dataclass
+class ResolutionEvent:
+    """One trigger or SBA death created during a resolution, by stable id.
+
+    Q-J slice 4.  The in-memory queues these mirror hold LIVE ``Card``
+    references (``game.pending_async_triggers``) or ``(Card, Player)`` tuples
+    (``game._recently_died``), so neither can be written to a JSON snapshot —
+    and neither was.  A save taken while either queue was non-empty dropped
+    every entry SILENTLY: a queued Blood Artist trigger round-tripped to
+    ``[]`` rather than to an error.  Silent omission is exactly what the Q-J
+    requirements forbid, which is why the durable record is by id.
+
+    CHOSEN SEMANTIC — at-most-once, matching the action ledger.  A record is
+    marked ``dispatched`` BEFORE the trigger resolves, so a process death
+    mid-drain drops that one trigger rather than firing it twice.  The
+    direction is the same argument the module docstring in mtg/resolution.py
+    makes for actions, and it applies with MORE force here: a drained trigger
+    resolves through Tier 3, which mints a fresh plan every time, so a
+    re-dispatch would apply a second plan's mutations on top of the first.
+    A dropped Blood Artist drain is visible and fixable at the table; a
+    doubled one is an illegal state nobody can unwind.
+    """
+    event_id: str
+    kind: str                      # "trigger" | "death"
+    source_id: str
+    source_name: str
+    controller_name: str = ""
+    trigger_text: str = ""
+    trigger_type: str = ""
+    context: str = ""
+    occurrence_key: Optional[str] = None
+    job_id: str = ""
+    dispatched: bool = False
+
+    def to_dict(self) -> Dict:
+        return {
+            "event_id": self.event_id,
+            "kind": self.kind,
+            "source_id": self.source_id,
+            "source_name": self.source_name,
+            "controller_name": self.controller_name,
+            "trigger_text": self.trigger_text,
+            "trigger_type": self.trigger_type,
+            "context": self.context,
+            "occurrence_key": self.occurrence_key,
+            "job_id": self.job_id,
+            "dispatched": self.dispatched,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict) -> "ResolutionEvent":
+        return cls(
+            event_id=str(data.get("event_id", "")),
+            kind=str(data.get("kind", "trigger")),
+            source_id=str(data.get("source_id", "")),
+            source_name=str(data.get("source_name", "")),
+            controller_name=str(data.get("controller_name", "")),
+            trigger_text=str(data.get("trigger_text", "")),
+            trigger_type=str(data.get("trigger_type", "")),
+            context=str(data.get("context", "")),
+            occurrence_key=data.get("occurrence_key"),
+            job_id=str(data.get("job_id", "")),
+            dispatched=bool(data.get("dispatched", False)),
+        )
+
+
+@dataclass
+class NarrationEntry:
+    """One user-visible line, with a stable id and a sent acknowledgement.
+
+    Q-J requires that a restart neither DUPLICATES nor OMITS visible events.
+    Those are two different failure modes and they pull in opposite
+    directions, so both halves are recorded rather than one:
+
+      - omission is prevented by enqueuing (and persisting) BEFORE the send,
+        so a line whose send never completed is still on disk afterwards;
+      - duplication is prevented by the ack, so a line already delivered is
+        never re-sent, and by the id being deterministic per scope+position,
+        so a replayed resolution re-derives the SAME id instead of minting a
+        second entry for the same line.
+    """
+    message_id: str
+    content: str
+    sent: bool = False
+    scope: str = "loose"
+
+    def to_dict(self) -> Dict:
+        return {
+            "message_id": self.message_id,
+            "content": self.content,
+            "sent": self.sent,
+            "scope": self.scope,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict) -> "NarrationEntry":
+        return cls(
+            message_id=str(data.get("message_id", "")),
+            content=str(data.get("content", "")),
+            sent=bool(data.get("sent", False)),
+            scope=str(data.get("scope", "loose")),
+        )
+
+
+@dataclass
 class ResolutionJob:
     """Durable continuation record for one spell/ability resolution.
 
@@ -4963,6 +5067,8 @@ class ResolutionJob:
     unresolved_choice_ids: List[str] = field(default_factory=list)
     planned_actions: List[Dict] = field(default_factory=list)
     applied_action_keys: List[str] = field(default_factory=list)
+    # Q-J slice 4: ids of the trigger/SBA events this resolution created.
+    trigger_event_ids: List[str] = field(default_factory=list)
     recovery_error: str = ""
 
     @staticmethod
@@ -5058,6 +5164,7 @@ class ResolutionJob:
             "unresolved_choice_ids": self.unresolved_choice_ids,
             "planned_actions": self.planned_actions,
             "applied_action_keys": self.applied_action_keys,
+            "trigger_event_ids": self.trigger_event_ids,
             "recovery_error": self.recovery_error,
         }
 
@@ -5087,6 +5194,7 @@ class ResolutionJob:
                 data.get("unresolved_choice_ids") or []),
             planned_actions=list(data.get("planned_actions") or []),
             applied_action_keys=list(data.get("applied_action_keys") or []),
+            trigger_event_ids=list(data.get("trigger_event_ids") or []),
             recovery_error=str(data.get("recovery_error", "")),
         )
 
@@ -5243,6 +5351,13 @@ class GameState:
     # record. Completed jobs are retained for audit/idempotency evidence and
     # may be compacted by a later journal policy.
     resolution_jobs: Dict[str, ResolutionJob] = field(default_factory=dict)
+    # Q-J slice 2: durable narration. Bounded — see prune_narration().
+    narration_outbox: List[NarrationEntry] = field(default_factory=list)
+    # Q-J slice 4: durable trigger/SBA events keyed by event_id.  The
+    # in-memory queues these mirror (pending_async_triggers, _recently_died)
+    # hold live objects and cannot serialize; this is the half that can.
+    # Bounded — see prune_resolution_events().
+    resolution_events: Dict[str, ResolutionEvent] = field(default_factory=dict)
 
     # Stack/priority feature flag — when True, spells go on stack with priority passes
     stack_enabled: bool = False
@@ -5448,6 +5563,15 @@ class GameState:
     # lets action handlers attribute damage / validate targets without every
     # caller threading source metadata explicitly.
     _current_resolution_source: Any = field(default=None, repr=False, compare=False)
+    # Q-J slice 1: the durable ResolutionJob id whose effect is executing
+    # right now, so the Tier-3 loop can persist its plan and claim each
+    # action idempotently. Stamped by _dispatch_resolution, which is the
+    # only place a cast's job is unambiguously in scope; resolve_effect
+    # has 23 call sites and threading a kwarg through them all would put
+    # the identity in the callers rather than at the one seam that owns
+    # it. None means "no durable job" (trigger drains, manual
+    # activations) and every Q-J path degrades to today's behaviour.
+    _active_resolution_job_id: Any = field(default=None, repr=False, compare=False)
     # !undo snapshot stack (list of to_dict snapshots; depth-capped in cog).
     _undo_stack: list = field(default_factory=list, repr=False, compare=False)
     # Discord thread object for the running autoplay game (carried over on !undo).
@@ -7117,6 +7241,14 @@ class GameState:
                 job_id: job.to_dict() if hasattr(job, "to_dict") else job
                 for job_id, job in self.resolution_jobs.items()
             },
+            "narration_outbox": [
+                entry.to_dict() if hasattr(entry, "to_dict") else entry
+                for entry in self.narration_outbox
+            ],
+            "resolution_events": {
+                event_id: event.to_dict() if hasattr(event, "to_dict") else event
+                for event_id, event in self.resolution_events.items()
+            },
             "stack_enabled": self.stack_enabled,
             "combat_priority_window": self.combat_priority_window,
             "priority_state": (
@@ -7258,6 +7390,16 @@ class GameState:
         game.resolution_jobs = {
             str(job_id): ResolutionJob.from_dict(payload)
             for job_id, payload in (data.get("resolution_jobs") or {}).items()
+        }
+        game.narration_outbox = [
+            NarrationEntry.from_dict(payload)
+            for payload in (data.get("narration_outbox") or [])
+            if isinstance(payload, dict)
+        ]
+        game.resolution_events = {
+            str(event_id): ResolutionEvent.from_dict(payload)
+            for event_id, payload in (data.get("resolution_events") or {}).items()
+            if isinstance(payload, dict)
         }
         restored_stack = []
         for payload in data.get("stack", []):

@@ -303,6 +303,19 @@ async def drain_pending_triggers(engine, game: GameState) -> List[str]:
         ctx = entry.get('context', '')
         if src is None or not trigger_text:
             continue
+        # Q-J slice 4: claim the durable record BEFORE resolving. At-most-once
+        # by design — a drained trigger resolves through Tier 3, which mints a
+        # fresh plan every call, so a re-dispatch would apply a SECOND plan's
+        # mutations on top of the first.
+        _eid = entry.get('event_id')
+        if _eid:
+            try:
+                from mtg.resolution import ResolutionCoordinator
+                if not ResolutionCoordinator.for_game(
+                        engine, game).mark_event_dispatched(_eid):
+                    continue
+            except (AttributeError, TypeError, ValueError) as e:
+                maybe_reraise(e)
         # CR 117.5: SBAs check whenever a player would receive priority,
         # which is between every trigger resolution. If a player has
         # already lost during this drain (e.g. the previous Blood Artist
@@ -6369,6 +6382,17 @@ def _accumulate_death_subscriber(game, card=None, player=None, **_):
     if card is None:
         return
     game._recently_died.append((card, player))
+    # Q-J slice 4: _recently_died holds (Card, Player) tuples and is a
+    # declared TRANSIENT — absent from to_dict(). A save taken between this
+    # append and the dispatcher's snapshot dropped the whole wave silently.
+    try:
+        from mtg.resolution import ResolutionCoordinator
+        ResolutionCoordinator.attached(game).record_event(
+            "death", card,
+            controller_name=(player.name if player is not None else ""))
+    except (AttributeError, TypeError, ValueError) as e:
+        maybe_reraise(e)
+        print(f"[RESOLVE-EVENT] could not persist death of {card.name}: {e}")
     # Aug 7 confirmation-batch audit (A-1, CRITICAL): snapshot WHO WAS
     # PRESENT when this death happened, for EVERY death — previously only
     # Living Death populated _dies_source_ids_by_dead_id, so the deferred

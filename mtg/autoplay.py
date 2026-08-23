@@ -2506,12 +2506,21 @@ async def _autoplay_execute_action(cog, thread, game: GameState, player_idx: int
             print(f"[AUTOPLAY] cycle action missing card name: {action}")
             return None
         print(f"[AUTOPLAY] Dispatching cycle for {cyc_name}")
-        return cog.engine.rules._execute_action_on_state(game, {
+        cyc_msg = cog.engine.rules._execute_action_on_state(game, {
             "action": "cycle",
             "player": player.name,
             "card": cyc_name,
             "x": action.get("X") or action.get("x") or 0,
         })
+        # Aug 23 audit: this branch RETURNED its message without sending
+        # it, unlike the 19 sibling branches that call _autoplay_send.
+        # The caller uses the returned list only as a truthiness flag for
+        # `turn_had_actions`, so the whole cycle — cost, draw and any
+        # tokens — was invisible in Discord. Same discarded-return class
+        # as the Aug 1 L3/M4 findings.
+        if cyc_msg:
+            await cog._autoplay_send(thread, cyc_msg)
+        return cyc_msg
 
     elif action_type == "activate":
         perm_name = action.get("permanent")

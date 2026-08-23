@@ -1034,7 +1034,28 @@ Respond with ONLY the JSON object, no markdown, no backticks, no preamble."""
         if not explanation:
             explanation = "Effect resolved"
         actions = result.get("actions", [])
-        
+
+        # Q-J slice 1: persist the plan BEFORE any of it runs. Recovery
+        # must never re-query Tier 3 — a second call can legitimately
+        # return a DIFFERENT plan, and applying half of one and half of
+        # another is not a resolution of anything.
+        _coord = None
+        _job_id = getattr(game, '_active_resolution_job_id', None)
+        if _job_id and actions:
+            try:
+                from mtg.resolution import ResolutionCoordinator
+                _coord = ResolutionCoordinator.for_game(
+                    getattr(rules, 'engine_ref', None), game)
+                _coord.record_plan(_job_id, actions, tier="tier3")
+            except (AttributeError, TypeError, ValueError, KeyError,
+                    OSError) as _e:
+                # Narrow on purpose: the ratchet's point is that a bare
+                # `except Exception` here would turn a real resolution bug
+                # into a silently unpersisted plan. OSError is in the tuple
+                # because record_plan's persist writes the save file.
+                _coord = None
+                print(f"[RESOLVE-PLAN] plan not persisted: {_e}")
+
         if not actions:
             return [f"📜 {explanation}"], []
         
@@ -1054,7 +1075,16 @@ Respond with ONLY the JSON object, no markdown, no backticks, no preamble."""
         if source_card:
             game._current_resolution_source = (source_card, controller or "")
         try:
-            for action in actions:
+            for _action_index, action in enumerate(actions):
+                # Q-J slice 1: claim the action before executing it. A
+                # key already in the ledger means a previous process
+                # owned this action; at-most-once is the deliberate
+                # direction (see mtg/resolution.py module docstring).
+                if _coord is not None:
+                    _should_apply, _ = _coord.claim_action(
+                        _job_id, _action_index, action)
+                    if not _should_apply:
+                        continue
                 action_type = action.get("action", "")
 
                 if action_type == "no_action":

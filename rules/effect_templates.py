@@ -2208,10 +2208,34 @@ class EffectTemplateLibrary:
             name="Decree of Justice",
             description="Create X 4/4 white Angel creature tokens with flying",
             action_generator=lambda ctrl, opp, ctx: [
+                # Aug 23 audit: the description promised "with flying" and
+                # the action granted no keywords, so these Angels could not
+                # block fliers — a live 4/4 Angel was refused as a blocker
+                # against Kokusho, the Evening Star.
                 {"action": "create_token", "player": ctrl, "name": "Angel",
                  "power": 4, "toughness": 4, "types": "Creature — Angel",
-                 "count": max(1, ctx.get('x_value', 1))}
+                 "keywords": "flying",
+                 "count": int(ctx.get('x_value', 1) or 0)}
             ],
+        ))
+
+        # Aug 23 audit: the CYCLING half, under the suffix key so it can
+        # never be answered by the main spell above. Printed: "When you
+        # cycle this card, you may pay {X}. If you do, create X 1/1 white
+        # Soldier creature tokens." Unpaid X means no tokens, which is
+        # exactly what happened live and was resolved as an Angel instead.
+        self._add_card("decree of justice cycling", EffectTemplate(
+            name="Decree of Justice (cycling)",
+            description="If you paid X, create X 1/1 white Soldier tokens",
+            action_generator=lambda ctrl, opp, ctx: (
+                [{"action": "create_token", "player": ctrl,
+                  "name": "Soldier", "power": 1, "toughness": 1,
+                  "types": "Creature — Soldier",
+                  "count": int(ctx.get('x_value', 0) or 0)}]
+                if int(ctx.get('x_value', 0) or 0) > 0
+                else [{"action": "no_action",
+                       "reason": "cycling X was not paid"}]
+            ),
         ))
 
         self._add_card("secure the wastes", EffectTemplate(
@@ -2220,7 +2244,7 @@ class EffectTemplateLibrary:
             action_generator=lambda ctrl, opp, ctx: [
                 {"action": "create_token", "player": ctrl, "name": "Warrior",
                  "power": 1, "toughness": 1, "types": "Creature — Warrior",
-                 "count": max(1, ctx.get('x_value', 1))}
+                 "count": int(ctx.get('x_value', 1) or 0)}
             ],
         ))
 
@@ -2228,9 +2252,14 @@ class EffectTemplateLibrary:
             name="Entreat the Angels",
             description="Create X 4/4 white Angel creature tokens with flying",
             action_generator=lambda ctrl, opp, ctx: [
+                # Aug 23 audit: the description promised "with flying" and
+                # the action granted no keywords, so these Angels could not
+                # block fliers — a live 4/4 Angel was refused as a blocker
+                # against Kokusho, the Evening Star.
                 {"action": "create_token", "player": ctrl, "name": "Angel",
                  "power": 4, "toughness": 4, "types": "Creature — Angel",
-                 "count": max(1, ctx.get('x_value', 1))}
+                 "keywords": "flying",
+                 "count": int(ctx.get('x_value', 1) or 0)}
             ],
         ))
 
@@ -8112,7 +8141,7 @@ class EffectTemplateLibrary:
             action_generator=lambda ctrl, opp, ctx: [
                 {"action": "create_token", "player": ctrl, "name": "Soldier",
                  "power": 1, "toughness": 1, "types": "Creature — Soldier",
-                 "count": max(1, ctx.get('x_value', 1)), "keywords": "lifelink"},
+                 "count": int(ctx.get('x_value', 1) or 0), "keywords": "lifelink"},
             ],
         ))
 
@@ -8681,7 +8710,7 @@ class EffectTemplateLibrary:
             action_generator=lambda ctrl, opp, ctx: [
                 {"action": "create_token", "player": ctrl, "name": "Cat",
                  "power": 2, "toughness": 2, "types": "Creature — Cat",
-                 "count": max(1, ctx.get('x_value', 3))},
+                 "count": int(ctx.get('x_value', 3) or 0)},
                 {"action": "move_card", "card": "White Sun's Zenith",
                  "from_zone": "stack", "to_zone": "library", "player": ctrl},
             ],
@@ -11057,17 +11086,21 @@ class EffectTemplateLibrary:
     def _gen_finale_of_glory(self, ctrl, opp, ctx) -> List[Dict]:
         """Finale of Glory: Create X 2/2 white Soldier tokens with vigilance.
         If X >= 10, also create X 4/4 white Angel tokens with flying."""
-        x = max(1, ctx.get('x_value', 1))
+        # Aug 23 audit: three defects of one family, all missed by the
+        # first sweep because it scanned `description=` fields and this is a
+        # generator with a DOCSTRING. The floor minted a free Soldier at X=0,
+        # and neither token carried the keyword its own docstring promises.
+        x = int(ctx.get('x_value', 1) or 0)
         actions = [
             {"action": "create_token", "player": ctrl, "name": "Soldier",
              "power": 2, "toughness": 2, "types": "Creature — Soldier",
-             "count": x},
+             "keywords": "vigilance", "count": x},
         ]
         if x >= 10:
             actions.append(
                 {"action": "create_token", "player": ctrl, "name": "Angel",
                  "power": 4, "toughness": 4, "types": "Creature — Angel",
-                 "count": x}
+                 "keywords": "flying", "count": x}
             )
         return actions
 
