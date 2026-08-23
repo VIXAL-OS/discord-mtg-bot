@@ -361,6 +361,42 @@ def drain_combat_damage_triggers(rules, game: GameState,
         game._combat_damage_to_creature = []
 
 
+def deal_unblocked_damage(rules, game, attacker, amount, defending_player,
+                          messages):
+    """Land unblocked/trample damage on a planeswalker if one was attacked.
+
+    Returns the damage actually dealt, so callers keep their existing lifelink
+    and trigger handling unchanged — lifelink fires either way, since CR
+    702.15b turns on damage DEALT and not on what received it.
+
+    Three CR points, all of which differ from the player path:
+      - damage to a planeswalker removes that many loyalty counters
+        (CR 120.3c), it does not reduce life;
+      - commander damage does NOT accrue, because this is damage to a
+        permanent rather than to a player (CR 903.10a);
+      - if the planeswalker has already left, the damage is simply not dealt
+        (CR 506.4 / 508.1) — it is NOT redirected to its controller.
+    """
+    walker = game.attacked_planeswalker_for(attacker)
+    if walker is None:
+        if getattr(attacker, 'attacking_planeswalker', None):
+            # Declared at a planeswalker that is no longer there.
+            messages.append(
+                f"⚔️ {attacker.name} was attacking a planeswalker that has "
+                f"left the battlefield — no damage is dealt")
+            return 0
+        return None  # not a planeswalker attack; caller uses the player path
+
+    before = getattr(walker, 'loyalty_counters', 0)
+    walker.loyalty_counters = max(0, before - amount)
+    messages.append(
+        f"⚔️ {attacker.name} deals {amount} damage to **{walker.name}** "
+        f"(loyalty: {walker.loyalty_counters})")
+    print(f"[PW-COMBAT] {attacker.name} dealt {amount} to {walker.name} "
+          f"({before} → {walker.loyalty_counters} loyalty)")
+    return amount
+
+
 def resolve_combat_damage(rules, game: GameState) -> List[str]:
     """
     Resolve combat damage with keyword abilities.
@@ -1370,8 +1406,17 @@ def deal_combat_damage(rules, game: GameState, attackers: List[Tuple[Card, Playe
             # CR 510.5: a non-FS/DS attacker deals no damage in the FS step.
             if is_first_strike_step and not (attacker.has_first_strike(game=game) or attacker.has_double_strike(game=game)):
                 continue
-            actual_damage = rules._apply_combat_damage_to_player(game, defending_player, attacker_power, attacker)
-            if actual_damage > 0:
+            _pw_damage = deal_unblocked_damage(
+                rules, game, attacker, attacker_power, defending_player,
+                messages)
+            if _pw_damage is not None:
+                # A planeswalker attack: loyalty already adjusted (or the
+                # walker is gone and nothing was dealt). Lifelink still
+                # applies below; the player-facing life/commander lines do not.
+                actual_damage = _pw_damage
+            else:
+                actual_damage = rules._apply_combat_damage_to_player(game, defending_player, attacker_power, attacker)
+            if _pw_damage is None and actual_damage > 0:
                 # May 16 audit: append running life total so players can follow
                 # the combat math live without scrolling for next !state. Burn
                 # spell damage already does this (`(life: 4)` format); combat
@@ -1396,7 +1441,9 @@ def deal_combat_damage(rules, game: GameState, attackers: List[Tuple[Card, Playe
                 # COMBAT_DAMAGE_DEALT emission inside the damage funnel
                 # accumulates via _accumulate_combat_damage_subscriber, so
                 # this producer site no longer appends directly.
-            else:
+            elif _pw_damage is None:
+                # Only the PLAYER path can be "prevented" here; a
+                # planeswalker attack already reported its own outcome.
                 messages.append(f"🛡️ {attacker.name}'s damage to {defending_player.name} was prevented")
 
             if attacker.has_lifelink(game=game) and actual_damage > 0:
@@ -1631,8 +1678,13 @@ def deal_combat_damage(rules, game: GameState, attackers: List[Tuple[Card, Playe
                 print(f"[TRAMPLE-BUG] remaining_damage {remaining_damage} > attacker_power {attacker_power}! Clamping.")
                 remaining_damage = attacker_power
             if remaining_damage > 0 and attacker.has_trample(game=game):
-                actual_trample = rules._apply_combat_damage_to_player(game, defending_player, remaining_damage, attacker)
-                if actual_trample > 0:
+                _pw_trample = deal_unblocked_damage(
+                    rules, game, attacker, remaining_damage, defending_player,
+                    messages)
+                actual_trample = (
+                    _pw_trample if _pw_trample is not None
+                    else rules._apply_combat_damage_to_player(game, defending_player, remaining_damage, attacker))
+                if _pw_trample is None and actual_trample > 0:
                     messages.append(
                         f"🦏 {attacker.name} tramples for {actual_trample} damage to "
                         f"{defending_player.name} (life: {max(0, defending_player.life)})"
@@ -1648,7 +1700,9 @@ def deal_combat_damage(rules, game: GameState, attackers: List[Tuple[Card, Playe
                                 f"{_cd_total}/21 from {attacker.name}"
                             )
                     # Slice 5b: bus-fed — see the unblocked producer site.
-                else:
+                elif _pw_trample is None:
+                    # See the unblocked path: a planeswalker attack already
+                    # reported its own outcome and cannot be "prevented" here.
                     messages.append(f"🛡️ {attacker.name}'s trample damage to {defending_player.name} was prevented")
                 if attacker.has_lifelink(game=game) and actual_trample > 0:
                     owner_idx = game.players.index(attacker_owner)

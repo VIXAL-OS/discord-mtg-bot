@@ -4134,8 +4134,8 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
             for group in groups:
                 card_text, defender_text = re.split(
                     r"\s+at\s+", group, maxsplit=1, flags=re.IGNORECASE)
-                defender_idx, error = self._resolve_defending_seat(
-                    game, defender_text)
+                defender_idx, defender_pw, error = self._resolve_attack_target(
+                    game, defender_text, player_idx)
                 if defender_idx is None:
                     await ctx.send(error)
                     return
@@ -4156,9 +4156,21 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
                             f"**{card.name}** was assigned to more than one defender.")
                         return
                     seen_ids.add(card.id)
-                    potential_attackers.append((card, defender_idx))
+                    potential_attackers.append((card, defender_idx, defender_pw))
         else:
             defender_idx = 1 - player_idx
+            defender_pw = None
+            # `at` is OPTIONAL here, unlike multiplayer — but it is how a
+            # 2-player game attacks a planeswalker at all, and the
+            # planeswalker-heavy decks are played two-handed.
+            if re.search(r"\s+at\s+", creatures, re.IGNORECASE):
+                creatures, _target_text = re.split(
+                    r"\s+at\s+", creatures, maxsplit=1, flags=re.IGNORECASE)
+                defender_idx, defender_pw, _err = self._resolve_attack_target(
+                    game, _target_text, player_idx)
+                if defender_idx is None:
+                    await ctx.send(_err)
+                    return
             if creatures.lower() == "all":
                 selected = player.untapped_creatures(game=game)
                 all_creatures = player.creatures(game=game)
@@ -4177,23 +4189,26 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
                     card = player.find_card(name, Zone.BATTLEFIELD)
                     if card and card.is_creature(game=game):
                         selected.append(card)
-            potential_attackers = [(card, defender_idx) for card in selected]
+            potential_attackers = [(card, defender_idx, defender_pw)
+                                   for card in selected]
 
         # Validate each attacker with rules engine
         attackers: List[Tuple[Card, int]] = []
         warnings = []
-        for card, defender_idx in potential_attackers:
+        for card, defender_idx, defender_pw in potential_attackers:
             card.attacking_player = defender_idx
             can_attack, reason = self.engine.rules.can_attack_with(game, player, card)
             if can_attack:
                 paid, tax_reason = self.engine.rules.pay_attack_tax(game, player, card)
                 if paid:
-                    attackers.append((card, defender_idx))
+                    attackers.append((card, defender_idx, defender_pw))
                 else:
                     card.attacking_player = None
+                    card.attacking_planeswalker = None
                     warnings.append(f"⚠️ {card.name}: {tax_reason}")
             else:
                 card.attacking_player = None
+                card.attacking_planeswalker = None
                 warnings.append(f"⚠️ {card.name}: {reason}")
         
         if warnings:
@@ -4208,10 +4223,12 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
         game.combat_defenders_done = []
         game.set_phase(Phase.DECLARE_ATTACKERS, via="cog:attack_cmd")
         
-        for card, defender_idx in attackers:
+        for card, defender_idx, defender_pw in attackers:
             card.attacking = True
             card.attacks_this_turn += 1  # C-1: Moraug's attack-count static
             card.attacking_player = defender_idx
+            card.attacking_planeswalker = (
+                defender_pw.id if defender_pw is not None else None)
             # Tap attacker (unless vigilance)
             if not card.has_vigilance():
                 self.engine.tap_permanent(card)
@@ -4221,9 +4238,13 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
         attacker_display = [
             f"{card.name}" +
             (" (vigilance)" if card.has_vigilance() else "") +
-            (f" at {game.players[defender_idx].name}"
-             if game.is_multiplayer else "")
-            for card, defender_idx in attackers
+            # Name the planeswalker whenever one is being attacked, in BOTH
+            # formats: in a 2-player game "at Jace" is the only thing that
+            # distinguishes it from a swing at the player's face.
+            (f" at {defender_pw.name}" if defender_pw is not None
+             else (f" at {game.players[defender_idx].name}"
+                   if game.is_multiplayer else ""))
+            for card, defender_idx, defender_pw in attackers
         ]
         await ctx.send(f"⚔️ **{player.name}** attacks with: {', '.join(attacker_display)}")
         
@@ -4242,8 +4263,8 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
             await self.engine._combat_priority_round(game, ctx.send, "after attackers declared")
             # Check if any attackers died from instant-speed removal
             attackers = [
-                (card, defender_idx)
-                for card, defender_idx in attackers
+                (card, defender_idx, defender_pw)
+                for card, defender_idx, defender_pw in attackers
                 if card in player.battlefield and card.attacking
             ]
             if not attackers:
@@ -4265,7 +4286,7 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
 
         # If opponent is Claude, have it block
         opponent = game.players[1 - player_idx]
-        attacker_cards = [card for card, _ in attackers]
+        attacker_cards = [card for card, _idx, _pw in attackers]
         if opponent.is_claude:
             await asyncio.sleep(1)
             blocks = await self.engine.claude_ai.decide_blocks(
@@ -5167,7 +5188,28 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
                 await ctx.send(_m)
             await ctx.send(f"🔄 Turn {game.turn_number} - **{game.active_player.name}**'s turn! (Drew a card)")
             await ctx.send(embed=self.display.create_game_embed(game))
-        
+        elif not game.ended:
+            # Q-H: the incoming HUMAN is at UNTAP too.
+            #
+            # end_turn() leaves whoever is next at UNTAP, and the branch
+            # above advances Claude — and then advances the human it hands
+            # back to. A human handing off to another human hits neither,
+            # so in every multiplayer lobby (and any 2-player human game)
+            # the incoming seat skipped its untap step, its upkeep triggers
+            # and its DRAW STEP until it manually passed three times, with
+            # nothing saying so. advance_phase emits its own Upkeep /
+            # "Draw Step - X draws a card" / Main Phase 1 lines, so
+            # forwarding them is the whole user-facing fix.
+            _, _h1 = self.engine.advance_phase(game)  # UNTAP → UPKEEP
+            _, _h2 = self.engine.advance_phase(game)  # UPKEEP → DRAW
+            _, _h3 = self.engine.advance_phase(game)  # DRAW → MAIN1
+            for _m in _h1 + _h2 + _h3:
+                await ctx.send(_m)
+            # Upkeep triggers that needed Tier 3 are queued by the sync
+            # scan and would otherwise sit until the next drain.
+            for _m in await self.engine.drain_pending_triggers(game):
+                await ctx.send(_m)
+
         # Save game state
         self.engine.save_game(game)
     
@@ -6945,6 +6987,41 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
         if len(matches) > 1:
             return None, "That name is ambiguous; use a Discord mention or seat number."
         return None, f"Couldn't find living defender '{value}'."
+
+    @staticmethod
+    def _resolve_attack_target(game: GameState, raw: str, attacker_seat: int):
+        """Resolve `at <text>` to a defending seat and, optionally, a walker.
+
+        Returns ``(seat_index, planeswalker_card_or_None, error)``. A
+        planeswalker resolves to ITS CONTROLLER's seat (CR 508.1a: you attack a
+        planeswalker a defending player controls), which is what keeps
+        blocking, attack taxes and defender grouping working unchanged.
+
+        Seats are tried first so a player named after a walker cannot be
+        shadowed, and an ambiguous walker name is refused rather than guessed.
+        """
+        seat, error = MTGGameCog._resolve_defending_seat(game, raw)
+        if seat is not None:
+            return seat, None, ""
+
+        value = raw.strip().casefold()
+        matches = []
+        for index, player in enumerate(game.players):
+            if index == attacker_seat or player.eliminated:
+                continue
+            for card in player.battlefield:
+                if (card.is_planeswalker()
+                        and card.name.casefold() == value):
+                    matches.append((index, card))
+        if len(matches) == 1:
+            return matches[0][0], matches[0][1], ""
+        if len(matches) > 1:
+            return None, None, (
+                f"More than one opponent controls a planeswalker named "
+                f"'{raw.strip()}'; name the seat instead.")
+        # Neither a seat nor a walker — surface the seat resolver's message,
+        # which is the more common mistake.
+        return None, None, error
 
     @staticmethod
     def _combat_defender_indices(game: GameState) -> List[int]:

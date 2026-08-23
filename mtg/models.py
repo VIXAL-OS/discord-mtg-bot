@@ -669,6 +669,12 @@ class Card:
     # Combat state
     attacking: bool = False
     attacking_player: Optional[int] = None
+    # CR 508.1a: an attack is declared against a player OR a planeswalker that
+    # player controls. The controller remains `attacking_player` (blocking,
+    # attack taxes and defender grouping all key off the SEAT), so this only
+    # names the planeswalker. Held as a card id, and read through
+    # GameState.attacked_planeswalker_for(), which re-resolves it live.
+    attacking_planeswalker: Optional[str] = None
     blocking: List[str] = field(default_factory=list)  # IDs of creatures being blocked
     blocked_by: List[str] = field(default_factory=list)  # IDs of blocking creatures
     damage_marked: int = 0
@@ -995,6 +1001,7 @@ class Card:
         self.tapped = False
         self.attacking = False
         self.attacking_player = None
+        self.attacking_planeswalker = None
         self.blocking = []
         self.blocked_by = []
         # C-1 (Aug 7): the per-turn attack counter is battlefield history the
@@ -2271,6 +2278,7 @@ class Card:
             "attachments": self.attachments,
             "attacking": self.attacking,
             "attacking_player": self.attacking_player,
+            "attacking_planeswalker": self.attacking_planeswalker,
             "blocking": self.blocking,
             "blocked_by": self.blocked_by,
             "damage_marked": self.damage_marked,
@@ -2315,6 +2323,7 @@ class Card:
             attachments=data.get("attachments", []),
             attacking=data.get("attacking", False),
             attacking_player=data.get("attacking_player"),
+            attacking_planeswalker=data.get("attacking_planeswalker"),
             blocking=data.get("blocking", []),
             blocked_by=data.get("blocked_by", []),
             damage_marked=data.get("damage_marked", 0),
@@ -5840,6 +5849,31 @@ class GameState:
             # cyclic).  Explicit player names and "each opponent" bypass it.
             return min(opponents, key=lambda opponent: opponent.life)
         return opponents[0] if opponents else None
+
+    def attacked_planeswalker_for(self, attacker: Card) -> Optional[Card]:
+        """The planeswalker this attacker was declared against, if still legal.
+
+        SELF-INVALIDATING BY DESIGN. Ten sites clear `attacking_player`, and
+        adding a parallel clear to each is a leak waiting to happen — so this
+        requires the creature to be CURRENTLY attacking and the planeswalker to
+        still be on the defending player's battlefield. A stale id on a
+        non-attacking creature therefore cannot route damage anywhere, which is
+        the same guarantee a perfectly-maintained clear would give.
+
+        Returning None when the planeswalker has left is also the CR-correct
+        outcome: the attacker stays attacking, but its damage is NOT redirected
+        to the defending player (CR 506.4 / 508.1) — the caller drops it.
+        """
+        pw_id = getattr(attacker, 'attacking_planeswalker', None)
+        if not pw_id or not getattr(attacker, 'attacking', False):
+            return None
+        defender = self.defender_for(attacker)
+        if defender is None:
+            return None
+        for card in defender.battlefield:
+            if str(getattr(card, 'id', '')) == str(pw_id):
+                return card if card.is_planeswalker() else None
+        return None
 
     def defender_for(self, attacker: Card) -> Optional[Player]:
         """Resolve an attacker's stable defending-player seat."""

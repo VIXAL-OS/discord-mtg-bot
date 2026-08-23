@@ -22,6 +22,36 @@ class GameDisplay:
     """Format game state for Discord display."""
     
     @staticmethod
+    def commander_damage_summary(game: GameState, player: Player) -> Optional[str]:
+        """"<source> N/21" for each commander that has connected, else None.
+
+        Shared by the text board and the embed so the two cannot drift. The
+        /21 matters as much as the number: without it a player watches a
+        total climb with no sense of what it is climbing towards, which is
+        how the June 11 audit found people learning the rule from their own
+        death message.
+
+        Gated on Commander/EDH because that is where the rule applies — Brawl
+        and Oathbreaker keep their command zones without inheriting the
+        21-damage loss condition (Aug 14).
+        """
+        if game.format not in ("commander", "edh"):
+            return None
+
+        def _label(key):
+            # Keys are commander NAMES (CR 903.10a per-commander, Aug 1);
+            # legacy int keys from older saves fall back to the player name.
+            if isinstance(key, int) or (isinstance(key, str) and key.isdigit()):
+                index = int(key)
+                return (game.players[index].name
+                        if 0 <= index < len(game.players) else str(key))
+            return str(key)
+
+        parts = ["%s %d/21" % (_label(k), dmg)
+                 for k, dmg in player.commander_damage.items() if dmg > 0]
+        return ", ".join(parts) if parts else None
+
+    @staticmethod
     def format_board_state(game: GameState, viewer_index: Optional[int] = None) -> str:
         """Format the full board state as a string."""
         lines = []
@@ -43,19 +73,9 @@ class GameDisplay:
             lines.append(f"   ❤️ {player.life} | ☠️ {player.poison} | 🎴 {len(player.hand)} cards")
             
             # Commander damage received
-            if game.format in ["commander", "edh"]:
-                # Keys are commander names (CR 903.10a per-commander, Aug 1);
-                # legacy int keys from old saves fall back to the player name.
-                def _cd_label(k):
-                    if isinstance(k, int) or (isinstance(k, str) and k.isdigit()):
-                        _i = int(k)
-                        return (game.players[_i].name
-                                if 0 <= _i < len(game.players) else str(k))
-                    return str(k)
-                cmd_dmg = [f"{_cd_label(j)}: {dmg}"
-                          for j, dmg in player.commander_damage.items() if dmg > 0]
-                if cmd_dmg:
-                    lines.append(f"   ⚔️ Commander damage: {', '.join(cmd_dmg)}")
+            _cd = GameDisplay.commander_damage_summary(game, player)
+            if _cd:
+                lines.append(f"   ⚔️ Commander damage: {_cd}")
             
             # Battlefield
             if player.battlefield:
@@ -140,6 +160,12 @@ class GameDisplay:
             # Build field value
             value_parts = [f"❤️ {player.life} | ☠️ {player.poison} | 🎴 {len(player.hand)} in hand"]
             
+            # The embed is what !state and every turn handoff actually send,
+            # and it omitted the second loss condition entirely.
+            cmd_dmg = GameDisplay.commander_damage_summary(game, player)
+            if cmd_dmg:
+                value_parts.append(f"👑 Commander damage: {cmd_dmg}")
+
             if player.battlefield:
                 bf = [c.display_name() for c in player.battlefield[:5]]
                 if len(player.battlefield) > 5:

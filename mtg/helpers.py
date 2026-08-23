@@ -2868,6 +2868,7 @@ def strip_combat_state(game, card):
     """
     card.attacking = False
     card.attacking_player = None
+    card.attacking_planeswalker = None
     card.blocking = []
     card.blocked_by = []
     try:

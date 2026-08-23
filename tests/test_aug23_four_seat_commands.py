@@ -301,3 +301,400 @@ class TestDurability:
                     if s.user_id == table.users[1].id)
         assert not seat.ready, \
             "a new deck must be re-readied, not inherit the old ready flag"
+
+
+# --------------------------------------------------------------------------
+# Q-H — the turn handoff, which needs a real engine rather than a lobby
+# --------------------------------------------------------------------------
+
+class Seated:
+    """A started multiplayer game driven through the real command callbacks.
+
+    The lobby harness above deliberately stops short of building an engine.
+    This one goes one step further because the handoff bug lives in what the
+    command does with `engine.end_turn()`'s result, which a lobby cannot show.
+    GAMES_DIR is redirected at a tmp dir: a real GameEngine loads and writes
+    the live save directory otherwise, which a test must never touch.
+    """
+
+    def __init__(self, tmp_path, monkeypatch, names=("Alice", "Bob", "Carol"),
+                 claude_seats=()):
+        from types import SimpleNamespace
+
+        from mtg.constants import Phase
+        from mtg.engine import GameEngine
+        from mtg.models import Card, GameState, Player
+
+        monkeypatch.setattr(GameEngine, "GAMES_DIR", str(tmp_path / "games"))
+
+        players = []
+        for i, name in enumerate(names):
+            if i in claude_seats:
+                players.append(Player(name=name, user_id=None, is_claude=True,
+                                      life=40))
+            else:
+                players.append(Player(name=name, user_id=1000 + i, life=40))
+        game = GameState(thread_id=77, format="commander", players=players)
+        game.turn_number = 1
+        game.active_player_index = 0
+        game.set_phase(Phase.MAIN1, via="test")
+        for p in players:
+            for k in range(6):
+                p.library.append(Card(
+                    name="Forest%d" % k, id="%s_l%d" % (p.name, k),
+                    type_line="Basic Land — Forest"))
+
+        engine = GameEngine(None)
+        engine.games[77] = game
+        game._rules_engine = engine.rules
+
+        cog = object.__new__(MTGGameCog)
+        cog.engine = engine
+        cog.display = SimpleNamespace(create_game_embed=lambda g: "<embed>")
+        cog._get_game = lambda _ctx: game
+
+        self.cog, self.game, self.engine = cog, game, engine
+        self.users = [FakeAuthor(1000 + i, n) for i, n in enumerate(names)]
+
+    def end_turn_as(self, index):
+        ctx = FakeCtx(self.users[index], FakeChannel(77))
+        asyncio.run(MTGGameCog.end_turn.callback(self.cog, ctx))
+        return ctx
+
+
+class TestTurnHandoff:
+    """end_turn() leaves the next seat at UNTAP; somebody has to advance it.
+
+    The 2-player path advances the incoming human INSIDE the Claude branch, so
+    human-vs-Claude always worked. A human handing to another human — every
+    multiplayer lobby, and any 2-player human game — hit neither branch, so the
+    incoming seat skipped its untap step, its upkeep triggers and its DRAW STEP
+    until it manually passed three times, with nothing saying so.
+
+    The same file already had the correct shape: `!discard`'s turn-continuation
+    path carries an `else: # Human's turn — draw and announce` doing exactly
+    these three advances. `!turn` simply lacked it, which is why this is an
+    omission rather than a design choice.
+    """
+
+    def test_a_human_handoff_reaches_main1_and_draws(self, tmp_path, monkeypatch):
+        from mtg.constants import Phase
+
+        table = Seated(tmp_path, monkeypatch)
+        bob = table.game.players[1]
+        before_hand, before_lib = len(bob.hand), len(bob.library)
+
+        ctx = table.end_turn_as(0)
+
+        assert table.game.active_player.name == "Bob"
+        assert table.game.phase == Phase.MAIN1, (
+            "the incoming seat was left at %s" % table.game.phase.name)
+        assert len(bob.hand) == before_hand + 1, "Bob skipped his draw step"
+        assert len(bob.library) == before_lib - 1
+        joined = "\n".join(ctx.sent)
+        assert "Draw Step" in joined, "the draw must be visible, not silent"
+        assert "Main Phase 1" in joined
+
+    def test_the_untouched_seats_do_not_draw(self, tmp_path, monkeypatch):
+        """Adverse control: only the incoming seat advances."""
+        table = Seated(tmp_path, monkeypatch)
+        carol = table.game.players[2]
+        before = len(carol.hand)
+        table.end_turn_as(0)
+        assert len(carol.hand) == before
+
+    def test_the_claude_branch_does_not_double_advance(self, tmp_path,
+                                                       monkeypatch):
+        """The new branch is an `elif`, so a Claude seat must still take the
+        old path exactly once — advancing twice would overshoot into combat."""
+        from types import SimpleNamespace
+
+        from mtg.constants import Phase
+
+        table = Seated(tmp_path, monkeypatch, claude_seats=(1,))
+
+        async def _no_actions(_game):
+            return []
+
+        table.engine.execute_claude_turn = _no_actions
+        table.engine.claude_ai = SimpleNamespace(last_error=None)
+        table.cog._sanitize_action_bullets = lambda a: a
+
+        table.end_turn_as(0)
+
+        # Claude took its turn and handed back to the next human, who is at
+        # MAIN1 — not past it.
+        assert table.game.active_player.name == "Carol"
+        assert table.game.phase == Phase.MAIN1
+
+    def test_an_ended_game_is_not_advanced(self, tmp_path, monkeypatch):
+        """`elif not game.ended` — a finished game must not draw anybody a
+        card on the way out (CR 104.2a)."""
+        from mtg.constants import Phase
+
+        table = Seated(tmp_path, monkeypatch)
+        bob = table.game.players[1]
+
+        real_end_turn = table.engine.end_turn
+
+        def _ending_end_turn(game):
+            out = real_end_turn(game)
+            game.ended = True
+            return out
+
+        table.engine.end_turn = _ending_end_turn
+        before = len(bob.hand)
+        table.end_turn_as(0)
+
+        assert len(bob.hand) == before
+        assert table.game.phase == Phase.UNTAP
+
+
+# --------------------------------------------------------------------------
+# Q-H — commander damage where players actually look
+# --------------------------------------------------------------------------
+
+class TestCommanderDamageUX:
+    """The embed is what !state and every turn handoff SEND to Discord.
+
+    It carried life, poison, hand size and battlefield but not the second loss
+    condition, so the only place a tally appeared was the text board and a
+    one-off line when a commander connected. The June 11 audit had already
+    found players learning the 21 rule from their own death message; this is
+    the persistent half of that fix, and it matters most at four seats, where
+    a player tracks up to three different commanders at once.
+    """
+
+    @staticmethod
+    def _game(fmt="commander"):
+        from mtg.models import GameState, Player
+        players = [Player(name=n, user_id=1000 + i, life=40)
+                   for i, n in enumerate(["Alice", "Bob", "Carol", "Dave"])]
+        return GameState(thread_id=5, format=fmt, players=players)
+
+    def test_the_embed_shows_every_commanders_tally(self):
+        from mtg.display import GameDisplay
+
+        game = self._game()
+        game.players[0].commander_damage = {"Atraxa": 7, "Korvold": 12}
+        embed = GameDisplay.create_game_embed(game)
+
+        alice = embed.fields[0].value
+        assert "Commander damage" in alice, "the embed omitted the tally"
+        assert "Atraxa 7/21" in alice
+        assert "Korvold 12/21" in alice, (
+            "each commander is tracked separately (CR 903.10a)")
+
+    def test_the_threshold_is_shown_not_just_the_number(self):
+        """/21 is the point: a bare number says nothing about how close the
+        player is to losing."""
+        from mtg.display import GameDisplay
+
+        game = self._game()
+        game.players[1].commander_damage = {"Atraxa": 20}
+        assert GameDisplay.commander_damage_summary(
+            game, game.players[1]) == "Atraxa 20/21"
+
+    def test_a_player_with_no_commander_damage_gets_no_line(self):
+        from mtg.display import GameDisplay
+
+        game = self._game()
+        game.players[0].commander_damage = {"Atraxa": 5}
+        embed = GameDisplay.create_game_embed(game)
+        assert "Commander damage" in embed.fields[0].value
+        assert "Commander damage" not in embed.fields[1].value
+
+    def test_non_commander_formats_show_nothing(self):
+        """Brawl and Oathbreaker keep command zones WITHOUT the 21-damage loss
+        condition (Aug 14), so the tally must not appear there either."""
+        from mtg.display import GameDisplay
+
+        for fmt in ("modern", "brawl", "oathbreaker"):
+            game = self._game(fmt)
+            game.players[0].commander_damage = {"Atraxa": 9}
+            assert GameDisplay.commander_damage_summary(
+                game, game.players[0]) is None, fmt
+            assert "Commander damage" not in GameDisplay.create_game_embed(
+                game).fields[0].value, fmt
+
+    def test_the_text_board_and_the_embed_cannot_drift(self):
+        """Both renderers go through one helper. A mutant that reverts either
+        to its own formatting shows up as a mismatch here."""
+        from mtg.display import GameDisplay
+
+        game = self._game()
+        game.players[2].commander_damage = {"Korvold": 14}
+        summary = GameDisplay.commander_damage_summary(game, game.players[2])
+
+        assert summary in GameDisplay.format_board_state(game)
+        assert summary in GameDisplay.create_game_embed(game).fields[2].value
+
+    def test_legacy_integer_keys_still_render(self):
+        """Saves written before the per-commander keying (Aug 14) hold seat
+        indices. They must degrade to the player name, not crash or print a
+        bare index."""
+        from mtg.display import GameDisplay
+
+        game = self._game()
+        game.players[0].commander_damage = {1: 6}
+        assert GameDisplay.commander_damage_summary(
+            game, game.players[0]) == "Bob 6/21"
+
+
+# --------------------------------------------------------------------------
+# Q-H — !attack can name a planeswalker (CR 508.1a)
+# --------------------------------------------------------------------------
+
+class TestAttackingAPlaneswalker:
+    """`at <defender>` already existed in multiplayer; it just could not name
+    a planeswalker, and 2-player had no `at` at all — which is where it
+    matters most, since the walker-heavy decks are played two-handed.
+
+    The engine-side routing lives in
+    tests/test_aug23_qh_planeswalker_defenders.py; these are the command pins.
+    """
+
+    @staticmethod
+    def _walker(table, seat, name="Jace, the Mind Sculptor"):
+        from mtg.models import Card
+        walker = Card(name=name, id="pw_%d" % seat,
+                      type_line="Legendary Planeswalker — Jace")
+        walker.loyalty_counters = 4
+        table.game.players[seat].battlefield.append(walker)
+        return walker
+
+    @staticmethod
+    def _bear(table, seat, name="Grizzly Bears"):
+        from mtg.constants import Phase
+        from mtg.models import Card
+        bear = Card(name=name, id="bear_%d" % seat, type_line="Creature — Bear",
+                    power="2", toughness="2", summoning_sick=False)
+        table.game.players[seat].battlefield.append(bear)
+        # !attack is only legal in the declare-attackers step; the harness
+        # starts at MAIN1 because the handoff tests need it there.
+        table.game.set_phase(Phase.DECLARE_ATTACKERS, via="test")
+        return bear
+
+    def test_attacking_at_a_planeswalker_records_the_assignment(
+            self, tmp_path, monkeypatch):
+        table = Seated(tmp_path, monkeypatch)
+        bear = self._bear(table, 0)
+        walker = self._walker(table, 1)
+
+        ctx = FakeCtx(table.users[0], FakeChannel(77))
+        asyncio.run(MTGGameCog.declare_attackers.callback(
+            table.cog, ctx, creatures="Grizzly Bears at Jace, the Mind Sculptor"))
+
+        assert bear.attacking is True
+        assert bear.attacking_planeswalker == walker.id
+        # The walker's CONTROLLER stays the defending seat, which is what keeps
+        # blocking and attack taxes working.
+        assert bear.attacking_player == 1
+        assert any("at Jace" in m for m in ctx.sent), ctx.sent
+
+    def test_attacking_at_a_seat_leaves_no_walker_assignment(
+            self, tmp_path, monkeypatch):
+        """Adverse control: the ordinary seat attack must be unchanged."""
+        table = Seated(tmp_path, monkeypatch)
+        bear = self._bear(table, 0)
+        self._walker(table, 1)
+
+        ctx = FakeCtx(table.users[0], FakeChannel(77))
+        asyncio.run(MTGGameCog.declare_attackers.callback(
+            table.cog, ctx, creatures="Grizzly Bears at Bob"))
+
+        assert bear.attacking is True
+        assert bear.attacking_planeswalker is None
+        assert bear.attacking_player == 1
+
+    def test_a_seat_name_wins_over_a_walker_of_the_same_name(
+            self, tmp_path, monkeypatch):
+        """Seats resolve first, so a player cannot be shadowed by a card."""
+        table = Seated(tmp_path, monkeypatch, names=("Alice", "Jace", "Carol"))
+        bear = self._bear(table, 0)
+        self._walker(table, 2, name="Jace")
+
+        ctx = FakeCtx(table.users[0], FakeChannel(77))
+        asyncio.run(MTGGameCog.declare_attackers.callback(
+            table.cog, ctx, creatures="Grizzly Bears at Jace"))
+
+        assert bear.attacking_player == 1, "the SEAT named Jace"
+        assert bear.attacking_planeswalker is None
+
+    def test_an_ambiguous_walker_name_is_refused_not_guessed(
+            self, tmp_path, monkeypatch):
+        table = Seated(tmp_path, monkeypatch)
+        bear = self._bear(table, 0)
+        self._walker(table, 1)
+        self._walker(table, 2)
+
+        ctx = FakeCtx(table.users[0], FakeChannel(77))
+        asyncio.run(MTGGameCog.declare_attackers.callback(
+            table.cog, ctx, creatures="Grizzly Bears at Jace, the Mind Sculptor"))
+
+        assert bear.attacking is False
+        assert any("More than one opponent" in m for m in ctx.sent), ctx.sent
+
+    def test_your_own_walker_is_not_a_legal_target(self, tmp_path, monkeypatch):
+        """You attack a planeswalker an OPPONENT controls (CR 508.1a)."""
+        table = Seated(tmp_path, monkeypatch)
+        bear = self._bear(table, 0)
+        self._walker(table, 0, name="My Own Jace")
+
+        ctx = FakeCtx(table.users[0], FakeChannel(77))
+        asyncio.run(MTGGameCog.declare_attackers.callback(
+            table.cog, ctx, creatures="Grizzly Bears at My Own Jace"))
+
+        assert bear.attacking is False
+        assert bear.attacking_planeswalker is None
+
+    def test_two_player_at_names_a_walker(self, tmp_path, monkeypatch):
+        """`at` is NEW in 2-player, and it is the only way to attack a walker
+        in the format the walker-heavy decks are actually played in."""
+        table = Seated(tmp_path, monkeypatch, names=("Alice", "Bob"))
+        bear = self._bear(table, 0)
+        walker = self._walker(table, 1)
+
+        ctx = FakeCtx(table.users[0], FakeChannel(77))
+        asyncio.run(MTGGameCog.declare_attackers.callback(
+            table.cog, ctx, creatures="Grizzly Bears at Jace, the Mind Sculptor"))
+
+        assert bear.attacking is True
+        assert bear.attacking_planeswalker == walker.id
+        assert bear.attacking_player == 1
+
+    def test_two_player_without_at_still_hits_the_face(self, tmp_path,
+                                                       monkeypatch):
+        """Adverse control: `at` is optional here, so the bare form is
+        unchanged."""
+        table = Seated(tmp_path, monkeypatch, names=("Alice", "Bob"))
+        bear = self._bear(table, 0)
+        self._walker(table, 1)
+
+        ctx = FakeCtx(table.users[0], FakeChannel(77))
+        asyncio.run(MTGGameCog.declare_attackers.callback(
+            table.cog, ctx, creatures="Grizzly Bears"))
+
+        assert bear.attacking is True
+        assert bear.attacking_planeswalker is None
+        assert bear.attacking_player == 1
+
+    def test_two_player_refuses_your_own_walker(self, tmp_path, monkeypatch):
+        """THE DECISIVE PATH for the resolver's own-seat skip.
+
+        The multiplayer branch has a separate `defender_idx == player_idx`
+        guard; 2-player has none, so here the skip inside
+        _resolve_attack_target is the only thing between a player and
+        attacking their own planeswalker (CR 508.1a).
+        """
+        table = Seated(tmp_path, monkeypatch, names=("Alice", "Bob"))
+        bear = self._bear(table, 0)
+        self._walker(table, 0, name="My Own Jace")
+
+        ctx = FakeCtx(table.users[0], FakeChannel(77))
+        asyncio.run(MTGGameCog.declare_attackers.callback(
+            table.cog, ctx, creatures="Grizzly Bears at My Own Jace"))
+
+        assert bear.attacking is False
+        assert bear.attacking_planeswalker is None
+        assert bear.attacking_player is None
