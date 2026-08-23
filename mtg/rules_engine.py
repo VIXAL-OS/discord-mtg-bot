@@ -444,9 +444,10 @@ class RulesEngine:
         try:
             tax_per_attacker = 0
             tax_sources = []
-            for opp in game.players:
-                if opp is player:
-                    continue
+            defender = game.defender_for(creature)
+            defenders = ([defender] if defender is not None
+                         else game.opponents_of(player))
+            for opp in defenders:
                 for perm in opp.battlefield:
                     oracle = (perm.oracle_text or '').lower()
                     # Match "creatures can't attack you unless their controller pays {N}"
@@ -494,14 +495,16 @@ class RulesEngine:
             pass
         return True, "OK"
 
-    def attack_tax_for(self, game: GameState, player: Player) -> Tuple[int, List[str]]:
-        """Return the generic mana cost for one creature to attack opponents."""
+    def attack_tax_for(self, game: GameState, player: Player,
+                       creature: Card = None) -> Tuple[int, List[str]]:
+        """Return the generic mana cost to attack this creature's defender."""
         import re as _re
         total = 0
         sources = []
-        for opponent in game.players:
-            if opponent is player:
-                continue
+        defender = game.defender_for(creature) if creature is not None else None
+        opponents = ([defender] if defender is not None
+                     else game.opponents_of(player))
+        for opponent in opponents:
             for permanent in opponent.battlefield:
                 oracle = (permanent.oracle_text or '').lower()
                 match = _re.search(
@@ -521,7 +524,7 @@ class RulesEngine:
     def pay_attack_tax(self, game: GameState, player: Player,
                        creature: Card) -> Tuple[bool, str]:
         """Actually pay the cost to declare one attacker (CR 508.1h)."""
-        amount, sources = self.attack_tax_for(game, player)
+        amount, sources = self.attack_tax_for(game, player, creature)
         if amount <= 0:
             return True, ""
         cost = f"{{{amount}}}"
@@ -1059,10 +1062,12 @@ class RulesEngine:
 
         return enters_tapped, etb_msg
 
-    def _make_replacement_callback(self, game: GameState, channel=None):
+    def _make_replacement_callback(self, game: GameState, channel=None,
+                                   private_send=None):
         """Delegates to mtg.combat.make_replacement_callback (Phase 2D)."""
         from mtg.combat import make_replacement_callback
-        return make_replacement_callback(self, game, channel)
+        return make_replacement_callback(
+            self, game, channel, private_send=private_send)
     def _deal_combat_damage(self, game: GameState, attackers: List[Tuple[Card, Player]], is_first_strike_step: bool = False, skip_attacker_damage: bool = False) -> Tuple[List[str], Dict[int, int]]:
         """Delegates to mtg.combat.deal_combat_damage (Phase 2D)."""
         from mtg.combat import deal_combat_damage

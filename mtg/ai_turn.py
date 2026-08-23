@@ -677,8 +677,11 @@ def _validate_plan_mana(engine, game: GameState, player_idx: int, plan: list) ->
                 # creatures with ETB triggers, enchantments with situational
                 # target abilities are NOT removal spells. Their primary effect
                 # is to enter the battlefield; the target text is conditional.
-                opp = game.players[1 - player_idx]
-                opp_creatures = [c for c in opp.battlefield if c.is_creature()]
+                opponents = game.opponents_of(player)
+                opp_creatures = [
+                    c for opponent in opponents
+                    for c in opponent.battlefield if c.is_creature()
+                ]
                 card_type_line = (getattr(card_obj, 'type_line', '') or '').lower()
                 is_instant_or_sorcery = (
                     'instant' in card_type_line or 'sorcery' in card_type_line
@@ -723,10 +726,11 @@ def _validate_plan_mana(engine, game: GameState, player_idx: int, plan: list) ->
                     # detrimental-target inference later picked the right
                     # one). Only classify as own-targeting when the caster is
                     # the ONLY controller of that name.
-                    _opp_p = game.players[1 - player_idx]
                     _opp_has_name = any(
                         _c.name.lower() == explicit_tgt_name.lower()
-                        and _c.is_creature() for _c in _opp_p.battlefield)
+                        and _c.is_creature()
+                        for _opp_p in opponents
+                        for _c in _opp_p.battlefield)
                     _own_has_name = any(
                         _c.name.lower() == explicit_tgt_name.lower()
                         and _c.is_creature() for _c in player.battlefield)
@@ -749,7 +753,7 @@ def _validate_plan_mana(engine, game: GameState, player_idx: int, plan: list) ->
                         # both sides control the name — detrimental spells
                         # target the opponent, and reading the caster's copy
                         # here would score the wrong creature's P/T.
-                        for _p in (_opp_p, player):
+                        for _p in (*opponents, player):
                             for _c in _p.battlefield:
                                 if _c.name.lower() == explicit_tgt_name.lower() and _c.is_creature():
                                     _tgt_card = _c
@@ -779,8 +783,14 @@ def _validate_plan_mana(engine, game: GameState, player_idx: int, plan: list) ->
                     targets_enchantments = 'enchantment' in oracle_lower
                     targets_any_permanent = 'permanent' in oracle_lower
 
-                    opp_artifacts = [c for c in opp.battlefield if 'artifact' in getattr(c, 'type_line', '').lower()]
-                    opp_enchantments = [c for c in opp.battlefield if 'enchantment' in getattr(c, 'type_line', '').lower()]
+                    opp_artifacts = [
+                        c for opponent in opponents for c in opponent.battlefield
+                        if 'artifact' in getattr(c, 'type_line', '').lower()
+                    ]
+                    opp_enchantments = [
+                        c for opponent in opponents for c in opponent.battlefield
+                        if 'enchantment' in getattr(c, 'type_line', '').lower()
+                    ]
 
                     # Spell targets only creatures — no valid targets
                     if not targets_artifacts and not targets_enchantments and not targets_any_permanent:
@@ -919,26 +929,27 @@ def _validate_plan_mana(engine, game: GameState, player_idx: int, plan: list) ->
                 if not card_obj.is_creature():
                     kambal_drain = 0
                     extort_drain = 0
-                    for op in opp.battlefield:
-                        op_oracle = (getattr(op, 'oracle_text', '') or '').lower()
-                        if not op_oracle:
-                            continue
-                        # Kambal-shape: "whenever (an opponent / a player you don't
-                        # control) casts a noncreature spell, that player loses N life"
-                        if ('noncreature spell' in op_oracle
-                                and ('opponent' in op_oracle or "don't control" in op_oracle)
-                                and ('loses' in op_oracle or 'lose' in op_oracle) and 'life' in op_oracle):
-                            # Pull the life-loss number if available, default 2 (Kambal).
-                            import re as _re
-                            m = _re.search(r'loses?\s+(\d+)\s+life', op_oracle)
-                            kambal_drain += int(m.group(1)) if m else 2
-                        # Extort-shape: "extort" keyword or "whenever you cast a spell
-                        # ... opponent loses 1 life" (Blind Obedience).
-                        if 'extort' in op_oracle or (
-                            'whenever you cast' in op_oracle
-                            and 'opponent' in op_oracle and 'loses 1 life' in op_oracle
-                        ):
-                            extort_drain += 1
+                    for opponent in opponents:
+                        for op in opponent.battlefield:
+                            op_oracle = (getattr(op, 'oracle_text', '') or '').lower()
+                            if not op_oracle:
+                                continue
+                            # Kambal-shape: "whenever (an opponent / a player you don't
+                            # control) casts a noncreature spell, that player loses N life"
+                            if ('noncreature spell' in op_oracle
+                                    and ('opponent' in op_oracle or "don't control" in op_oracle)
+                                    and ('loses' in op_oracle or 'lose' in op_oracle) and 'life' in op_oracle):
+                                # Pull the life-loss number if available, default 2 (Kambal).
+                                import re as _re
+                                m = _re.search(r'loses?\s+(\d+)\s+life', op_oracle)
+                                kambal_drain += int(m.group(1)) if m else 2
+                            # Extort-shape: "extort" keyword or "whenever you cast a spell
+                            # ... opponent loses 1 life" (Blind Obedience).
+                            if 'extort' in op_oracle or (
+                                'whenever you cast' in op_oracle
+                                and 'opponent' in op_oracle and 'loses 1 life' in op_oracle
+                            ):
+                                extort_drain += 1
                     total_drain = kambal_drain + extort_drain
                     if total_drain > 0 and player.life <= total_drain:
                         _reject("cast", card_name,
@@ -2319,7 +2330,7 @@ def _get_action_error(engine, game: GameState, player_index: int, action: Dict) 
                 except Exception:
                     pass
             if not used_engine:
-                opp = game.players[1 - player_index] if len(game.players) > 1 else None
+                opp = game.default_opponent_for(player)
                 any_target = False
                 try:
                     for pl in game.players:
@@ -2629,7 +2640,8 @@ async def _validate_activation(engine, game: GameState, player: 'Player',
                 return False, reason
 
     # --- XMage bridge cross-check (when available) ---
-    if engine._xmage_available and engine.xmage_bridge:
+    if (not getattr(game, 'experimental_ffa', False)
+            and engine._xmage_available and engine.xmage_bridge):
         try:
             xmage_state, _ = engine._serialize_for_xmage(game)
             result = await engine.xmage_bridge.validate_activate(

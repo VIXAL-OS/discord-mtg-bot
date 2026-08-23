@@ -52,9 +52,148 @@ from mtg.constants import Phase, Zone, COMMAND_ZONE_FORMATS, PHASE_NAMES
 from mtg.helpers import (_normalize_pw_ability_idx,
                          _resolve_player_or_card_target, coerce_ai_string,
                          exile_after_resolution_reason, library_top_cast_types,
-                         is_castable_from_exile, spell_face_for_gates)
+                         is_castable_from_exile, spell_face_for_gates,
+                         resolve_target_choice)
 from mtg.models import Card, Player, GameState
 from mtg.util import GameLogger
+
+
+def extract_seed_card_flags(args: List[str]) -> Tuple[List[str], List[str]]:
+    """Remove repeatable ``--seed-card NAME`` flags from autoplay arguments.
+
+    Discord command parsing uses ``shlex.split`` so quoted multi-word names
+    remain one argument. Optional ``p1:`` / ``p2:`` prefixes choose the seat;
+    unprefixed cards prefer an existing copy in either deck, then player one.
+    """
+    cleaned: List[str] = []
+    seeds: List[str] = []
+    idx = 0
+    while idx < len(args):
+        arg = args[idx]
+        if arg == "--seed-card":
+            if idx + 1 >= len(args) or args[idx + 1].startswith("--"):
+                raise ValueError("--seed-card requires a card name")
+            seeds.append(args[idx + 1])
+            idx += 2
+            continue
+        cleaned.append(arg)
+        idx += 1
+    return cleaned, seeds
+
+
+def _seed_card_from_cache(deck_loader, requested_name: str) -> Optional[Card]:
+    """Build a private runtime Card from the already-loaded cache only."""
+    data = (getattr(deck_loader, "card_cache", {}) or {}).get(
+        requested_name.strip().lower())
+    if not data:
+        return None
+
+    from mtg.deck_loader import _front_face_keywords
+    card = Card(
+        name=data.get("name") or requested_name,
+        mana_cost=data.get("mana_cost", ""),
+        type_line=data.get("type_line", ""),
+        oracle_text=data.get("oracle_text", ""),
+        power=data.get("power"),
+        toughness=data.get("toughness"),
+        loyalty=data.get("loyalty"),
+        keywords=_front_face_keywords(data),
+        color_identity=list(data.get("color_identity", []) or []),
+    )
+    card.colors = list(data.get("colors", []) or [])
+    # Preserve the normal loader's face metadata without fetching or saving.
+    deck_loader._extract_adventure_data(card, data)
+    deck_loader._extract_split_data(card, data)
+    deck_loader._extract_transform_data(card, data)
+    return card
+
+
+def apply_autoplay_card_seeds(game: GameState, deck_loader,
+                              seed_specs: List[str]) -> List[Dict[str, str]]:
+    """Place requested exercise cards in opening hands after mulligans.
+
+    An existing deck card is swapped with an unseeded hand card, keeping the
+    deck's exact inventory. Cache-only cards (notably cube cards exercised in
+    a constructed matchup) replace a hand card and keep the displaced object
+    on the GameState. No deck JSON or cache object is mutated. Companion and
+    command-zone cards remain in their legal zones instead of bypassing their
+    costs or format rules.
+    """
+    results: List[Dict[str, str]] = []
+    for raw_spec in seed_specs:
+        spec = raw_spec.strip()
+        seat = None
+        lower_spec = spec.lower()
+        if lower_spec.startswith("p1:") or lower_spec.startswith("p2:"):
+            seat = 0 if lower_spec.startswith("p1:") else 1
+            spec = spec[3:].strip()
+        if not spec:
+            results.append({"card": raw_spec, "status": "invalid-empty-name"})
+            continue
+
+        candidates = ([game.players[seat]] if seat is not None
+                      else list(game.players))
+        found = None
+        for player in candidates:
+            for zone_name in ("hand", "library", "companion_zone", "command_zone"):
+                zone = getattr(player, zone_name, []) or []
+                card = next((c for c in zone if c.name.lower() == spec.lower()), None)
+                if card is not None:
+                    found = (player, zone_name, card)
+                    break
+            if found:
+                break
+
+        if found:
+            player, zone_name, card = found
+            if zone_name in ("companion_zone", "command_zone"):
+                status = f"legal-{zone_name.replace('_', '-')}"
+            elif zone_name == "hand":
+                card._autoplay_seeded = True
+                status = "already-in-hand"
+            else:
+                replace = next(
+                    (c for c in reversed(player.hand)
+                     if not getattr(c, "_autoplay_seeded", False)), None)
+                if replace is None:
+                    status = "no-hand-slot"
+                else:
+                    player.library.remove(card)
+                    player.hand.remove(replace)
+                    player.hand.append(card)
+                    player.library.append(replace)
+                    card._autoplay_seeded = True
+                    status = "seeded-from-library"
+            result = {"card": card.name, "player": player.name, "status": status}
+        else:
+            player = game.players[seat if seat is not None else 0]
+            replace = next(
+                (c for c in reversed(player.hand)
+                 if not getattr(c, "_autoplay_seeded", False)), None)
+            card = _seed_card_from_cache(deck_loader, spec)
+            if card is None:
+                result = {"card": spec, "player": player.name,
+                          "status": "cache-miss"}
+            elif replace is None:
+                result = {"card": card.name, "player": player.name,
+                          "status": "no-hand-slot"}
+            else:
+                player.hand.remove(replace)
+                game._seed_replaced_cards.append((player.name, replace))
+                card.owner_index = game.players.index(player)
+                card._autoplay_seeded = True
+                player.hand.append(card)
+                result = {"card": card.name, "player": player.name,
+                          "status": "seeded-from-cache"}
+
+        results.append(result)
+        print(
+            f"[CARD-SEED] card={result.get('card')} "
+            f"player={result.get('player', 'none')} status={result['status']}"
+        )
+
+    game._card_seed_results = list(results)
+    return results
 
 def _mark_active_turn_narration_sent(game: GameState) -> None:
     """Consume the early-stack narration buffer after its summary is sent.
@@ -194,6 +333,24 @@ def _format_blocker_list(names):
     return " + ".join(parts)
 
 
+def _format_autoplay_attacker(game: GameState, card: Card, *,
+                              show_vigilance: bool = False) -> str:
+    """Format an attacker, including its defender when there are 3+ seats.
+
+    Two-player output intentionally stays unchanged because there is only one
+    possible defender. FFA additional-combat declarations were ambiguous even
+    though ``card.attacking_player`` held the correct stable seat.
+    """
+    label = card.name
+    if show_vigilance and card.has_vigilance():
+        label += " (vigilance)"
+    defender_index = getattr(card, 'attacking_player', None)
+    if (game.is_multiplayer and isinstance(defender_index, int)
+            and 0 <= defender_index < len(game.players)):
+        label += f" → {game.players[defender_index].name}"
+    return label
+
+
 async def _resolve_combat(cog, ctx, game: GameState):
     """Resolve combat damage using rules engine."""
     game.set_phase(Phase.COMBAT_DAMAGE, via="autoplay:_resolve_combat")
@@ -217,13 +374,13 @@ async def _resolve_combat(cog, ctx, game: GameState):
             attacker.attacking = False
             attacker.attacking_player = None
             attacker.blocked_by = []
-    
     for player in game.players:
         for creature in player.creatures():
             creature.blocking = []
-    
     game.attackers = []
     game.blockers = {}
+    game.combat_defenders_done = []
+    game.waiting_for_human_blocks = False
     game._block_triggers_fired_ids = set()
     game._gorgon_recluse_fired_pairs = set()
 
@@ -640,11 +797,19 @@ async def _claude_extra_combats(cog, thread, game: GameState) -> None:
         declared = []
         if attacker_names:
             used_ids = set()
+            defender_indices = [
+                index for index in game.living_player_indices()
+                if index != claude_idx
+            ]
             for name in attacker_names:
                 card = None
                 for c in claude_p.get_zone(Zone.BATTLEFIELD):
                     if (c.name.lower() == name.lower() and c.id not in used_ids
                             and c.is_creature(game=game) and not c.tapped):
+                        if not defender_indices:
+                            continue
+                        c.attacking_player = defender_indices[
+                            len(game.attackers) % len(defender_indices)]
                         can_atk, _r = cog.engine.rules.can_attack_with(
                             game, claude_p, c)
                         if can_atk:
@@ -653,15 +818,15 @@ async def _claude_extra_combats(cog, thread, game: GameState) -> None:
                             if paid:
                                 card = c
                                 break
+                        c.attacking_player = None
                 if card:
                     card.attacking = True
-                    card.attacking_player = 1 - claude_idx
                     card.attacks_this_turn += 1  # C-1: Moraug's attack-count static
                     if not card.has_vigilance():
                         cog.engine.tap_permanent(card)
                     game.attackers.append(card.id)
                     used_ids.add(card.id)
-                    declared.append(card.name)
+                    declared.append(_format_autoplay_attacker(game, card))
                 else:
                     print(f"[COMBAT] Proposed attacker '{name}' skipped — no "
                           f"untapped, eligible, unclaimed instance on "
@@ -681,15 +846,21 @@ async def _claude_extra_combats(cog, thread, game: GameState) -> None:
         # Defender (Rick) blocks — compact application with the can_block
         # guard; same-name label disambiguation is skipped here (extra
         # combats are rare and short).
-        defender_idx = 1 - claude_idx
-        defender = game.players[defender_idx]
+        if game.experimental_ffa:
+            await _autoplay_assign_multiplayer_blocks(cog, thread, game)
+            defender = None
+            defender_idx = claude_idx
+        else:
+            defender = game.default_opponent_for(claude_p)
+            defender_idx = game.players.index(defender)
         attacker_cards = []
         for a_id in game.attackers:
             res = game.find_card_global(a_id)
             if res:
                 attacker_cards.append(res[0])
-        blocks = await cog.engine.claude_ai.decide_blocks(
-            game, defender_idx, attacker_cards)
+        blocks = (None if game.experimental_ffa else
+                  await cog.engine.claude_ai.decide_blocks(
+                      game, defender_idx, attacker_cards))
         block_msgs = []
         for attacker_id, blocker_ids in (blocks or {}).items():
             atk_res = game.find_card_global(attacker_id)
@@ -759,6 +930,155 @@ async def _advance_phase_with_display(cog, thread, game: GameState):
         await cog._autoplay_send(thread, _m)
 
 
+async def _autoplay_assign_multiplayer_blocks(cog, thread,
+                                               game: GameState) -> None:
+    """Ask each attacked defender for blocks against only their attackers.
+
+    An FFA combat has one declaration step but several independent defending
+    players.  Grouping by ``Card.attacking_player`` prevents seat C from
+    borrowing seat B's blocker, the most dangerous way a two-player shortcut
+    can appear to work in a four-seat smoke.
+    """
+    game.blockers = {}
+    groups = {}
+    for attacker_id in list(game.attackers):
+        result = game.find_card_global(attacker_id)
+        if not result:
+            continue
+        attacker = result[0]
+        defender = game.defender_for(attacker)
+        if defender is None:
+            continue
+        defender_index = game.players.index(defender)
+        groups.setdefault(defender_index, []).append(attacker)
+
+    for defender_index, attackers in groups.items():
+        defender = game.players[defender_index]
+        if defender.eliminated:
+            continue
+        saved_default = game._default_opponent_index
+        game._default_opponent_index = game.active_player_index
+        try:
+            blocks = await cog.engine.claude_ai.decide_blocks(
+                game, defender_index, attackers)
+        finally:
+            game._default_opponent_index = saved_default
+        allowed_attackers = {attacker.id: attacker for attacker in attackers}
+        block_messages = []
+        claimed_blockers = set()
+        for attacker_id, blocker_ids in (blocks or {}).items():
+            attacker = allowed_attackers.get(attacker_id)
+            if attacker is None:
+                print(f"[BLOCK-INVALID] {defender.name} proposed a block "
+                      f"against an attacker assigned to another defender")
+                continue
+            used_names = []
+            for blocker_id in blocker_ids or []:
+                result = game.find_card_global(blocker_id)
+                if not result:
+                    continue
+                blocker, blocker_owner, zone = result
+                if blocker_owner is not defender:
+                    print(f"[BLOCK-INVALID] {blocker.name} is controlled by "
+                          f"{blocker_owner.name}, not defender {defender.name}")
+                    continue
+                if blocker_id in claimed_blockers:
+                    print(f"[BLOCK-INVALID] {blocker.name} was proposed for "
+                          f"multiple attackers — later assignment skipped")
+                    continue
+                if (zone != Zone.BATTLEFIELD
+                        or not blocker.can_block(attacker, game=game)):
+                    print(f"[BLOCK-INVALID] {blocker.name} cannot block "
+                          f"{attacker.name} — skipped")
+                    continue
+                claimed_blockers.add(blocker_id)
+                blocker.blocking.append(attacker.id)
+                attacker.blocked_by.append(blocker.id)
+                game.blockers.setdefault(attacker.id, []).append(blocker.id)
+                used_names.append(blocker.name)
+            if used_names:
+                block_messages.append(
+                    f"{_format_blocker_list(used_names)} blocks {attacker.name}")
+
+        if block_messages:
+            await cog._autoplay_send(
+                thread,
+                f"🛡️ **{defender.name}** blocks:\n"
+                + "\n".join(f"• {line}" for line in block_messages),
+            )
+        else:
+            available = sum(
+                1 for card in defender.battlefield
+                if card.is_creature(game=game) and not card.tapped
+                and not getattr(card, '_phased_out', False)
+            )
+            suffix = ("can't block (no untapped creatures)" if not available
+                      else f"doesn't block ({available} potential blocker(s) held back)")
+            await cog._autoplay_send(
+                thread, f"🛡️ **{defender.name}** {suffix}.")
+
+
+def _coalesce_repeated_x_target_casts(player: Player,
+                                      plan: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Turn repeated declarations of one ``X target creatures`` spell into
+    one cast with a target list.
+
+    The actor sometimes expresses Curse of the Swine as two adjacent cast
+    actions, one target per action.  Only the first cast can exist; after it
+    resolves the card is no longer in hand.  Coalescing at the plan boundary
+    preserves the declared choices and lets the normal cast funnel validate
+    and charge one X spell.  Other spells and non-adjacent duplicate copies
+    retain their existing behavior.
+    """
+    normalized: List[Dict[str, Any]] = []
+    index = 0
+    while index < len(plan):
+        action = plan[index]
+        if action.get("type") != "cast":
+            normalized.append(action)
+            index += 1
+            continue
+        card_name = action.get("card")
+        card = (player.find_card(card_name, Zone.HAND)
+                if isinstance(card_name, str) else None)
+        oracle = (getattr(card, "oracle_text", "") or "").lower()
+        if not re.search(r"\bx target creatures?\b", oracle):
+            normalized.append(action)
+            index += 1
+            continue
+
+        run = [action]
+        cursor = index + 1
+        while cursor < len(plan):
+            candidate = plan[cursor]
+            if (candidate.get("type") != "cast"
+                    or str(candidate.get("card", "")).lower()
+                    != str(card_name).lower()):
+                break
+            run.append(candidate)
+            cursor += 1
+        target_names: List[str] = []
+        for declaration in run:
+            raw = declaration.get("target")
+            values = raw if isinstance(raw, (list, tuple)) else [raw]
+            for value in values:
+                value = coerce_ai_string(value) if value is not None else ""
+                if value and value not in target_names:
+                    target_names.append(value)
+        if len(run) > 1 and target_names:
+            merged = dict(action)
+            merged["target"] = target_names
+            if not any(key in merged for key in ("x", "X", "x_value")):
+                merged["x"] = len(target_names)
+            normalized.append(merged)
+            print(f"[PLAN-MULTITARGET] Coalesced {len(run)} {card_name} "
+                  f"declarations into targets={target_names}")
+        else:
+            normalized.extend(run)
+        index = cursor
+    return normalized
+
+
 async def _autoplay_human_turn(cog, thread, game: GameState, player_idx: int):
     """Simulate a human player's turn using AI decisions but human code paths.
 
@@ -776,6 +1096,10 @@ async def _autoplay_human_turn(cog, thread, game: GameState, player_idx: int):
     game._recent_action_card_names = set()
 
     player = game.players[player_idx]
+
+    def _turn_continues() -> bool:
+        """A multiplayer turn stops when its stable seat leaves the game."""
+        return not game.ended and not getattr(player, 'eliminated', False)
     actions_taken = []
     max_actions = 20
     max_retries = 3
@@ -790,7 +1114,7 @@ async def _autoplay_human_turn(cog, thread, game: GameState, player_idx: int):
     # --- MAIN PHASE 1 ---
     # Try batch planning first (one API call for the whole phase)
     plan_used = False
-    if game.phase == Phase.MAIN1 and not game.ended:
+    if game.phase == Phase.MAIN1 and _turn_continues():
         ap_player = game.players[player_idx]
         has_hand = bool(ap_player.hand)
         has_pending = bool(getattr(game, 'pending_resolves', None))
@@ -811,9 +1135,10 @@ async def _autoplay_human_turn(cog, thread, game: GameState, player_idx: int):
         elif not has_pending:
             plan = await cog.engine.claude_ai.plan_turn(game, player_idx,
                                                        call_source="autoplay:main1")
+            plan = _coalesce_repeated_x_target_casts(player, plan)
             plan_failed = False
             for action in plan:
-                if game.ended:
+                if not _turn_continues():
                     break
                 if action.get("type") == "pass":
                     await _advance_phase_with_display(cog, thread, game)
@@ -861,7 +1186,8 @@ async def _autoplay_human_turn(cog, thread, game: GameState, player_idx: int):
 
     # Fallback: per-action loop (if plan failed or pending resolves)
     if not plan_used:
-        while game.phase == Phase.MAIN1 and not game.ended and len(actions_taken) < max_actions:
+        while (game.phase == Phase.MAIN1 and _turn_continues()
+               and len(actions_taken) < max_actions):
             ap_player = game.players[player_idx]
             if not ap_player.hand and not getattr(game, 'pending_resolves', None):
                 has_activatable = any(
@@ -961,7 +1287,7 @@ async def _autoplay_human_turn(cog, thread, game: GameState, player_idx: int):
 
     # --- COMBAT ---
     # Two passes to get from MAIN1 exit to DECLARE_ATTACKERS (like human !pass !pass)
-    if game.phase == Phase.COMBAT_BEGIN and not game.ended:
+    if game.phase == Phase.COMBAT_BEGIN and _turn_continues():
         # July 20 display audit: same dropped-return as the Claude path —
         # beginning-of-combat trigger output was invisible to players.
         _, _cb_msgs = cog.engine.advance_phase(game)  # → DECLARE_ATTACKERS
@@ -978,7 +1304,7 @@ async def _autoplay_human_turn(cog, thread, game: GameState, player_idx: int):
         for _m in await cog.engine.drain_pending_triggers(game):
             await cog._autoplay_send(thread, _m)
 
-    if game.phase == Phase.DECLARE_ATTACKERS and not game.ended:
+    if game.phase == Phase.DECLARE_ATTACKERS and _turn_continues():
         # Aug 2 (batch-13): a fresh declaration starts from an EMPTY attacker
         # list. Claude's combat path can leave the previous turn's ids in
         # game.attackers (its COMBAT_END branch doesn't run on every flow),
@@ -994,9 +1320,17 @@ async def _autoplay_human_turn(cog, thread, game: GameState, player_idx: int):
             used_ids = set()
             for name in attacker_names:
                 card = None
+                defender_indices = [
+                    index for index in game.living_player_indices()
+                    if index != player_idx
+                ]
                 for c in player.get_zone(Zone.BATTLEFIELD):
                     if (c.name.lower() == name.lower() and c.id not in used_ids
                             and c.is_creature() and not c.tapped):
+                        if not defender_indices:
+                            continue
+                        c.attacking_player = defender_indices[
+                            len(game.attackers) % len(defender_indices)]
                         # Validate with rules engine (like !attack does)
                         can_attack, reason = cog.engine.rules.can_attack_with(game, player, c)
                         if can_attack:
@@ -1004,15 +1338,16 @@ async def _autoplay_human_turn(cog, thread, game: GameState, player_idx: int):
                             if paid:
                                 card = c
                                 break
+                        c.attacking_player = None
                 if card:
                     card.attacking = True
-                    card.attacking_player = 1 - player_idx
                     card.attacks_this_turn += 1  # C-1: Moraug's attack-count static
                     if not card.has_vigilance():
                         cog.engine.tap_permanent(card)
                     game.attackers.append(card.id)
                     used_ids.add(card.id)
-                    attacked.append(card.name + (" (vigilance)" if card.has_vigilance() else ""))
+                    attacked.append(_format_autoplay_attacker(
+                        game, card, show_vigilance=True))
                 else:
                     # June 10 round 3 (A10b follow-up): the silent drop here
                     # made legal filtering (summoning-sick twin token, all
@@ -1036,7 +1371,7 @@ async def _autoplay_human_turn(cog, thread, game: GameState, player_idx: int):
                 for msg in sba_msgs:
                     await cog._autoplay_send(thread, f"⚡ {msg}")
 
-        if game.attackers and not game.ended:
+        if game.attackers and _turn_continues():
             # Combat priority window: after attackers declared
             if game.stack_enabled:
                 send_fn = lambda msg: cog._autoplay_send(thread, msg)
@@ -1044,16 +1379,20 @@ async def _autoplay_human_turn(cog, thread, game: GameState, player_idx: int):
                 # Check if attackers survived instant-speed removal
                 game.attackers = [aid for aid in game.attackers
                                   if any(c.id == aid and c.attacking for p in game.players for c in p.battlefield)]
-                if not game.attackers and not game.ended:
+                if not game.attackers and _turn_continues():
                     await cog._autoplay_send(thread, "⚔️ No attackers remain after priority — skipping combat.")
                     while game.phase not in [Phase.MAIN2, Phase.END, Phase.CLEANUP]:
                         await _advance_phase_with_display(cog, thread, game)
                     # Fall through to MAIN2
 
             # Opponent blocks (Claude is the opponent since pretend human is attacking)
-            opponent_idx = 1 - player_idx
-            opponent = game.players[opponent_idx]
-            if game.attackers and not game.ended and opponent.is_claude:
+            opponent = game.default_opponent_for(player)
+            opponent_idx = (game.players.index(opponent)
+                            if opponent is not None else player_idx)
+            if game.experimental_ffa:
+                await _autoplay_assign_multiplayer_blocks(cog, thread, game)
+            if (not game.experimental_ffa and game.attackers
+                    and _turn_continues() and opponent.is_claude):
                 await asyncio.sleep(1)
                 attacker_cards = []
                 for a_id in game.attackers:
@@ -1151,7 +1490,7 @@ async def _autoplay_human_turn(cog, thread, game: GameState, player_idx: int):
                         await cog._autoplay_send(thread, f"🛡️ **{opponent.name}** can't block (no untapped creatures).")
                     else:
                         await cog._autoplay_send(thread, f"🛡️ **{opponent.name}** doesn't block ({untapped_creature_count} potential blocker(s) held back).")
-            else:
+            elif not game.experimental_ffa:
                 # Both are pretend humans — use AI for the other too
                 await asyncio.sleep(1)
                 attacker_cards = []
@@ -1193,9 +1532,10 @@ async def _autoplay_human_turn(cog, thread, game: GameState, player_idx: int):
                 await cog.engine._combat_priority_round(game, send_fn, "after blockers declared")
 
             # Resolve combat damage
-            if game.attackers and not game.ended:
+            if game.attackers and _turn_continues():
                 await cog._autoplay_resolve_combat(thread, game)
-        elif not game.attackers and game.phase == Phase.DECLARE_ATTACKERS and not game.ended:
+        elif (not game.attackers and game.phase == Phase.DECLARE_ATTACKERS
+              and _turn_continues()):
             # No attackers — skip to MAIN2
             while game.phase not in [Phase.MAIN2, Phase.END, Phase.CLEANUP]:
                 await _advance_phase_with_display(cog, thread, game)
@@ -1203,7 +1543,7 @@ async def _autoplay_human_turn(cog, thread, game: GameState, player_idx: int):
     # --- ADDITIONAL COMBAT PHASES (Moraug, Aurelia, etc.) ---
     additional_combats = getattr(game, '_additional_combats', 0)
     combat_round = 0
-    while additional_combats > 0 and not game.ended:
+    while additional_combats > 0 and _turn_continues():
         additional_combats -= 1
         game._additional_combats = additional_combats
         combat_round += 1
@@ -1240,40 +1580,55 @@ async def _autoplay_human_turn(cog, thread, game: GameState, player_idx: int):
             used_ids = set()
             for name in attacker_names:
                 card = None
+                defender_indices = [
+                    index for index in game.living_player_indices()
+                    if index != player_idx
+                ]
                 for c in player.get_zone(Zone.BATTLEFIELD):
                     if (c.name.lower() == name.lower() and c.id not in used_ids
                             and c.is_creature() and not c.tapped):
+                        if not defender_indices:
+                            continue
+                        c.attacking_player = defender_indices[
+                            len(game.attackers) % len(defender_indices)]
                         can_attack, reason = cog.engine.rules.can_attack_with(game, player, c)
                         if can_attack:
                             paid, tax_reason = cog.engine.rules.pay_attack_tax(game, player, c)
                             if paid:
                                 card = c
                                 break
+                        c.attacking_player = None
                 if card:
                     card.attacking = True
-                    card.attacking_player = 1 - player_idx
                     card.attacks_this_turn += 1  # C-1: Moraug's attack-count static
                     if not card.has_vigilance():
                         cog.engine.tap_permanent(card)
                     game.attackers.append(card.id)
                     used_ids.add(card.id)
-                    attacked.append(card.name)
+                    attacked.append(_format_autoplay_attacker(game, card))
             if attacked:
                 await cog._autoplay_send(thread, f"⚔️ **{player.name}** attacks with: {', '.join(attacked)}")
                 trigger_msgs = cog.engine.process_attack_triggers(game, player_idx)
                 for msg in trigger_msgs:
                     await cog._autoplay_send(thread, msg)
 
-        if game.attackers and not game.ended:
+        if game.attackers and _turn_continues():
             # Opponent blocks
-            opponent_idx = 1 - player_idx
-            opponent = game.players[opponent_idx]
+            if game.experimental_ffa:
+                await _autoplay_assign_multiplayer_blocks(cog, thread, game)
+                opponent = None
+                opponent_idx = player_idx
+            else:
+                opponent = game.default_opponent_for(player)
+                opponent_idx = game.players.index(opponent)
             attacker_cards = []
             for a_id in game.attackers:
                 result = game.find_card_global(a_id)
                 if result:
                     attacker_cards.append(result[0])
-            blocks = await cog.engine.claude_ai.decide_blocks(game, opponent_idx, attacker_cards)
+            blocks = (None if game.experimental_ffa else
+                      await cog.engine.claude_ai.decide_blocks(
+                          game, opponent_idx, attacker_cards))
             if blocks:
                 for attacker_id, blocker_ids in blocks.items():
                     if blocker_ids:
@@ -1301,7 +1656,7 @@ async def _autoplay_human_turn(cog, thread, game: GameState, player_idx: int):
                                 game.blockers[attacker.id] = []
                             game.blockers[attacker.id].append(blocker.id)
             # Resolve combat damage
-            if game.attackers and not game.ended:
+        if game.attackers and _turn_continues():
                 await cog._autoplay_resolve_combat(thread, game)
         else:
             await cog._autoplay_send(thread, f"⚔️ No attackers for additional combat — skipping.")
@@ -1330,12 +1685,13 @@ async def _autoplay_human_turn(cog, thread, game: GameState, player_idx: int):
     game._extra_combat_untaps = 0
 
     # Advance to MAIN2 if we're stuck in combat phases
-    if game.phase not in [Phase.MAIN2, Phase.END, Phase.CLEANUP] and not game.ended:
+    if (game.phase not in [Phase.MAIN2, Phase.END, Phase.CLEANUP]
+            and _turn_continues()):
         while game.phase not in [Phase.MAIN2, Phase.END, Phase.CLEANUP]:
             await _advance_phase_with_display(cog, thread, game)
 
     # --- MAIN PHASE 2 ---
-    if game.phase == Phase.MAIN2 and not game.ended:
+    if game.phase == Phase.MAIN2 and _turn_continues():
         retry_count = 0
         last_error = None
         last_action_key = None
@@ -1359,9 +1715,10 @@ async def _autoplay_human_turn(cog, thread, game: GameState, player_idx: int):
         elif not has_pending:
             plan = await cog.engine.claude_ai.plan_turn(game, player_idx,
                                                        call_source="autoplay:main2")
+            plan = _coalesce_repeated_x_target_casts(player, plan)
             plan_failed_m2 = False
             for action in plan:
-                if game.ended:
+                if not _turn_continues():
                     break
                 if action.get("type") == "pass":
                     break
@@ -1380,7 +1737,8 @@ async def _autoplay_human_turn(cog, thread, game: GameState, player_idx: int):
 
         # Fallback per-action loop for MAIN2
         if not plan_used_m2:
-            while game.phase == Phase.MAIN2 and not game.ended and len(actions_taken) < max_actions:
+            while (game.phase == Phase.MAIN2 and _turn_continues()
+                   and len(actions_taken) < max_actions):
                 ap_player = game.players[player_idx]
                 if not ap_player.hand and not getattr(game, 'pending_resolves', None):
                     has_activatable = any(
@@ -1464,6 +1822,8 @@ async def _autoplay_execute_action(cog, thread, game: GameState, player_idx: int
     _prev_cast_like = getattr(game, '_last_exec_cast_like', None)
     game._last_exec_cast_like = None
     action_type = action.get("type")
+    target_player_id = action.get('target_player_id')
+    target_card_id = action.get('target_card_id')
 
     if action_type == "play_land":
         card_name = action.get("card")
@@ -1879,17 +2239,45 @@ async def _autoplay_execute_action(cog, thread, game: GameState, player_idx: int
         # declared target, and "opponent" never resolved to a player at all.
         target = None
         if isinstance(target_name, (list, tuple)):
-            target = list(target_name)
-        elif target_name:
             from mtg.helpers import resolve_cast_target
-            target = resolve_cast_target(game, player, card, target_name)
-        if (target_name and target is None and HAS_TARGETING
+            resolved_targets = []
+            unresolved_target = None
+            for declared in target_name:
+                resolved = resolve_cast_target(game, player, card, declared)
+                if resolved is None:
+                    unresolved_target = declared
+                    break
+                stable_key = ("player", game.players.index(resolved)
+                              if resolved in game.players else None)
+                if resolved not in game.players:
+                    stable_key = ("card", getattr(resolved, "id", None))
+                if stable_key not in [
+                        (("player", game.players.index(existing))
+                         if existing in game.players
+                         else ("card", getattr(existing, "id", None)))
+                        for existing in resolved_targets]:
+                    resolved_targets.append(resolved)
+            target = None if unresolved_target is not None else resolved_targets
+        elif (target_name or target_player_id is not None
+              or target_card_id is not None):
+            from mtg.helpers import resolve_cast_target
+            target = resolve_cast_target(
+                game, player, card, target_name,
+                target_player_id=target_player_id,
+                target_card_id=target_card_id)
+        target_declared = (bool(target_name) or target_player_id is not None
+                           or target_card_id is not None)
+        if (target_declared and target is None and HAS_TARGETING
                 and _spell_requires_targets(spell_face_for_gates(card))):
             _stash_name = (card.adventure_name
                            if getattr(card, 'cast_as_adventure', False)
                            and getattr(card, 'adventure_name', None)
                            else card.name)
-            reason = (f"declared target '{target_name}' is not a legal target "
+            target_label = (target_name or
+                            (f"player_id={target_player_id}"
+                             if target_player_id is not None
+                             else f"card_id={target_card_id}"))
+            reason = (f"declared target '{target_label}' is not a legal target "
                       f"for {_stash_name} (CR 601.2c)")
             print(f"[TARGETING] {reason}")
             game._last_cast_failure = (game.turn_number, _stash_name, reason)
@@ -1919,9 +2307,23 @@ async def _autoplay_execute_action(cog, thread, game: GameState, player_idx: int
             card.cast_as_split_half = -1
             return None
 
-        # Pass explicit X value from batch plan (Walking Ballista, Hangarback Walker, etc.)
-        if action.get("X") is not None:
-            card._x_value = int(action["X"])
+        # Pass explicit X value from batch/inline plans (Walking Ballista,
+        # Comet Storm, etc.).  The engine-side executor accepts all three
+        # documented/provider spellings; this human-like autoplay twin only
+        # accepted uppercase ``X``.  In live FFA game 1537881091866886225,
+        # Deepseek chose ``x: 1`` and the cast funnel silently maximized it to
+        # X=2.  Preserve the exact strategic choice across both executors.
+        explicit_x = action.get("x_value")
+        if explicit_x is None:
+            explicit_x = action.get("X")
+        if explicit_x is None:
+            explicit_x = action.get("x")
+        if explicit_x is not None:
+            try:
+                card._x_value = int(explicit_x)
+            except (ValueError, TypeError):
+                print(f"[AUTOPLAY] Invalid X value for {card.name}: "
+                      f"{explicit_x!r}; cast funnel will choose")
 
         # Apr 30 audit fix #21: stash modal mode selection on card so templates
         # can read ctx['_modes']. Same convention as engine.py:_execute_action.
@@ -2162,8 +2564,14 @@ async def _autoplay_execute_action(cog, thread, game: GameState, player_idx: int
             # and hasattr(target, 'damage_marked') for creatures.
             auto_targets = None
             # If the plan provided an explicit target, try to resolve it first.
-            if target_name and ability.needs_target:
-                target_obj = _resolve_player_or_card_target(game, player, target_name)
+            explicit_target_declared = (
+                bool(target_name) or target_player_id is not None
+                or target_card_id is not None)
+            if explicit_target_declared and ability.needs_target:
+                target_obj = _resolve_player_or_card_target(
+                    game, player, target_name,
+                    target_player_id=target_player_id,
+                    target_card_id=target_card_id)
                 if target_obj is not None:
                     # July 30: CR 109.5 — "any target" abilities must not
                     # forward a land (Wrenn -1 hit one live in batch 15315).
@@ -2176,12 +2584,23 @@ async def _autoplay_execute_action(cog, thread, game: GameState, player_idx: int
                 if target_obj is not None:
                     auto_targets = [target_obj]
                     tname = target_obj.name if hasattr(target_obj, 'name') else str(target_obj)
-                    print(f"[PW-TARGET] Forwarding explicit target '{target_name}' → {tname} for {perm.name}")
+                    # Aug 23: name the identifier that was ACTUALLY supplied.
+                    # Printing target_name unconditionally logged "'None'" for
+                    # every id-declared target (target_player_id=0 resolving
+                    # correctly to seat 0 read as a dropped target).
+                    _declared = target_name or (
+                        f"player_id={target_player_id}"
+                        if target_player_id is not None
+                        else f"card_id={target_card_id}"
+                        if target_card_id is not None else "?")
+                    print(f"[PW-TARGET] Forwarding explicit target '{_declared}' → {tname} for {perm.name}")
+                else:
+                    print(f"[CHOICE-STALE] Explicit target for {perm.name} is no longer legal")
+                    return None
             if auto_targets is None and ability.needs_target:
                 target_desc = (ability.target_description or '').lower()
                 oracle_lower = (ability.text or '').lower()
-                opp_idx = 1 - game.players.index(player)
-                opp = game.players[opp_idx]
+                opp = game.default_opponent_for(player)
                 if 'player' in target_desc or 'opponent' in target_desc:
                     # Target a player — default to opponent for mill/damage, cog for draw/gain
                     # Only cog-target if the ability is purely beneficial (draw/scry/gain)
@@ -2585,12 +3004,14 @@ async def _autoplay_execute_action(cog, thread, game: GameState, player_idx: int
                     source_card = card.name
                     break
         if not source_card:
-            opponent = game.players[1 - player_idx]
-            for card in opponent.battlefield:
-                if card.name.lower() in BASIC_LAND_NAMES:
-                    continue
-                if card.name.lower() in description.lower():
-                    source_card = card.name
+            for opponent in game.opponents_of(player):
+                for card in opponent.battlefield:
+                    if card.name.lower() in BASIC_LAND_NAMES:
+                        continue
+                    if card.name.lower() in description.lower():
+                        source_card = card.name
+                        break
+                if source_card:
                     break
 
         try:
@@ -2701,7 +3122,15 @@ async def _autoplay_resolve_pending_action(cog, thread, game: GameState):
     pa = game.pending_action
     pa_type = pa.get('type', '')
     pi = pa.get('player_idx', 0)
-    player = game.players[pi]
+    chooser_id = pa.get('chooser_player_id')
+    player = (game.get_player_by_stable_id(chooser_id, living_only=True)
+              if chooser_id is not None
+              else (game.players[pi] if 0 <= pi < len(game.players) else None))
+    if player is None or getattr(player, 'eliminated', False):
+        print(f"[CHOICE-STALE] Pending {pa_type} chooser is no longer active")
+        game.pending_action = None
+        return
+    pi = game.players.index(player)
 
     if pa_type == 'discard_to_hand_size':
         # Already handled in the main loop, but handle here too as safety net.
@@ -2833,10 +3262,18 @@ async def _autoplay_resolve_pending_action(cog, thread, game: GameState):
         game.pending_action = None
 
     elif pa_type == 'planeswalker_target':
-        # Pick first legal target
-        legal_targets = pa.get('legal_targets', [])
-        if legal_targets:
-            target, desc = legal_targets[0]
+        # Pick the first still-legal persisted target.  Exact references make
+        # moved objects and eliminated seats fail closed.
+        choices = pa.get('target_choices', [])
+        resolved = None
+        for choice in choices:
+            candidate = resolve_target_choice(game, choice)
+            if candidate is not None:
+                resolved = candidate, choice
+                break
+        if resolved:
+            target, choice = resolved
+            desc = choice.get('label', getattr(target, 'name', 'target'))
             card_id = pa.get('card_id')
             ability_index = pa.get('ability_index', 0)
             card = None
@@ -2851,14 +3288,21 @@ async def _autoplay_resolve_pending_action(cog, thread, game: GameState):
                     for msg in result.messages:
                         await cog._autoplay_send(thread, msg)
             await cog._autoplay_send(thread, f"🎯 Target: {desc}")
+        elif choices:
+            print("[CHOICE-STALE] No persisted planeswalker target remains legal")
         game.pending_action = None
 
     elif pa_type in ('chandra_dual_target_player', 'chandra_dual_target_creature'):
         # Auto-pick first opponent / biggest creature
         if pa_type == 'chandra_dual_target_player':
-            # Target the opponent
-            opponent_idx = 1 - pi
-            opponent = game.players[opponent_idx]
+            choices = pa.get('target_choices', [])
+            opponent = next((candidate for candidate in
+                             (resolve_target_choice(game, c) for c in choices)
+                             if candidate is not None), None)
+            if opponent is None:
+                print("[CHOICE-STALE] No Chandra player target remains legal")
+                game.pending_action = None
+                return
             dmg = pa.get('player_dmg', 0)
             card_id = pa.get('card_id', '')
             actual_dmg = cog.engine.rules._apply_noncombat_damage_to_player(game, opponent, dmg, "Chandra", card_id)
@@ -2866,9 +3310,10 @@ async def _autoplay_resolve_pending_action(cog, thread, game: GameState):
                 f"🔥 Deals {actual_dmg} damage to {opponent.name} (Life: {opponent.life})")
         else:
             # Pick biggest creature to damage
-            target_pi = pa.get('target_player_idx', 1 - pi)
-            target_player = game.players[target_pi]
-            creatures = [c for c in target_player.battlefield if c.is_creature()]
+            choices = pa.get('target_choices', [])
+            creatures = [candidate for candidate in
+                         (resolve_target_choice(game, c) for c in choices)
+                         if candidate is not None]
             dmg = pa.get('creature_dmg', 0)
             if creatures:
                 biggest = max(creatures, key=lambda c: (c.toughness or 0))
@@ -2897,7 +3342,8 @@ async def _autoplay_resolve_pending_action(cog, thread, game: GameState):
 
 async def _run_single_autoplay(cog, channel, game_format: str, deck1_name: str, deck2_name: str,
                                matchup_label: str = None, force_claude: bool = False,
-                               openrouter_model: str = None) -> dict:
+                               openrouter_model: str = None,
+                               seed_cards: Optional[List[str]] = None) -> dict:
     """Run a single autoplay game. Returns a result dict.
 
     Used by both !autoplay (single game) and !autoplay-batch (matrix).
@@ -2912,7 +3358,7 @@ async def _run_single_autoplay(cog, channel, game_format: str, deck1_name: str, 
     result = {"format": game_format, "deck1": deck1_name, "deck2": deck2_name,
               "outcome": "crash", "winner": None, "turns": 0,
               "p1_life": 0, "p2_life": 0, "error": None, "thread_id": None,
-              "duration_seconds": 0}
+              "duration_seconds": 0, "card_seeds": []}
 
     # June 11 audit: concurrency tracking so the per-game stats line can say
     # when its numbers are polluted by parallel games (all concurrent games
@@ -3335,6 +3781,20 @@ async def _run_single_autoplay(cog, channel, game_format: str, deck1_name: str, 
             player.mulligans_taken = mulligans
             player.has_kept_hand = True
 
+        # Developer-only card exercise runs seed after the last possible
+        # shuffle. The next autoplay creates a fresh GameState, so this state
+        # cannot persist beyond the current game.
+        if seed_cards:
+            seed_results = apply_autoplay_card_seeds(
+                game, cog.engine.deck_loader, seed_cards)
+            result["card_seeds"] = list(seed_results)
+            for seeded in seed_results:
+                await cog._autoplay_send(
+                    thread,
+                    f"🧪 Card exercise seed: **{seeded.get('card')}** — "
+                    f"{seeded['status']} ({seeded.get('player', 'no seat')})"
+                )
+
         # ============================
         # MAIN GAME LOOP
         # ============================
@@ -3392,10 +3852,13 @@ async def _run_single_autoplay(cog, channel, game_format: str, deck1_name: str, 
                     # Claude's newly-cast (summoning-sick) Peregrine Drake
                     # could swing for lethal.
                     if not has_swing:
-                        for _si, _sp in enumerate(game.players):
-                            _opp_p = game.players[1 - _si]
-                            if _sp.life <= 5 and any(
-                                    c.is_creature() for c in _opp_p.battlefield):
+                        for _sp in game.players:
+                            if (_sp.eliminated or _sp.life > 5):
+                                continue
+                            if any(
+                                    c.is_creature()
+                                    for _opp_p in game.opponents_of(_sp)
+                                    for c in _opp_p.battlefield):
                                 has_swing = True
                                 print(f"[AUTOPLAY] [STUCK-GAME] Stagnation suppressed: "
                                       f"{_sp.name} at {_sp.life} life with opposing "
@@ -3501,7 +3964,9 @@ async def _run_single_autoplay(cog, channel, game_format: str, deck1_name: str, 
 
                     if game.waiting_for_human_blocks:
                         game.waiting_for_human_blocks = False
-                        defender_idx = 1 - game.active_player_index
+                        _defender = game.default_opponent_for(game.active_player)
+                        defender_idx = (game.players.index(_defender)
+                                        if _defender else game.active_player_index)
                         attacker_cards = []
                         for a_id in game.attackers:
                             card_result = game.find_card_global(a_id)

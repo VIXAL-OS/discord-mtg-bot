@@ -475,12 +475,14 @@
       "key": "dig through time",
       "name": "Dig Through Time",
       "event": "etb",
-      "description": "Look at top seven, put two into hand (simplified as draw 2)",
+      "description": "Look at top seven, put two into hand and the rest on the bottom",
       "actions": [
         {
-          "action": "draw_cards",
+          "action": "select_cards_from_top",
           "player": "$controller",
-          "amount": 2
+          "amount": 7,
+          "choose_count": 2,
+          "rest_to": "library_bottom"
         }
       ]
     },
@@ -646,17 +648,12 @@
       "key": "fact or fiction",
       "name": "Fact or Fiction",
       "event": "etb",
-      "description": "Reveal top 5, split into piles (simplified: draw 3, mill 2)",
+      "description": "Reveal top five, opponent separates them into piles, choose one pile",
       "actions": [
         {
-          "action": "draw_cards",
+          "action": "fact_or_fiction",
           "player": "$controller",
-          "amount": 3
-        },
-        {
-          "action": "mill",
-          "player": "$controller",
-          "amount": 2
+          "opponent": "$opponent"
         }
       ]
     },
@@ -775,9 +772,10 @@
       "description": "When Goblin Chainwhirler enters, it deals 1 damage to each opponent and each creature and planeswalker they control",
       "actions": [
         {
-          "action": "deal_damage",
+          "action": "damage_each_opponent_board",
           "amount": 1,
-          "target_player": "$opponent"
+          "controller": "$controller",
+          "source": "Goblin Chainwhirler"
         }
       ]
     },
@@ -1186,13 +1184,16 @@
       "key": "long-term plans",
       "name": "Long-Term Plans",
       "event": "etb",
-      "description": "Search library for a card, shuffle, place third from top (approximated as tutor-to-hand)",
+      "description": "Search library for a card, shuffle, then put it third from the top",
       "actions": [
         {
           "action": "search_library",
           "player": "$controller",
           "count": 1,
-          "reason": "Long-Term Plans (third-from-top approximated as tutor-to-hand)"
+          "to_zone": "library_position",
+          "position": 3,
+          "shuffle": true,
+          "reason": "Long-Term Plans"
         }
       ]
     },
@@ -1829,19 +1830,6 @@
           "action": "release_queller_exile",
           "source": "Spell Queller",
           "silent_on_no_result": true
-        }
-      ]
-    },
-    {
-      "key": "sphinx of uthuun",
-      "name": "Sphinx of Uthuun",
-      "event": "etb",
-      "description": "When Sphinx of Uthuun enters, reveal top 5, opponent splits, you choose a pile",
-      "actions": [
-        {
-          "action": "draw_cards",
-          "player": "$controller",
-          "amount": 3
         }
       ]
     },

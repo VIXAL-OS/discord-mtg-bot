@@ -387,9 +387,18 @@ class ReplacementEngine:
         # Determine who chooses
         chooser = event.affected_player
         if not chooser and event.affected_object:
-            # Controller of affected object chooses
-            # Would need to look up in game_state
-            chooser = event.source_controller
+            # CR 616.1: the controller of the AFFECTED object chooses. The
+            # source controller may be an opponent and is not a substitute.
+            finder = getattr(game_state, 'find_card_global', None)
+            found = finder(event.affected_object) if callable(finder) else None
+            if found:
+                affected_card = found[0]
+                for player in getattr(game_state, 'players', []):
+                    if affected_card in getattr(player, 'battlefield', []):
+                        chooser = player.name
+                        break
+            if not chooser:
+                chooser = event.source_controller
         
         if choose_callback:
             # Use provided callback for player choice

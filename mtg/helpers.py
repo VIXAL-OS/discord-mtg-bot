@@ -626,7 +626,8 @@ def decimate_target_choices(game, caster, source_card):
     return selected
 
 
-def _resolve_player_or_card_target(game, activating_player, target_name):
+def _resolve_player_or_card_target(game, activating_player, target_name=None, *,
+                                   target_player_id=None, target_card_id=None):
     """Resolve an AI-provided target string to a Player or Card object.
 
     Accepts common AI conventions:
@@ -637,6 +638,18 @@ def _resolve_player_or_card_target(game, activating_player, target_name):
 
     Returns the resolved object, or None if unresolvable.
     """
+    # Explicit IDs are authoritative.  A stale seat/card must fail closed;
+    # silently falling back to a same-named object is disastrous in FFA.
+    if target_player_id is not None or target_card_id is not None:
+        if target_player_id is not None and target_card_id is not None:
+            return None
+        if target_player_id is not None:
+            resolver = getattr(game, 'get_player_by_stable_id', None)
+            return resolver(target_player_id, living_only=True) if resolver else None
+        finder = getattr(game, 'find_battlefield_card_by_id', None)
+        found = finder(target_card_id, living_only=True) if finder else None
+        return found[0] if found else None
+
     target_name = coerce_ai_string(target_name)
     if not target_name:
         return None
@@ -644,15 +657,21 @@ def _resolve_player_or_card_target(game, activating_player, target_name):
     # Player-keyword resolution
     if t in ('you', 'yourself', 'self', 'me', 'my', 'controller', 'caster'):
         return activating_player
-    if t in ('opponent', 'opp', 'them', 'enemy', 'target player', 'target opponent',
-             'another player', 'each opponent'):
-        for p in game.players:
-            if p is not activating_player:
-                return p
+    if t in ('opponent', 'opp', 'them', 'enemy', 'target player',
+             'target opponent', 'another player'):
+        if hasattr(game, 'default_opponent_for'):
+            return game.default_opponent_for(activating_player)
+        # Lightweight fixtures and downstream adapters may expose only the
+        # historical ``players`` list. Preserve that duck-typed contract;
+        # real GameState supplies the stable-seat multiplayer selector above.
+        return next((p for p in getattr(game, 'players', [])
+                     if p is not activating_player
+                     and not getattr(p, 'eliminated', False)), None)
     # Player name match (case-insensitive, allow substring for display names)
     for p in game.players:
         pname = (getattr(p, 'name', '') or '').lower()
-        if pname and (pname == t or pname.startswith(t) or t.startswith(pname)):
+        if (not getattr(p, 'eliminated', False) and pname
+                and (pname == t or pname.startswith(t) or t.startswith(pname))):
             return p
     # Exact card match on any battlefield
     for p in game.players:
@@ -722,7 +741,7 @@ _SELF_TARGET_WORDS = frozenset((
     'you', 'yourself', 'self', 'me', 'my', 'controller', 'caster'))
 _OPPONENT_TARGET_WORDS = frozenset((
     'opponent', 'opp', 'them', 'enemy', 'target player', 'target opponent',
-    'another player', 'each opponent'))
+    'another player'))
 
 
 def cast_face_allows_player_target(card) -> bool:
@@ -736,7 +755,8 @@ def cast_face_allows_player_target(card) -> bool:
                           oracle))
 
 
-def resolve_cast_target(game, caster, card, target_name):
+def resolve_cast_target(game, caster, card, target_name=None, *,
+                        target_player_id=None, target_card_id=None):
     """Resolve a declared cast target string to a StackEntry, Card or Player.
 
     ONE resolver for both cast paths. Two divergent copies existed — the AI one
@@ -758,13 +778,54 @@ def resolve_cast_target(game, caster, card, target_name):
 
     Returns the resolved object, or None if nothing matches.
     """
+    face = spell_face_for_gates(card)
+    oracle = (getattr(face, 'oracle_text', '') or '').lower()
+
+    # Q-E multiplayer choice contract: IDs select an exact object and never
+    # degrade to name/default-opponent resolution.  Zone and Oracle gates are
+    # still applied, so a moved card or eliminated seat is a stale choice.
+    if target_player_id is not None or target_card_id is not None:
+        if target_player_id is not None and target_card_id is not None:
+            return None
+        if target_player_id is not None:
+            if not cast_face_allows_player_target(card):
+                return None
+            resolver = getattr(game, 'get_player_by_stable_id', None)
+            return resolver(target_player_id, living_only=True) if resolver else None
+
+        if 'counter target' in oracle and 'spell' in oracle:
+            for entry in reversed(getattr(game, 'stack', []) or []):
+                entry_card = getattr(entry, 'card', None)
+                entry_id = getattr(entry_card, 'id', None) or (
+                    entry.get('card_id') if isinstance(entry, dict) else None)
+                if entry_id == target_card_id:
+                    return entry
+
+        _reaches_graveyard = any(phrase in oracle for phrase in
+                                 ('in a graveyard', 'in your graveyard',
+                                  'from your graveyard', 'from a graveyard'))
+        _targets_battlefield = bool(re.search(
+            r'target\s+(?:[\w-]+\s+){0,3}'
+            r'(?:creature|permanent|artifact|enchantment|land|planeswalker)\b'
+            r'(?!\s+card)', oracle))
+        if _reaches_graveyard:
+            for player in game.players:
+                for candidate in player.graveyard:
+                    if candidate.id == target_card_id:
+                        return candidate
+        if not (_reaches_graveyard and not _targets_battlefield):
+            finder = getattr(game, 'find_battlefield_card_by_id', None)
+            found = finder(target_card_id, living_only=True) if finder else None
+            if found:
+                return found[0]
+        return None
+
     if not target_name:
         return None
     target_name = coerce_ai_string(target_name)
     if not target_name:
         return None
     lowered = target_name.strip().lower()
-    oracle = (getattr(card, 'oracle_text', '') or '').lower()
 
     # 1. Counterspells target objects on the stack.
     if 'counter target' in oracle and 'spell' in oracle:
@@ -835,12 +896,69 @@ def resolve_cast_target(game, caster, card, target_name):
     if lowered in _SELF_TARGET_WORDS:
         return caster
     if lowered in _OPPONENT_TARGET_WORDS:
-        for p in game.players:
-            if p is not caster:
-                return p
+        return game.default_opponent_for(caster)
     for p in game.players:
-        if (getattr(p, 'name', '') or '').lower() == lowered:
+        if (not getattr(p, 'eliminated', False)
+                and (getattr(p, 'name', '') or '').lower() == lowered):
             return p
+    return None
+
+
+def serialize_target_choice(game, target, description=None):
+    """Convert a live Player/Card target to a JSON-safe stable reference."""
+    if target in getattr(game, 'players', []):
+        return {
+            'kind': 'player',
+            'target_player_id': game.stable_player_id(target),
+            'label': description or getattr(target, 'name', 'player'),
+        }
+    target_id = getattr(target, 'id', None)
+    if target_id:
+        found = game.find_battlefield_card_by_id(target_id, living_only=False)
+        if found:
+            card, owner = found
+            return {
+                'kind': 'card',
+                'target_card_id': card.id,
+                'target_controller_id': game.stable_player_id(owner),
+                'label': description or card.name,
+            }
+    return None
+
+
+def serialize_target_choices(game, legal_targets):
+    """Serialize ``[(object, label), ...]`` returned by rules managers."""
+    choices = []
+    for target, description in legal_targets or []:
+        ref = serialize_target_choice(game, target, description)
+        if ref is not None:
+            choices.append(ref)
+    return choices
+
+
+def resolve_target_choice(game, choice):
+    """Rebind a persisted choice to current state, or None when stale.
+
+    This deliberately never searches by the human-readable label.  A moved
+    permanent or eliminated player invalidates the choice instead of causing
+    a similarly named object to inherit it.
+    """
+    if not isinstance(choice, dict):
+        return None
+    if choice.get('kind') == 'player':
+        return game.get_player_by_stable_id(
+            choice.get('target_player_id'), living_only=True)
+    if choice.get('kind') == 'card':
+        found = game.find_battlefield_card_by_id(
+            choice.get('target_card_id'), living_only=True)
+        if not found:
+            return None
+        card, owner = found
+        expected_owner = choice.get('target_controller_id')
+        if (expected_owner is not None
+                and game.stable_player_id(owner) != expected_owner):
+            return None
+        return card
     return None
 
 
@@ -2869,10 +2987,15 @@ def apnap_order_died(died_pairs, game):
     on any error, matching the previous inline behavior.
     """
     try:
-        active_idx = game.active_player_index
+        rank = {
+            player_index: position
+            for position, player_index in enumerate(
+                game.apnap_player_indices(resolution_order=True))
+        }
         return sorted(
             died_pairs,
-            key=lambda pair: 0 if game.players.index(pair[1]) != active_idx else 1,
+            key=lambda pair: rank.get(
+                game.players.index(pair[1]), len(rank)),
         )
     except (ValueError, AttributeError, TypeError, IndexError):
         # Player not in game.players / malformed pair — insertion order.

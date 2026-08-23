@@ -199,9 +199,9 @@
    "note": "Now reaches the unhandled queue, but its damage-back effect still has no deterministic branch."
   },
   "inscription of abundance": {
-   "status": "unexercised",
-   "since_sha": "a59953c",
-   "note": "Not in the corpus."
+   "status": "awaiting",
+   "since_sha": "bf0c128",
+   "note": "The player-target life mode ignored the explicit player and always used the caster's greatest power. It now uses the selected player's battlefield."
   },
   "instigator gang": {
    "status": "awaiting",
@@ -215,8 +215,8 @@
   },
   "killing wave": {
    "status": "awaiting",
-   "since_sha": "6a30802",
-   "note": "The cross-game dedupe that cancelled it was fixed after the corpus."
+   "since_sha": "bf0c128",
+   "note": "X=1 let a creature survive without payment or sacrifice. Each creature now takes its controller's explicit deterministic pay-or-sacrifice branch; X=0 is a keep control."
   },
   "kozilek, the broken reality": {
    "status": "verified",
@@ -422,14 +422,14 @@
    "note": "Activated self-sacrifice reached the graveyard but missed the shared undying/persist save. Both self-sac and chosen-sac activation costs now reuse the graveyard-only save helper."
   },
   "history of benalia": {
-   "status": "awaiting",
+   "status": "verified",
    "since_sha": "a49460a",
-   "note": "Chapter III's Tier-3 action pumped non-Knights. It now resolves deterministically as +2/+1 to Knights only; chapters I/II are preserved."
+   "note": "Seventh-cycle live evidence showed chapter III pumping Knights only; chapters I/II remained intact."
   },
   "hollowhenge overlord": {
-   "status": "awaiting",
+   "status": "verified",
    "since_sha": "a49460a",
-   "note": "The upkeep trigger hardcoded one Wolf. It now snapshots all Wolves/Werewolves controlled at resolution, including itself, without recursive token counting."
+   "note": "Seventh-cycle live upkeep created exactly five Wolves from the pre-resolution Wolf/Werewolf snapshot, including the source."
   },
   "gisela, the broken blade": {
    "status": "awaiting",
@@ -467,9 +467,99 @@
    "note": "Attached parameterized attack keywords were invisible because only printed attacker text was parsed. Attached Aura static grants now contribute annihilator without duplicating printed keywords."
   },
   "tooth and nail": {
+   "status": "verified",
+   "since_sha": "34fc998",
+   "note": "Cube FFA game 1537840778339160126 took a structured tutor_card2 plan through the formerly crashing production executor, paid the base {5}{G}{G} cost, put Torrential Gearhulk from hand onto the battlefield, and fired its noncast ETB. The earlier live corpus had already verified entwine semantics."
+  },
+  "spider umbra": {
+   "status": "verified",
+   "since_sha": "516d8bf",
+   "note": "Seventh-cycle live cross-controller evidence: Spider Umbra saved Puppeteer Clique and the Aura went to its owner's graveyard."
+  },
+  "khalni heart expedition": {
    "status": "awaiting",
-   "since_sha": "a49460a",
-   "note": "Entwine previously resolved one mode twice. It now searches up to two creatures library-to-hand, then puts up to two creatures from hand onto the battlefield, with two explicit tutor choices threaded end to end."
+   "since_sha": "bf0c128",
+   "note": "Activation searched only one basic despite Oracle allowing up to two; now performs a bounded two-card search with tapped entry and landfall per land."
+  },
+  "decimate": {
+   "status": "awaiting",
+   "since_sha": "bf0c128",
+   "note": "Was cast without every mandatory target class and destroyed only one permanent. It now gates before payment and preserves four stable target IDs through resolution."
+  },
+  "aurelia's fury": {
+   "status": "awaiting",
+   "since_sha": "bf0c128",
+   "note": "Damage resolved but the damaged-player noncreature cast restriction was prose-only. The turn-scoped cast gate is now deterministic; creatures and later turns are controls."
+  },
+  "blizzard strix": {
+   "status": "awaiting",
+   "since_sha": "bf0c128",
+   "note": "Generic ETB exile consumed the compound sentence and omitted the next-end-step return. The named template now requires another snow permanent and schedules the exact return."
+  },
+  "aluren": {
+   "status": "awaiting",
+   "since_sha": "c3f8c30",
+   "note": "The initial repair supplied free mana and flash but missed response-prompt game context and priority affordability. All cast/response paths now share the Aluren predicate; MV<=3 zero-mana response, absent-Aluren, MV4, and additional-cost controls are pinned."
+  },
+  "howlpack piper": {
+   "status": "awaiting",
+   "since_sha": "bf0c128",
+   "note": "Tovolar's direct night path transformed the card without the shared transforms-into dispatcher. Awaiting a live Wildsong Howler draw-trigger confirmation."
+  },
+  "counterspell": {
+   "status": "awaiting",
+   "since_sha": "bf0c128",
+   "note": "A response decision finished after the fixed stack timeout had already resolved its target. Stack entries now remain live while the bounded AI decision is in flight."
+  },
+  "bonecrusher giant": {
+   "status": "awaiting",
+   "since_sha": "fd60fa2",
+   "note": "Cube game 1537622789408817162 verified front-face ingestion and the three-mana creature cast/resolution/combat path, but two legal Stomp opponent-target attempts exposed declared-target validation reusing the creature face. Implementation fd60fa2 now validates against the active Adventure face; the production-path pin casts Stomp, deals 2, and moves Bonecrusher Giant to Adventure exile. Awaiting fresh live Stomp evidence before promotion."
+  },
+  "primeval titan": {
+   "status": "verified",
+   "since_sha": "284c881",
+   "note": "Strict cube FFA game 1537847378839609484 verified the complete deterministic path: Primeval Titan fetched exactly two lands tapped on ETB, then each of three attacks fetched exactly two more tapped lands, shuffling once per trigger and firing land-entry/landfall handling."
+  },
+  "lightning runner": {
+   "status": "verified",
+   "since_sha": "34fc998",
+   "note": "Cube FFA game 1537840778339160126 exercised four attacks: energy advanced 2 -> 4 -> 6 -> 8, then Lightning Runner paid eight, untapped four controlled creatures, and granted an additional combat. The phase was correctly discarded only because that combat eliminated the final opponent and ended the game."
+  },
+  "obsidian fireheart": {
+   "status": "awaiting",
+   "since_sha": "bf812f5",
+   "note": "First FFA game 1537820738592186419 falsely treated the upkeep ability quoted inside Fireheart's activated ability as Fireheart's own trigger. Implementation bf812f5 strips activated-ability lines before the battlefield upkeep predicate while preserving real and reminder-text upkeep controls. Awaiting a fresh live negative confirmation."
+  },
+  "goblin goliath": {
+   "status": "awaiting",
+   "since_sha": "bf812f5",
+   "note": "First FFA game 1537820738592186419 resolved its each-opponent ability with a stale eliminated seat named as the sole opponent; the count was correct only by coincidence. Implementation bf812f5 gives Tier 3 every living opponent and marks eliminated seats unavailable. Awaiting fresh live multiplayer evidence."
+  },
+  "goblin chainwhirler": {
+   "status": "awaiting",
+   "since_sha": "203206d",
+   "note": "Pre-fix cube FFA game 1537840778339160126 dealt one damage to Bot-Karn but skipped every creature and planeswalker he controlled, leaving a live 1/1 Akroan Crusader untouched. Implementation 203206d replaces the player-only JSON action with a shared non-targeting living-opponent board sweep, including stable-ID duplicate creatures, planeswalker loyalty, replacements/prevention, damage triggers, and duel/FFA controls. Awaiting post-fix live evidence."
+  },
+  "goblin shortcutter": {
+   "status": "awaiting",
+   "since_sha": "b4918f6",
+   "note": "Pre-fix strict cube FFA game 1537847378839609484 cast Goblin Shortcutter into several legal opposing creatures, but the ETB was classified as having no actionable verb and made no creature unable to block. Implementation b4918f6 adds a deterministic targeted until-end-of-turn blocking restriction, legal-target recheck, cleanup and save/undo state, plus duel and multi-seat controls. Awaiting post-fix live evidence."
+  },
+  "bloodthirsty adversary": {
+   "status": "awaiting",
+   "since_sha": "43d8370",
+   "note": "Pre-fix strict cube FFA game 1537891334034165935 paid no {2}{R}, selected a creature, and fabricated a token. Implementation 43d8370 now pays each additional cost, accepts only distinct instant/sorcery cards with mana value 3 or less, exiles the originals, and queues real spell copies. Awaiting fresh live evidence."
+  },
+  "nevermaker": {
+   "status": "awaiting",
+   "since_sha": "43d8370",
+   "note": "Pre-fix strict cube FFA game 1537891334034165935 fired Nevermaker's LTB trigger but resolved zero actions because its template used the ETB key. Implementation 43d8370 registers the LTB suffix handler and tucks exactly one legal nonland permanent. Awaiting fresh live evidence."
+  },
+  "sphinx of uthuun": {
+   "status": "awaiting",
+   "since_sha": "43d8370",
+   "note": "Pre-fix strict cube FFA game 1537891334034165935 drew three cards from a stale JSON template and left the other two revealed cards in the library. Implementation 43d8370 uses the deterministic 3/2 pile handler so all five cards leave the library exactly once. Awaiting fresh live evidence."
   }
  }
 }

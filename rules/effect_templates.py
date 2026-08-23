@@ -181,6 +181,12 @@ _RESIDUAL_EFFECT_VERBS = (
     'draw', 'discard', 'lose ', 'gain ', 'deals ', 'damage', 'destroy',
     'exile', 'sacrifice', 'return', 'create', 'counter target', 'search',
     'mill', 'reveals their hand', 'put a +1/+1',
+    # Compound library-look effects often use "put" rather than one of the
+    # verbs above. These destinations change real zones and must never be
+    # mistaken for a pure reorder. Risen Reef was silently reduced to a
+    # no-op by that classification.
+    'onto the battlefield', 'into your hand', 'into their hand',
+    "into its owner's hand", "into that player's hand",
 )
 
 
@@ -840,7 +846,7 @@ class EffectTemplateLibrary:
                 name=name.title(),
                 description=f"Each opponent loses {drain} life, you gain {gain} life",
                 action_generator=lambda ctrl, opp, ctx, d=drain, g=gain: [
-                    {"action": "lose_life", "player": opp, "amount": d},
+                    {"action": "lose_life", "player": "each opponent", "amount": d},
                     {"action": "gain_life", "player": ctrl, "amount": g}
                 ]))
 
@@ -965,8 +971,9 @@ class EffectTemplateLibrary:
             description="Kokusho dies: each opponent loses 5 life, you gain "
                         "5 life",
             action_generator=lambda ctrl, opp, ctx: [
-                {"action": "lose_life", "player": opp, "amount": 5},
-                {"action": "gain_life", "player": ctrl, "amount": 5},
+                {"action": "extort_drain", "player": ctrl,
+                 "opponent": "each opponent", "amount": 5,
+                 "source": "Kokusho, the Evening Star"},
             ]))
 
         # --- DIES FORCE SACRIFICE: each opponent sacrifices their weakest creature ---
@@ -1737,6 +1744,99 @@ class EffectTemplateLibrary:
             ),
         ))
 
+        def _gen_goblin_shortcutter(ctrl, opp, ctx):
+            """Choose one legal creature for Shortcutter's mandatory ETB.
+
+            In FFA, inspect every living opponent instead of treating the
+            default singular opponent as the whole game.  Prefer the largest
+            opposing blocker; if none is legal, the ability still has to
+            target a controlled creature (normally Shortcutter itself).
+            """
+            game = ctx.get('_game')
+            can_target = ctx.get('_can_target', lambda _card, _owner: True)
+            if game is None:
+                target = ctx.get('explicit_target_name') or ctx.get(
+                    'best_opponent_creature')
+                if not target:
+                    return [{"action": "no_action",
+                             "reason": "Goblin Shortcutter: no creature target"}]
+                return [{"action": "cant_block_this_turn",
+                         "target_card": target,
+                         "target_controller": (ctx.get('explicit_target_owner')
+                                               or opp),
+                         "_source_card_name": "Goblin Shortcutter",
+                         "_source_controller": ctrl}]
+
+            controller = _find_player_by_name(game, ctrl)
+            if controller is None:
+                return [{"action": "no_action",
+                         "reason": "Goblin Shortcutter: controller unavailable"}]
+
+            def _legal_creatures(owner):
+                return [
+                    creature for creature in owner.battlefield
+                    if creature.is_creature(game)
+                    and not getattr(creature, '_phased_out', False)
+                    and can_target(creature, owner)
+                ]
+
+            # Preserve a legal explicit choice, including a controlled target.
+            explicit_id = ctx.get('explicit_target_id')
+            explicit_name = ctx.get('explicit_target_name')
+            explicit_owner = ctx.get('explicit_target_owner')
+            if explicit_id or explicit_name:
+                for owner in game.living_players_in_turn_order(
+                        game.players.index(controller)):
+                    if explicit_owner and owner.name != explicit_owner:
+                        continue
+                    for creature in _legal_creatures(owner):
+                        if ((explicit_id and creature.id == explicit_id)
+                                or (not explicit_id and creature.name == explicit_name)):
+                            return [{
+                                "action": "cant_block_this_turn",
+                                "target_card": creature.name,
+                                "target_card_id": creature.id,
+                                "target_controller": owner.name,
+                                "_source_card_name": "Goblin Shortcutter",
+                                "_source_controller": ctrl,
+                            }]
+
+            opposing = []
+            for owner in game.opponents_of(controller):
+                for creature in _legal_creatures(owner):
+                    try:
+                        power = creature.get_effective_power(game)
+                    except (AttributeError, TypeError, ValueError):
+                        power = int(getattr(creature, 'power', 0) or 0)
+                    opposing.append((power, owner, creature))
+            if opposing:
+                # max() retains the first cyclic-seat/battlefield candidate on
+                # a tie, making headless and live runs reproducible.
+                _power, owner, creature = max(opposing, key=lambda item: item[0])
+            else:
+                own = _legal_creatures(controller)
+                source = ctx.get('_source_card')
+                creature = (source if source in own else (own[0] if own else None))
+                owner = controller
+            if creature is None:
+                return [{"action": "no_action",
+                         "reason": "Goblin Shortcutter: no creature target"}]
+            return [{
+                "action": "cant_block_this_turn",
+                "target_card": creature.name,
+                "target_card_id": creature.id,
+                "target_controller": owner.name,
+                "_source_card_name": "Goblin Shortcutter",
+                "_source_controller": ctrl,
+            }]
+
+        self._add_card("goblin shortcutter", EffectTemplate(
+            name="Goblin Shortcutter",
+            description=("When Goblin Shortcutter enters, target creature "
+                         "can't block this turn"),
+            action_generator=_gen_goblin_shortcutter,
+        ))
+
         self._add_card("killing wave", EffectTemplate(
             name="Killing Wave",
             description=("Each creature's controller sacrifices it unless "
@@ -2277,6 +2377,24 @@ class EffectTemplateLibrary:
             name="Sun Titan",
             description="Whenever Sun Titan attacks, return a permanent with MV 3 or less from graveyard",
             action_generator=self._gen_sun_titan,
+        ))
+
+        # Primeval Titan's printed trigger fires on BOTH entry and attack.
+        # The cast/ETB path already resolves the land search through the
+        # deterministic ramp handler, but the attack scanner needs its own
+        # event-specific registration; otherwise it queues the combined
+        # paragraph to Tier 3, where free-text combat safety can refuse it.
+        # One multi-card search action preserves the printed single shuffle.
+        self._add_attack_card("primeval titan", EffectTemplate(
+            name="Primeval Titan",
+            description=("Whenever Primeval Titan attacks, search for up to "
+                         "two land cards and put them onto the battlefield tapped"),
+            action_generator=lambda ctrl, opp, ctx: [{
+                "action": "search_library", "player": ctrl,
+                "card_type": "Land", "to_zone": "battlefield",
+                "count": 2, "tapped": True, "shuffle": True,
+                "reason": "Primeval Titan attack trigger",
+            }],
         ))
 
         # --- Land Tax: search for up to 3 basic lands ---
@@ -3705,20 +3823,63 @@ class EffectTemplateLibrary:
         # (which then never existed). "Exile X target creatures. For each
         # creature exiled this way, its controller creates a 2/2 green Boar."
         def _curse_of_swine(ctrl, opp, ctx):
-            x = max(1, int(ctx.get('x_value') or 1))
-            victims = sorted(ctx.get('_opponent_creatures') or [],
-                             key=lambda c: -(c.get('power') or 0))[:x]
+            x = max(0, int(ctx.get('x_value') or 0))
+            game = ctx.get('_game')
+            explicit_cards = list(ctx.get('_explicit_target_cards') or [])
+            victims = []
+
+            if explicit_cards and game is not None:
+                # Chosen targets are authoritative.  Resolve their current
+                # controllers by object identity; duplicate names across
+                # seats must never redirect the effect.
+                for card in explicit_cards[:x]:
+                    owner = next((p for p in game.players
+                                  if card in p.battlefield), None)
+                    if (owner is not None and card.is_creature(game)
+                            and not getattr(card, '_phased_out', False)):
+                        victims.append({'name': card.name,
+                                        'controller': owner.name,
+                                        'controller_id': (
+                                            owner.seat_id if owner.seat_id is not None
+                                            else game.players.index(owner)),
+                                        'card_id': card.id,
+                                        '_card': card})
+            elif ctx.get('_all_opponent_creatures'):
+                victims = sorted(
+                    ctx['_all_opponent_creatures'],
+                    key=lambda c: -(c.get('power') or 0))[:x]
+            else:
+                # Synthetic/legacy two-player contexts keep their old shape.
+                victims = [dict(v, controller=opp)
+                           for v in sorted(ctx.get('_opponent_creatures') or [],
+                                           key=lambda c: -(c.get('power') or 0))[:x]]
             if not victims:
                 return [{"action": "no_action",
                          "reason": "Curse of the Swine: no creatures to exile"}]
-            actions = [{"action": "move_card", "card": v['name'],
-                        "from_zone": "battlefield", "to_zone": "exile",
-                        "player": opp}
-                       for v in victims]
-            actions.append({"action": "create_token", "player": opp,
-                            "name": "Boar", "power": "2", "toughness": "2",
-                            "types": "Creature Token — Boar", "colors": "G",
-                            "count": len(victims)})
+            actions = [
+                {"action": "move_card", "card": victim['name'],
+                 "from_zone": "battlefield", "to_zone": "exile",
+                 "player": victim.get('controller') or opp,
+                 **({"player_id": victim['controller_id']}
+                    if victim.get('controller_id') else {}),
+                 **({"target_card_id": victim['card_id']}
+                    if victim.get('card_id') else {})}
+                for victim in victims
+            ]
+            by_controller = {}
+            for victim in victims:
+                victim_controller = victim.get('controller') or opp
+                victim_controller_id = victim.get('controller_id') or ''
+                key = (victim_controller_id, victim_controller)
+                by_controller[key] = by_controller.get(key, 0) + 1
+            for (victim_controller_id, victim_controller), count in by_controller.items():
+                actions.append({"action": "create_token",
+                                "player": victim_controller,
+                                **({"player_id": victim_controller_id}
+                                   if victim_controller_id else {}),
+                                "name": "Boar", "power": "2", "toughness": "2",
+                                "types": "Creature Token — Boar", "colors": "G",
+                                "count": count})
             return actions
         self._add_card("curse of the swine", EffectTemplate(
             name="Curse of the Swine",
@@ -4356,7 +4517,7 @@ class EffectTemplateLibrary:
                 name="ETB Drain Opponents",
                 description="Drain opponents on ETB",
                 action_generator=lambda ctrl, opp, ctx: [
-                    {"action": "lose_life", "player": opp, "amount": int(ctx['_match'].group(1))}
+                    {"action": "lose_life", "player": "each opponent", "amount": int(ctx['_match'].group(1))}
                 ]
             )
         )
@@ -4368,7 +4529,7 @@ class EffectTemplateLibrary:
                 name="ETB Drain + Gain",
                 description="Drain opponents and gain life",
                 action_generator=lambda ctrl, opp, ctx: [
-                    {"action": "lose_life", "player": opp, "amount": int(ctx['_match'].group(1))},
+                    {"action": "lose_life", "player": "each opponent", "amount": int(ctx['_match'].group(1))},
                     {"action": "gain_life", "player": ctrl, "amount": int(ctx['_match'].group(1))}
                 ]
             )
@@ -4732,7 +4893,7 @@ class EffectTemplateLibrary:
                 name="Dies Drain Opponents",
                 description="Each opponent loses life when a creature dies",
                 action_generator=lambda ctrl, opp, ctx: [
-                    {"action": "lose_life", "player": opp, "amount": int(ctx['_match'].group(1))}
+                    {"action": "lose_life", "player": "each opponent", "amount": int(ctx['_match'].group(1))}
                 ]
             )
         )
@@ -4744,7 +4905,7 @@ class EffectTemplateLibrary:
                 name="Dies Drain + Gain",
                 description="Drain opponents and gain life when a creature dies",
                 action_generator=lambda ctrl, opp, ctx: [
-                    {"action": "lose_life", "player": opp, "amount": int(ctx['_match'].group(1))},
+                    {"action": "lose_life", "player": "each opponent", "amount": int(ctx['_match'].group(1))},
                     {"action": "gain_life", "player": ctrl, "amount": int(ctx['_match'].group(1))},
                 ]
             )
@@ -6182,6 +6343,16 @@ class EffectTemplateLibrary:
             action_generator=self._gen_coiling_oracle,
         ))
 
+        # The same top-card branch as Coiling Oracle, except lands enter
+        # tapped. The creature-enters dispatcher supplies later Elemental
+        # triggers; this generator owns the shared zone mutation.
+        self._add_card("risen reef", EffectTemplate(
+            name="Risen Reef",
+            description=("Look at the top card; put a land onto the "
+                         "battlefield tapped, otherwise put it into hand"),
+            action_generator=self._gen_risen_reef,
+        ))
+
         # --- Restoration Angel: blink ANOTHER non-Angel creature you control ---
         self._add_card("restoration angel", EffectTemplate(
             name="Restoration Angel",
@@ -7349,7 +7520,7 @@ class EffectTemplateLibrary:
                 description="Deal damage to each player",
                 action_generator=lambda ctrl, opp, ctx: [
                     {"action": "deal_damage", "amount": int(ctx['_match'].group(1)), "target_player": ctrl},
-                    {"action": "deal_damage", "amount": int(ctx['_match'].group(1)), "target_player": opp},
+                    {"action": "deal_damage", "amount": int(ctx['_match'].group(1)), "target_player": "each opponent"},
                 ],
             )
         )
@@ -7361,7 +7532,7 @@ class EffectTemplateLibrary:
                 name="Damage to each opponent",
                 description="Deal damage to each opponent",
                 action_generator=lambda ctrl, opp, ctx: [
-                    {"action": "deal_damage", "amount": int(ctx['_match'].group(1)), "target_player": opp},
+                    {"action": "deal_damage", "amount": int(ctx['_match'].group(1)), "target_player": "each opponent"},
                 ],
             )
         )
@@ -7449,7 +7620,7 @@ class EffectTemplateLibrary:
                 name="ETB group discard",
                 description="Each opponent discards when this enters",
                 action_generator=lambda ctrl, opp, ctx: [
-                    {"action": "discard", "player": opp, "card": "random",
+                    {"action": "discard", "player": "each opponent", "card": "random",
                      "count": self._word_to_num(ctx['_match'].group(1))},
                 ],
             )
@@ -7845,7 +8016,8 @@ class EffectTemplateLibrary:
             can_pay, _ = ctrl_player.can_pay_mana_cost('{W/B}')
             if can_pay and ctrl_player.tap_sources_for_cost('{W/B}'):
                 return [{"action": "extort_drain", "player": ctrl,
-                         "opponent": opp, "amount": 1, "source": "Extort"}]
+                         "opponent": "each opponent", "amount": 1,
+                         "source": "Extort"}]
             return [{"action": "no_action",
                      "reason": "Extort: no untapped W or B source to pay optional cost"}]
             # Legacy source-by-source payment code remains below unreachable;
@@ -7981,17 +8153,55 @@ class EffectTemplateLibrary:
         ))
 
 
-        # Fix 20: Nevermaker LTB — put nonland permanent on top of library
-        self._add_card("nevermaker", EffectTemplate(
+        # Nevermaker is an LTB trigger.  The async drain deliberately refuses
+        # bare ETB-name keys for event_type="ltb", so the old "nevermaker"
+        # registration was unreachable and the live FFA trigger executed zero
+        # actions.  Use the same suffix contract as Spell Queller/Detention
+        # Sphere and make the empty-target case explicit.
+        def _nevermaker_ltb_gen(ctrl, opp, ctx):
+            target = (ctx.get('explicit_target_name')
+                      or ctx.get('best_opponent_nonland'))
+            if not target:
+                return [{"action": "no_action",
+                         "reason": "Nevermaker: no legal nonland permanent"}]
+            return [{
+                "action": "move_card", "card": target,
+                "from_zone": "battlefield", "to_zone": "library",
+                "position": "top", "player": opp,
+            }]
+
+        self._add_card("nevermaker ltb", EffectTemplate(
             name="Nevermaker",
             description="When Nevermaker leaves the battlefield, put target nonland permanent on top of its owner's library",
-            action_generator=lambda ctrl, opp, ctx: [
-                {"action": "move_card",
-                 "card": ctx.get('best_opponent_nonland', ctx.get('best_opponent_creature', '')),
-                 "from_zone": "battlefield", "to_zone": "library", "position": "top",
-                 "player": opp},
-            ],
+            action_generator=_nevermaker_ltb_gen,
             needs_target=True,
+        ))
+
+        # Sphinx of Uthuun / Fact or Fiction needs dynamic library objects.
+        # A fixed JSON migration reduced it to draw-three, leaving the other
+        # two revealed cards in the library.  Keep the deterministic 3/2
+        # headless pile policy, but execute both destinations exactly.
+        self._add_card("sphinx of uthuun", EffectTemplate(
+            name="Sphinx of Uthuun",
+            description=("When Sphinx of Uthuun enters, reveal top 5, "
+                         "opponent splits, you choose a pile"),
+            action_generator=self._sphinx_of_uthuun,
+        ))
+
+        # Bloodthirsty Adversary's optional repeated payment, MV/type filter,
+        # exile, and spell-copy cast are one atomic card-specific effect.  A
+        # custom deterministic action keeps Tier 3 from inventing payment or
+        # treating a creature card as an instant/sorcery.
+        self._add_card("bloodthirsty adversary", EffectTemplate(
+            name="Bloodthirsty Adversary",
+            description=("When Bloodthirsty Adversary enters, you may pay "
+                         "{2}{R} any number of times; counter it and copy up "
+                         "to that many MV<=3 instants/sorceries"),
+            action_generator=lambda ctrl, opp, ctx: [{
+                "action": "bloodthirsty_adversary_etb",
+                "player": ctrl,
+                "source_card_id": getattr(ctx.get('_source_card'), 'id', ''),
+            }],
         ))
 
 
@@ -9058,10 +9268,9 @@ class EffectTemplateLibrary:
     def _gary_drain(self, ctrl, opp, ctx) -> List[Dict]:
         """Gray Merchant: drain = devotion to black. Estimate from context or default to 5."""
         devotion = ctx.get('black_devotion', 5)  # Default estimate
-        return [
-            {"action": "lose_life", "player": opp, "amount": devotion},
-            {"action": "gain_life", "player": ctrl, "amount": devotion}
-        ]
+        return [{"action": "extort_drain", "player": ctrl,
+                 "opponent": "each opponent", "amount": devotion,
+                 "source": "Gray Merchant of Asphodel"}]
     
     def _phyrexian_processor_etb(self, ctrl, opp, ctx) -> List[Dict]:
         """Phyrexian Processor: pay any amount of life on ETB to set token size.
@@ -9077,7 +9286,7 @@ class EffectTemplateLibrary:
         return [{"action": "lose_life", "player": ctrl, "amount": pay}]
 
     def _force_sacrifice_creature(self, ctrl, opp, ctx) -> List[Dict]:
-        """Force opponent to sacrifice their weakest creature (Grave Pact, Dictate of Erebos)."""
+        """Force each opponent to sacrifice a creature."""
         # July 24 batch-6 (reviewer A1 #7): name the actual trigger source so
         # the Discord line reads "💀 Butcher of Malakir: 💀 Claude sacrifices
         # X" instead of an unattributed sacrifice (the hardcoded Grave Pact/
@@ -9085,11 +9294,22 @@ class EffectTemplateLibrary:
         _src_card = ctx.get('_source_card')
         _src = (ctx.get('_source_card_name')
                 or (getattr(_src_card, 'name', '') if _src_card else ''))
-        if ctx.get('worst_opponent_creature') or ctx.get('best_opponent_creature'):
-            return [{"action": "sacrifice_permanent", "player": opp,
-                     "type_filter": "creature", "source": _src,
-                     "reason": f"{_src or 'Grave Pact / Dictate / Butcher'} dies trigger"}]
-        return [{"action": "no_action", "reason": f"{opp} has no creatures to sacrifice"}]
+        opponents = ctx.get('_opponent_players') or []
+        if len(opponents) <= 1:
+            # Preserve the mature 1v1 action contract. Besides keeping old
+            # templates/tests stable, this lets the deterministic executor
+            # select the named opponent's weakest legal creature directly.
+            if (ctx.get('worst_opponent_creature')
+                    or ctx.get('best_opponent_creature')):
+                return [{"action": "sacrifice_permanent", "player": opp,
+                         "type_filter": "creature", "source": _src,
+                         "reason": (f"{_src or 'Grave Pact / Dictate / Butcher'} "
+                                    "dies trigger")}]
+            return [{"action": "no_action",
+                     "reason": f"{opp} has no creatures to sacrifice"}]
+        return [{"action": "edict_sacrifice", "types": "creature",
+                 "opponents_only": True, "source": _src,
+                 "_source_controller": ctrl}]
 
     def _avenger_tokens(self, ctrl, opp, ctx) -> List[Dict]:
         """Avenger of Zendikar: tokens = lands you control."""
@@ -10470,6 +10690,53 @@ class EffectTemplateLibrary:
                     best_p, best = p, nm
             return best
 
+        # Aug 14 live FFA follow-up: the original helper knew exactly two
+        # participants (controller + singular ``opp``), so Fleshbag resolved
+        # for only Rick and Deepseek while two other living seats kept every
+        # creature.  When a real game is available, emit the established
+        # sacrifice_permanent action once for EVERY living player.  That
+        # shared action preserves sacrifice watchers, death queues,
+        # commander redirects, undying/persist, and devotion-aware type
+        # checks; direct zone mutation here would bypass all of them.
+        game = ctx.get('_game')
+        if game is not None:
+            source = ctx.get('_source_card')
+            source_name = ctx.get('_source_card_name') or "edict: sacrifice a creature"
+            for participant in game.living_players_in_turn_order():
+                creatures = [
+                    permanent for permanent in participant.battlefield
+                    if permanent.is_creature(game)
+                    and not getattr(permanent, '_phased_out', False)
+                ]
+                if not creatures:
+                    actions.append({
+                        "action": "no_action",
+                        "reason": f"{participant.name} has no creatures to sacrifice",
+                    })
+                    continue
+                choices = creatures
+                if participant.name == ctrl and source in creatures and len(creatures) > 1:
+                    choices = [permanent for permanent in creatures
+                               if permanent is not source]
+
+                def _sacrifice_score(permanent):
+                    try:
+                        power = permanent.get_effective_power(game)
+                    except (AttributeError, TypeError, ValueError):
+                        power = int(getattr(permanent, 'power', 0) or 0)
+                    return (power, int(getattr(permanent, 'cmc', 0) or 0),
+                            permanent.name, permanent.id)
+
+                preferred = min(choices, key=_sacrifice_score)
+                actions.append({
+                    "action": "sacrifice_permanent",
+                    "player": participant.name,
+                    "type_filter": "creature",
+                    "preferred_card": preferred.name,
+                    "reason": source_name,
+                })
+            return actions
+
         # Opponent: sacrifices a creature of their choice.
         opp_creatures = ctx.get('_opponent_creatures', [])
         opp_pick = _weakest(opp_creatures) or ctx.get('best_opponent_creature')
@@ -11402,6 +11669,24 @@ class EffectTemplateLibrary:
                 return [{"action": "draw_cards", "player": ctrl, "amount": 1}]
         return [{"action": "draw_cards", "player": ctrl, "amount": 1}]
 
+    def _gen_risen_reef(self, ctrl, opp, ctx) -> List[Dict]:
+        """Resolve one Risen Reef trigger against the actual top card."""
+        library = ctx.get('controller_library', [])
+        if not library:
+            return [{"action": "no_action",
+                     "reason": "Risen Reef: controller's library is empty"}]
+        top_card = library[0]
+        if 'land' in (getattr(top_card, 'type_line', '') or '').lower():
+            return [{"action": "move_card", "card": top_card.name,
+                     "from_zone": "library", "to_zone": "battlefield",
+                     "player": ctrl, "tapped": True,
+                     "reason": "Risen Reef"}]
+        # This is a put-into-hand instruction, not a draw. Using move_card
+        # preserves that rules distinction for draw replacement effects.
+        return [{"action": "move_card", "card": top_card.name,
+                 "from_zone": "library", "to_zone": "hand",
+                 "player": ctrl, "reason": "Risen Reef"}]
+
     def _gen_primal_command(self, ctrl, opp, ctx) -> List[Dict]:
         """Resolve the two modes actually chosen for Primal Command."""
         aliases = {
@@ -12094,6 +12379,12 @@ def build_game_context(game, player, opponent, card=None, entering_creature=None
     action generators, which need info like "best opponent creature" etc.
     """
     ctx = {}
+    opponents = (
+        game.opponents_of(player)
+        if hasattr(game, 'opponents_of') else [opponent]
+    )
+    ctx['_opponent_players'] = opponents
+    ctx['opponent_names'] = [p.name for p in opponents]
 
     # Source card (for templates that need to inspect cast-time attributes
     # like _cast_from_graveyard for flashback-doubled effects).
@@ -12320,6 +12611,18 @@ def build_game_context(game, player, opponent, card=None, entering_creature=None
         }
     ctx['_opponent_creatures'] = [
         _creature_info(c) for c in opponent.battlefield if c.is_creature()
+    ]
+    # Multiplayer-aware companion to the legacy singular-opponent list.
+    # Keep controller and object identity so multi-target templates can route
+    # each zone move and follow-up token to the correct seat.
+    ctx['_all_opponent_creatures'] = [
+        dict(_creature_info(c), controller=p.name,
+             controller_id=(p.seat_id if p.seat_id is not None
+                            else game.players.index(p)),
+             card_id=c.id, _card=c)
+        for p in opponents
+        for c in p.battlefield
+        if c.is_creature(game) and not getattr(c, '_phased_out', False)
     ]
     ctx['_controller_creatures'] = [
         _creature_info(c) for c in player.battlefield if c.is_creature()
@@ -12676,6 +12979,9 @@ def build_game_context(game, player, opponent, card=None, entering_creature=None
         if isinstance(explicit_target, (list, tuple)):
             _card_items = [item for item in explicit_target if not _is_player_like(item)]
             _player_items = [item for item in explicit_target if _is_player_like(item)]
+            ctx['_explicit_target_cards'] = [
+                item for item in _card_items if hasattr(item, 'name')
+            ]
             target_names = [getattr(item, 'name', str(item)) for item in _card_items]
             ctx['explicit_target_names'] = target_names
             if target_names:
@@ -12692,6 +12998,7 @@ def build_game_context(game, player, opponent, card=None, entering_creature=None
             # fall to its own heuristics or no_action.
         elif hasattr(explicit_target, 'name'):
             # It's a Card object — find which player owns it
+            ctx['_explicit_target_cards'] = [explicit_target]
             ctx['explicit_target_name'] = explicit_target.name
             ctx['explicit_target_id'] = getattr(explicit_target, 'id', '')
             # July 27 fanout: `explicit_target_is_creature` is READ by the Rift

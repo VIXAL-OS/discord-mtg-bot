@@ -18,6 +18,9 @@ Commands:
 - !draftgame             - Start post-draft game
 - !draftstatus           - Show draft progress
 - !autodraft [source]    - Run fully automated draft + game (testing)
+- !autodraft [source] bracket - Draft all 8 decks + four 1v1 first-round games
+- !autodraft [source] ffa - Draft all 8 decks + experimental four-seat FFA
+- !cubestandings         - Show persisted bracket standings for this thread
 """
 
 import discord
@@ -33,6 +36,7 @@ import os
 import re
 import time as _time
 import anthropic
+from collections import Counter
 
 # Import Card and related classes from game engine
 from mtg_game import (
@@ -343,7 +347,14 @@ class CubeLoader:
             try:
                 scryfall_data = await self.deck_loader.fetch_card_data(name)
                 card = Card(
-                    name=scryfall_data.get("name", name),
+                    # Keep the requested front-face name, matching DeckLoader.
+                    # Scryfall gives Adventures a combined top-level name
+                    # ("Bonecrusher Giant // Stomp"). Passing that combined
+                    # name to _extract_adventure_data defeats its strict
+                    # front-face guard and leaves the combined mana cost live.
+                    # The requested name also preserves the fuzzy-search guard
+                    # for Reanimate -> Grave Researcher // Reanimate.
+                    name=name,
                     mana_cost=scryfall_data.get("mana_cost", ""),
                     type_line=scryfall_data.get("type_line", ""),
                     oracle_text=scryfall_data.get("oracle_text", ""),
@@ -528,16 +539,20 @@ async def claude_make_pick(
         # max_tokens=100 truncated BEFORE the number appeared. 300 gives the
         # number room to arrive even after a prose preamble; the regex takes
         # the first integer either way.
+        # A direct cube run may install the selected batch adapter here. Pass
+        # its real model through the request and usage callback instead of
+        # mislabeling every draft pick as Claude usage.
+        request_model = getattr(client, 'model', 'claude-sonnet-5')
         response = await asyncio.to_thread(
             client.messages.create,
-            model="claude-sonnet-5",
+            model=request_model,
             max_tokens=300,
             thinking={"type": "disabled"},
             messages=[{"role": "user", "content": prompt}],
         )
 
         if usage_callback and hasattr(response, 'usage'):
-            usage_callback(response.usage, "claude-sonnet-5")
+            usage_callback(response.usage, request_model)
 
         # claude-sonnet-5 may lead content with thinking blocks (no .text)
         from mtg.helpers import response_text
@@ -738,6 +753,148 @@ def auto_build_deck(pool: List[Card], deck_size: int = 40) -> Tuple[List[Card], 
     return deck, sideboard
 
 
+def build_all_drafted_decks(seats: List[DraftSeat],
+                            deck_size: int = DEFAULT_DECK_SIZE) -> None:
+    """Build and finalize every seat in a completed autonomous draft pod."""
+    for seat in seats:
+        deck, sideboard = auto_build_deck(seat.pool, deck_size)
+        seat.deck = deck
+        seat.sideboard = sideboard
+        seat.deck_finalized = True
+
+
+def first_round_pairings(seats: List[DraftSeat]) -> List[Tuple[DraftSeat, DraftSeat]]:
+    """Return four stable adjacent-seat pairings, covering each pod seat once."""
+    if len(seats) != POD_SIZE:
+        raise ValueError(f"cube bracket requires {POD_SIZE} seats, got {len(seats)}")
+    ordered = sorted(seats, key=lambda seat: seat.seat_index)
+    indices = [seat.seat_index for seat in ordered]
+    if len(set(indices)) != POD_SIZE:
+        raise ValueError("cube bracket seat indices must be unique")
+    return [(ordered[idx], ordered[idx + 1])
+            for idx in range(0, POD_SIZE, 2)]
+
+
+def new_bracket_state(thread_id: int, cube_name: str, cube_source: str,
+                      seats: List[DraftSeat]) -> Dict[str, Any]:
+    """Create the JSON-safe persistent first-round standings record."""
+    pairings = first_round_pairings(seats)
+    return {
+        "kind": "cube_bracket",
+        "version": 1,
+        "thread_id": thread_id,
+        "cube_name": cube_name,
+        "cube_source": cube_source,
+        "created_at": datetime.now().isoformat(),
+        "status": "scheduled",
+        "pairings": [
+            {
+                "match": match_number,
+                "seat1": left.seat_index,
+                "seat2": right.seat_index,
+                "player1": left.name,
+                "player2": right.name,
+                "status": "scheduled",
+                "result": None,
+            }
+            for match_number, (left, right) in enumerate(pairings, 1)
+        ],
+        "standings": [
+            {
+                "seat": seat.seat_index,
+                "player": seat.name,
+                "played": 0,
+                "wins": 0,
+                "losses": 0,
+                "draws": 0,
+                "no_contests": 0,
+                "points": 0,
+            }
+            for seat in sorted(seats, key=lambda item: item.seat_index)
+        ],
+    }
+
+
+def record_bracket_result(bracket: Dict[str, Any], match_number: int,
+                          match_result: Dict[str, Any]) -> None:
+    """Record one match exactly once and recompute stable standings."""
+    pairing = next((item for item in bracket["pairings"]
+                    if item["match"] == match_number), None)
+    if pairing is None:
+        raise ValueError(f"unknown cube bracket match {match_number}")
+    if pairing["status"] == "complete":
+        raise ValueError(f"cube bracket match {match_number} already recorded")
+
+    by_seat = {row["seat"]: row for row in bracket["standings"]}
+    left = by_seat[pairing["seat1"]]
+    right = by_seat[pairing["seat2"]]
+    result_copy = dict(match_result)
+    outcome = result_copy.get("outcome")
+    winner_seat = result_copy.get("winner_seat")
+
+    allowed_outcomes = {
+        "win_p1", "win_p2", "timeout", "circuit_breaker", "draw",
+        "crash", "aborted",
+    }
+    if outcome not in allowed_outcomes:
+        raise ValueError(f"unsupported cube bracket outcome: {outcome!r}")
+
+    expected_winner_seat = (
+        pairing["seat1"] if outcome == "win_p1"
+        else pairing["seat2"] if outcome == "win_p2"
+        else None)
+    if outcome in ("win_p1", "win_p2") and winner_seat != expected_winner_seat:
+        raise ValueError(
+            f"match {match_number} outcome {outcome} requires winner seat "
+            f"{expected_winner_seat}, got {winner_seat}")
+
+    # Mutate only after all decisive validation passes. A malformed runner
+    # result must leave the scheduled match retryable.
+    pairing["status"] = "complete"
+    pairing["result"] = result_copy
+    if outcome in ("win_p1", "win_p2"):
+        winner = by_seat[winner_seat]
+        loser = right if winner is left else left
+        winner["wins"] += 1
+        loser["losses"] += 1
+        winner["played"] += 1
+        loser["played"] += 1
+    elif outcome in ("timeout", "circuit_breaker", "draw"):
+        for row in (left, right):
+            row["draws"] += 1
+            row["played"] += 1
+    elif outcome in ("crash", "aborted"):
+        # Crashes and aborted games are visible but do not masquerade as draws.
+        left["no_contests"] += 1
+        right["no_contests"] += 1
+
+    for row in bracket["standings"]:
+        row["points"] = row["wins"] * 3 + row["draws"]
+    bracket["standings"].sort(
+        key=lambda row: (-row["points"], -row["wins"], row["losses"],
+                         row["seat"]))
+    if all(item["status"] == "complete" for item in bracket["pairings"]):
+        bracket["status"] = "complete"
+        bracket["completed_at"] = datetime.now().isoformat()
+    else:
+        bracket["status"] = "in_progress"
+
+
+def format_cube_standings(bracket: Dict[str, Any]) -> str:
+    """Render compact standings suitable for Discord and test assertions."""
+    lines = [
+        f"**Cube First-Round Standings - {bracket.get('cube_name', 'Cube')}**",
+        "`#  Player                 P  W  L  D  NC  Pts`",
+    ]
+    for rank, row in enumerate(bracket.get("standings", []), 1):
+        player = str(row["player"])[:20]
+        lines.append(
+            f"`{rank:<2} {player:<20} {row['played']:>2} {row['wins']:>2} "
+            f"{row['losses']:>2} {row['draws']:>2} {row['no_contests']:>3} "
+            f"{row['points']:>3}`")
+    return "\n".join(lines)
+
+
 # =============================================================================
 # DISPLAY HELPERS
 # =============================================================================
@@ -866,6 +1023,7 @@ class CubeDraftCog(commands.Cog, name="Cube Draft"):
         self.bot = bot
         self.drafts: Dict[int, DraftState] = {}   # thread_id -> DraftState
         self.loaded_cubes: Dict[int, Tuple[List[Card], str]] = {}  # user_id -> (cards, name)
+        self.brackets: Dict[int, Dict[str, Any]] = {}  # thread_id -> standings
 
         # Get engine reference from MTGGameCog for Scryfall cache + game creation
         self.engine: Optional[GameEngine] = None
@@ -873,6 +1031,7 @@ class CubeDraftCog(commands.Cog, name="Cube Draft"):
         self.cube_loader = CubeLoader(self.deck_loader)
 
         os.makedirs(self.DRAFTS_DIR, exist_ok=True)
+        self._load_all_brackets()
         self._load_all_drafts()
 
     async def cog_load(self):
@@ -888,12 +1047,157 @@ class CubeDraftCog(commands.Cog, name="Cube Draft"):
             self.game_cog = None
             print("[DRAFT] MTGGameCog not loaded yet, using standalone DeckLoader")
 
+    @staticmethod
+    def _autodraft_provider_name(provider: str) -> str:
+        """Return the player-name token for an actually selected provider."""
+        provider = (provider or "").lower()
+        if provider == "qwen":
+            return "Qwen"
+        if provider.startswith("deepseek"):
+            return "Deepseek"
+        return "Claude"
+
+    def _begin_autodraft_provider_session(self) -> Dict[str, Any]:
+        """Install the selected batch provider for draft picks and gameplay.
+
+        Ordinary autoplay swaps the shared GameEngine clients and reference-
+        counts parallel games. Direct ``!autodraft`` previously used only the
+        provider display name and stats adapter, while its calls stayed on the
+        original Claude client. Join the same swap count so either kind of run
+        can finish first without restoring Claude under a running sibling.
+        """
+        game_cog = getattr(self, 'game_cog', None)
+        claude_client = getattr(self.bot, 'claude', None)
+        session = {
+            "provider": "claude",
+            "actor": None,
+            "strategist": None,
+            "draft_client": claude_client,
+            "ai_name": "Claude",
+            "start_actor_stats": {},
+            "start_strategist_stats": {},
+            "joined_swap": False,
+        }
+        if (game_cog is None
+                or not getattr(game_cog, 'batch_stats_adapters', None)):
+            return session
+
+        provider, actor, strategist = game_cog.batch_stats_adapters()
+        # A stale _active_provider must not affect the seat name or stats when
+        # its adapter is absent. The real client remains Claude in that case.
+        if actor is None:
+            return session
+
+        actor_model = actor.model  # Fail loudly rather than guess a model.
+        strategist_model = strategist.model if strategist is not None else None
+        start_actor_stats = (
+            actor.get_stats().copy() if hasattr(actor, 'get_stats') else {})
+        start_strategist_stats = (
+            strategist.get_stats().copy()
+            if strategist is not None and strategist is not actor
+            and hasattr(strategist, 'get_stats') else {})
+        engine = self.engine
+        originals = {
+            'claude_ai_client': engine.claude_ai.client,
+            'claude_ai_model': engine.claude_ai.model,
+            'claude_ai_strategist_client': engine.claude_ai.strategist_client,
+            'claude_ai_strategist_model': engine.claude_ai.strategist_model,
+            'rules_client': engine.rules.client,
+            'rules_model': engine.rules.model,
+        }
+
+        import mtg.autoplay as autoplay_module
+        depth = getattr(autoplay_module, '_AUTOPLAY_SWAP_DEPTH', 0) + 1
+        autoplay_module._AUTOPLAY_SWAP_DEPTH = depth
+        if depth == 1:
+            autoplay_module._AUTOPLAY_TRUE_ORIGINALS = dict(originals)
+
+        # Mark ownership before mutating shared clients so an unexpected
+        # assignment failure can still unwind the reference count.
+        session["joined_swap"] = True
+
+        try:
+            engine.claude_ai.client = actor
+            engine.claude_ai.model = actor_model
+            engine.rules.client = actor
+            engine.rules.model = actor_model
+            if strategist is not None:
+                engine.claude_ai.strategist_client = strategist
+                engine.claude_ai.strategist_model = strategist_model
+            else:
+                engine.claude_ai.strategist_client = None
+                engine.claude_ai.strategist_model = None
+
+            if (engine.spell_resolver
+                    and hasattr(engine.spell_resolver, 'effect_executor')
+                    and engine.spell_resolver.effect_executor):
+                executor = engine.spell_resolver.effect_executor
+                originals['effect_executor_client'] = executor.claude_client
+                if depth == 1:
+                    autoplay_module._AUTOPLAY_TRUE_ORIGINALS[
+                        'effect_executor_client'] = executor.claude_client
+                executor.claude_client = actor
+
+            engine.claude_ai._consecutive_failures = 0
+            engine.claude_ai._api_disabled = False
+        except Exception:
+            self._end_autodraft_provider_session(session)
+            raise
+        session.update({
+            "provider": provider,
+            "actor": actor,
+            "strategist": strategist,
+            "draft_client": actor,
+            "ai_name": self._autodraft_provider_name(provider),
+            "start_actor_stats": start_actor_stats,
+            "start_strategist_stats": start_strategist_stats,
+            "joined_swap": True,
+        })
+        print(f"[AUTO-DRAFT] Using {session['ai_name']} for draft and gameplay "
+              f"(actor={actor_model}, "
+              f"strategist={strategist_model or actor_model})")
+        return session
+
+    def _end_autodraft_provider_session(
+            self, session: Optional[Dict[str, Any]]):
+        """Release one shared provider-swap reference and restore at zero."""
+        if not session or not session.get("joined_swap"):
+            return
+
+        import mtg.autoplay as autoplay_module
+        depth = max(
+            0, getattr(autoplay_module, '_AUTOPLAY_SWAP_DEPTH', 1) - 1)
+        autoplay_module._AUTOPLAY_SWAP_DEPTH = depth
+        originals = getattr(
+            autoplay_module, '_AUTOPLAY_TRUE_ORIGINALS', None)
+        if depth != 0 or not originals:
+            return
+
+        engine = self.engine
+        engine.claude_ai.client = originals['claude_ai_client']
+        engine.claude_ai.model = originals['claude_ai_model']
+        engine.claude_ai.strategist_client = originals[
+            'claude_ai_strategist_client']
+        engine.claude_ai.strategist_model = originals[
+            'claude_ai_strategist_model']
+        engine.rules.client = originals['rules_client']
+        engine.rules.model = originals['rules_model']
+        if ('effect_executor_client' in originals
+                and engine.spell_resolver
+                and hasattr(engine.spell_resolver, 'effect_executor')
+                and engine.spell_resolver.effect_executor):
+            engine.spell_resolver.effect_executor.claude_client = originals[
+                'effect_executor_client']
+        autoplay_module._AUTOPLAY_TRUE_ORIGINALS = None
+
     def _load_all_drafts(self):
         """Load saved drafts from disk on startup."""
         if not os.path.exists(self.DRAFTS_DIR):
             return
         for filename in os.listdir(self.DRAFTS_DIR):
             if filename.endswith('.json'):
+                if filename.startswith('bracket_'):
+                    continue
                 filepath = os.path.join(self.DRAFTS_DIR, filename)
                 try:
                     with open(filepath, 'r', encoding='utf-8') as f:
@@ -904,6 +1208,38 @@ class CubeDraftCog(commands.Cog, name="Cube Draft"):
                         print(f"[DRAFT] Loaded draft in thread {draft.thread_id}")
                 except Exception as e:
                     print(f"[DRAFT] Failed to load draft from {filename}: {e}")
+
+    def _load_all_brackets(self):
+        """Restore persisted cube standings without treating them as drafts."""
+        if not os.path.exists(self.DRAFTS_DIR):
+            return
+        for filename in os.listdir(self.DRAFTS_DIR):
+            if not (filename.startswith('bracket_') and filename.endswith('.json')):
+                continue
+            filepath = os.path.join(self.DRAFTS_DIR, filename)
+            try:
+                with open(filepath, 'r', encoding='utf-8') as handle:
+                    bracket = json.load(handle)
+                if bracket.get("kind") != "cube_bracket":
+                    raise ValueError("not a cube bracket record")
+                thread_id = int(bracket["thread_id"])
+                self.brackets[thread_id] = bracket
+                print(f"[CUBE-BRACKET] Loaded standings for thread {thread_id}")
+            except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+                print(f"[CUBE-BRACKET] Failed to load {filename}: {exc}")
+
+    def _save_bracket(self, bracket: Dict[str, Any]) -> str:
+        """Atomically persist standings and return the runtime filepath."""
+        thread_id = int(bracket["thread_id"])
+        filepath = os.path.join(self.DRAFTS_DIR, f"bracket_{thread_id}.json")
+        temp_path = filepath + ".tmp"
+        with open(temp_path, 'w', encoding='utf-8', newline='\n') as handle:
+            json.dump(bracket, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+        os.replace(temp_path, filepath)
+        self.brackets[thread_id] = bracket
+        print(f"[CUBE-BRACKET] Saved standings: {filepath}")
+        return filepath
 
     def _save_draft(self, draft: DraftState):
         """Save draft state to disk."""
@@ -1258,14 +1594,19 @@ class CubeDraftCog(commands.Cog, name="Cube Draft"):
                     f"Check your DMs for deck building. Use `!build`, `!addcard`, `!cut`, `!autoland`, `!finalize`."
                 )
 
-                # Auto-build Claude's deck
-                if draft.claude_seat is not None:
-                    claude_seat = draft.seats[draft.claude_seat]
-                    deck, sideboard = auto_build_deck(claude_seat.pool)
-                    claude_seat.deck = deck
-                    claude_seat.sideboard = sideboard
-                    claude_seat.deck_finalized = True
-                    print(f"[DRAFT-CLAUDE] Auto-built deck: {len(deck)} cards")
+                # Build every autonomous seat, not just the named AI opponent.
+                # The pod always drafted eight pools; leaving filler seats with
+                # empty decks made a post-draft bracket impossible.
+                for auto_seat in draft.seats:
+                    if auto_seat.is_human:
+                        continue
+                    deck, sideboard = auto_build_deck(
+                        auto_seat.pool, draft.deck_size)
+                    auto_seat.deck = deck
+                    auto_seat.sideboard = sideboard
+                    auto_seat.deck_finalized = True
+                    print(f"[DRAFT-DECK] Seat {auto_seat.seat_index + 1} "
+                          f"{auto_seat.name}: {len(deck)} cards")
 
                 # DM each human their pool + auto-suggestion
                 for seat_idx in draft.human_seats:
@@ -1855,6 +2196,15 @@ class CubeDraftCog(commands.Cog, name="Cube Draft"):
         else:
             await ctx.send(f"Draft phase: **{draft.phase}**")
 
+    @commands.command(name="cubestandings")
+    async def cube_standings(self, ctx):
+        """Show persisted first-round standings for this cube thread."""
+        bracket = self.brackets.get(ctx.channel.id)
+        if bracket is None:
+            await ctx.send("No cube bracket standings exist for this thread.")
+            return
+        await ctx.send(format_cube_standings(bracket))
+
     # =========================================================================
     # AUTO-DRAFT — Fully automated draft + game for testing
     # =========================================================================
@@ -1922,16 +2272,380 @@ class CubeDraftCog(commands.Cog, name="Cube Draft"):
 
         return await self.cube_loader.load_from_json(cube_data)
 
+    async def _run_cube_first_round(self, thread, cube_name: str,
+                                    cube_source: str,
+                                    seats: List[DraftSeat],
+                                    max_turns: int = 60
+                                    ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+        """Run and checkpoint exactly four independent two-player matches."""
+        bracket = new_bracket_state(thread.id, cube_name, cube_source, seats)
+        self._save_bracket(bracket)
+        match_results = []
+        for match_number, (left, right) in enumerate(
+                first_round_pairings(seats), 1):
+            match_result = await self._run_bracket_match(
+                thread, left, right, match_number, max_turns=max_turns)
+            match_results.append(match_result)
+            record_bracket_result(bracket, match_number, match_result)
+            self._save_bracket(bracket)
+        return bracket, match_results
+
+    async def _run_bracket_match(self, thread, left: DraftSeat,
+                                 right: DraftSeat,
+                                 match_number: int,
+                                 max_turns: int = 60) -> Dict[str, Any]:
+        """Run one ordinary two-player limited game for the cube first round."""
+        game = await self.engine.create_game_from_cards(
+            thread_id=thread.id,
+            player1_name=left.name,
+            player1_id=99999,
+            player1_cards=list(left.deck),
+            player2_name=right.name,
+            player2_id=None,
+            player2_cards=list(right.deck),
+            format_name="limited",
+        )
+        game.is_autoplay = True
+        self.engine.setup_stack(
+            game, auto_pass_seconds=0.05,
+            send_func=lambda msg: self._autodraft_send(thread, msg),
+            ai_response_enabled=True,
+        )
+        first_player = random.randint(0, 1)
+        self.engine.start_game(game, first_player)
+        try:
+            from mtg.util import strict_mode, git_sha
+            deck_sizes = [len(player.library) + len(player.hand)
+                          for player in game.players]
+            print(
+                f"[GAME-INIT] format=cube-bracket life=20/20 "
+                f"deck0=seat{left.seat_index + 1}({deck_sizes[0]}) "
+                f"deck1=seat{right.seat_index + 1}({deck_sizes[1]}) "
+                f"first_player={game.players[first_player].name} "
+                f"strict={1 if strict_mode() else 0} sha={git_sha()}"
+            )
+        except (AttributeError, TypeError, ValueError) as exc:
+            print(f"[CUBE-BRACKET] GAME-INIT emit failed: {exc}")
+        print(
+            f"[CUBE-BRACKET-GAME] match={match_number} "
+            f"seat1={left.seat_index} seat2={right.seat_index} "
+            f"p1={left.name} p2={right.name} first={game.players[first_player].name}"
+        )
+        await self._autodraft_send(
+            thread,
+            f"\n**Cube Match {match_number}/4**: "
+            f"**{left.name}** vs **{right.name}**\n"
+            f"{game.players[first_player].name} goes first.",
+        )
+
+        # Both bracket seats are automated. Drive both through the pretend-
+        # human path so all four games exercise the normal public cast/combat
+        # pipeline; this is still a real two-player GameState, not a simulator.
+        for player in game.players:
+            mulligans = 0
+            while mulligans < 3 and await self.engine.claude_ai.decide_mulligan(
+                    player.hand, mulligans):
+                mulligans += 1
+                player.library.extend(player.hand)
+                player.hand.clear()
+                random.shuffle(player.library)
+                self.engine.draw_cards(player, 7)
+            if mulligans:
+                player.hand.sort(key=lambda card: card.cmc or 0, reverse=True)
+                for _ in range(mulligans):
+                    if player.hand:
+                        player.library.append(player.hand.pop(0))
+                random.shuffle(player.library)
+            player.mulligans_taken = mulligans
+            player.has_kept_hand = True
+
+        turns_run = 0
+        error = None
+        try:
+            for _ in range(max_turns):
+                if game.ended:
+                    break
+                turns_run += 1
+                if game.phase == Phase.UNTAP:
+                    for _advance in range(3):
+                        _, messages = self.engine.advance_phase(game)
+                        for message in messages:
+                            await self._autodraft_send(thread, message)
+                    for message in await self.engine.drain_pending_triggers(game):
+                        await self._autodraft_send(thread, message)
+
+                await self.game_cog._autoplay_human_turn(
+                    thread, game, game.active_player_index)
+                if game.ended:
+                    break
+                # Match ordinary autoplay's end-of-turn board checkpoint.  The
+                # first bracket slice omitted this call, leaving a long stream
+                # of phase/action text with none of the card-bearing embeds
+                # users rely on to follow the board.
+                await self._autodraft_send(
+                    thread, embed=self.game_cog.display.create_game_embed(game))
+                for message in self.engine.end_turn(game):
+                    await self._autodraft_send(thread, message)
+                await self.game_cog._autoplay_resolve_pending_action(thread, game)
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            error = str(exc)
+
+        if game.ended and game.winner is None:
+            alive = [idx for idx, player in enumerate(game.players)
+                     if player.life > 0]
+            if len(alive) == 1:
+                game.winner = alive[0]
+
+        if error:
+            outcome = "crash"
+            winner_seat = None
+            winner_name = None
+        elif game.ended and game.winner in (0, 1):
+            outcome = "win_p1" if game.winner == 0 else "win_p2"
+            winner_seat = left.seat_index if game.winner == 0 else right.seat_index
+            winner_name = game.players[game.winner].name
+        else:
+            outcome = "timeout"
+            winner_seat = None
+            winner_name = None
+
+        match_result = {
+            "outcome": outcome,
+            "winner": winner_name,
+            "winner_seat": winner_seat,
+            "turns": game.turn_number or turns_run,
+            "p1_life": game.players[0].life,
+            "p2_life": game.players[1].life,
+            "error": error,
+        }
+        print(
+            f"[CUBE-BRACKET-RESULT] match={match_number} outcome={outcome} "
+            f"winner_seat={winner_seat} turns={match_result['turns']}"
+        )
+        await self._autodraft_send(
+            thread,
+            f"**Match {match_number} result:** "
+            f"{winner_name + ' wins' if winner_name else outcome} "
+            f"({match_result['turns']} turns)",
+        )
+        if thread.id in self.engine.games:
+            # All four matches share one Discord thread and one GameLogger.
+            # Retire only this GameState; the outer autodraft finally block
+            # closes the logger after the standings message has been sent.
+            self.engine.delete_game(thread.id, preserve_logging=True)
+        return match_result
+
+    @staticmethod
+    def _format_ffa_board(game: GameState) -> str:
+        """Compact public-zone checkpoint for all four stable seats."""
+        lines = [f"**FFA board — turn {game.turn_number}**"]
+        for index, player in enumerate(game.players):
+            status = "eliminated" if player.eliminated else f"{max(0, player.life)} life"
+            counts = Counter(card.name for card in player.battlefield)
+            permanents = [
+                f"{count}× {name}" if count > 1 else name
+                for name, count in counts.items()
+            ]
+            board = ", ".join(permanents[:14]) or "empty"
+            if len(permanents) > 14:
+                board += f", +{len(permanents) - 14} more"
+            lines.append(
+                f"• Seat {index + 1} **{player.name}** — {status}; "
+                f"hand {len(player.hand)}, library {len(player.library)}; "
+                f"battlefield: {board}"
+            )
+        return "\n".join(lines)
+
+    async def _run_cube_ffa(self, thread, cube_name: str, cube_source: str,
+                            seats: List[DraftSeat],
+                            max_turns: int = 48) -> Dict[str, Any]:
+        """Run the bounded experimental four-seat free-for-all cube smoke."""
+        ffa_seats = list(seats[:4])
+        if len(ffa_seats) != 4:
+            raise ValueError("Cube FFA smoke requires exactly four drafted seats")
+
+        specs = [
+            {
+                "name": seat.name,
+                "user_id": 99999,
+                "is_claude": False,
+                "cards": list(seat.deck),
+                "deck_name": f"Cube Seat {seat.seat_index + 1}",
+            }
+            for seat in ffa_seats
+        ]
+        game = await self.engine.create_game_from_card_sets(
+            thread.id, specs, format_name="limited")
+        game.is_autoplay = True
+        game.experimental_ffa = True
+        self.engine.setup_stack(
+            game,
+            auto_pass_seconds=0.05,
+            send_func=lambda msg: self._autodraft_send(thread, msg),
+            # Four response-model calls for every priority handoff would turn
+            # a smoke into a token-volume test. Priority rotation itself stays
+            # live; seats auto-pass in cyclic order.
+            ai_response_enabled=False,
+        )
+        first_player = random.randrange(4)
+        self.engine.start_game(game, first_player)
+        # CR 103.8: the first-turn draw skip is a two-player rule.  A
+        # free-for-all starts at the first player's untap step and every seat
+        # draws on its first turn.
+        for player in game.players:
+            player.has_drawn_for_turn = False
+        game.set_phase(Phase.UNTAP, via="cube_ffa_start")
+
+        try:
+            from mtg.util import strict_mode, git_sha
+            sizes = [len(player.library) + len(player.hand)
+                     for player in game.players]
+            print(
+                f"[GAME-INIT] format=cube-ffa seats=4 "
+                f"life={'/'.join(str(player.life) for player in game.players)} "
+                f"decks={'/'.join(str(size) for size in sizes)} "
+                f"first_player={game.players[first_player].name} "
+                f"strict={1 if strict_mode() else 0} sha={git_sha()}"
+            )
+        except (AttributeError, TypeError, ValueError) as exc:
+            print(f"[CUBE-FFA] GAME-INIT emit failed: {exc}")
+        print("[XMAGE-FFA-DISABLED] XMage serialization is two-seat; "
+              "experimental cube FFA uses Python/template tiers only")
+        print(
+            f"[CUBE-FFA-GAME] cube={cube_name} source={cube_source} "
+            f"seats={[seat.seat_index for seat in ffa_seats]} "
+            f"first={game.players[first_player].name} cap={max_turns}"
+        )
+        await self._autodraft_send(
+            thread,
+            "\n**Experimental four-seat cube FFA smoke**\n"
+            f"Seats: {', '.join(player.name for player in game.players)}\n"
+            f"{game.players[first_player].name} goes first. "
+            f"Bounded at {max_turns} turns; stack seats auto-pass.",
+        )
+
+        for player in game.players:
+            mulligans = 0
+            while (mulligans < 3
+                   and await self.engine.claude_ai.decide_mulligan(
+                       player.hand, mulligans)):
+                mulligans += 1
+                player.library.extend(player.hand)
+                player.hand.clear()
+                random.shuffle(player.library)
+                self.engine.draw_cards(player, 7, game=game)
+            if mulligans:
+                player.hand.sort(key=lambda card: card.cmc or 0, reverse=True)
+                for _ in range(mulligans):
+                    if player.hand:
+                        player.library.append(player.hand.pop(0))
+                random.shuffle(player.library)
+            player.mulligans_taken = mulligans
+            player.has_kept_hand = True
+
+        turns_run = 0
+        error = None
+        try:
+            for _ in range(max_turns):
+                if game.ended:
+                    break
+                turns_run += 1
+                active = game.active_player
+                target = game.default_opponent_for(active)
+                game._default_opponent_index = (
+                    game.players.index(target) if target is not None else None)
+                if target is not None:
+                    print(f"[FFA-TARGET] turn={game.turn_number} "
+                          f"actor={active.name} default={target.name}")
+
+                if game.phase == Phase.UNTAP:
+                    for _advance in range(3):
+                        _, messages = self.engine.advance_phase(game)
+                        for message in messages:
+                            await self._autodraft_send(thread, message)
+                    for message in await self.engine.drain_pending_triggers(game):
+                        await self._autodraft_send(thread, message)
+
+                await self.game_cog._autoplay_human_turn(
+                    thread, game, game.active_player_index)
+                if game.ended:
+                    break
+                await self._autodraft_send(
+                    thread, self._format_ffa_board(game))
+                for message in self.engine.end_turn(game):
+                    await self._autodraft_send(thread, message)
+                await self.game_cog._autoplay_resolve_pending_action(
+                    thread, game)
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            error = str(exc)
+
+        living = game.living_player_indices()
+        if error:
+            outcome = "crash"
+            winner_name = None
+        elif game.ended and game.winner is not None:
+            outcome = "ffa_win"
+            winner_name = game.players[game.winner].name
+        elif game.ended:
+            outcome = "ffa_draw"
+            winner_name = None
+        else:
+            outcome = "ffa_timeout"
+            winner_name = None
+
+        result = {
+            "outcome": outcome,
+            "winner": winner_name,
+            "winner_seat": (
+                ffa_seats[game.winner].seat_index
+                if game.winner is not None else None),
+            "turns": game.turn_number or turns_run,
+            "error": error,
+            "survivors": [game.players[index].name for index in living],
+            "life_totals": {player.name: player.life for player in game.players},
+            "elimination_order": [
+                game.players[index].name for index in game.elimination_order
+            ],
+            "seats": [seat.seat_index for seat in ffa_seats],
+        }
+        print(
+            f"[CUBE-FFA-RESULT] outcome={outcome} winner={winner_name} "
+            f"turns={result['turns']} survivors={result['survivors']} "
+            f"eliminations={result['elimination_order']}"
+        )
+        await self._autodraft_send(
+            thread,
+            f"**FFA result:** {winner_name + ' wins' if winner_name else outcome} "
+            f"({result['turns']} turns)\n"
+            f"Survivors: {', '.join(result['survivors']) or 'none'}\n"
+            f"Elimination order: {', '.join(result['elimination_order']) or 'none'}",
+            final=True,
+        )
+        if thread.id in self.engine.games:
+            self.engine.delete_game(thread.id, preserve_logging=True)
+        return result
+
     @commands.command(name="autodraft")
-    async def autodraft(self, ctx, cube_source: str = "test"):
+    async def autodraft(self, ctx, cube_source: str = "test",
+                        mode: str = "single"):
         """
         Run a fully automated cube draft + post-draft game.
         Exercises the full pipeline: cube load → 8-seat draft → deck build → limited game.
 
         Usage:
-            !autodraft              - Use default test cube (360 cards)
-            !autodraft <source>     - Use data/test_cube_<source>.json
+            !autodraft                   - Existing one-game matrix smoke
+            !autodraft <source>          - One game with another test cube
+            !autodraft <source> bracket  - Four 1v1 first-round matches
+            !autodraft <source> ffa      - Experimental four-seat FFA smoke
         """
+        mode = (mode or "single").lower()
+        if mode not in ("single", "bracket", "ffa"):
+            await ctx.send("Mode must be `single`, `bracket`, or `ffa`.")
+            return
         if not self.engine or not self.game_cog:
             # Try to grab references if cog_load ran before MTGGameCog
             game_cog = self.bot.get_cog("MTG Game")
@@ -1944,9 +2658,28 @@ class CubeDraftCog(commands.Cog, name="Cube Draft"):
                 return
 
         await ctx.send(f"🎲 Starting automated draft (cube: {cube_source})...")
-        result = await self._run_autodraft(ctx.channel, cube_source)
+        result = await self._run_autodraft(
+            ctx.channel, cube_source,
+            run_bracket=(mode == "bracket"),
+            run_ffa=(mode == "ffa"))
 
         # Post final summary back in original channel
+        if result["outcome"] == "bracket_complete":
+            await ctx.send(
+                f"**Cube first round complete!** "
+                f"{len(result.get('matches', []))}/4 matches | "
+                f"{result['turns']} total turns | "
+                f"{result['duration_seconds']:.0f}s\n"
+                f"Use `!cubestandings` in the draft thread for the table.")
+            return
+        if result["outcome"] in ("ffa_win", "ffa_draw", "ffa_timeout"):
+            await ctx.send(
+                f"**Experimental cube FFA complete!** "
+                f"{result.get('winner') or result['outcome']} | "
+                f"{result['turns']} turns | "
+                f"{result['duration_seconds']:.0f}s | "
+                f"survivors: {', '.join(result.get('survivors', [])) or 'none'}")
+            return
         icon = {"win_p1": "🏆", "win_p2": "🏆", "timeout": "⏱️",
                 "crash": "❌", "circuit_breaker": "⚡"}.get(result["outcome"], "❓")
         await ctx.send(
@@ -1955,7 +2688,9 @@ class CubeDraftCog(commands.Cog, name="Cube Draft"):
             f"Outcome: {result['outcome']}"
         )
 
-    async def _run_autodraft(self, channel, cube_source: str = "test") -> dict:
+    async def _run_autodraft(self, channel, cube_source: str = "test",
+                             run_bracket: bool = False,
+                             run_ffa: bool = False) -> dict:
         """Run a full automated cube draft + post-draft game.
 
         Creates its own thread, runs draft picks, builds decks, plays the game.
@@ -1964,6 +2699,7 @@ class CubeDraftCog(commands.Cog, name="Cube Draft"):
         start_time = _time.time()
         max_turns = 60
         thread = None
+        provider_session = None
         result = {
             "format": "draft", "deck1": "Rick (drafted)", "deck2": "Claude (drafted)",
             "outcome": "crash", "winner": None, "turns": 0,
@@ -2019,6 +2755,11 @@ class CubeDraftCog(commands.Cog, name="Cube Draft"):
                 self.game_cog._stdout_tee.active_thread = thread.id
             print(f"[AUTO-DRAFT] Game logging to {game_logger.console_path}")
 
+            # Install the selected provider only after the per-thread logger
+            # is live, so the wiring declaration and every provider call are
+            # retained in the same auditable console artifact.
+            provider_session = self._begin_autodraft_provider_session()
+
             # ================================================================
             # PHASE 3: Build 8-seat pod
             # ================================================================
@@ -2036,11 +2777,9 @@ class CubeDraftCog(commands.Cog, name="Cube Draft"):
             # Aug 3: name the AI seat after whoever is actually playing it
             # (the autodraft runs on the same provider as an autoplay batch).
             # DraftSeat.is_claude is the identity flag; the name is display.
-            _game_cog_for_name = self.bot.get_cog("MTG Game")
-            _ai_name = (_game_cog_for_name.ai_player_name()
-                        if _game_cog_for_name
-                        and hasattr(_game_cog_for_name, 'ai_player_name')
-                        else "Claude")
+            # Name the seat after the client actually installed above, not
+            # merely after a configured adapter that may never receive calls.
+            _ai_name = provider_session["ai_name"]
             seats.append(DraftSeat(
                 seat_index=1, name=_ai_name,
                 is_claude=True,
@@ -2102,7 +2841,7 @@ class CubeDraftCog(commands.Cog, name="Cube Draft"):
                         if seat.is_claude:
                             usage_cb = getattr(self.bot, 'track_mtg_usage', None)
                             await claude_make_pick(
-                                self.bot.claude, seat, pack,
+                                provider_session["draft_client"], seat, pack,
                                 round_num, pick_num,
                                 usage_callback=usage_cb,
                             )
@@ -2139,13 +2878,9 @@ class CubeDraftCog(commands.Cog, name="Cube Draft"):
             # ================================================================
             # PHASE 5: Deck building
             # ================================================================
-            rick_deck, rick_sb = auto_build_deck(rick_seat.pool)
-            rick_seat.deck = rick_deck
-            rick_seat.sideboard = rick_sb
-
-            claude_deck, claude_sb = auto_build_deck(claude_seat_obj.pool)
-            claude_seat_obj.deck = claude_deck
-            claude_seat_obj.sideboard = claude_sb
+            build_all_drafted_decks(seats)
+            rick_deck = rick_seat.deck
+            claude_deck = claude_seat_obj.deck
 
             await self._autodraft_send(thread, self._format_deck_summary("Rick Deckard", rick_deck))
             await self._autodraft_send(thread, self._format_deck_summary(
@@ -2153,6 +2888,33 @@ class CubeDraftCog(commands.Cog, name="Cube Draft"):
 
             print(f"[AUTO-DRAFT] Rick's deck: {len(rick_deck)} cards, "
                   f"Claude's deck: {len(claude_deck)} cards")
+
+            if run_bracket:
+                result["deck_count"] = len(seats)
+                await self._autodraft_send(
+                    thread,
+                    "\n**Eight decks built. Starting four-match cube first round.**")
+                bracket, result["matches"] = await self._run_cube_first_round(
+                    thread, cube_name, cube_source, seats, max_turns=max_turns)
+                result["standings"] = list(bracket["standings"])
+                result["outcome"] = "bracket_complete"
+                result["turns"] = sum(
+                    match.get("turns", 0) for match in result["matches"])
+                result["winner"] = bracket["standings"][0]["player"]
+                await self._autodraft_send(
+                    thread, format_cube_standings(bracket), final=True)
+                return result
+
+            if run_ffa:
+                result["deck_count"] = len(seats)
+                await self._autodraft_send(
+                    thread,
+                    "\n**Eight decks built. Starting bounded four-seat "
+                    "free-for-all smoke.**")
+                ffa_result = await self._run_cube_ffa(
+                    thread, cube_name, cube_source, seats, max_turns=48)
+                result.update(ffa_result)
+                return result
 
             # ================================================================
             # PHASE 6: Post-draft game
@@ -2490,15 +3252,13 @@ class CubeDraftCog(commands.Cog, name="Cube Draft"):
                 # that tag counted 142 and game 100 "seemed missing". Read
                 # the cog first, keep the engine attrs as a fallback, and
                 # never skip silently again.
-                _gc = getattr(self, 'game_cog', None)
-                if (_gc is not None
-                        and getattr(_gc, 'batch_stats_adapters', None)):
-                    provider, actor_adapter, strat_adapter = (
-                        _gc.batch_stats_adapters())
-                else:
-                    provider = "unknown"
-                    actor_adapter = None
-                    strat_adapter = None
+                # Read the immutable session choice rather than asking the
+                # cog again: the seat label, installed client and accounting
+                # must all describe the same provider.
+                _session = provider_session or {}
+                provider = _session.get("provider", "claude")
+                actor_adapter = _session.get("actor")
+                strat_adapter = _session.get("strategist")
 
                 if (actor_adapter is not None
                         and hasattr(actor_adapter, 'get_stats')):
@@ -2516,6 +3276,24 @@ class CubeDraftCog(commands.Cog, name="Cube Draft"):
                     completion_tokens = (
                         actor_stats.get('completion_tokens', 0)
                         + strat_stats.get('completion_tokens', 0))
+                    start_actor = _session.get("start_actor_stats", {})
+                    start_strat = _session.get(
+                        "start_strategist_stats", {})
+                    delta_calls = (
+                        actor_stats.get('calls', 0)
+                        - start_actor.get('calls', 0)
+                        + strat_stats.get('calls', 0)
+                        - start_strat.get('calls', 0))
+                    delta_prompt = (
+                        actor_stats.get('prompt_tokens', 0)
+                        - start_actor.get('prompt_tokens', 0)
+                        + strat_stats.get('prompt_tokens', 0)
+                        - start_strat.get('prompt_tokens', 0))
+                    delta_completion = (
+                        actor_stats.get('completion_tokens', 0)
+                        - start_actor.get('completion_tokens', 0)
+                        + strat_stats.get('completion_tokens', 0)
+                        - start_strat.get('completion_tokens', 0))
                     print(
                         f"[STATS-GAME-SHARED] cube_draft "
                         f"provider={provider} scope=cumulative-shared "
@@ -2523,20 +3301,29 @@ class CubeDraftCog(commands.Cog, name="Cube Draft"):
                         f"(actor={actor_stats.get('calls', 0)}, "
                         f"strat={strat_stats.get('calls', 0)}) "
                         f"prompt_tokens={prompt_tokens} "
-                        f"completion_tokens={completion_tokens}")
+                        f"completion_tokens={completion_tokens} "
+                        f"cube_delta_calls={delta_calls} "
+                        f"cube_delta_prompt_tokens={delta_prompt} "
+                        f"cube_delta_completion_tokens={delta_completion}")
                     print(
                         f"[CALL-BREAKDOWN-FINAL] cube_draft "
                         f"provider={provider} scope=cumulative-shared "
                         f"actor={actor_stats.get('purpose_counts', {})} "
                         f"strategist={strat_stats.get('purpose_counts', {})}")
                 else:
-                    print("[STATS-GAME-SHARED] cube_draft: "
-                          "no provider-aware actor adapter found \u2014 "
+                    print(f"[STATS-GAME-SHARED] cube_draft "
+                          f"provider={provider}: "
+                          "no provider-aware actor adapter active \u2014 "
                           "token stats unavailable")
-                    print("[CALL-BREAKDOWN-FINAL] cube_draft: "
-                          "no provider-aware actor adapter found")
+                    print(f"[CALL-BREAKDOWN-FINAL] cube_draft "
+                          f"provider={provider}: "
+                          "no provider-aware actor adapter active")
             except Exception as _cb_err:
                 print(f"[CALL-BREAKDOWN-FINAL] cube_draft emit failed: {_cb_err}")
+            try:
+                self._end_autodraft_provider_session(provider_session)
+            except Exception as _restore_err:
+                print(f"[AUTO-DRAFT] Provider restore failed: {_restore_err}")
             # Cleanup logging and game state
             if hasattr(self.game_cog, '_stdout_tee') and self.game_cog._stdout_tee:
                 self.game_cog._stdout_tee.active_thread = None

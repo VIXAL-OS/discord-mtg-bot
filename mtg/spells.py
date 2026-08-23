@@ -62,6 +62,7 @@ from mtg.constants import Phase, Zone, COMMAND_ZONE_FORMATS
 from mtg import helpers
 from mtg.helpers import _should_emit_resolve_hint
 from mtg.models import Card, Player, GameState, StackEntry
+from mtg.resolution import ResolutionCoordinator
 from mtg import events
 
 # Optional: Tier 2 spell resolver
@@ -716,21 +717,25 @@ def _validate_cast(engine, game: GameState, player: Player, card: Card,
                              []), _cast_from_graveyard, target)
                 if hasattr(declared_target, 'battlefield'):
                     legal, target_reason = _validate_player_target_for_action(
-                        game, declared_target, card, player.name)
+                        game, declared_target, _gate_card, player.name)
                 else:
                     target_owner = next(
                         (p for p in game.players
                          if declared_target in p.battlefield), player)
                     legal, target_reason = _validate_target_for_action(
-                        game, declared_target, target_owner, card, player.name)
+                        game, declared_target, target_owner, _gate_card,
+                        player.name)
                 if not legal:
-                    return ((False, f"Illegal target for {card.name}: {target_reason}", []),
+                    return ((False,
+                             f"Illegal target for {_gate_card.name}: "
+                             f"{target_reason}", []),
                             _cast_from_graveyard, target)
     return None, _cast_from_graveyard, target
 
 
 def _compute_alt_costs(engine, game: GameState, player: Player, card: Card,
-                       pay_mana: bool, additional_cost: int
+                       pay_mana: bool, additional_cost: int,
+                       target=None
                        ) -> Tuple[Optional[Tuple[bool, str, List[str]]], Optional[Dict]]:
     """Cost selection + alternative/additional cost handling (refactor #2 step 2b).
 
@@ -1160,6 +1165,24 @@ def _compute_alt_costs(engine, game: GameState, player: Player, card: Card,
             x_value_chosen = remaining_for_x // max(x_count, 1)
             total_cost = (fixed_cost + (x_value_chosen * x_count)
                           + additional_cost + cost_increase)
+
+        # CR 601.2c/107.3c: wording such as "Exile X target creatures"
+        # requires exactly X declared targets.  Headless actors may omit an X
+        # field and let the mana funnel maximize X; when they DID declare a
+        # concrete target list, cap X to that list before payment instead of
+        # charging for effects that cannot legally have that many targets.
+        # Targetless casts keep the existing deterministic auto-pick path.
+        if (target is not None
+                and re.search(r"\bx target creatures?\b",
+                              (card.oracle_text or "").lower())):
+            declared_count = len(target) if isinstance(target, (list, tuple)) else 1
+            declared_count = max(0, declared_count)
+            if x_value_chosen > declared_count:
+                print(f"[X-TARGET-COUNT] {card.name}: clamping X="
+                      f"{x_value_chosen} to {declared_count} declared target(s)")
+                x_value_chosen = declared_count
+                total_cost = (fixed_cost + (x_value_chosen * x_count)
+                              + additional_cost + cost_increase)
 
         _adj = (f", increase=+{cost_increase}" if cost_increase else "") + \
                (f", reduction=-{raw_reduction}" if raw_reduction else "")
@@ -1625,7 +1648,7 @@ def _force_stack_above(engine, game: GameState, stack_entry,
             try:
                 ctrl_idx = getattr(entry, 'controller_index', 0)
                 ctrl = game.players[ctrl_idx]
-                opp = game.players[1 - ctrl_idx]
+                opp = game.default_opponent_for(ctrl)
                 ctx = build_game_context(game, ctrl, opp, card=entry.card)
                 lib = get_effect_library()
                 actions, explanation = lib.resolve_etb(
@@ -1709,7 +1732,8 @@ def _awake_spell_above(game: GameState, stack_entry) -> bool:
 
 async def _await_stack_window(engine, game: GameState, player: Player,
                               card: Card, target: Any,
-                              effect_messages: List[str]
+                              effect_messages: List[str], *,
+                              additional_cost: int = 0
                               ) -> Tuple[Optional[Tuple[bool, str, List[str]]], List[str], int]:
     """Stack push + priority window (refactor #2 step 2d — extracted July 20, 2026).
 
@@ -1735,6 +1759,8 @@ async def _await_stack_window(engine, game: GameState, player: Player,
         is_spell=True,
     )
     game.stack.append(stack_entry)
+    resolution = ResolutionCoordinator.for_game(engine, game)
+    resolution.register(stack_entry, additional_cost=additional_cost)
     print(f"[STACK] {card.name} goes on the stack (controller: {player.name}, stack size: {len(game.stack)})")
 
     # May 18 audit: helper to keep game.stack and PrioritySystem.stack in
@@ -1811,10 +1837,47 @@ async def _await_stack_window(engine, game: GameState, player: Player,
     # The scan below stays authoritative; the recorder diffs at end_turn.
     events.emit(events.CARD_CAST, game, card=card, caster=player,
                 via="cast", engine=engine)
+    # CR 117.5 / 704.3: after casting is complete and before anyone gets
+    # priority, check state-based actions. Mana abilities used while paying
+    # the cost can change life totals (Ancient Tomb, pain lands). The old
+    # pipeline went straight from payment to cast-trigger/priority handling,
+    # so an FFA player at 1 life could reach 0 and still resolve the spell.
+    # This checkpoint is shared by normal two-player and multiplayer casts.
+    cast_trigger_msgs: List[str] = []
+    _post_cast_sbas = engine.rules.process_state_based_actions(game)
+    if _post_cast_sbas:
+        effect_messages.extend(_post_cast_sbas)
+    if game.ended or getattr(player, 'eliminated', False):
+        if stack_entry in game.stack:
+            game.stack.remove(stack_entry)
+        _drop_from_priority_stack()
+        print(f"[CAST-SBA] {card.name}: caster {player.name} lost before "
+              "priority; spell will not resolve")
+        resolution.transition(stack_entry, "complete")
+        return ((True, f"Cast {card.name} (caster lost before priority)",
+                 effect_messages), cast_trigger_msgs, player_idx)
+
     # Cast triggers fire when spell is put on stack (before resolution/countering)
     # This is correct for Rhystic Study, Esper Sentinel, etc. — they trigger on cast
     cast_trigger_msgs = await engine._check_cast_triggers(game, player, card)
     effect_messages.extend(cast_trigger_msgs)
+
+    # Inline cast-trigger resolution is the engine's current approximation of
+    # trigger stack resolution. Check SBAs again before opening priority: an
+    # Eidolon/Guttersnipe-class trigger may end the game or eliminate the
+    # caster, in which case their spell must leave the stack.
+    _post_trigger_sbas = engine.rules.process_state_based_actions(game)
+    if _post_trigger_sbas:
+        effect_messages.extend(_post_trigger_sbas)
+    if game.ended or getattr(player, 'eliminated', False):
+        if stack_entry in game.stack:
+            game.stack.remove(stack_entry)
+        _drop_from_priority_stack()
+        print(f"[CAST-SBA] {card.name}: game/caster ended after cast triggers; "
+              "spell will not resolve")
+        resolution.transition(stack_entry, "complete")
+        return ((True, f"Cast {card.name} (game ended before priority)",
+                 effect_messages), cast_trigger_msgs, player_idx)
 
     # If stack is enabled, announce to PrioritySystem and wait for resolution
     if game.stack_enabled and game._priority_system:
@@ -1843,17 +1906,17 @@ async def _await_stack_window(engine, game: GameState, player: Player,
             # before announcing the cast.
             ps = game._priority_system
             try:
-                caster_name = player.name
-                active_name = game.players[game.active_player_index].name
-                if ps.active_player != active_name:
+                caster_key = game.priority_identifier(player)
+                active_key = game.priority_identifier(game.active_player_index)
+                if ps.active_player != active_key:
                     print(f"[STACK] Resyncing priority_system.active_player "
-                          f"({ps.active_player} → {active_name})")
-                    ps.active_player = active_name
-                if ps.priority_holder != caster_name:
+                          f"({ps.active_player} → {active_key})")
+                    ps.active_player = active_key
+                if ps.priority_holder != caster_key:
                     print(f"[STACK] Resyncing priority_system.priority_holder "
-                          f"({ps.priority_holder} → {caster_name}) — caster has "
+                          f"({ps.priority_holder} → {caster_key}) — caster has "
                           f"priority by CR 117.1a (they just initiated a cast)")
-                    ps.priority_holder = caster_name
+                    ps.priority_holder = caster_key
                     # Drop stale pass tracking — the new caster's action starts
                     # a fresh priority round.
                     ps._passes_in_succession = []
@@ -1862,7 +1925,7 @@ async def _await_stack_window(engine, game: GameState, player: Player,
 
             # Announce spell — caster retains priority, auto-pass timer starts
             result = await game._priority_system.player_action(
-                player.name,
+                game.priority_identifier(player),
                 PriorityAction.cast(card.name, targets=[str(target)] if target else [])
             )
             # May 14 audit: if player_action still rejects after resync (race
@@ -1877,6 +1940,10 @@ async def _await_stack_window(engine, game: GameState, player: Player,
             # Correlate this StackEntry with the PrioritySystem's StackObject
             if result and result.get("stack_object"):
                 stack_entry.priority_id = result["stack_object"]["id"]
+                _job = resolution.find(stack_entry)
+                if _job is not None:
+                    _job.priority_id = stack_entry.priority_id
+            resolution.transition(stack_entry, "priority_open")
 
             # Wait for this specific spell to resolve (or be countered)
             # Bug #34/#37: Use game-mode-appropriate timeout to prevent hangs
@@ -1930,7 +1997,8 @@ async def _await_stack_window(engine, game: GameState, player: Player,
             if cast_rejected:
                 resolution_timeout = 0.1
             try:
-                await asyncio.wait_for(stack_entry.resolution_event.wait(), timeout=resolution_timeout)
+                await resolution.wait_for_priority(
+                    stack_entry, resolution_timeout)
             except asyncio.TimeoutError:
                 # A priority decision is an open priority window, not a dead
                 # timer.  The previous fixed six-second timeout consumed the
@@ -1941,9 +2009,8 @@ async def _await_stack_window(engine, game: GameState, player: Player,
                     print(f"[STACK-PRIORITY] {card.name}: AI response decision "
                           "still pending at timeout — keeping stack entry live")
                     try:
-                        await asyncio.wait_for(
-                            stack_entry.resolution_event.wait(),
-                            timeout=_AI_DECISION_PENDING_TIMEOUT)
+                        await resolution.wait_for_priority(
+                            stack_entry, _AI_DECISION_PENDING_TIMEOUT)
                     except asyncio.TimeoutError:
                         print(f"[STACK-PRIORITY] {card.name}: AI response "
                               f"decision exceeded "
@@ -2001,8 +2068,8 @@ async def _await_stack_window(engine, game: GameState, player: Player,
                     window_waits_used = 0
                     while extensions_used < max_lifo_extensions:
                         try:
-                            await asyncio.wait_for(stack_entry.resolution_event.wait(),
-                                                   timeout=resolution_timeout)
+                            await resolution.wait_for_priority(
+                                stack_entry, resolution_timeout)
                             # Event fired — spell resolved (or was countered) in proper order.
                             break
                         except asyncio.TimeoutError:
@@ -2081,9 +2148,8 @@ async def _await_stack_window(engine, game: GameState, player: Player,
                             _force_stack_above(engine, game, stack_entry,
                                                effect_messages)
                             try:
-                                await asyncio.wait_for(
-                                    stack_entry.resolution_event.wait(),
-                                    timeout=min(resolution_timeout, 3.0))
+                                await resolution.wait_for_priority(
+                                    stack_entry, min(resolution_timeout, 3.0))
                                 break
                             except asyncio.TimeoutError:
                                 pass
@@ -2129,6 +2195,12 @@ async def _await_stack_window(engine, game: GameState, player: Player,
             _drop_from_priority_stack()
             # Signature spells return to command zone even when countered
             _countered_to = getattr(stack_entry, 'countered_to', None)
+            _counter_already_narrated = bool(getattr(
+                stack_entry, '_counter_narration_queued', False))
+
+            def _counter_route_message(original: str, routed: str) -> str:
+                """Keep destination information without announcing twice."""
+                return routed if _counter_already_narrated else original
             if _countered_to == "already_handled":
                 # July 30 batch-9 audit: the removing effect (Summary
                 # Dismissal, Spell Queller) already moved the card to its
@@ -2137,12 +2209,16 @@ async def _await_stack_window(engine, game: GameState, player: Player,
                 print(f"[STACK] {card.name} was removed from the stack by "
                       f"another effect — unwinding without resolving")
                 engine.rules.log_event(f"{player.name}'s {card.name} was removed from the stack")
+                resolution.transition(
+                    stack_entry, "complete", countered=True)
                 return ((True, f"Cast {card.name} (removed from stack)", effect_messages),
                         cast_trigger_msgs, player_idx)
             if getattr(card, 'is_signature_spell', False) and game.format == "oathbreaker":
                 player.command_zone.append(card)
                 print(f"[OATHBREAKER] {card.name} was countered → returns to command zone")
-                effect_messages.append(f"❌ **{card.name}** was countered! → returns to command zone")
+                effect_messages.append(_counter_route_message(
+                    f"❌ **{card.name}** was countered! → returns to command zone",
+                    f"↩️ **{card.name}** returns to the command zone."))
             elif _countered_to == "exile_suspend":
                 # Delay: exile with three time counters, suspended (owner
                 # recasts free when they run out — CR 702.62). June 11 audit:
@@ -2152,18 +2228,24 @@ async def _await_stack_window(engine, game: GameState, player: Player,
                 card.counters['time'] = 3
                 player.exile.append(card)
                 print(f"[STACK] {card.name} was countered — exiled with 3 time counters (suspend)")
-                effect_messages.append(f"❌ **{card.name}** was countered — exiled with three time counters (suspended)!")
+                effect_messages.append(_counter_route_message(
+                    f"❌ **{card.name}** was countered — exiled with three time counters (suspended)!",
+                    f"⏳ **{card.name}** is exiled with three time counters (suspended)."))
             elif _countered_to == "library":
                 # Commit: owner's library, second from the top (CR 608.2 —
                 # a resolved Commit moves the spell off the stack itself).
                 _pos = min(1, len(player.library))
                 player.library.insert(_pos, card)
                 print(f"[STACK] {card.name} was countered — put into library second from top")
-                effect_messages.append(f"❌ **{card.name}** is put into its owner's library, second from the top!")
+                effect_messages.append(_counter_route_message(
+                    f"❌ **{card.name}** is put into its owner's library, second from the top!",
+                    f"🔀 **{card.name}** goes into its owner's library, second from the top."))
             elif _countered_to == "library_top":
                 player.library.insert(0, card)
                 print(f"[STACK] {card.name} was countered — put on top of its owner's library")
-                effect_messages.append(f"❌ **{card.name}** is put on top of its owner's library!")
+                effect_messages.append(_counter_route_message(
+                    f"❌ **{card.name}** is put on top of its owner's library!",
+                    f"🔀 **{card.name}** goes on top of its owner's library."))
             elif _countered_to == "hand":
                 # Aug 2 batch-14 audit (R-B1): Remand — "put it into its
                 # owner's hand instead of into that player's graveyard".
@@ -2175,7 +2257,9 @@ async def _await_stack_window(engine, game: GameState, player: Player,
                 # months — this is the same shape, one destination over).
                 player.hand.append(card)
                 print(f"[STACK] {card.name} was countered — returned to its owner's hand")
-                effect_messages.append(f"❌ **{card.name}** is returned to its owner's hand!")
+                effect_messages.append(_counter_route_message(
+                    f"❌ **{card.name}** is returned to its owner's hand!",
+                    f"↩️ **{card.name}** returns to its owner's hand."))
             elif _countered_to == "exile":
                 # July 23 audit (#8): Force of Negation — "exile it instead of
                 # putting it into its owner's graveyard" (CR 614 zone-change
@@ -2183,7 +2267,9 @@ async def _await_stack_window(engine, game: GameState, player: Player,
                 # leaving the countered spell recoverable.
                 player.exile.append(card)
                 print(f"[STACK] {card.name} was countered — exiled instead of graveyard")
-                effect_messages.append(f"❌ **{card.name}** was countered — exiled!")
+                effect_messages.append(_counter_route_message(
+                    f"❌ **{card.name}** was countered — exiled!",
+                    f"📤 **{card.name}** is exiled."))
             elif (getattr(card, 'is_commander', False)
                   and game.format in COMMAND_ZONE_FORMATS):
                 # CR 903.9b: a countered commander may go to the command zone
@@ -2194,12 +2280,19 @@ async def _await_stack_window(engine, game: GameState, player: Player,
                     player.command_zone = []
                 player.command_zone.append(card)
                 print(f"[STACK] {card.name} was countered — commander returns to command zone (CR 903.9)")
-                effect_messages.append(f"❌ **{card.name}** was countered! → returns to command zone")
+                effect_messages.append(_counter_route_message(
+                    f"❌ **{card.name}** was countered! → returns to command zone",
+                    f"↩️ **{card.name}** returns to the command zone."))
             else:
                 player.graveyard.append(card)
                 print(f"[STACK] {card.name} was countered — goes to graveyard")
-                effect_messages.append(f"❌ **{card.name}** was countered!")
+                if _counter_already_narrated:
+                    print(f"[COUNTER-NARRATION-DEDUP] {card.name} counter "
+                          f"already announced; generic graveyard echo suppressed")
+                else:
+                    effect_messages.append(f"❌ **{card.name}** was countered!")
             engine.rules.log_event(f"{player.name}'s {card.name} was countered")
+            resolution.transition(stack_entry, "complete", countered=True)
             return ((True, f"Cast {card.name} (countered)", effect_messages),
                     cast_trigger_msgs, player_idx)
 
@@ -2252,6 +2345,7 @@ async def _await_stack_window(engine, game: GameState, player: Player,
                 engine.rules.log_event(
                     f"{card.name}'s printed target was illegal; its spliced "
                     f"text resolved (CR 608.2b)")
+                resolution.transition(stack_entry, "complete")
                 return ((True, f"Cast {card.name} (printed target illegal)",
                          effect_messages), cast_trigger_msgs, player_idx)
         if should_fizzle:
@@ -2268,6 +2362,7 @@ async def _await_stack_window(engine, game: GameState, player: Player,
                 effect_messages.append(f"💨 **{fizzle_reason}**")
             print(f"[TARGETING] {fizzle_reason}")
             engine.rules.log_event(f"{card.name} fizzled — all targets illegal")
+            resolution.transition(stack_entry, "complete")
             return ((True, f"Cast {card.name} (fizzled)", effect_messages),
                     cast_trigger_msgs, player_idx)
 
@@ -2275,6 +2370,7 @@ async def _await_stack_window(engine, game: GameState, player: Player,
     if stack_entry in game.stack:
         game.stack.remove(stack_entry)
     _drop_from_priority_stack()
+    resolution.transition(stack_entry, "resolving")
     return None, cast_trigger_msgs, player_idx
 
 
@@ -2326,8 +2422,7 @@ def maybe_resolve_devour(engine, game: GameState, player: Player, card) -> List[
     try:
         _dlib = get_effect_library()
         if card.name.lower() in getattr(_dlib, '_card_templates', {}):
-            _opp = game.players[1 - game.players.index(player)] \
-                if player in game.players else game.players[0]
+            _opp = game.default_opponent_for(player)
             _dctx = build_game_context(game, player, _opp, card=card)
             _dactions, _ddesc = _dlib.resolve_etb(
                 card.name, card.oracle_text, player.name, _opp.name,
@@ -2387,8 +2482,7 @@ async def _dispatch_resolution(engine, game: GameState, player: Player,
         split_msgs = engine.resolve_special_effects(game, player, split_half_card, target)
         if not split_msgs and HAS_EFFECT_TEMPLATES and half_text:
             try:
-                player_idx = game.players.index(player) if player in game.players else 0
-                opponent = game.players[1 - player_idx]
+                opponent = game.default_opponent_for(player)
                 ctx = build_game_context(game, player, opponent, card=split_half_card, explicit_target=target)
                 lib = get_effect_library()
                 tmpl_actions, tmpl_explanation = lib.resolve_spell(
@@ -2592,8 +2686,7 @@ async def _dispatch_resolution(engine, game: GameState, player: Player,
         # Tier 1.5: Effect template library (card name + oracle pattern matching)
         if not effect_messages and not getattr(card, '_spell_resolved', False) and HAS_EFFECT_TEMPLATES and card.oracle_text:
             try:
-                player_idx = game.players.index(player) if player in game.players else 0
-                opponent = game.players[1 - player_idx]
+                opponent = game.default_opponent_for(player)
                 ctx = build_game_context(game, player, opponent, card=card, explicit_target=target)
                 # Apr 30 audit fix #21: pass modal mode selection to templates
                 if getattr(card, '_modes_chosen', None):
@@ -3022,8 +3115,7 @@ async def _dispatch_resolution(engine, game: GameState, player: Player,
                     template_fired = False
                     try:
                         lib = get_effect_library()
-                        opp_idx = 1 - game.players.index(player)
-                        opp = game.players[opp_idx]
+                        opp = game.default_opponent_for(player)
                         # June 10 round 3: saga chapters used to call the
                         # library with NO game_context, so generators needing
                         # board state (chapter II "+1/+1 counter on target
@@ -3720,8 +3812,7 @@ async def _dispatch_resolution(engine, game: GameState, player: Player,
                 elif not effect_messages and HAS_EFFECT_TEMPLATES:
                     try:
                         etb_text = "\n".join(etb_paragraphs)
-                        opponent_idx = 1 - (game.players.index(player) if player in game.players else 0)
-                        opponent = game.players[opponent_idx]
+                        opponent = game.default_opponent_for(player)
                         
                         ctx = build_game_context(game, player, opponent, card=card, explicit_target=target)
                         lib = get_effect_library()
@@ -3934,7 +4025,10 @@ async def _dispatch_resolution(engine, game: GameState, player: Player,
                                 resolved_by_spell_resolver = True
                         
                         # If SpellResolver couldn't handle it, try XMage bridge (tier 2.5)
-                        if not resolved_by_spell_resolver and engine._xmage_available and engine._xmage_translator:
+                        if (not resolved_by_spell_resolver
+                                and not getattr(game, 'experimental_ffa', False)
+                                and engine._xmage_available
+                                and engine._xmage_translator):
                             try:
                                 print(f"[ETB] SpellResolver punted on {card.name}, trying XMage bridge")
                                 xmage_state, name_map = engine._serialize_for_xmage(game)
@@ -3952,8 +4046,7 @@ async def _dispatch_resolution(engine, game: GameState, player: Player,
                                 ]
 
                                 if self_triggers:
-                                    opponent_idx = 1 - (game.players.index(player) if player in game.players else 0)
-                                    opponent = game.players[opponent_idx]
+                                    opponent = game.default_opponent_for(player)
                                     ctx = build_game_context(game, player, opponent, card=card)
 
                                     for trigger in self_triggers:
@@ -4187,8 +4280,7 @@ async def _resolve_spliced_effects(engine, game: GameState, player: Player,
     if not spliced:
         return []
     messages: List[str] = []
-    player_idx = game.players.index(player) if player in game.players else 0
-    opponent = game.players[1 - player_idx]
+    opponent = game.default_opponent_for(player)
     for source in spliced:
         text = helpers.strip_splice_line(getattr(source, 'oracle_text', '') or '')
         if not text:
@@ -4288,7 +4380,7 @@ async def cast_spell_async(engine, game: GameState, player: Player, card: Card,
         return _rejection
 
     _rejection, _costs = _compute_alt_costs(
-        engine, game, player, card, pay_mana, additional_cost)
+        engine, game, player, card, pay_mana, additional_cost, target=target)
     if _rejection is not None:
         return _rejection
     free_cast_source = _costs['free_cast_source']
@@ -4395,7 +4487,8 @@ async def cast_spell_async(engine, game: GameState, player: Player, card: Card,
         effect_messages.append(f"🆓 {card.name} cast for free via {free_cast_source}!")
 
     _final, cast_trigger_msgs, player_idx = await _await_stack_window(
-        engine, game, player, card, target, effect_messages)
+        engine, game, player, card, target, effect_messages,
+        additional_cost=additional_cost)
     if _final is not None:
         return _final
 
@@ -4421,6 +4514,7 @@ async def cast_spell_async(engine, game: GameState, player: Player, card: Card,
         if _splice_msgs:
             _effects = list(_effects) + _splice_msgs
         card._spliced_cards = []
+    ResolutionCoordinator.for_game(engine, game).transition(card, "complete")
     return _success, _message, _effects
 
 # =========================================================================
@@ -4565,8 +4659,7 @@ def _advance_sagas(engine, game: GameState, player: Player) -> List[str]:
                 # Try to resolve the chapter via template/tier system
                 try:
                     lib = get_effect_library()
-                    opp_idx = 1 - game.players.index(player)
-                    opp = game.players[opp_idx]
+                    opp = game.default_opponent_for(player)
                     # June 10 round 3: pass real context (see chapter-I site).
                     _saga_ctx = build_game_context(game, player, opp, card=card)
                     actions, desc = lib.resolve_etb(card.name, chapter_text, player.name, opp.name,
@@ -5098,8 +5191,7 @@ def _process_suspend_upkeep(engine, game: GameState) -> List[str]:
     """Process suspended cards at upkeep - remove time counters and cast if 0."""
     messages = []
     player = game.active_player
-    player_idx = game.players.index(player) if player in game.players else 0
-    opponent = game.players[1 - player_idx]
+    opponent = game.default_opponent_for(player)
     
     # Find all suspended cards in exile
     cards_to_cast = []
@@ -5447,8 +5539,68 @@ def resolve_special_effects(engine, game: GameState, player: Player, card: Card,
     oracle = card.oracle_text.lower() if card.oracle_text else ""
     card_name_lower = card.name.lower()
     player_idx = game.players.index(player) if player in game.players else 0
-    opponent_idx = 1 - player_idx
-    opponent = game.players[opponent_idx]
+    opponent = game.default_opponent_for(player)
+
+    # Comet Storm's target count is fixed when cast: one, plus one for each
+    # multikicker payment. Tier 3 saw every living opponent in the FFA prompt
+    # and misread "each of them" as every opponent even when the spell was
+    # not kicked and the cast declared one named target. Resolve the bounded
+    # target list deterministically. This shared spell path also covers 1v1.
+    if card_name_lower == "comet storm":
+        damage = max(0, int(getattr(card, '_x_value', 0) or 0))
+        allowed = 1 + max(0, int(getattr(card, '_kicked_times', 0) or 0))
+        declared = (list(target) if isinstance(target, (list, tuple))
+                    else [target] if target is not None else [opponent])
+        resolved_targets = []
+        for declared_target in declared[:allowed]:
+            if isinstance(declared_target, str):
+                declared_target = helpers.resolve_cast_target(
+                    game, player, card, declared_target)
+            if (declared_target is not None
+                    and declared_target not in resolved_targets):
+                resolved_targets.append(declared_target)
+
+        if damage == 0:
+            messages.append("☄️ **Comet Storm** resolves with X=0 — no damage")
+            return messages
+        if not resolved_targets:
+            messages.append("💨 **Comet Storm** fizzles — its target is no longer legal")
+            return messages
+
+        for chosen in resolved_targets:
+            if hasattr(chosen, 'life') and hasattr(chosen, 'battlefield'):
+                action = {
+                    "action": "deal_damage",
+                    "amount": damage,
+                    "target_player": chosen.name,
+                }
+            else:
+                controller = next(
+                    (candidate for candidate in game.players
+                     if chosen in candidate.battlefield), None)
+                if controller is None:
+                    continue
+                action = {
+                    "action": "deal_damage",
+                    "amount": damage,
+                    "target_card": chosen.name,
+                    "target_controller": controller.name,
+                }
+            action.update({
+                "source": card.name,
+                "_source_card_name": card.name,
+                "_source_controller": player.name,
+                "_source_oracle": card.oracle_text or "",
+            })
+            out = engine.rules._execute_action_on_state(game, action)
+            if out:
+                messages.append(out)
+        if not messages:
+            messages.append("💨 **Comet Storm** fizzles — its target is no longer legal")
+        print(f"[COMET-STORM] X={damage} kicked="
+              f"{getattr(card, '_kicked_times', 0) or 0} "
+              f"targets={len(resolved_targets)}")
+        return messages
 
     # Summary Dismissal: exile all other spells and counter all abilities.
     # July 21 batch audit (R2-2): Tier 2's EXILE regex garbled this into an

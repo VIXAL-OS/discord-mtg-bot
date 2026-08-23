@@ -22,6 +22,7 @@ import asyncio
 import hashlib
 import random
 import re
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
@@ -853,6 +854,11 @@ class Card:
     # Copies of spells are stack objects but are not cards. Instant/sorcery
     # copies cease after resolution; permanent-spell copies resolve as tokens.
     _is_spell_copy: bool = field(default=False, repr=False, compare=False)
+    # Developer-only autoplay exercise hook. This flag is set after mulligans
+    # on a card deliberately placed into an opening hand. It exists only on
+    # the in-memory Card instance and is never serialized back into a deck or
+    # the shared Scryfall cache.
+    _autoplay_seeded: bool = field(default=False, repr=False, compare=False)
     # Converge (CR 702.100a): the distinct COLORS of mana actually spent
     # casting this spell, recorded by the mana engine at payment time. The
     # engine already resolves each tapped source to one committed color, so
@@ -891,6 +897,10 @@ class Card:
     # for the turn (approximation of the Layer-6 later-timestamp ordering a
     # "lose" effect nearly always has). Cleared by clear_end_of_turn_effects.
     temp_removed_keywords: List[str] = field(default_factory=list)
+    # Until-end-of-turn blocking restriction (Goblin Shortcutter, Chandra,
+    # Pyromaster).  Declared state keeps save/undo truthful in the middle of a
+    # turn; clear_end_of_turn_effects and zone changes remove it.
+    cant_block_this_turn: bool = False
     
     # Planeswalker loyalty counters
     loyalty_counters: int = 0
@@ -981,6 +991,7 @@ class Card:
         self.toughness_modifier = 0
         self.temp_keywords = []
         self.temp_removed_keywords = []
+        self.cant_block_this_turn = False
         self.tapped = False
         self.attacking = False
         self.attacking_player = None
@@ -2267,6 +2278,7 @@ class Card:
             "power_modifier": self.power_modifier,
             "toughness_modifier": self.toughness_modifier,
             "temp_keywords": self.temp_keywords,
+            "cant_block_this_turn": self.cant_block_this_turn,
             "loyalty_counters": self.loyalty_counters,
             "played_face": self.played_face,
             "mdfc_back_name": self.mdfc_back_name,
@@ -2310,6 +2322,7 @@ class Card:
             power_modifier=data.get("power_modifier", 0),
             toughness_modifier=data.get("toughness_modifier", 0),
             temp_keywords=data.get("temp_keywords", []),
+            cant_block_this_turn=data.get("cant_block_this_turn", False),
             loyalty_counters=data.get("loyalty_counters", 0),
             played_face=data.get("played_face", ""),
             mdfc_back_name=data.get("mdfc_back_name", ""),
@@ -2337,6 +2350,12 @@ class Player:
     life: int = 20
     poison: int = 0
     energy: int = 0
+    # Multiplayer seats are stable for the lifetime of a game. Eliminated
+    # players remain in GameState.players so owner indices, saved references,
+    # commander-damage keys, and drafted-seat results never renumber.
+    seat_id: Optional[int] = None
+    eliminated: bool = False
+    loss_reason: str = ""
     # commander NAME -> combat damage taken from that commander. CR 903.10a
     # is per-COMMANDER ("by the same commander"), not per-player — keying by
     # controller index summed partner commanders into one bucket (Aug 1
@@ -2853,7 +2872,25 @@ class Player:
         if 'mana confluence' in name_lower:
             return {'any': 1}
         if 'reflecting pool' in name_lower:
-            return {'any': 1}
+            # Reflecting Pool does not intrinsically make any colour. It can
+            # make one mana of a type another land we control could produce;
+            # alone (or beside only other Pools) it makes nothing. Do not
+            # recurse through another Pool, and inspect lands regardless of
+            # tapped state because "could produce" is about their abilities,
+            # not whether their costs can currently be paid.
+            reflected = set()
+            for other in self.lands():
+                if other is card or 'reflecting pool' in other.name.lower():
+                    continue
+                production = self._get_mana_production(other)
+                if production.get('any', 0) > 0:
+                    return {'any': 1}
+                reflected.update(
+                    color for color, amount in production.items()
+                    if color in 'WUBRGC' and amount > 0)
+            if reflected:
+                return {color: 1 for color in sorted(reflected)}
+            return {'C': 0}
         if 'exotic orchard' in name_lower:
             return {'any': 1}
         if 'forbidden orchard' in name_lower:
@@ -2970,7 +3007,23 @@ class Player:
                 # Default to front face if not tracked
                 return {mdfc_info["front_produces"]: 1}
         
-        # === BASIC LANDS ===
+        # === BASIC LAND TYPES ===
+        # Original duals, shocks, and typed triomes have more than one basic
+        # land subtype. Name-first matching made Tropical/Volcanic Island stop
+        # at Island and silently lose their second colour. CR 305.6 grants the
+        # intrinsic mana ability for every printed basic land type.
+        if card.is_land():
+            type_lower = (card.type_line or '').lower()
+            typed_colors = {}
+            for subtype, color in (
+                    ('plains', 'W'), ('island', 'U'), ('swamp', 'B'),
+                    ('mountain', 'R'), ('forest', 'G')):
+                if subtype in type_lower:
+                    typed_colors[color] = 1
+            if typed_colors:
+                return typed_colors
+
+        # === BASIC LANDS (defensive fallback for sparse hand-built cards) ===
         if 'plains' in name_lower:
             return {'W': 1}
         if 'island' in name_lower:
@@ -3263,7 +3316,7 @@ class Player:
         ]
         return spent
     
-    def _get_mana_tap_damage(self, card: Card) -> int:
+    def _get_mana_tap_damage(self, card: Card, paid_generic: bool = False) -> int:
         """Self-damage dealt when tapping this permanent for mana.
 
         Aug 10 deferred (H1). This was a hardcoded FOUR-NAME list with no
@@ -3279,14 +3332,22 @@ class Player:
         whole-oracle scan charges the free colorless tap too. Only a line that
         both produces mana and deals the damage counts.
 
-        KNOWN LIMITATION, stated rather than implied: the call sites do not
-        pass which ability line they used, and they cannot usefully — today
-        _get_mana_production collapses a Talisman to {'any': 1} and never
-        models the free {C} option at all, so the colored (damage-bearing)
-        ability is the only one the engine can pick. If production ever gains
-        the {C} option, this must take the committed color and charge only
-        when the damage-bearing line was the one used; tap_sources_for_cost
-        already computes committed_color a few lines later.
+        `paid_generic` closes what the Aug 10 note filed as a KNOWN
+        LIMITATION. Aug 23 cube-FFA audit: it was outcome-affecting. A
+        Talisman of Curiosity was charged 1 damage on all six of its taps,
+        every one of them paying a GENERIC portion that its printed free line
+        ("{T}: Add {C}.") covers, and those 6 life were exactly the margin
+        Bot-Elspeth died by (game_1538942949243621457, turn 44).
+
+        The discriminator is the PHASE, not the committed colour: a pain land
+        tapped for generic still gets committed_color set to one of its two
+        colours, so colour alone cannot tell "paid a pip" from "paid generic".
+        tap_sources_for_cost snapshots tapped_cards at the Phase-3 boundary
+        instead, which covers future generic tap sites by construction.
+
+        Deliberately NOT wired into tap_lands_for_mana: that path is
+        amount-based and colour-unaware, so it cannot establish that only
+        generic was owed. Defaulting to False keeps it byte-identical.
 
         Mana Confluence is deliberately NOT here: it prints "{T}, Pay 1 life:
         Add one mana of any color" — a life PAYMENT, not damage, so it cannot
@@ -3295,8 +3356,11 @@ class Player:
         damage; that classification was wrong.
         """
         oracle = getattr(card, 'oracle_text', '') or ''
-        for raw in oracle.split('\n'):
-            line = raw.strip()
+        lines = [raw.strip() for raw in oracle.split('\n')]
+        dmg_idx = None
+        dmg_amount = 0
+        dmg_is_trigger = False
+        for idx, line in enumerate(lines):
             low = line.lower()
             match = re.search(r'deals? (\d+) damage to you', low)
             if not match:
@@ -3306,8 +3370,30 @@ class Player:
             # becomes-tapped trigger that fires whatever the tap was for
             # (City of Brass).
             if 'add ' in low or 'becomes tapped' in low:
-                return int(match.group(1))
-        return 0
+                dmg_idx = idx
+                dmg_amount = int(match.group(1))
+                dmg_is_trigger = 'becomes tapped' in low
+                break
+        if dmg_idx is None:
+            return 0
+        # City of Brass' damage is a becomes-tapped TRIGGER rather than a
+        # rider on one ability, so it fires whichever ability was
+        # activated — the free-line escape below must never reach it.
+        if dmg_is_trigger or not paid_generic:
+            return dmg_amount
+        # Only generic was owed. A card printing a SEPARATE damage-free
+        # mana ability (every Talisman and pain land: "{T}: Add {C}.")
+        # could have used that line, so it takes no damage. Ancient Tomb
+        # prints only the one damage-bearing line and still pays.
+        for idx, line in enumerate(lines):
+            if idx == dmg_idx:
+                continue
+            low = line.lower()
+            if 'add ' in low and 'damage to you' not in low:
+                print(f"[MANA-FREE-TAP] {card.name}: paid generic via its "
+                      f"damage-free line — {dmg_amount} damage not dealt")
+                return 0
+        return dmg_amount
 
     def _get_mana_tap_life_cost(self, card: Card) -> int:
         """Life paid as part of a mana ability's COST (Mana Confluence).
@@ -3970,6 +4056,12 @@ class Player:
         # Priority: multi-mana rocks (Sol Ring=2, Thran Dynamo=3) before single-mana
         # sources (basic lands). This keeps colored lands untapped for future spells.
         total_mana_committed = sum(mana_produced.values())
+        # Aug 23 cube-FFA audit: everything tapped from here on pays GENERIC,
+        # so a source printing a damage-free mana line (Talismans, pain lands)
+        # could have used that line and takes no tap damage. Snapshotting the
+        # set at the phase boundary rather than flagging each tap site keeps
+        # this correct for tap sites added later.
+        _colored_pip_taps = set(tapped_cards)
         # June 10 audit (V5): life-paid Phyrexian symbols are already EXCLUDED
         # from color_needs/total_cost (see phyrexian_symbols_paid skip above),
         # so no adjustment belongs here. The old `+ phyrexian_life_cost` term
@@ -4130,7 +4222,8 @@ class Player:
                     print(f"[MANA-COST] {card.name}: {self.name} pays {tap_life} life (life: {max(0, self.life)})")
                     self._pending_tap_damage_msgs.append(
                         f"💧 {card.name}: {self.name} pays {tap_life} life (life: {max(0, self.life)})")
-                tap_damage = self._get_mana_tap_damage(card)
+                tap_damage = self._get_mana_tap_damage(
+                    card, paid_generic=id(card) not in _colored_pip_taps)
                 if tap_damage > 0:
                     self.life -= tap_damage
                     self.record_life_loss(tap_damage)
@@ -4703,6 +4796,9 @@ class Player:
             "life": self.life,
             "poison": self.poison,
             "energy": self.energy,
+            "seat_id": self.seat_id,
+            "eliminated": self.eliminated,
+            "loss_reason": self.loss_reason,
             "commander_damage": self.commander_damage,
             "library": [c.to_dict() for c in self.library],
             "hand": [c.to_dict() for c in self.hand],
@@ -4716,6 +4812,8 @@ class Player:
             "lands_played_this_turn": self.lands_played_this_turn,
             "max_lands_per_turn": self.max_lands_per_turn,
             "has_drawn_for_turn": self.has_drawn_for_turn,
+            "mulligans_taken": self.mulligans_taken,
+            "has_kept_hand": self.has_kept_hand,
             "mana_pool": self.mana_pool,
             "restricted_mana_pool": self.restricted_mana_pool,
             "playable_from_exile": self.playable_from_exile,
@@ -4736,12 +4834,17 @@ class Player:
             life=data.get("life", 20),
             poison=data.get("poison", 0),
             energy=data.get("energy", 0),
+            seat_id=data.get("seat_id"),
+            eliminated=data.get("eliminated", False),
+            loss_reason=data.get("loss_reason", ""),
             commander_damage=data.get("commander_damage", {}),
             deck_name=data.get("deck_name", ""),
             deck_source=data.get("deck_source", ""),
             lands_played_this_turn=data.get("lands_played_this_turn", 0),
             max_lands_per_turn=data.get("max_lands_per_turn", 1),
             has_drawn_for_turn=data.get("has_drawn_for_turn", False),
+            mulligans_taken=data.get("mulligans_taken", 0),
+            has_kept_hand=data.get("has_kept_hand", False),
             mana_pool=data.get("mana_pool", {'W': 0, 'U': 0, 'B': 0, 'R': 0, 'G': 0, 'C': 0}),
             restricted_mana_pool=data.get("restricted_mana_pool", []),
         )
@@ -4758,6 +4861,234 @@ class Player:
         player.landfall_count_this_turn = data.get("landfall_count_this_turn", 0)
         player.city_blessing = data.get("city_blessing", False)
         return player
+
+
+_RESOLUTION_CARD_FIELDS = (
+    "has_transform", "is_transformed", "back_face_name",
+    "back_face_type_line", "back_face_oracle_text", "back_face_power",
+    "back_face_toughness", "back_face_mana_cost", "front_face_name",
+    "adventure_name", "adventure_cost", "adventure_text",
+    "adventure_type", "cast_as_adventure", "split_names", "split_costs",
+    "split_types", "split_texts", "cast_as_split_half",
+)
+
+_RESOLUTION_CAST_FACTS = (
+    "_cast_origin", "_x_value", "_decimate_target_ids",
+    "_cast_from_command_zone", "_cast_from_graveyard", "_escape_cost",
+    "_was_escaped", "_cast_via_madness", "_was_spectacled", "_kicked",
+    "_entwined", "_kicked_times", "_exile_after_resolution",
+    "_buyback_paid", "_cast_via_foretell", "_cast_via_miracle",
+    "_cast_via_effect", "_free_cast_source", "_is_spell_copy",
+    "_colors_spent", "_snow_mana_spent", "_mana_paid", "_modes_chosen",
+    "_tutor_card", "_tutor_cards", "_tutor_to_hand",
+    "_tutor_to_graveyard", "_spliced_cards",
+)
+
+
+@dataclass(frozen=True)
+class ResolutionTargetRef:
+    """Exact persisted reference to one declared target.
+
+    Names are presentation only.  Recovery resolves players by stable seat,
+    cards by instance ID, and stack objects by stable stack-entry ID.  A stale
+    reference resolves to ``None`` and is handled by ordinary CR 608.2b
+    legality; it never redirects to a same-named object.
+    """
+    kind: str
+    stable_id: str
+
+    def to_dict(self) -> Dict:
+        return {"kind": self.kind, "stable_id": self.stable_id}
+
+    @classmethod
+    def from_dict(cls, data: Dict) -> 'ResolutionTargetRef':
+        return cls(kind=str(data.get("kind", "")),
+                   stable_id=str(data.get("stable_id", "")))
+
+    @classmethod
+    def capture(cls, game: 'GameState', value: Any) -> Optional['ResolutionTargetRef']:
+        if isinstance(value, Player):
+            stable = game.priority_identifier(value)
+            return cls("player", stable) if stable else None
+        for entry in getattr(game, "stack", []) or []:
+            if getattr(entry, "card", None) is value:
+                stable = (getattr(entry, "entry_id", None)
+                          or getattr(entry, "priority_id", None))
+                return cls("stack", str(stable)) if stable else None
+        card_id = getattr(value, "id", None)
+        return cls("card", str(card_id)) if card_id else None
+
+    def resolve(self, game: 'GameState') -> Any:
+        if self.kind == "player":
+            return game.player_from_priority_identifier(
+                self.stable_id, living_only=False, allow_legacy_name=False)
+        if self.kind == "stack":
+            for entry in getattr(game, "stack", []) or []:
+                if (getattr(entry, "entry_id", None) == self.stable_id
+                        or getattr(entry, "priority_id", None) == self.stable_id):
+                    return getattr(entry, "card", None)
+            return None
+        if self.kind == "card":
+            found = game.find_card_global(self.stable_id)
+            return found[0] if found else None
+        return None
+
+
+@dataclass
+class ResolutionJob:
+    """Durable continuation record for one spell/ability resolution.
+
+    Q-I persists enough identity and cast truth to reconstruct a real
+    ``StackEntry`` after process death.  Q-J owns deterministic action plans,
+    idempotent application, and the narration outbox; those fields live here
+    now so later checkpoints extend this record rather than inventing a
+    second persistence seam.
+    """
+    job_id: str
+    card_snapshot: Dict
+    controller_id: str
+    target_refs: List[ResolutionTargetRef] = field(default_factory=list)
+    checkpoint: str = "costs_paid"
+    priority_id: Optional[str] = None
+    is_spell: bool = True
+    is_copy: bool = False
+    countered: bool = False
+    trigger_source: Optional[str] = None
+    trigger_text: Optional[str] = None
+    cast_facts: Dict = field(default_factory=dict)
+    modes: List[Any] = field(default_factory=list)
+    additional_cost: int = 0
+    final_destination_policy: str = "normal"
+    replacement_effect_ids: List[str] = field(default_factory=list)
+    unresolved_choice_ids: List[str] = field(default_factory=list)
+    planned_actions: List[Dict] = field(default_factory=list)
+    applied_action_keys: List[str] = field(default_factory=list)
+    recovery_error: str = ""
+
+    @staticmethod
+    def _snapshot_card(card: Card) -> Dict:
+        snapshot = card.to_dict()
+        for name in _RESOLUTION_CARD_FIELDS:
+            value = getattr(card, name, None)
+            snapshot[name] = list(value) if isinstance(value, tuple) else value
+        return snapshot
+
+    @staticmethod
+    def _restore_card(snapshot: Dict, cast_facts: Optional[Dict] = None) -> Card:
+        card = Card.from_dict(snapshot)
+        for name in _RESOLUTION_CARD_FIELDS:
+            if name in snapshot:
+                setattr(card, name, snapshot[name])
+        for name, value in (cast_facts or {}).items():
+            if name == "_spliced_cards":
+                # Stable IDs are rebound after every zone/stack object exists.
+                continue
+            if name == "_colors_spent" and isinstance(value, list):
+                value = tuple(value)
+            setattr(card, name, value)
+        return card
+
+    @classmethod
+    def capture(cls, game: 'GameState', entry: 'StackEntry', *,
+                checkpoint: str = "on_stack", additional_cost: int = 0
+                ) -> 'ResolutionJob':
+        raw_targets = (list(entry.target)
+                       if isinstance(entry.target, (list, tuple))
+                       else ([entry.target] if entry.target is not None else []))
+        refs = [ref for ref in
+                (ResolutionTargetRef.capture(game, value)
+                 for value in raw_targets) if ref is not None]
+        facts = {}
+        for name in _RESOLUTION_CAST_FACTS:
+            if not hasattr(entry.card, name):
+                continue
+            value = getattr(entry.card, name)
+            if name == "_spliced_cards":
+                value = [getattr(item, "id", "") for item in value]
+            elif isinstance(value, tuple):
+                value = list(value)
+            facts[name] = value
+        controller_id = game.priority_identifier(entry.controller_index) or ""
+        job_id = entry.entry_id or f"resolution-{uuid.uuid4().hex}"
+        return cls(
+            job_id=job_id,
+            card_snapshot=(cls._snapshot_card(entry.card)
+                           if entry.card is not None else {
+                               "name": entry.trigger_source or "Triggered ability",
+                               "id": f"trigger-source-{entry.entry_id}",
+                               "type_line": "Ability",
+                               "oracle_text": entry.trigger_text or "",
+                           }),
+            controller_id=controller_id,
+            target_refs=refs,
+            checkpoint=checkpoint,
+            priority_id=entry.priority_id,
+            is_spell=entry.is_spell,
+            is_copy=bool(getattr(entry.card, "_is_spell_copy", False)),
+            countered=entry.countered,
+            trigger_source=entry.trigger_source,
+            trigger_text=entry.trigger_text,
+            cast_facts=facts,
+            modes=list(getattr(entry.card, "_modes_chosen", []) or []),
+            additional_cost=int(additional_cost or 0),
+            final_destination_policy=(
+                getattr(entry.card, "_exile_after_resolution", "")
+                or ("buyback" if getattr(entry.card, "_buyback_paid", False)
+                    else "normal")),
+        )
+
+    def to_dict(self) -> Dict:
+        return {
+            "job_id": self.job_id,
+            "card_snapshot": self.card_snapshot,
+            "controller_id": self.controller_id,
+            "target_refs": [ref.to_dict() for ref in self.target_refs],
+            "checkpoint": self.checkpoint,
+            "priority_id": self.priority_id,
+            "is_spell": self.is_spell,
+            "is_copy": self.is_copy,
+            "countered": self.countered,
+            "trigger_source": self.trigger_source,
+            "trigger_text": self.trigger_text,
+            "cast_facts": self.cast_facts,
+            "modes": self.modes,
+            "additional_cost": self.additional_cost,
+            "final_destination_policy": self.final_destination_policy,
+            "replacement_effect_ids": self.replacement_effect_ids,
+            "unresolved_choice_ids": self.unresolved_choice_ids,
+            "planned_actions": self.planned_actions,
+            "applied_action_keys": self.applied_action_keys,
+            "recovery_error": self.recovery_error,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict) -> 'ResolutionJob':
+        return cls(
+            job_id=str(data.get("job_id", "")),
+            card_snapshot=dict(data.get("card_snapshot") or {}),
+            controller_id=str(data.get("controller_id", "")),
+            target_refs=[ResolutionTargetRef.from_dict(item)
+                         for item in data.get("target_refs", [])],
+            checkpoint=str(data.get("checkpoint", "costs_paid")),
+            priority_id=data.get("priority_id"),
+            is_spell=bool(data.get("is_spell", True)),
+            is_copy=bool(data.get("is_copy", False)),
+            countered=bool(data.get("countered", False)),
+            trigger_source=data.get("trigger_source"),
+            trigger_text=data.get("trigger_text"),
+            cast_facts=dict(data.get("cast_facts") or {}),
+            modes=list(data.get("modes") or []),
+            additional_cost=int(data.get("additional_cost", 0) or 0),
+            final_destination_policy=str(
+                data.get("final_destination_policy", "normal")),
+            replacement_effect_ids=list(
+                data.get("replacement_effect_ids") or []),
+            unresolved_choice_ids=list(
+                data.get("unresolved_choice_ids") or []),
+            planned_actions=list(data.get("planned_actions") or []),
+            applied_action_keys=list(data.get("applied_action_keys") or []),
+            recovery_error=str(data.get("recovery_error", "")),
+        )
 
 
 @dataclass
@@ -4781,19 +5112,92 @@ class StackEntry:
     # stack machinery can finish resolving it; surviving a second cleanup
     # means the coroutine leaked and the entry is swept as truly stale.
     cleanup_survivals: int = 0
+    # Stable identity independent of PrioritySystem's runtime stack object.
+    entry_id: str = field(default_factory=lambda: f"resolution-{uuid.uuid4().hex}")
+    resolution_job_id: Optional[str] = None
+    target_refs: List[ResolutionTargetRef] = field(default_factory=list)
 
     def to_dict(self) -> Dict:
         return {
             "card_name": self.card.name if self.card else "Unknown",
             "card_id": self.card.id if self.card else "",
+            "card_snapshot": (ResolutionJob._snapshot_card(self.card)
+                              if self.card else {}),
             "controller_name": self.controller_name,
             "controller_index": self.controller_index,
-            "target": str(self.target) if self.target else None,
+            "target_refs": [ref.to_dict() for ref in self.target_refs],
             "is_spell": self.is_spell,
             "trigger_source": self.trigger_source,
             "trigger_text": self.trigger_text,
             "countered": self.countered,
+            "priority_id": self.priority_id,
+            "cleanup_survivals": self.cleanup_survivals,
+            "entry_id": self.entry_id,
+            "resolution_job_id": self.resolution_job_id,
         }
+
+    def bind_persisted_targets(self, game: 'GameState') -> None:
+        """Resolve exact target references after the whole stack exists.
+
+        Stack targets (counter-wars) cannot be rebound while entries are
+        being constructed one at a time.  This deliberately runs as a
+        second pass and never falls back to a display/card name.
+        """
+        resolved = [ref.resolve(game) for ref in self.target_refs]
+        resolved = [value for value in resolved if value is not None]
+        self.target = (resolved if len(self.target_refs) > 1 else
+                       (resolved[0] if resolved else None))
+        job = game.resolution_jobs.get(
+            str(self.resolution_job_id or self.entry_id))
+        if job is not None and "_spliced_cards" in job.cast_facts:
+            rebound = []
+            for card_id in job.cast_facts.get("_spliced_cards") or []:
+                found = game.find_card_global(str(card_id))
+                if found:
+                    rebound.append(found[0])
+            self.card._spliced_cards = rebound
+
+    @classmethod
+    def from_dict(cls, game: 'GameState', data: Dict,
+                  job: Optional[ResolutionJob] = None) -> 'StackEntry':
+        snapshot = ((job.card_snapshot if job else None)
+                    or data.get("card_snapshot") or {
+                        "name": data.get("card_name", "Unknown"),
+                        "id": data.get("card_id", ""),
+                    })
+        card = ResolutionJob._restore_card(
+            snapshot, job.cast_facts if job else None)
+        refs = (job.target_refs if job is not None else
+                [ResolutionTargetRef.from_dict(item)
+                 for item in data.get("target_refs", [])])
+        controller = (game.player_from_priority_identifier(
+            job.controller_id, living_only=False, allow_legacy_name=False)
+            if job is not None else None)
+        try:
+            controller_index = (game.players.index(controller)
+                                if controller is not None
+                                else int(data.get("controller_index", 0)))
+            controller_name = game.players[controller_index].name
+        except (ValueError, TypeError, IndexError):
+            controller_index = 0
+            controller_name = str(data.get("controller_name", ""))
+        return cls(
+            card=card,
+            controller_name=controller_name,
+            controller_index=controller_index,
+            # Bound in a second pass after every restored stack entry exists.
+            target=None,
+            is_spell=(job.is_spell if job else bool(data.get("is_spell", True))),
+            trigger_source=(job.trigger_source if job else data.get("trigger_source")),
+            trigger_text=(job.trigger_text if job else data.get("trigger_text")),
+            countered=(job.countered if job else bool(data.get("countered", False))),
+            priority_id=(job.priority_id if job else data.get("priority_id")),
+            cleanup_survivals=int(data.get("cleanup_survivals", 0) or 0),
+            entry_id=str(data.get("entry_id") or
+                         (job.job_id if job else f"resolution-{uuid.uuid4().hex}")),
+            resolution_job_id=(job.job_id if job else data.get("resolution_job_id")),
+            target_refs=list(refs),
+        )
 
 
 @dataclass
@@ -4833,11 +5237,27 @@ class GameState:
     # Stack (list of StackEntry objects when stack_enabled, else empty list)
     stack: List = field(default_factory=list)
 
+    # Durable CR 608 continuation records keyed by StackEntry.entry_id.  Jobs
+    # remain after the physical stack object is popped so a process death in
+    # the resolving/effect-routing window still has an exact continuation
+    # record. Completed jobs are retained for audit/idempotency evidence and
+    # may be compacted by a later journal policy.
+    resolution_jobs: Dict[str, ResolutionJob] = field(default_factory=dict)
+
     # Stack/priority feature flag — when True, spells go on stack with priority passes
     stack_enabled: bool = False
 
     # PrioritySystem instance (only created when stack_enabled=True)
     _priority_system: Any = field(default=None, repr=False)
+
+    # Recreated by mtg.resolution after load; never serialized directly.
+    _resolution_coordinator: Any = field(
+        default=None, repr=False, compare=False)
+
+    # JSON snapshot consumed by GameEngine.setup_stack after load/undo. The
+    # live PrioritySystem remains runtime-only because it owns tasks/callbacks.
+    _restored_priority_state: Optional[Dict] = field(
+        default=None, repr=False, compare=False)
 
     # Async event for waiting on stack resolution (legacy fallback)
     _stack_resolution_event: Any = field(default=None, repr=False)
@@ -4847,6 +5267,9 @@ class GameState:
 
     # Autoplay mode — suppress human-facing prompts (!judge, !respond, !pass, etc.)
     is_autoplay: bool = False
+    # Explicit marker for the bounded four-seat cube smoke path. Ordinary
+    # two-player games and the shipped cube bracket remain unchanged.
+    experimental_ffa: bool = False
     # Track which effects have already emitted a !judge/!resolve hint (dedup in autoplay)
     _judge_hints_emitted: set = field(default_factory=set, repr=False)
 
@@ -4968,7 +5391,7 @@ class GameState:
     # sole sanctioned appender for both (the slice-3b pattern: subscribers
     # accumulate, the drain in resolve_combat_damage keeps its batch
     # semantics and its `not game.ended` gate). Player-kind entries are
-    # (source_card, source_owner, amount); creature-kind entries are
+    # (source_card, source_owner, amount, damaged_player); creature-kind entries are
     # (source_card, damaged_creature, amount) for the damaged-creature scan
     # (Phyrexian Obliterator class). The 5a parity recorder and its
     # _cdd_bus_seen/_cdd_consumer_seen scaffolding were retired at the flip.
@@ -5029,7 +5452,18 @@ class GameState:
     _undo_stack: list = field(default_factory=list, repr=False, compare=False)
     # Discord thread object for the running autoplay game (carried over on !undo).
     _autoplay_thread: Any = field(default=None, repr=False, compare=False)
+    # Developer-only autoplay card exercise evidence. A fresh GameState gets
+    # fresh lists, so a seed cannot leak into the next game. Injected cache
+    # cards replace (rather than append to) an opening-hand card; the displaced
+    # objects stay here for exact inventory accounting during the run.
+    _card_seed_results: list = field(default_factory=list, repr=False, compare=False)
+    _seed_replaced_cards: list = field(default_factory=list, repr=False, compare=False)
     _panharmonicon_repeat_active: bool = field(default=False, repr=False, compare=False)
+    # Automated multiplayer turns choose a concrete opponent seat up front.
+    # Ambiguous labels such as "opponent" resolve only through this recorded
+    # choice; they never silently mean "the first other player" in an FFA.
+    _default_opponent_index: Optional[int] = field(
+        default=None, repr=False, compare=False)
 
     # Opt-in: put triggered abilities on the stack instead of resolving immediately
     triggers_use_stack: bool = False
@@ -5042,10 +5476,19 @@ class GameState:
     started: bool = False
     ended: bool = False
     winner: Optional[int] = None
+    # Stable seat ids in elimination order. Persisted so a headless FFA
+    # result and a save/undo snapshot agree about placements.
+    elimination_order: List[int] = field(default_factory=list)
     created_at: datetime = field(default_factory=datetime.now)
     
     # Pending confirmations
     pending_action: Optional[Dict] = None
+
+    # Q-F production choice sessions. Records are JSON-safe and stable across
+    # reconnect/save. Opaque payloads and asyncio futures live separately.
+    pending_choices: Dict[str, Dict] = field(default_factory=dict)
+    _choice_runtime: Dict[str, Dict] = field(
+        default_factory=dict, repr=False, compare=False)
 
     # Last unresolved effect (for argumentless !judge)
     last_unresolved_effect: Optional[Dict] = None
@@ -5186,6 +5629,16 @@ class GameState:
 
     # Combat flow: when Claude attacks a human, we pause for the human to declare blocks
     waiting_for_human_blocks: bool = False
+    # Explicit pregame lock for production human lobbies. Legacy/headless
+    # multiplayer constructors do not run Discord London mulligans and must
+    # not be inferred as pending merely because Player.has_kept_hand defaults
+    # false.
+    opening_hands_pending: bool = False
+    # Stable defender seats that have finalized blockers this combat. In a
+    # multiplayer attack, damage waits until every attacked living seat has
+    # submitted !doneblocking/!noblock. Persisted so reconnect/restart cannot
+    # silently skip a defender's declaration.
+    combat_defenders_done: List[int] = field(default_factory=list)
 
     # Day/Night tracking (CR 726) — for daybound/nightbound transform cards
     is_day: bool = True  # True = day, False = night (only meaningful when day_night_active)
@@ -5202,10 +5655,312 @@ class GameState:
     @property
     def active_player(self) -> Player:
         return self.players[self.active_player_index]
+
+    @property
+    def is_multiplayer(self) -> bool:
+        return len(self.players) > 2
+
+    def living_player_indices(self) -> List[int]:
+        """Stable seat indices for players still in the game."""
+        return [
+            index for index, player in enumerate(self.players)
+            if not getattr(player, 'eliminated', False)
+        ]
+
+    def living_players_in_turn_order(
+            self, start_index: Optional[int] = None) -> List[Player]:
+        """Living players in cyclic seat order, beginning at start_index."""
+        if not self.players:
+            return []
+        start = (self.active_player_index if start_index is None
+                 else int(start_index)) % len(self.players)
+        return [
+            self.players[index]
+            for offset in range(len(self.players))
+            for index in [(start + offset) % len(self.players)]
+            if not getattr(self.players[index], 'eliminated', False)
+        ]
+
+    def opponents_of(self, player: Player) -> List[Player]:
+        """Living opponents in turn order after player (never list order)."""
+        if player not in self.players:
+            return []
+        start = (self.players.index(player) + 1) % len(self.players)
+        return [p for p in self.living_players_in_turn_order(start)
+                if p is not player]
+
+    def next_living_player_index(self, after_index: int) -> Optional[int]:
+        """Next non-eliminated stable seat, or None when nobody remains."""
+        if not self.players:
+            return None
+        for offset in range(1, len(self.players) + 1):
+            index = (int(after_index) + offset) % len(self.players)
+            if not getattr(self.players[index], 'eliminated', False):
+                return index
+        return None
+
+    def default_opponent_for(self, player: Player) -> Optional[Player]:
+        """Concrete opponent selected for singular automated choices."""
+        if player not in self.players:
+            return None
+        chosen = self._default_opponent_index
+        if chosen is not None and 0 <= chosen < len(self.players):
+            target = self.players[chosen]
+            if target is not player and not getattr(target, 'eliminated', False):
+                return target
+        opponents = self.opponents_of(player)
+        if self.experimental_ffa and opponents:
+            # Headless FFA has no human target prompt.  Make the automation's
+            # singular choice explicit and reproducible: lowest life, with
+            # cyclic seat order as the tie-break (``opponents`` is already
+            # cyclic).  Explicit player names and "each opponent" bypass it.
+            return min(opponents, key=lambda opponent: opponent.life)
+        return opponents[0] if opponents else None
+
+    def defender_for(self, attacker: Card) -> Optional[Player]:
+        """Resolve an attacker's stable defending-player seat."""
+        seat = getattr(attacker, 'attacking_player', None)
+        if isinstance(seat, int):
+            # An explicit defender is a stable combat assignment, not a
+            # target preference. If that seat leaves mid-combat, this
+            # attacker cannot acquire a replacement defender in a later
+            # first/double-strike damage step.
+            if not 0 <= seat < len(self.players):
+                return None
+            defender = self.players[seat]
+            return (None if getattr(defender, 'eliminated', False)
+                    else defender)
+        controller = attacker._find_controller(self)
+        return self.default_opponent_for(controller) if controller else None
+
+    def apnap_player_indices(self, *, resolution_order: bool = False) -> List[int]:
+        """Cyclic APNAP seats; reverse for immediate-mode LIFO resolution."""
+        ordered_players = self.living_players_in_turn_order(
+            self.active_player_index)
+        ordered = [self.players.index(player) for player in ordered_players]
+        return list(reversed(ordered)) if resolution_order else ordered
+
+    def eliminate_player(self, player_index: int, reason: str = "",
+                         *, finalize: bool = True) -> List[str]:
+        """Eliminate one stable seat and perform the CR 800.4 cleanup core.
+
+        Owned objects leave the game; borrowed permanents return to their
+        owner's battlefield; that player's stack/triggers/effects disappear.
+        The Player object itself stays in ``players`` so every seat and owner
+        index remains stable. ``finalize=False`` lets one SBA pass eliminate
+        several players simultaneously before deciding the winner.
+        """
+        if not (0 <= int(player_index) < len(self.players)):
+            return []
+        index = int(player_index)
+        player = self.players[index]
+        if getattr(player, 'eliminated', False):
+            return []
+
+        player.eliminated = True
+        player.loss_reason = reason or "lost the game"
+        if index not in self.elimination_order:
+            self.elimination_order.append(index)
+        messages = [
+            f"💀 **{player.name}** is eliminated! ({player.loss_reason})"
+        ]
+
+        # Snapshot combat participation before zone cleanup moves/removes the
+        # cards. Stable ids are the only safe discriminator with duplicate
+        # names and borrowed permanents.
+        departing_ids = {
+            card.id
+            for controller_index, controller in enumerate(self.players)
+            for card in controller.battlefield
+            if (getattr(card, 'owner_index', controller_index) == index
+                or controller_index == index)
+        }
+
+        # Battlefield objects owned by the departing player leave the game.
+        # Objects they merely controlled return to their stable owner seat.
+        for controller_index, controller in enumerate(self.players):
+            for card in list(controller.battlefield):
+                owner_index = getattr(card, 'owner_index', controller_index)
+                if owner_index == index:
+                    controller.battlefield.remove(card)
+                    self.unregister_static_effects(card)
+                elif controller_index == index:
+                    controller.battlefield.remove(card)
+                    if (isinstance(owner_index, int)
+                            and 0 <= owner_index < len(self.players)
+                            and not self.players[owner_index].eliminated):
+                        owner = self.players[owner_index]
+                        owner.battlefield.append(card)
+                        self.unregister_static_effects(card)
+                        self.register_static_keyword_grants(card, owner.name)
+                        self.register_static_pt_effects(card, owner.name)
+                        self.register_replacement_effects(card, owner.name)
+
+        # CR 800.4a is ownership-based, not zone-container-based. A card the
+        # departing player owns can be sitting in another seat's exile, while
+        # a borrowed card in the departing seat's engine-owned zone must not
+        # disappear with the wrong owner. Move the latter to its owner's
+        # corresponding zone and remove the former from every zone.
+        zone_names = ('library', 'hand', 'graveyard', 'exile',
+                      'command_zone', 'companion_zone')
+        departing_object_ids = set(departing_ids)
+        for holder_index, holder in enumerate(self.players):
+            for zone_name in zone_names:
+                zone = getattr(holder, zone_name, [])
+                kept = []
+                for card in list(zone):
+                    owner_index = getattr(card, 'owner_index', holder_index)
+                    if not isinstance(owner_index, int) or owner_index < 0:
+                        owner_index = holder_index
+                    if owner_index == index:
+                        departing_object_ids.add(card.id)
+                        continue
+                    if holder_index == index:
+                        if (0 <= owner_index < len(self.players)
+                                and not self.players[owner_index].eliminated):
+                            owner_zone = getattr(self.players[owner_index], zone_name)
+                            if card not in owner_zone:
+                                owner_zone.append(card)
+                        continue
+                    if getattr(card, '_castable_by_player', None) == player.name:
+                        card._castable_by_player = None
+                    kept.append(card)
+                zone[:] = kept
+        player.playable_from_exile = []
+        player.playable_from_graveyard = []
+
+        def _record_value(record, key, default=None):
+            if isinstance(record, dict):
+                return record.get(key, default)
+            return getattr(record, key, default)
+
+        def _record_belongs_to_departing_player(record) -> bool:
+            if (_record_value(record, 'controller_index') == index
+                    or _record_value(record, 'controller_name') == player.name
+                    or _record_value(record, 'controller') in (index, player.name)):
+                return True
+            card = _record_value(record, 'card')
+            return (card is not None
+                    and getattr(card, 'owner_index', None) == index)
+
+        self.stack = [entry for entry in self.stack
+                      if not _record_belongs_to_departing_player(entry)]
+        self.pending_async_triggers = [
+            trigger for trigger in self.pending_async_triggers
+            if not _record_belongs_to_departing_player(trigger)
+        ]
+        self.turn_effects = [
+            effect for effect in self.turn_effects
+            if not _record_belongs_to_departing_player(effect)
+        ]
+        self.delayed_triggers = [
+            trigger for trigger in self.delayed_triggers
+            if not _record_belongs_to_departing_player(trigger)
+        ]
+        self.conditional_exile_casts = {
+            card_id: record
+            for card_id, record in self.conditional_exile_casts.items()
+            if (card_id not in departing_object_ids
+                and not _record_belongs_to_departing_player(record))
+        }
+
+        # Remove combat objects and defender assignments involving this seat.
+        # A surviving attacker aimed at the departing defender stays on the
+        # battlefield but leaves combat (CR 800.4). Clear its per-card flags
+        # now: the end-turn COMBAT-SWEEP is a tripwire, not routine cleanup.
+        from mtg.helpers import strip_combat_state
+        for attacker_id in list(self.attackers):
+            result = self.find_card_global(attacker_id)
+            if (result is not None
+                    and getattr(result[0], 'attacking_player', None) == index):
+                strip_combat_state(self, result[0])
+        self.attackers = [
+            attacker_id for attacker_id in self.attackers
+            if attacker_id not in departing_ids
+            and (self.find_card_global(attacker_id) is not None)
+            and getattr(self.find_card_global(attacker_id)[0],
+                        'attacking_player', None) != index
+        ]
+        cleaned_blockers = {}
+        for attacker_id, blocker_ids in self.blockers.items():
+            if attacker_id not in self.attackers:
+                continue
+            live_blockers = [
+                blocker_id for blocker_id in blocker_ids
+                if (self.find_card_global(blocker_id) is not None)
+            ]
+            if live_blockers:
+                cleaned_blockers[attacker_id] = live_blockers
+        self.blockers = cleaned_blockers
+
+        # PrioritySystem is already N-player capable; remove the dead seat
+        # without renumbering GameState and advance a dead holder cyclically.
+        priority = self._priority_system
+        priority_key = self.priority_identifier(player)
+        # Compatibility for tests and pre-Q-H runtime objects created with
+        # display names. Newly constructed games always take the stable path.
+        stable_priority = bool(
+            priority is not None
+            and priority_key in getattr(priority, 'players', []))
+        priority_identity = priority_key if stable_priority else player.name
+        if (priority is not None
+                and priority_identity in getattr(priority, 'players', [])):
+            priority.stack = [entry for entry in priority.stack
+                              if getattr(entry, 'controller', None) !=
+                              priority_identity]
+            priority.players = [name for name in priority.players
+                                if name != priority_identity]
+            priority._passes_in_succession = [
+                name for name in priority._passes_in_succession
+                if name != priority_identity
+            ]
+            priority._auto_pass_configs.pop(priority_identity, None)
+            priority._connected.pop(priority_identity, None)
+            priority._holds.discard(priority_identity)
+            priority.display_names.pop(priority_identity, None)
+            if priority.priority_holder == priority_identity:
+                next_index = self.next_living_player_index(index)
+                priority.priority_holder = (
+                    (self.priority_identifier(next_index)
+                     if stable_priority
+                     else self.players[next_index].name)
+                    if next_index is not None else None)
+            if priority.active_player == priority_identity:
+                next_index = self.next_living_player_index(index)
+                priority.active_player = (
+                    ((self.priority_identifier(next_index)
+                      if stable_priority
+                      else self.players[next_index].name)
+                     if next_index is not None else priority_identity))
+        if self.priority_player_index == index:
+            next_index = self.next_living_player_index(index)
+            if next_index is not None:
+                self.priority_player_index = next_index
+
+        self.recalculate_power_toughness()
+        if finalize:
+            self.finalize_eliminations()
+        return messages
+
+    def finalize_eliminations(self) -> None:
+        """End the game at one living player, or draw at zero."""
+        living = self.living_player_indices()
+        if len(living) == 1:
+            self.ended = True
+            self.winner = living[0]
+        elif not living:
+            self.ended = True
+            self.winner = None
+        else:
+            self.ended = False
+            self.winner = None
     
     @property
     def non_active_player(self) -> Player:
-        return self.players[1 - self.active_player_index]
+        opponent = self.default_opponent_for(self.active_player)
+        if opponent is None:
+            return self.active_player
+        return opponent
     
     def get_player_by_user_id(self, user_id: int) -> Optional[Player]:
         for p in self.players:
@@ -5217,6 +5972,150 @@ class GameState:
         for i, p in enumerate(self.players):
             if p.user_id == user_id:
                 return i
+        return None
+
+    def stable_player_id(self, player: Player) -> Optional[int]:
+        """Return the persistent seat identifier used by choice payloads.
+
+        Older saved games predate ``seat_id``.  Their list position is a safe
+        compatibility fallback because seats are never reordered in-place.
+        """
+        try:
+            index = self.players.index(player)
+        except ValueError:
+            return None
+        return player.seat_id if player.seat_id is not None else index
+
+    def priority_identifier(self, player_or_index) -> Optional[str]:
+        """Return the durable identifier used by the priority ring.
+
+        Display names are presentation, not identity: Discord users may share
+        a display name and may rename themselves between saves.  Seats never
+        move inside ``players``, so ``seat:<stable id>`` survives both cases.
+        """
+        if isinstance(player_or_index, Player):
+            player = player_or_index
+            try:
+                index = self.players.index(player)
+            except ValueError:
+                return None
+        else:
+            try:
+                index = int(player_or_index)
+                player = self.players[index]
+            except (TypeError, ValueError, IndexError):
+                return None
+        stable_id = player.seat_id if player.seat_id is not None else index
+        return f"seat:{stable_id}"
+
+    def player_from_priority_identifier(
+            self, identifier, *, living_only: bool = False,
+            allow_legacy_name: bool = True) -> Optional[Player]:
+        """Resolve a priority identity without operational name matching.
+
+        ``allow_legacy_name`` exists only to migrate saves written before the
+        stable-seat conversion.  Live command paths always send ``seat:N``.
+        """
+        value = str(identifier or "")
+        if value.startswith("seat:"):
+            player = self.get_player_by_stable_id(
+                value.partition(":")[2], living_only=living_only)
+            return player
+        if allow_legacy_name:
+            matches = [
+                player for player in self.players
+                if player.name == value
+                and (not living_only or not player.eliminated)
+            ]
+            if len(matches) == 1:
+                return matches[0]
+        return None
+
+    def priority_display_name(self, identifier) -> str:
+        """Human label for an internal priority identifier."""
+        player = self.player_from_priority_identifier(
+            identifier, living_only=False, allow_legacy_name=True)
+        if player is None:
+            return str(identifier or "none")
+        if sum(candidate.name == player.name for candidate in self.players) > 1:
+            stable_id = self.stable_player_id(player)
+            return f"{player.name} (seat {stable_id + 1})"
+        return player.name
+
+    def priority_identity_for(self, player_or_index, priority=None) -> Optional[str]:
+        """Stable live key, with a narrow legacy-runtime compatibility path."""
+        key = self.priority_identifier(player_or_index)
+        system = priority if priority is not None else self._priority_system
+        if system is None or key in getattr(system, 'players', []):
+            return key
+        try:
+            player = (player_or_index if isinstance(player_or_index, Player)
+                      else self.players[int(player_or_index)])
+        except (TypeError, ValueError, IndexError):
+            return key
+        if player.name in getattr(system, 'players', []):
+            return player.name
+        return key
+
+    def normalize_priority_state(self, data: Optional[Dict]) -> Optional[Dict]:
+        """Migrate a serialized name-keyed priority window to stable seats."""
+        if not data:
+            return data
+        import copy
+        normalized = copy.deepcopy(data)
+
+        def _key(value):
+            if value is None:
+                return None
+            player = self.player_from_priority_identifier(
+                value, living_only=False, allow_legacy_name=True)
+            return self.priority_identifier(player) if player else str(value)
+
+        normalized["players"] = [
+            _key(value) for value in normalized.get("players", [])
+        ]
+        for field_name in ("active_player", "priority_holder"):
+            normalized[field_name] = _key(normalized.get(field_name))
+        for field_name in ("passes_in_succession", "holds"):
+            normalized[field_name] = [
+                _key(value) for value in normalized.get(field_name, [])
+            ]
+        for field_name in ("auto_pass_configs", "connected", "display_names"):
+            normalized[field_name] = {
+                _key(value): payload
+                for value, payload in normalized.get(field_name, {}).items()
+            }
+        for item in normalized.get("stack", []):
+            if isinstance(item, dict) and item.get("controller") is not None:
+                item["controller"] = _key(item["controller"])
+        normalized["version"] = max(2, int(normalized.get("version", 1)))
+        return normalized
+
+    def get_player_by_stable_id(self, seat_id, *, living_only: bool = False) -> Optional[Player]:
+        """Resolve an exact seat reference without falling back by name."""
+        try:
+            wanted = int(seat_id)
+        except (TypeError, ValueError):
+            return None
+        for index, player in enumerate(self.players):
+            actual = player.seat_id if player.seat_id is not None else index
+            if actual == wanted:
+                if living_only and getattr(player, 'eliminated', False):
+                    return None
+                return player
+        return None
+
+    def find_battlefield_card_by_id(self, card_id: str, *,
+                                    living_only: bool = False) -> Optional[Tuple[Card, Player]]:
+        """Resolve an exact battlefield object for a persisted choice."""
+        if not card_id:
+            return None
+        for player in self.players:
+            if living_only and getattr(player, 'eliminated', False):
+                continue
+            for card in player.battlefield:
+                if card.id == card_id:
+                    return card, player
         return None
     
     def find_card_global(self, name_or_id: str) -> Optional[Tuple[Card, Player, Zone]]:
@@ -6214,14 +7113,31 @@ class GameState:
             "priority_player_index": self.priority_player_index,
             "phase": self.phase.value,
             "stack": [s.to_dict() if hasattr(s, 'to_dict') else s for s in self.stack],
+            "resolution_jobs": {
+                job_id: job.to_dict() if hasattr(job, "to_dict") else job
+                for job_id, job in self.resolution_jobs.items()
+            },
             "stack_enabled": self.stack_enabled,
+            "combat_priority_window": self.combat_priority_window,
+            "priority_state": (
+                self._priority_system.to_dict()
+                if self._priority_system is not None
+                and hasattr(self._priority_system, 'to_dict')
+                else self._restored_priority_state
+            ),
+            "experimental_ffa": self.experimental_ffa,
             "attackers": self.attackers,
             "blockers": self.blockers,
+            "waiting_for_human_blocks": self.waiting_for_human_blocks,
+            "opening_hands_pending": self.opening_hands_pending,
+            "combat_defenders_done": self.combat_defenders_done,
             "started": self.started,
             "ended": self.ended,
             "winner": self.winner,
+            "elimination_order": self.elimination_order,
             "created_at": self.created_at.isoformat(),
             "pending_action": self.pending_action,
+            "pending_choices": self.pending_choices,
             "turn_effects": self.turn_effects,
             "last_unresolved_effect": self.last_unresolved_effect,
             "pending_resolves": self.pending_resolves,
@@ -6252,6 +7168,8 @@ class GameState:
           - battlefields, graveyards, the stack, and command zones are
             public (CR 400.2)
         """
+        from mtg.choices import choice_views_for
+
         def _card_public(c):
             if getattr(c, '_face_down', False):
                 return {"name": "Face-down card", "face_down": True}
@@ -6262,6 +7180,9 @@ class GameState:
             is_viewer = (idx == viewer_index)
             players.append({
                 "name": p.name,
+                "seat_id": p.seat_id,
+                "eliminated": p.eliminated,
+                "loss_reason": p.loss_reason,
                 "life": p.life,
                 "poison": getattr(p, 'poison', 0),
                 "is_viewer": is_viewer,
@@ -6286,6 +7207,16 @@ class GameState:
                       for s in self.stack],
             "ended": self.ended,
             "winner": self.winner,
+            "elimination_order": self.elimination_order,
+            "pending_choice": (
+                self.pending_action
+                if (self.pending_action
+                    and self.get_player_by_stable_id(
+                        self.pending_action.get('chooser_player_id'),
+                        living_only=False) is self.players[viewer_index])
+                else None
+            ),
+            "pending_choices": choice_views_for(self, viewer_index),
             "players": players,
         }
 
@@ -6300,15 +7231,23 @@ class GameState:
             active_player_index=data.get("active_player_index", 0),
             priority_player_index=data.get("priority_player_index", 0),
             phase=Phase(data.get("phase", "main1")),
-            stack=data.get("stack", []),  # Stack entries not reconstructed (transient)
+            stack=[],
+            resolution_jobs={},
             stack_enabled=data.get("stack_enabled", False),
+            combat_priority_window=data.get("combat_priority_window"),
+            experimental_ffa=data.get("experimental_ffa", False),
             attackers=data.get("attackers", []),
             blockers=data.get("blockers", {}),
+            waiting_for_human_blocks=data.get("waiting_for_human_blocks", False),
+            opening_hands_pending=data.get("opening_hands_pending", False),
+            combat_defenders_done=data.get("combat_defenders_done", []),
             started=data.get("started", False),
             ended=data.get("ended", False),
             winner=data.get("winner"),
+            elimination_order=data.get("elimination_order", []),
             created_at=datetime.fromisoformat(data["created_at"]) if "created_at" in data else datetime.now(),
             pending_action=data.get("pending_action"),
+            pending_choices=data.get("pending_choices", {}),
             turn_effects=data.get("turn_effects", []),
             last_unresolved_effect=data.get("last_unresolved_effect"),
             pending_resolves=data.get("pending_resolves", []),
@@ -6316,6 +7255,32 @@ class GameState:
                 "temporary_cost_increases", []),
             conditional_exile_casts=data.get("conditional_exile_casts", {}),
         )
+        game.resolution_jobs = {
+            str(job_id): ResolutionJob.from_dict(payload)
+            for job_id, payload in (data.get("resolution_jobs") or {}).items()
+        }
+        restored_stack = []
+        for payload in data.get("stack", []):
+            if not isinstance(payload, dict):
+                continue
+            job_id = payload.get("resolution_job_id") or payload.get("entry_id")
+            job = game.resolution_jobs.get(str(job_id)) if job_id else None
+            entry = StackEntry.from_dict(game, payload, job=job)
+            # Version-1 stack snapshots cannot recover exact targets or full
+            # cast state. Keep the real object for display/priority migration,
+            # but mark the synthesized job honestly instead of name-matching.
+            if job is None:
+                job = ResolutionJob.capture(
+                    game, entry, checkpoint="priority_open")
+                job.recovery_error = (
+                    "legacy stack snapshot lacks exact target/cast facts")
+                entry.resolution_job_id = job.job_id
+                game.resolution_jobs[job.job_id] = job
+            restored_stack.append(entry)
+        game.stack = restored_stack
+        for entry in game.stack:
+            entry.bind_persisted_targets(game)
+        game._restored_priority_state = data.get("priority_state")
         # [LAYERS] Rebuild continuous effects from current battlefield state
         game.rebuild_layers_from_battlefield()
         return game

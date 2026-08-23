@@ -550,9 +550,13 @@ class SpellResolver:
         else:
             # Standalone fallback (no rules engine wired) — same wording SBA
             # produces, so the discord log stays grep-consistent.
-            sba_messages = [f"💀 **{target.name}** loses the game! ({target.name} has 0 life)"]
-            game.ended = True
-            game.winner = 1 - game.players.index(target)
+            if game.is_multiplayer:
+                sba_messages = game.eliminate_player(
+                    game.players.index(target), f"{target.name} has 0 life")
+            else:
+                sba_messages = [f"💀 **{target.name}** loses the game! ({target.name} has 0 life)"]
+                game.ended = True
+                game.winner = 1 - game.players.index(target)
         if sba_messages:
             if messages:
                 messages[-1] += "\n" + "\n".join(sba_messages)
@@ -945,6 +949,7 @@ class SpellResolver:
         target_name = getattr(getattr(target, 'card', None), 'name', None) or 'spell'
         if hasattr(target, 'countered'):
             target.countered = True
+            target._counter_narration_queued = True
         messages.append(f"🚫 **{target_name}** is countered by **{spell_name}**!")
         print(f"[COUNTER] {spell_name} cast by {caster} → countered {target_name}")
         # July 29: Baral-class "counters a spell" triggers.
@@ -1149,8 +1154,7 @@ class SpellResolver:
         
         if not player:
             # Default to opponent
-            player_idx = game.players.index(ctx.source_controller) if ctx.source_controller in game.players else 0
-            player = game.players[1 - player_idx]
+            player = game.default_opponent_for(ctx.source_controller)
         
         milled = []
         for _ in range(min(amount, len(player.library))):

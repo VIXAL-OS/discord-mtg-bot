@@ -54,6 +54,14 @@ data/api_costs.json
 # so ignoring it is safe on a fresh clone.
 data/games/
 
+# Draft/bracket runtime state. These records persist standings across bot
+# restarts and may contain Discord thread IDs / player display names.
+data/drafts/
+
+# Human multiplayer lobby runtime state. Contains Discord user/thread IDs and
+# complete submitted deck JSON; LobbyStore recreates the directory on startup.
+data/lobbies/
+
 # Bot memories (private context — the memories/*.json pattern above didn't
 # cover this path)
 data/memories.json

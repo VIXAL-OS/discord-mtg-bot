@@ -24,6 +24,7 @@ import logging
 import os
 import random
 import re
+import shlex
 import sys
 import time
 from datetime import datetime
@@ -38,6 +39,7 @@ from discord.ext import commands
 
 from mtg.autoplay import AUTOPLAY_DECKS, AUTOPLAY_MATRIX, AUTOPLAY_PHASES
 from mtg.claude_player import ClaudePlayer
+from mtg.choices import format_choice_prompt, pending_choices_for, submit_choice
 from mtg.constants import (
     Phase, Zone, PHASE_NAMES, FORMAT_STARTING_LIFE, FORMAT_DECK_SIZE,
     SINGLETON_FORMATS, COMMAND_ZONE_FORMATS, BANNED_CARDS,
@@ -48,7 +50,10 @@ from mtg.engine import GameEngine
 from mtg.helpers import (_normalize_pw_ability_idx,
                          _resolve_player_or_card_target,
                          exile_after_resolution_reason,
-                         is_castable_from_exile, library_top_cast_types)
+                         is_castable_from_exile, library_top_cast_types,
+                         resolve_target_choice, serialize_target_choice,
+                         serialize_target_choices)
+from mtg.lobby import GameLobby, LobbyStore
 from mtg.models import Card, Player, GameState, FormatValidator
 from mtg.rules_engine import RulesEngine
 from mtg.util import GameLogger, StdoutTee, StderrTee
@@ -149,6 +154,8 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
         self.engine = GameEngine(bot.claude, usage_callback=usage_callback)
         self.display = GameDisplay()
         self.player_decks: Dict[int, Dict] = {}  # user_id -> deck_data
+        self.lobbies = LobbyStore(
+            Path(__file__).resolve().parent.parent / "data" / "lobbies")
 
         # Per-game file logging
         self.game_loggers: Dict[int, GameLogger] = {}
@@ -211,13 +218,19 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
 
         # Wrap engine.delete_game so logging cleanup happens automatically
         _original_delete = self.engine.delete_game
-        def _delete_with_logging(thread_id):
-            self._cleanup_game_logging(thread_id)
-            _original_delete(thread_id)
+        def _delete_with_logging(thread_id, *, preserve_logging=False):
+            # A cube bracket runs four independent GameStates in one Discord
+            # thread.  Retiring match 1 must not unregister that thread's
+            # logger before matches 2-4.  Ordinary one-game callers retain the
+            # original cleanup behavior.
+            if not preserve_logging:
+                self._cleanup_game_logging(thread_id)
+            _original_delete(thread_id, preserve_logging=preserve_logging)
         self.engine.delete_game = _delete_with_logging
 
         # Try to auto-load the default deck
         self._load_default_deck()
+
     async def cog_load(self):
         """Called when the cog is loaded - start async components."""
         # Install stdout tee so engine print() calls get routed to game logs
@@ -270,6 +283,33 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
                     f"direct-spawn failed: {type(e).__name__}: {e}")
                 print(f"[XMAGE] Direct spawn failed: {e} \u2014 Tier 2.5 inactive")
 
+        # Rebind saved priority windows to fresh callbacks/tasks after a bot
+        # restart. GameState.from_dict deliberately never deserializes asyncio
+        # objects; setup_stack restores the exact APNAP holder/pass/deadline.
+        for saved_game in self.engine.games.values():
+            if not saved_game.stack_enabled:
+                continue
+
+            async def _resume_send(content, thread_id=saved_game.thread_id):
+                channel = self.bot.get_channel(thread_id)
+                if channel is None:
+                    try:
+                        channel = await self.bot.fetch_channel(thread_id)
+                    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                        return
+                await self._thread_send(channel, content)
+
+            self.engine.setup_stack(
+                saved_game,
+                auto_pass_seconds=8.0,
+                send_func=_resume_send,
+                ai_response_enabled=any(
+                    player.is_claude or player.user_id == 99999
+                    for player in saved_game.players
+                    if not player.eliminated
+                ),
+            )
+
     async def cog_unload(self):
         """Called when the cog is unloaded - clean up."""
         # Detach logging handler first — it holds a reference to the tee.
@@ -320,6 +360,43 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
         if self._stdout_tee:
             self._stdout_tee.active_thread = None
 
+    @commands.Cog.listener()
+    async def on_disconnect(self):
+        """Freeze each human seat behind reconnect grace on gateway loss."""
+        for game in self.engine.games.values():
+            priority = getattr(game, '_priority_system', None)
+            if not game.stack_enabled or priority is None:
+                continue
+            for player in game.players:
+                if not player.eliminated and not player.is_claude:
+                    priority.mark_disconnected(
+                        game.priority_identity_for(player, priority))
+            self.engine.save_game(game)
+
+    @commands.Cog.listener()
+    async def on_resumed(self):
+        """Rebind live seats and re-issue pending private prompts after resume."""
+        for game in self.engine.games.values():
+            priority = getattr(game, '_priority_system', None)
+            if not game.stack_enabled or priority is None:
+                continue
+            for player_index, player in enumerate(game.players):
+                if player.eliminated or player.is_claude:
+                    continue
+                await priority.mark_reconnected(
+                    game.priority_identity_for(player, priority))
+                for record in pending_choices_for(game, player_index):
+                    await self._dm_choice_to_user(game, player_index, record)
+            channel = self.bot.get_channel(game.thread_id)
+            if channel and priority.priority_holder:
+                await self._thread_send(
+                    channel,
+                    f"🔄 Priority restored after reconnect: "
+                    f"**{game.priority_display_name(priority.priority_holder)}** "
+                    "has priority.",
+                )
+            self.engine.save_game(game)
+
     # _on_message_priority listener removed May 17, 2026.
     # The body was gated by a retired engine bridge that was always disabled;
     # the Apr 2026 integrated-engine deprecation, and the listener was never
@@ -346,6 +423,50 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
             if logger:
                 logger.log_discord_out(str(content))
         return await thread.send(content, **kwargs)
+
+    async def _dm_choice_to_user(self, game, player_idx, record) -> bool:
+        """DM one stable seat's choice inventory without a public fallback."""
+        if not (0 <= player_idx < len(game.players)):
+            return False
+        player = game.players[player_idx]
+        seat_id = player.seat_id
+        prompt = format_choice_prompt(record, seat_id)
+        user = self.bot.get_user(player.user_id) if player.user_id else None
+        if user is None and player.user_id:
+            try:
+                user = await self.bot.fetch_user(player.user_id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                return False
+        if user is None:
+            return False
+        try:
+            await user.send(prompt)
+            return True
+        except (discord.Forbidden, discord.HTTPException, AttributeError) as exc:
+            print(f"[CHOICE-PRIVATE] Could not DM seat {seat_id}: {exc}")
+            return False
+
+    async def _send_choice_privately(self, ctx, game, record) -> bool:
+        """Resolve the invoking seat, then use the shared private router."""
+        player_idx = game.get_player_index(ctx.author.id)
+        if player_idx is None:
+            return False
+        return await self._dm_choice_to_user(game, player_idx, record)
+
+    async def _ensure_thread_member(self, thread, user) -> bool:
+        """Best-effort repair for an archived thread or a missing member."""
+        try:
+            if getattr(thread, 'archived', False) and hasattr(thread, 'edit'):
+                await thread.edit(archived=False)
+            if hasattr(thread, 'add_user'):
+                await thread.add_user(user)
+            return True
+        except (discord.Forbidden, discord.NotFound, discord.HTTPException,
+                AttributeError) as exc:
+            print(f"[MULTIPLAYER-THREAD] Could not add user "
+                  f"{getattr(user, 'id', '?')} to thread "
+                  f"{getattr(thread, 'id', '?')}: {exc}")
+            return False
 
     @staticmethod
     def _sanitize_action_bullets(actions):
@@ -414,16 +535,56 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
         return False
     
     @commands.command(name="game")
-    async def start_game(self, ctx, opponent: str = None, format: str = "standard"):
+    async def start_game(self, ctx, opponent: str = None,
+                         format: str = "standard", seats: int = 4):
         """
         Start an MTG game.
         
         Usage:
             !game @Friend commander  - Play against another player
             !game claude modern       - Play against Claude
+            !game create commander 4  - Open a four-human lobby
         """
         if not opponent:
-            await ctx.send("Usage: `!game @opponent [format]` or `!game claude [format]`")
+            await ctx.send(
+                "Usage: `!game @opponent [format]`, `!game claude [format]`, "
+                "or `!game create <format> <3|4>`")
+            return
+
+        if opponent.lower() == "create":
+            if seats not in (3, 4):
+                await ctx.send("Human multiplayer lobbies support exactly 3 or 4 seats.")
+                return
+            format = format.lower()
+            if format not in FORMAT_STARTING_LIFE:
+                await ctx.send(
+                    "Unknown format. Use `!formats` to see supported formats.")
+                return
+            thread = await ctx.channel.create_thread(
+                name=f"MTG FFA: {format.title()} (1/{seats})",
+                type=discord.ChannelType.public_thread,
+            )
+            lobby = GameLobby(
+                thread_id=thread.id,
+                guild_id=getattr(ctx.guild, "id", None),
+                owner_user_id=ctx.author.id,
+                format_name=format,
+                max_players=seats,
+            )
+            lobby.add_user(
+                ctx.author.id,
+                ctx.author.display_name,
+                self.player_decks.get(ctx.author.id),
+            )
+            self.lobbies.save(lobby)
+            await self._thread_send(
+                thread,
+                f"**{ctx.author.display_name} opened a {seats}-seat "
+                f"{format.title()} lobby.**\n"
+                "Use `!join`, load a deck with `!mydeck`, then `!ready`. "
+                "The host starts with `!startgame`. Use `!lobby` for status.\n"
+                "Lobby seats and loaded deck JSON survive a bot restart.",
+            )
             return
         
         # Determine opponent
@@ -571,6 +732,221 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
                 traceback.print_exc()
                 await self._thread_send(thread, f"⚠️ Something went wrong during Claude's turn: {str(e)[:100]}")
     
+    @commands.command(name="lobby")
+    async def show_lobby(self, ctx):
+        """Show the durable human-multiplayer lobby for this thread."""
+        lobby = self.lobbies.get(ctx.channel.id)
+        if lobby is None:
+            await ctx.send("No open lobby in this thread.")
+            return
+        lines = []
+        for seat in sorted(lobby.seats, key=lambda item: item.seat_id):
+            deck_name = ((seat.deck_data or {}).get("name")
+                         if seat.deck_data else None)
+            state = "ready" if seat.ready else "not ready"
+            deck = f" — {deck_name}" if deck_name else " — no deck"
+            host = " (host)" if seat.user_id == lobby.owner_user_id else ""
+            lines.append(
+                f"• Seat {seat.seat_id + 1}: **{seat.display_name}**"
+                f"{host} — {state}{deck}")
+        open_count = lobby.max_players - len(lobby.seats)
+        if open_count:
+            lines.append(f"• {open_count} open seat(s)")
+        await ctx.send(
+            f"**{lobby.format_name.title()} lobby "
+            f"({len(lobby.seats)}/{lobby.max_players})**\n" +
+            "\n".join(lines))
+
+    @commands.command(name="join")
+    async def join_lobby(self, ctx):
+        """Join the human-multiplayer lobby in this thread."""
+        lobby = self.lobbies.get(ctx.channel.id)
+        if lobby is None:
+            await ctx.send("No open lobby in this thread.")
+            return
+        if lobby.seat_for_user(ctx.author.id):
+            await ctx.send("You're already seated in this lobby.")
+            return
+        try:
+            seat = lobby.add_user(
+                ctx.author.id,
+                ctx.author.display_name,
+                self.player_decks.get(ctx.author.id),
+            )
+        except ValueError as exc:
+            await ctx.send(str(exc))
+            return
+        self.lobbies.save(lobby)
+        await ctx.send(
+            f"**{ctx.author.display_name}** joined as seat "
+            f"{seat.seat_id + 1}. Load a deck with `!mydeck`, then `!ready`.")
+
+    @commands.command(name="leave")
+    async def leave_lobby(self, ctx):
+        """Leave an open lobby without renumbering the other stable seats."""
+        lobby = self.lobbies.get(ctx.channel.id)
+        if lobby is None:
+            await ctx.send("No open lobby in this thread.")
+            return
+        if ctx.author.id == lobby.owner_user_id:
+            await ctx.send("The host must use `!cancelgame` instead of leaving.")
+            return
+        if not lobby.remove_user(ctx.author.id):
+            await ctx.send("You're not seated in this lobby.")
+            return
+        self.lobbies.save(lobby)
+        await ctx.send(f"**{ctx.author.display_name}** left the lobby.")
+
+    @commands.command(name="ready")
+    async def ready_lobby(self, ctx, state: str = "on"):
+        """Set or clear readiness for the current lobby seat."""
+        lobby = self.lobbies.get(ctx.channel.id)
+        if lobby is None:
+            await ctx.send("No open lobby in this thread.")
+            return
+        seat = lobby.seat_for_user(ctx.author.id)
+        if seat is None:
+            await ctx.send("Join this lobby with `!join` first.")
+            return
+        ready = state.lower() not in {"off", "no", "false", "unready"}
+        if ready and not seat.deck_data:
+            await ctx.send("Load your deck with `!mydeck` before readying.")
+            return
+        seat.ready = ready
+        self.lobbies.save(lobby)
+        await ctx.send(
+            f"**{seat.display_name}** is now "
+            f"{'ready' if ready else 'not ready'} "
+            f"({sum(item.ready for item in lobby.seats)}/{lobby.max_players}).")
+
+    @commands.command(name="cancelgame")
+    async def cancel_lobby(self, ctx):
+        """Cancel an open lobby (host only)."""
+        lobby = self.lobbies.get(ctx.channel.id)
+        if lobby is None:
+            await ctx.send("No open lobby in this thread.")
+            return
+        if ctx.author.id != lobby.owner_user_id:
+            await ctx.send("Only the lobby host can cancel it.")
+            return
+        self.lobbies.delete(lobby.thread_id)
+        await ctx.send("Lobby cancelled. This thread no longer has a pending game.")
+
+    @commands.command(name="startgame")
+    async def start_lobby_game(self, ctx):
+        """Validate every ready seat and start a 3- or 4-human game."""
+        lobby = self.lobbies.get(ctx.channel.id)
+        if lobby is None:
+            await ctx.send("No open lobby in this thread.")
+            return
+        if ctx.author.id != lobby.owner_user_id:
+            await ctx.send("Only the lobby host can start the game.")
+            return
+        if lobby.thread_id in self.engine.games:
+            await ctx.send("This thread already has an active game.")
+            return
+        if not lobby.can_start:
+            await ctx.send(
+                f"Need exactly {lobby.max_players} seated players, each with "
+                "a loaded deck and `!ready`. Use `!lobby` for status.")
+            return
+
+        # Human labels stay unique for narration; operational priority
+        # identity is the stable seat id assigned below.
+        name_counts: Dict[str, int] = {}
+        for seat in lobby.seats:
+            key = seat.display_name.casefold()
+            name_counts[key] = name_counts.get(key, 0) + 1
+        specs = []
+        for seat in sorted(lobby.seats, key=lambda item: item.seat_id):
+            name = seat.display_name
+            if name_counts[name.casefold()] > 1:
+                name = f"{name} (seat {seat.seat_id + 1})"
+            specs.append({
+                "name": name,
+                "user_id": seat.user_id,
+                "seat_id": seat.seat_id,
+                "deck_data": seat.deck_data,
+            })
+
+        try:
+            async with ctx.typing():
+                game = await self.engine.create_game_from_decks(
+                    lobby.thread_id, specs, lobby.format_name)
+        except (ValueError, TypeError, KeyError, OSError,
+                aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            print(f"[LOBBY-START] Deck load failed: {exc}")
+            await ctx.send(f"Couldn't load every deck: {str(exc)[:300]}")
+            return
+
+        validation_failures = []
+        for player in game.players:
+            cards = list(player.library) + list(player.command_zone)
+            commanders = [card for card in player.command_zone
+                          if getattr(card, "is_commander", False)]
+            companion = (player.companion_zone[0]
+                         if player.companion_zone else None)
+            valid, issues = FormatValidator.validate_deck(
+                cards, lobby.format_name, commanders, companion)
+            if not valid:
+                validation_failures.append(
+                    f"**{player.name}:** " + "; ".join(issues[:5]))
+        if validation_failures:
+            self.engine.delete_game(game.thread_id)
+            await ctx.send(
+                "Deck validation failed; the lobby remains open:\n" +
+                "\n".join(validation_failures))
+            return
+
+        game_logger = GameLogger(game.thread_id)
+        self.game_loggers[game.thread_id] = game_logger
+        if self._stdout_tee:
+            self._stdout_tee.add_game(
+                game.thread_id, game_logger.console_path)
+        self.engine.setup_stack(
+            game,
+            auto_pass_seconds=8.0,
+            send_func=ctx.send,
+            ai_response_enabled=False,
+        )
+        first_player = random.randrange(len(game.players))
+        self.engine.start_game(game, first_player)
+        game.opening_hands_pending = True
+        self.engine.save_game(game)
+        self.lobbies.delete(lobby.thread_id)
+
+        dm_failures = []
+        for player in game.players:
+            user = self.bot.get_user(player.user_id)
+            if user is None:
+                try:
+                    user = await self.bot.fetch_user(player.user_id)
+                except (discord.NotFound, discord.Forbidden,
+                        discord.HTTPException):
+                    user = None
+            try:
+                if user is None:
+                    raise RuntimeError("Discord user unavailable")
+                await self._ensure_thread_member(ctx.channel, user)
+                await user.send(
+                    f"**Opening hand for {lobby.format_name.title()} seat "
+                    f"{player.seat_id + 1}:**\n{self.display.format_hand(player)}\n\n"
+                    "Use `!mulligan`, or `!keephand` when ready.")
+            except (discord.Forbidden, discord.HTTPException, RuntimeError):
+                dm_failures.append(player.name)
+
+        message = (
+            f"**Game started!** {game.active_player.name} won the random "
+            "first-player selection. Everyone: check your private opening "
+            "hand, then use `!mulligan` or `!keephand`. Gameplay remains "
+            "locked until every living seat keeps."
+        )
+        if dm_failures:
+            message += (
+                "\nI couldn't DM: " + ", ".join(dm_failures) +
+                ". Enable server DMs, then use `!hand`.")
+        await ctx.send(message, embed=self.display.create_game_embed(game))
+
     @commands.command(name="resumegame")
     async def resume_game(self, ctx):
         """
@@ -607,6 +983,19 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
             os.utime(filepath, None)
 
             self.engine.games[thread_id] = game
+            game._rules_engine = self.engine.rules
+            if game.stack_enabled:
+                async def _resume_command_send(content):
+                    await ctx.send(content)
+                self.engine.setup_stack(
+                    game,
+                    auto_pass_seconds=8.0,
+                    send_func=_resume_command_send,
+                    ai_response_enabled=any(
+                        player.is_claude or player.user_id == 99999
+                        for player in game.players if not player.eliminated
+                    ),
+                )
             file_age_hours = (datetime.now().timestamp() - os.path.getmtime(filepath)) / 3600
             print(f"[GAME-LOAD] Force-resumed game {thread_id} (turn {game.turn_number})")
 
@@ -702,6 +1091,7 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
                 content = await attachment.read()
                 deck_data = json.loads(content.decode('utf-8'))
                 self.player_decks[user_id] = deck_data
+                self._bind_deck_to_lobby(ctx, deck_data)
                 total_cards = sum(c.get('quantity', 1) for c in deck_data.get('cards', []))
                 await ctx.send(f"✅ Loaded YOUR deck: **{deck_data.get('name', 'Unknown')}** ({total_cards} cards)")
                 return
@@ -722,6 +1112,7 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
                         if sig_spell:
                             deck_dict["signature_spell"] = sig_spell.name
                         self.player_decks[user_id] = deck_dict
+                        self._bind_deck_to_lobby(ctx, deck_dict)
                         await ctx.send(f"✅ Loaded YOUR deck from Archidekt: **{name}** ({len(cards)} cards)")
                     except Exception as e:
                         await ctx.send(f"❌ Failed to load deck: {e}")
@@ -736,6 +1127,7 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
                     with open(deck_path, 'r', encoding='utf-8') as f:
                         deck_data = json.load(f)
                     self.player_decks[user_id] = deck_data
+                    self._bind_deck_to_lobby(ctx, deck_data)
                     total_cards = sum(c.get('quantity', 1) for c in deck_data.get('cards', []))
                     await ctx.send(f"✅ Loaded YOUR deck: **{deck_data.get('name', 'Unknown')}** ({total_cards} cards)")
                     return
@@ -965,7 +1357,9 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
                     notes.append("signature spell")
                 lines[-1] += f" ({', '.join(notes)})"
         
-        lines.append("\n*Use `!game @opponent format_name` to start*")
+        lines.append(
+            "\n*Use `!game @opponent format_name` for a duel, or "
+            "`!game create format_name 3|4` for a human FFA lobby.*")
         await ctx.send("\n".join(lines))
     
     @commands.command(name="commander", aliases=["cmd", "cmdr"])
@@ -989,7 +1383,6 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
         if player_idx is None:
             await ctx.send("You're not in this game!")
             return
-
         player = game.players[player_idx]
 
         lines = [f"**{player.name}'s Command Zone:**"]
@@ -1110,6 +1503,7 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
         self.engine.draw_cards(player, 7)
         
         cards_to_bottom = player.mulligans_taken
+        self.engine.save_game(game)
         
         await ctx.send(
             f"🔄 **Mulligan #{player.mulligans_taken}!** Shuffled and drew 7 new cards.\n"
@@ -1166,6 +1560,7 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
         player.library.insert(0, card)  # Index 0 = bottom
         
         remaining = player.mulligans_taken - (7 - len(player.hand))
+        self.engine.save_game(game)
         
         if remaining > 0:
             await ctx.send(f"📥 Put **{card.name}** on bottom. ({remaining} more to go)")
@@ -1205,6 +1600,18 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
         else:
             await ctx.send(f"✋ **{player.name}** keeps with {len(player.hand)} cards (mulliganed {player.mulligans_taken}x)")
         
+        if game.is_multiplayer:
+            waiting = [p.name for p in game.players
+                       if not p.eliminated and not p.has_kept_hand]
+            if waiting:
+                await ctx.send("Waiting for opening-hand decisions from: " +
+                               ", ".join(waiting))
+            else:
+                game.opening_hands_pending = False
+                await ctx.send(
+                    f"All players have kept. **{game.active_player.name}** "
+                    "may begin the first turn.")
+
         self.engine.save_game(game)
     
     @commands.command(name="state")
@@ -1313,12 +1720,16 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
         if not game:
             await ctx.send("No active game in this thread!")
             return
+        if await self._reject_during_opening_hands(ctx, game):
+            return
         
         player_idx = game.get_player_index(ctx.author.id)
         if player_idx is None:
             await ctx.send("You're not in this game!")
             return
-        
+        if await self._reject_eliminated_seat(ctx, game, player_idx):
+            return
+
         if player_idx != game.active_player_index:
             await ctx.send(self._not_your_turn_msg(game))
             return
@@ -1738,6 +2149,8 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
             return
         
         player_idx = game.get_player_index(ctx.author.id)
+        if await self._reject_eliminated_seat(ctx, game, player_idx):
+            return
         if player_idx is None or player_idx != game.active_player_index:
             await ctx.send(self._not_your_turn_msg(game))
             return
@@ -1783,12 +2196,16 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
         if not game:
             await ctx.send("No active game in this thread!")
             return
+        if await self._reject_during_opening_hands(ctx, game):
+            return
         
         player_idx = game.get_player_index(ctx.author.id)
         if player_idx is None:
             await ctx.send("You're not in this game!")
             return
-        
+        if await self._reject_eliminated_seat(ctx, game, player_idx):
+            return
+
         player = game.players[player_idx]
 
         # Parse arguments
@@ -1919,7 +2336,8 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
             creature_dmg = int(dual_target_match.group(2))
 
             # Stage 1: pick a target player (opponents only for damage)
-            opponent_players = [p for p in game.players if p != player]
+            opponent_players = [p for p in game.players
+                                if p != player and not p.eliminated]
             if not opponent_players:
                 await ctx.send(f"❌ No legal targets for {card.name}'s ability")
                 return
@@ -1943,15 +2361,20 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
                     'card_id': card.id,
                     'ability_index': ability_index,
                     'player_idx': player_idx,
+                    'chooser_player_id': game.stable_player_id(player),
                     'player_dmg': player_dmg,
                     'creature_dmg': creature_dmg,
+                    'target_choices': [
+                        serialize_target_choice(game, p) for p in opponent_players
+                    ],
                 }
                 cost_str = f"+{ability.loyalty_cost}" if ability.loyalty_cost > 0 else str(ability.loyalty_cost)
                 lines = [f"🎯 **Choose a target player for {card.name}'s [{cost_str}] ability:**"]
-                for i, p in enumerate(game.players):
+                for i, p in enumerate(opponent_players):
                     lines.append(f"  `{i}` - {p.name}")
                 lines.append(f"\n*Reply with `!target <number>` to select*")
                 await ctx.send("\n".join(lines))
+                self.engine.save_game(game)
                 return
 
             # Execute: apply loyalty cost manually (Chandra dual-target handles damage itself)
@@ -1979,9 +2402,14 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
                     'type': 'chandra_dual_target_creature',
                     'card_id': card.id,
                     'player_idx': player_idx,
+                    'chooser_player_id': game.stable_player_id(player),
                     'creature_dmg': creature_dmg,
                     'target_player_name': target_player.name,
                     'target_player_idx': game.players.index(target_player),
+                    'target_player_id': game.stable_player_id(target_player),
+                    'target_choices': [
+                        serialize_target_choice(game, c) for c in target_creatures
+                    ],
                 }
                 lines = [f"🎯 **Optionally choose a creature {target_player.name} controls (up to one):**"]
                 for i, c in enumerate(target_creatures):
@@ -2034,8 +2462,10 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
                     'type': 'planeswalker_target',
                     'card_id': card.id,
                     'ability_index': ability_index,
-                    'legal_targets': legal_targets,
                     'player_idx': player_idx,
+                    'chooser_player_id': game.stable_player_id(player),
+                    'target_choices': serialize_target_choices(
+                        game, legal_targets),
                 }
 
                 cost_str = f"+{ability.loyalty_cost}" if ability.loyalty_cost > 0 else str(ability.loyalty_cost)
@@ -2044,6 +2474,7 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
                     lines.append(f"  `{i}` - {desc}")
                 lines.append(f"\n*Reply with `!target <number>` to select*")
                 await ctx.send("\n".join(lines))
+                self.engine.save_game(game)
                 return
         else:
             targets = []
@@ -2817,7 +3248,7 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
         # === TIER 1.5: Try effect template library (card name + pattern matching) ===
         if not effect_resolved and HAS_EFFECT_TEMPLATES:
             try:
-                opponent = game.players[1 - player_idx]
+                opponent = game.default_opponent_for(player) or player
                 effect_desc = resolved_effect if x_value is not None else ability['effect']
                 ctx = build_game_context(game, player, opponent, card=card)
                 if x_value is not None:
@@ -2877,7 +3308,7 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
                     # being resolved twice).
                     from rules.spell_resolver import target_restrictions_for_text
                     from mtg.helpers import pick_targets_for_restrictions
-                    opponent = game.players[1 - player_idx]
+                    opponent = game.default_opponent_for(player) or player
                     _picked, _missed = pick_targets_for_restrictions(
                         game, player, opponent,
                         target_restrictions_for_text(effect_desc))
@@ -2900,7 +3331,7 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
         if not effect_resolved and getattr(self.engine, '_xmage_translator', None):
             try:
                 effect_desc = resolved_effect if x_value is not None else ability['effect']
-                opponent = game.players[1 - player_idx]
+                opponent = game.default_opponent_for(player) or player
                 # The translator has its own regex patterns beyond what SpellResolver covers
                 # (e.g., "deals damage equal to that creature's power", "each opponent" patterns)
                 t_actions, t_expl = self.engine._xmage_translator.translate_trigger(
@@ -2987,7 +3418,17 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
         action_type = game.pending_action.get('type')
         
         player_idx = game.get_player_index(ctx.author.id)
-        if player_idx != game.pending_action.get('player_idx'):
+        if await self._reject_eliminated_seat(ctx, game, player_idx):
+            return
+        chooser_id = game.pending_action.get('chooser_player_id')
+        chooser_matches = (
+            player_idx is not None
+            and (chooser_id is None
+                 and player_idx == game.pending_action.get('player_idx')
+                 or chooser_id is not None
+                 and game.stable_player_id(game.players[player_idx]) == chooser_id)
+        )
+        if not chooser_matches:
             await ctx.send("It's not your ability to target for!")
             return
         
@@ -3031,12 +3472,18 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
         
         # Handle planeswalker targeting
         elif action_type == 'planeswalker_target':
-            legal_targets = game.pending_action.get('legal_targets', [])
-            if target_index < 0 or target_index >= len(legal_targets):
-                await ctx.send(f"Invalid target index! Choose 0-{len(legal_targets)-1}")
+            target_choices = game.pending_action.get('target_choices', [])
+            if target_index < 0 or target_index >= len(target_choices):
+                await ctx.send(f"Invalid target index! Choose 0-{len(target_choices)-1}")
                 return
             
-            target, desc = legal_targets[target_index]
+            choice = target_choices[target_index]
+            target = resolve_target_choice(game, choice)
+            if target is None:
+                await ctx.send("❌ That target is no longer legal; the activation was not performed.")
+                game.pending_action = None
+                self.engine.save_game(game)
+                return
             targets = [target]
             
             card_id = game.pending_action['card_id']
@@ -3074,11 +3521,18 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
             card_id = game.pending_action['card_id']
             ability_index = game.pending_action['ability_index']
 
-            if target_index < 0 or target_index >= len(game.players):
-                await ctx.send(f"Invalid target! Choose 0-{len(game.players)-1}")
+            target_choices = game.pending_action.get('target_choices', [])
+            if target_index < 0 or target_index >= len(target_choices):
+                await ctx.send(f"Invalid target! Choose 0-{len(target_choices)-1}")
                 return
 
-            target_player = game.players[target_index]
+            target_player = resolve_target_choice(
+                game, target_choices[target_index])
+            if target_player is None:
+                await ctx.send("❌ That player is no longer a legal target; the activation was not performed.")
+                game.pending_action = None
+                self.engine.save_game(game)
+                return
 
             # Find and activate the planeswalker
             card = None
@@ -3104,9 +3558,14 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
                     'type': 'chandra_dual_target_creature',
                     'card_id': card_id,
                     'player_idx': player_idx,
+                    'chooser_player_id': game.stable_player_id(player),
                     'creature_dmg': creature_dmg,
                     'target_player_name': target_player.name,
-                    'target_player_idx': target_index,
+                    'target_player_idx': game.players.index(target_player),
+                    'target_player_id': game.stable_player_id(target_player),
+                    'target_choices': [
+                        serialize_target_choice(game, c) for c in target_creatures
+                    ],
                 }
                 lines = [f"🎯 **Optionally choose a creature {target_player.name} controls:**"]
                 for i, c in enumerate(target_creatures):
@@ -3123,22 +3582,28 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
         # Handle Chandra dual-target: stage 2 — creature selection
         elif action_type == 'chandra_dual_target_creature':
             creature_dmg = game.pending_action['creature_dmg']
-            target_player_idx = game.pending_action['target_player_idx']
-            target_player = game.players[target_player_idx]
-            target_creatures = [c for c in target_player.creatures() if c.is_creature()]
+            target_player = game.get_player_by_stable_id(
+                game.pending_action.get('target_player_id'), living_only=True)
+            target_choices = game.pending_action.get('target_choices', [])
 
             # Check if player chose "skip"
-            if target_index == len(target_creatures):
+            if target_index == len(target_choices):
                 await ctx.send("*No creature targeted.*")
                 game.pending_action = None
                 self.engine.save_game(game)
                 return
 
-            if target_index < 0 or target_index >= len(target_creatures):
-                await ctx.send(f"Invalid target! Choose 0-{len(target_creatures)} (last option = skip)")
+            if target_index < 0 or target_index >= len(target_choices):
+                await ctx.send(f"Invalid target! Choose 0-{len(target_choices)} (last option = skip)")
                 return
 
-            target_creature = target_creatures[target_index]
+            target_creature = resolve_target_choice(
+                game, target_choices[target_index])
+            if target_player is None or target_creature is None:
+                await ctx.send("❌ That creature is no longer a legal target; no damage was dealt.")
+                game.pending_action = None
+                self.engine.save_game(game)
+                return
             target_creature.damage_marked += creature_dmg
             msgs = [f"🔥 Deals {creature_dmg} damage to {target_creature.name}"]
 
@@ -3194,46 +3659,91 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
             await ctx.send("No pending target selection!")
             return
 
-    @commands.command(name="replacement", aliases=["replace"])
-    async def choose_replacement(self, ctx, choice: int):
-        """
-        Choose which replacement effect applies when multiple compete.
-
-        Usage:
-            !replacement 0    → Select replacement effect #0 from the list
-            !replace 1        → Select replacement effect #1
-        """
+    @commands.command(name="choice", aliases=["choices"])
+    async def show_private_choices(self, ctx, choice_id: str = ""):
+        """Re-send this seat's pending choice inventory by DM."""
         game = self._get_game(ctx)
         if not game:
             await ctx.send("No active game in this thread!")
             return
-
-        if not game.pending_action or game.pending_action.get('type') != 'choose_replacement':
-            await ctx.send("No pending replacement choice!")
-            return
-
         player_idx = game.get_player_index(ctx.author.id)
-        if player_idx != game.pending_action.get('player_idx'):
-            await ctx.send("It's not your choice to make!")
+        if player_idx is None:
+            await ctx.send("You're not in this game!")
             return
-
-        effects = game.pending_action.get('effects', [])
-        if choice < 0 or choice >= len(effects):
-            await ctx.send(f"Invalid choice! Choose 0-{len(effects)-1}")
+        if await self._reject_eliminated_seat(ctx, game, player_idx):
             return
-
-        chosen = effects[choice]
-        future = game.pending_action.get('future')
-
-        game.pending_action = None
-
-        if future and not future.done():
-            future.set_result(chosen)
-            await ctx.send(f"✅ Applied: **{chosen.source_name}** — {chosen.description}")
+        records = pending_choices_for(game, player_idx)
+        if choice_id:
+            records = [record for record in records
+                       if record.get('choice_id') == choice_id]
+        if not records:
+            await ctx.send("No pending choice for your seat.")
+            return
+        results = [
+            await self._send_choice_privately(ctx, game, record)
+            for record in records
+        ]
+        if all(results):
+            await ctx.send("🔒 Private choice details sent by DM.")
         else:
-            await ctx.send("⚠️ Replacement choice already resolved or timed out.")
+            await ctx.send(
+                "I couldn't DM the private options. Enable server-member DMs "
+                "and run `!choice` again; the shared thread will not reveal them.")
 
+    async def _submit_seat_choice(self, ctx, option: int,
+                                  choice_id: str = "",
+                                  expected_type: str = ""):
+        game = self._get_game(ctx)
+        if not game:
+            await ctx.send("No active game in this thread!")
+            return
+        player_idx = game.get_player_index(ctx.author.id)
+        if player_idx is None:
+            await ctx.send("You're not in this game!")
+            return
+        if await self._reject_eliminated_seat(ctx, game, player_idx):
+            return
+        if expected_type:
+            matching = [
+                record for record in pending_choices_for(game, player_idx)
+                if record.get('type') == expected_type
+            ]
+            if len(matching) == 1:
+                choice_id = matching[0]['choice_id']
+            elif not matching:
+                await ctx.send(f"No pending {expected_type.replace('_', ' ')} choice!")
+                return
+        result = submit_choice(game, player_idx, option, choice_id or None)
+        if not result.get('success'):
+            await ctx.send(result.get('message', 'Could not submit that choice.'))
+            return
+        record = game.pending_choices.get(result['choice_id'], {})
+        if record.get('simultaneous') and not result.get('complete'):
+            message = "🔒 Answer sealed; waiting for the other required seats."
+        elif record.get('private'):
+            message = "🔒 Private choice accepted."
+        else:
+            message = f"✅ Chose: **{result.get('selected_label')}**"
+        await ctx.send(message)
         self.engine.save_game(game)
+
+    @commands.command(name="choose")
+    async def choose_pending(self, ctx, choice_id: str, option: Optional[int] = None):
+        """Submit `!choose <choice-id> <number>` or `!choose <number>`."""
+        if option is None:
+            try:
+                option = int(choice_id)
+            except ValueError:
+                await ctx.send("Use `!choose <choice-id> <number>`.")
+                return
+            choice_id = ""
+        await self._submit_seat_choice(ctx, option, choice_id)
+
+    @commands.command(name="replacement", aliases=["replace"])
+    async def choose_replacement(self, ctx, choice: int):
+        """Shortcut for this seat's pending replacement-order choice."""
+        await self._submit_seat_choice(
+            ctx, choice, expected_type="replacement_order")
 
     @commands.command(name="loyalty", aliases=["loy"])
     async def show_loyalty(self, ctx, *, card_name: str = ""):
@@ -3317,6 +3827,14 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
                 f"Active player: {state['active_player']}",
                 f"Priority: {state['priority_holder'] or 'none'}",
             ]
+            disconnected = [
+                player for player, connected in state.get('connected', {}).items()
+                if not connected
+            ]
+            if disconnected:
+                lines.append("Reconnect grace: " + ", ".join(disconnected))
+            if state.get('deadline'):
+                lines.append(f"Window deadline: {state['deadline']}")
             if state['stack']:
                 lines.append("**Stack (top first):**")
                 for item in state['stack']:
@@ -3368,19 +3886,79 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
         if player_idx is None:
             await ctx.send("You're not in this game!")
             return
-        
+        if await self._reject_eliminated_seat(ctx, game, player_idx):
+            return
+
         player_name = game.players[player_idx].name
 
         # Use game's own PrioritySystem if stack is enabled
         if game.stack_enabled and game._priority_system:
             result = await game._priority_system.set_auto_pass(
-                player_name, until="end_of_turn")
+                game.priority_identity_for(
+                    player_idx, game._priority_system), until="end_of_turn")
             if result.get("success"):
                 await ctx.send(f"⏩ **{player_name}** yields until end of turn (F6)")
             else:
                 await ctx.send(f"⚠️ {result.get('message', 'Could not set auto-pass')}")
         else:
             await ctx.send("⏩ Priority yield noted (stack system not active this game).")
+
+    @commands.command(name="holdpriority", aliases=["hold"])
+    async def hold_priority(self, ctx):
+        """Pause the current seat's auto-pass timer while they think."""
+        game = self._get_game(ctx)
+        if not game or not game.stack_enabled or not game._priority_system:
+            await ctx.send("No active priority window in this thread!")
+            return
+        player_idx = game.get_player_index(ctx.author.id)
+        if player_idx is None:
+            await ctx.send("You're not in this game!")
+            return
+        from rules.priority import PriorityAction
+        player = game.players[player_idx]
+        if await self._reject_eliminated_seat(ctx, game, player_idx):
+            return
+        player_name = player.name
+        result = await game._priority_system.player_action(
+            game.priority_identity_for(
+                player, game._priority_system), PriorityAction.hold())
+        await ctx.send(result.get('message', 'Could not hold priority.'))
+        self.engine.save_game(game)
+
+    @commands.command(name="reconnect", aliases=["rejoin", "resume-seat"])
+    async def reconnect_seat(self, ctx):
+        """Rebind a Discord seat to its priority window and private choices."""
+        game = self._get_game(ctx)
+        if not game:
+            await ctx.send("No active game in this thread!")
+            return
+        player_idx = game.get_player_index(ctx.author.id)
+        if player_idx is None:
+            await ctx.send("You're not in this game!")
+            return
+        player = game.players[player_idx]
+        if player.eliminated:
+            await ctx.send("Your seat was eliminated; reconnect is spectator-only.")
+            return
+        await self._ensure_thread_member(ctx.channel, ctx.author)
+        if game.stack_enabled and game._priority_system:
+            await game._priority_system.mark_reconnected(
+                game.priority_identity_for(
+                    player, game._priority_system))
+        records = pending_choices_for(game, player_idx)
+        delivered = True
+        for record in records:
+            delivered = (
+                await self._send_choice_privately(ctx, game, record)
+                and delivered
+            )
+        self.engine.save_game(game)
+        suffix = ""
+        if records:
+            suffix = (" Private choices were re-sent."
+                      if delivered
+                      else " I couldn't DM your private choice; enable DMs and retry.")
+        await ctx.send(f"🔄 **{player.name}** reconnected to the live game.{suffix}")
 
     @commands.command(name="respond", aliases=["resp", "counter"])
     async def respond_to_stack(self, ctx, *, card_name: str):
@@ -3395,6 +3973,8 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
         if not game:
             await ctx.send("No active game in this thread!")
             return
+        if await self._reject_during_opening_hands(ctx, game):
+            return
 
         if not game.stack_enabled or not game.stack:
             await ctx.send("❌ No spells on the stack to respond to.")
@@ -3404,8 +3984,20 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
         if player_idx is None:
             await ctx.send("You're not in this game!")
             return
+        if await self._reject_eliminated_seat(ctx, game, player_idx):
+            return
 
         player = game.players[player_idx]
+
+        priority_system = game._priority_system
+        if (priority_system is not None
+                and priority_system.priority_holder !=
+                game.priority_identity_for(player, priority_system)):
+            await ctx.send(
+                f"❌ It's not your priority. "
+                f"**{game.priority_display_name(priority_system.priority_holder)}** "
+                "has priority.")
+            return
 
         # Parse target from card_name string (e.g., "Lightning Bolt target Bob")
         target = None
@@ -3478,8 +4070,12 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
         if not game:
             await ctx.send("No active game in this thread!")
             return
+        if await self._reject_during_opening_hands(ctx, game):
+            return
         
         player_idx = game.get_player_index(ctx.author.id)
+        if await self._reject_eliminated_seat(ctx, game, player_idx):
+            return
         if player_idx is None or player_idx != game.active_player_index:
             await ctx.send(self._not_your_turn_msg(game))
             return
@@ -3490,37 +4086,85 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
         # when the AI rejected a block-tricks-considered analysis.
         self._snapshot_for_undo(game, f"{player.name} declared attackers ({creatures})")
 
-        # Get potential attackers
-        if creatures.lower() == "all":
-            potential_attackers = player.untapped_creatures()
-            # Debug: log all creatures and why some are excluded
-            all_creatures = player.creatures()
-            if len(all_creatures) != len(potential_attackers):
-                for c in all_creatures:
-                    if c not in potential_attackers:
-                        print(f"[ATTACK-DEBUG] {c.name}: excluded from !attack all "
-                              f"(tapped={c.tapped}, sick={c.summoning_sick}, "
-                              f"is_creature={c.is_creature()}, type_line='{c.type_line}')")
+        # Parse stable defender assignments before legality/tax checks. Attack
+        # taxes are defender-specific, so selecting a defender after payment
+        # would charge against the wrong battlefield in multiplayer.
+        potential_attackers: List[Tuple[Card, int]] = []
+        if game.is_multiplayer:
+            groups = [group.strip() for group in creatures.split(";")
+                      if group.strip()]
+            if not groups or any(
+                    not re.search(r"\s+at\s+", group, re.IGNORECASE)
+                    for group in groups):
+                await ctx.send(
+                    "Multiplayer attacks require a defender for each group. "
+                    "Example: `!attack Ragavan at @Alice; Goblin Guide, "
+                    "Swiftspear at @Bob`.")
+                return
+            seen_ids = set()
+            for group in groups:
+                card_text, defender_text = re.split(
+                    r"\s+at\s+", group, maxsplit=1, flags=re.IGNORECASE)
+                defender_idx, error = self._resolve_defending_seat(
+                    game, defender_text)
+                if defender_idx is None:
+                    await ctx.send(error)
+                    return
+                if defender_idx == player_idx:
+                    await ctx.send("You can't attack your own seat.")
+                    return
+                if card_text.strip().lower() == "all":
+                    selected = player.untapped_creatures(game=game)
+                else:
+                    selected = []
+                    for name in (part.strip() for part in card_text.split(",")):
+                        card = player.find_card(name, Zone.BATTLEFIELD)
+                        if card and card.is_creature(game=game):
+                            selected.append(card)
+                for card in selected:
+                    if card.id in seen_ids:
+                        await ctx.send(
+                            f"**{card.name}** was assigned to more than one defender.")
+                        return
+                    seen_ids.add(card.id)
+                    potential_attackers.append((card, defender_idx))
         else:
-            creature_names = [c.strip() for c in creatures.split(",")]
-            potential_attackers = []
-            for name in creature_names:
-                card = player.find_card(name, Zone.BATTLEFIELD)
-                if card and card.is_creature():
-                    potential_attackers.append(card)
-        
+            defender_idx = 1 - player_idx
+            if creatures.lower() == "all":
+                selected = player.untapped_creatures(game=game)
+                all_creatures = player.creatures(game=game)
+                if len(all_creatures) != len(selected):
+                    for card in all_creatures:
+                        if card not in selected:
+                            print(
+                                f"[ATTACK-DEBUG] {card.name}: excluded from "
+                                f"!attack all (tapped={card.tapped}, "
+                                f"sick={card.summoning_sick}, "
+                                f"is_creature={card.is_creature(game=game)}, "
+                                f"type_line='{card.type_line}')")
+            else:
+                selected = []
+                for name in (part.strip() for part in creatures.split(",")):
+                    card = player.find_card(name, Zone.BATTLEFIELD)
+                    if card and card.is_creature(game=game):
+                        selected.append(card)
+            potential_attackers = [(card, defender_idx) for card in selected]
+
         # Validate each attacker with rules engine
-        attackers = []
+        attackers: List[Tuple[Card, int]] = []
         warnings = []
-        for card in potential_attackers:
+        for card, defender_idx in potential_attackers:
+            card.attacking_player = defender_idx
             can_attack, reason = self.engine.rules.can_attack_with(game, player, card)
             if can_attack:
                 paid, tax_reason = self.engine.rules.pay_attack_tax(game, player, card)
                 if paid:
-                    attackers.append(card)
+                    attackers.append((card, defender_idx))
                 else:
+                    card.attacking_player = None
                     warnings.append(f"⚠️ {card.name}: {tax_reason}")
             else:
+                card.attacking_player = None
                 warnings.append(f"⚠️ {card.name}: {reason}")
         
         if warnings:
@@ -3532,19 +4176,26 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
         
         # Declare attacks
         game.attackers = []
+        game.combat_defenders_done = []
         game.set_phase(Phase.DECLARE_ATTACKERS, via="cog:attack_cmd")
         
-        for card in attackers:
+        for card, defender_idx in attackers:
             card.attacking = True
             card.attacks_this_turn += 1  # C-1: Moraug's attack-count static
-            card.attacking_player = 1 - player_idx
+            card.attacking_player = defender_idx
             # Tap attacker (unless vigilance)
             if not card.has_vigilance():
                 self.engine.tap_permanent(card)
             game.attackers.append(card.id)
             self.engine.rules.log_event(f"{card.name} attacks")
         
-        attacker_display = [f"{c.name}" + (" (vigilance)" if c.has_vigilance() else "") for c in attackers]
+        attacker_display = [
+            f"{card.name}" +
+            (" (vigilance)" if card.has_vigilance() else "") +
+            (f" at {game.players[defender_idx].name}"
+             if game.is_multiplayer else "")
+            for card, defender_idx in attackers
+        ]
         await ctx.send(f"⚔️ **{player.name}** attacks with: {', '.join(attacker_display)}")
         
         # Process attack triggers (Jaya's -2, etc.)
@@ -3561,18 +4212,35 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
         if game.stack_enabled:
             await self.engine._combat_priority_round(game, ctx.send, "after attackers declared")
             # Check if any attackers died from instant-speed removal
-            attackers = [c for c in attackers if c in player.battlefield and c.attacking]
+            attackers = [
+                (card, defender_idx)
+                for card, defender_idx in attackers
+                if card in player.battlefield and card.attacking
+            ]
             if not attackers:
                 await ctx.send("⚔️ No attackers remain after priority — skipping to end of combat.")
                 game.set_phase(Phase.COMBAT_END, via="cog:attack_cmd:no_attackers")
                 self.engine.save_game(game)
                 return
 
+        if game.is_multiplayer:
+            defenders = self._combat_defender_indices(game)
+            game.waiting_for_human_blocks = True
+            self.engine.save_game(game)
+            await ctx.send(
+                "Defending seats: " +
+                ", ".join(game.players[index].name for index in defenders) +
+                ". Each attacked player must use `!block <attacker> with "
+                "<blocker>` as needed, then `!doneblocking` or `!noblock`.")
+            return
+
         # If opponent is Claude, have it block
         opponent = game.players[1 - player_idx]
+        attacker_cards = [card for card, _ in attackers]
         if opponent.is_claude:
             await asyncio.sleep(1)
-            blocks = await self.engine.claude_ai.decide_blocks(game, 1 - player_idx, attackers)
+            blocks = await self.engine.claude_ai.decide_blocks(
+                game, 1 - player_idx, attacker_cards)
             
             if blocks:
                 # May 7 audit fix #2: disambiguate same-name creatures
@@ -3680,20 +4348,32 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
         if player_idx is None:
             await ctx.send("You're not in this game!")
             return
-        
+        if await self._reject_eliminated_seat(ctx, game, player_idx):
+            return
+
         player = game.players[player_idx]
+        if player_idx in game.combat_defenders_done:
+            await ctx.send("Your blockers are already finalized this combat.")
+            return
         blocker = player.find_card(blocker_name, Zone.BATTLEFIELD)
         
         if not blocker or not blocker.is_creature():
             await ctx.send(f"Couldn't find creature '{blocker_name}' on your battlefield.")
             return
         
-        # Find attacker
-        opponent = game.players[1 - player_idx]
-        attacker = opponent.find_card(attacker_name, Zone.BATTLEFIELD)
+        # Attackers always belong to the active player, but only the exact
+        # stable defending seat assigned at declaration may block one.
+        attacker = game.active_player.find_card(
+            attacker_name, Zone.BATTLEFIELD)
         
         if not attacker or attacker.id not in game.attackers:
             await ctx.send(f"'{attacker_name}' isn't attacking!")
+            return
+        if game.defender_for(attacker) is not player:
+            defender = game.defender_for(attacker)
+            await ctx.send(
+                f"**{attacker.name}** is attacking "
+                f"{defender.name if defender else 'a different seat'}, not you.")
             return
         
         # Rules check for blocking
@@ -3709,6 +4389,7 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
         if attacker.id not in game.blockers:
             game.blockers[attacker.id] = []
         game.blockers[attacker.id].append(blocker.id)
+        self.engine.save_game(game)
         
         self.engine.rules.log_event(f"{blocker.name} blocks {attacker.name}")
         await ctx.send(f"🛡️ **{blocker.name}** blocks **{attacker.name}**")
@@ -3722,6 +4403,8 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
             return
 
         player_idx = game.get_player_index(ctx.author.id)
+        if await self._reject_eliminated_seat(ctx, game, player_idx):
+            return
         if player_idx is None or player_idx == game.active_player_index:
             await ctx.send("Only the defending player can decline blocks!")
             return
@@ -3744,11 +4427,7 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
         else:
             await ctx.send("🛡️ No blockers declared.")
 
-        # Combat priority window: after blockers declared (combat tricks!)
-        if game.stack_enabled:
-            await self.engine._combat_priority_round(game, ctx.send, "after blockers declared")
-
-        await self._resolve_combat(ctx, game)
+        await self._finish_defender_blocks(ctx, game, player_idx)
 
     @commands.command(name="doneblocking")
     async def done_blocking(self, ctx):
@@ -3759,6 +4438,8 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
             return
 
         player_idx = game.get_player_index(ctx.author.id)
+        if await self._reject_eliminated_seat(ctx, game, player_idx):
+            return
         if player_idx is None or player_idx == game.active_player_index:
             await ctx.send("Only the defending player can finalize blocks!")
             return
@@ -3783,11 +4464,7 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
         else:
             await ctx.send("🛡️ No blockers declared, proceeding to damage.")
 
-        # Combat priority window: after blockers declared (combat tricks!)
-        if game.stack_enabled:
-            await self.engine._combat_priority_round(game, ctx.send, "after blockers declared")
-
-        await self._resolve_combat(ctx, game)
+        await self._finish_defender_blocks(ctx, game, player_idx)
 
     @commands.command(name="combat")
     async def resolve_combat(self, ctx):
@@ -3799,6 +4476,14 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
 
         if not game.attackers:
             await ctx.send("No attackers to resolve!")
+            return
+        player_idx = game.get_player_index(ctx.author.id)
+        if await self._reject_eliminated_seat(ctx, game, player_idx):
+            return
+        if game.is_multiplayer:
+            await ctx.send(
+                "Each attacked seat must use `!doneblocking` or `!noblock`; "
+                "multiplayer combat resolves after every defender submits.")
             return
         
         await self._resolve_combat(ctx, game)
@@ -3846,6 +4531,12 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
                     'draw', 'discard', 'counter', 'token', 'dies', 'sacrifice',
                     'tap', 'untap', 'gain life', 'lose life', 'mana',
                 ])
+                if (needs_execution and player is not None
+                        and player.eliminated):
+                    await ctx.send(
+                        "Your eliminated seat can ask rules questions, but "
+                        "can't use `!judge` to change the game state.")
+                    return
                 # Undo snapshot: only when this !judge call is going to mutate
                 # state (matched by needs_execution above). Plain rule-question
                 # !judge calls don't change game state, so snapshotting would
@@ -3961,6 +4652,8 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
         if player_idx is None:
             await ctx.send("You're not in this game!")
             return
+        if await self._reject_eliminated_seat(ctx, game, player_idx):
+            return
         player = game.players[player_idx]
         target_card = None
         card_name_lower = card_name.strip().lower()
@@ -4024,6 +4717,8 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
         if player_idx is None:
             await ctx.send("You're not in this game!")
             return
+        if await self._reject_eliminated_seat(ctx, game, player_idx):
+            return
 
         player = game.players[player_idx]
         # Undo snapshot: resolve_effect actually mutates state via the Tier 3
@@ -4056,14 +4751,19 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
                     source_card = card.name
                     break
 
-        # Also check opponent's battlefield
+        # Also check every other battlefield. In multiplayer there is no
+        # privileged ``1 - player_idx`` opponent.
         if not source_card:
-            opponent = game.players[1 - player_idx]
-            for card in opponent.battlefield:
-                if card.name.lower() in BASIC_LAND_NAMES:
+            for other in game.players:
+                if other is player:
                     continue
-                if card.name.lower() in description.lower():
-                    source_card = card.name
+                for card in other.battlefield:
+                    if card.name.lower() in BASIC_LAND_NAMES:
+                        continue
+                    if card.name.lower() in description.lower():
+                        source_card = card.name
+                        break
+                if source_card:
                     break
         
         async with ctx.typing():
@@ -4109,14 +4809,39 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
         if player_idx is None:
             await ctx.send("You're not in this game!")
             return
+        if await self._reject_eliminated_seat(ctx, game, player_idx):
+            return
         
         # Determine target
-        if ctx.message.mentions:
-            target_player = game.get_player_by_user_id(ctx.message.mentions[0].id)
+        mentions = getattr(getattr(ctx, 'message', None), 'mentions', [])
+        target_player = None
+        if mentions:
+            target_player = game.get_player_by_user_id(mentions[0].id)
         elif target and target.lower() in ["opponent", "them", "opp"]:
-            target_player = game.players[1 - player_idx]
+            opponents = [
+                candidate for index, candidate in enumerate(game.players)
+                if index != player_idx and not candidate.eliminated
+            ]
+            if len(opponents) == 1:
+                target_player = opponents[0]
+            else:
+                await ctx.send(
+                    "`opponent` is ambiguous in multiplayer. Mention a player, "
+                    "or use their exact name or `seat N`.")
+                return
         elif target and target.lower() in ["self", "me"]:
             target_player = game.players[player_idx]
+        elif target:
+            target_index, error = self._resolve_defending_seat(game, target)
+            if target_index is None:
+                await ctx.send(error)
+                return
+            target_player = game.players[target_index]
+        elif game.is_multiplayer:
+            await ctx.send(
+                "Multiplayer damage needs an explicit target: mention a "
+                "player, use their exact name, or `seat N`.")
+            return
         else:
             target_player = game.players[1 - player_idx]  # Default to opponent
         
@@ -4133,6 +4858,7 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
         
         if game.ended:
             await ctx.send(f"🏆 **{game.players[game.winner].name} wins!**")
+        self.engine.save_game(game)
     
     @commands.command(name="life")
     async def adjust_life(self, ctx, adjustment: str, target: str = None):
@@ -4159,10 +4885,19 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
         if player_idx is None:
             await ctx.send("You're not in this game!")
             return
+        if await self._reject_eliminated_seat(ctx, game, player_idx):
+            return
         
         # Determine target
-        if ctx.message.mentions:
-            target_player = game.get_player_by_user_id(ctx.message.mentions[0].id)
+        mentions = getattr(getattr(ctx, 'message', None), 'mentions', [])
+        if mentions:
+            target_player = game.get_player_by_user_id(mentions[0].id)
+        elif target:
+            target_index, error = self._resolve_defending_seat(game, target)
+            if target_index is None:
+                await ctx.send(error)
+                return
+            target_player = game.players[target_index]
         else:
             target_player = game.players[player_idx]
         
@@ -4180,6 +4915,7 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
         events = self.engine.check_state_based_actions(game)
         if events:
             await ctx.send("\n".join(f"⚡ {e}" for e in events))
+        self.engine.save_game(game)
     
     @commands.command(name="pass")
     async def pass_priority(self, ctx):
@@ -4188,9 +4924,47 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
         if not game:
             await ctx.send("No active game in this thread!")
             return
+        if await self._reject_during_opening_hands(ctx, game):
+            return
 
         player_idx = game.get_player_index(ctx.author.id)
-        if player_idx is None or player_idx != game.active_player_index:
+        if player_idx is None:
+            await ctx.send("You're not in this game!")
+            return
+        if await self._reject_eliminated_seat(ctx, game, player_idx):
+            return
+
+        # During a real stack/combat window, !pass belongs to the current
+        # priority holder, which may be any living APNAP seat. Outside such a
+        # window the command retains its historical phase-advance behavior for
+        # the active player only.
+        priority_system = game._priority_system
+        priority_window_open = bool(
+            game.stack_enabled and priority_system
+            and (game.stack or game.combat_priority_window)
+        )
+        if priority_window_open:
+            player = game.players[player_idx]
+            player_key = game.priority_identity_for(player, priority_system)
+            if priority_system.priority_holder != player_key:
+                await ctx.send(
+                    f"It's not your priority. "
+                    f"**{game.priority_display_name(priority_system.priority_holder)}** "
+                    "has priority.")
+                return
+            if pending_choices_for(game, player_idx):
+                await ctx.send(
+                    "You have a pending choice. Use `!choice` for its private "
+                    "prompt before passing priority.")
+                return
+            from rules.priority import PriorityAction
+            result = await priority_system.player_action(
+                player_key, PriorityAction.pass_priority())
+            await ctx.send(result.get('message', f"{player.name} passes priority."))
+            self.engine.save_game(game)
+            return
+
+        if player_idx != game.active_player_index:
             await ctx.send(self._not_your_turn_msg(game))
             return
 
@@ -4255,8 +5029,12 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
         if not game:
             await ctx.send("No active game in this thread!")
             return
+        if await self._reject_during_opening_hands(ctx, game):
+            return
 
         player_idx = game.get_player_index(ctx.author.id)
+        if await self._reject_eliminated_seat(ctx, game, player_idx):
+            return
         if player_idx is None or player_idx != game.active_player_index:
             await ctx.send(self._not_your_turn_msg(game))
             return
@@ -4377,6 +5155,23 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
             await ctx.send("You're not in this game!")
             return
         
+        if game.is_multiplayer:
+            await ctx.send(
+                f"**{game.players[player_idx].name}** concedes their seat.")
+            for message in game.eliminate_player(player_idx, "conceded"):
+                await ctx.send(message)
+            if game.ended and game.winner is not None:
+                await ctx.send(
+                    f"**{game.players[game.winner].name} wins!**")
+                self.engine.delete_game(game.thread_id)
+            else:
+                living = [player.name for player in game.players
+                          if not player.eliminated]
+                await ctx.send(
+                    "The game continues with: " + ", ".join(living))
+                self.engine.save_game(game)
+            return
+
         game.ended = True
         game.winner = 1 - player_idx
         
@@ -4430,6 +5225,8 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
             if player_idx is None:
                 await ctx.send("You're not in this game!")
                 return
+            if await self._reject_eliminated_seat(ctx, game, player_idx):
+                return
             
             player = game.players[player_idx]
             card_name = args.lower().replace(" from hand", "").strip()
@@ -4463,6 +5260,8 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
                 player_idx = game.get_player_index(ctx.author.id)
                 if player_idx is None:
                     await ctx.send("You're not in this game!")
+                    return
+                if await self._reject_eliminated_seat(ctx, game, player_idx):
                     return
                 
                 player = game.players[player_idx]
@@ -4527,6 +5326,11 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
         if player_idx is None:
             await ctx.send("You're not in this game!")
             return
+        if game.players[player_idx].eliminated:
+            await ctx.send("Your seat is already eliminated.")
+            return
+        if await self._reject_eliminated_seat(ctx, game, player_idx):
+            return
         
         player = game.players[player_idx]
         args_lower = args.lower().strip()
@@ -4580,6 +5384,8 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
         player_idx = game.get_player_index(ctx.author.id)
         if player_idx is None:
             await ctx.send("You're not in this game!")
+            return
+        if await self._reject_eliminated_seat(ctx, game, player_idx):
             return
 
         player = game.players[player_idx]
@@ -4739,21 +5545,35 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
         if not game:
             await ctx.send("No active game in this thread!")
             return
-        # Undo snapshot: !fix is the bluntest state-mutation command — snapshot
-        # so an over-aggressive fix can be rolled back. Especially important
-        # since "set life to 20" / "move X to battlefield" can have downstream
-        # SBA / trigger effects the user didn't intend.
-        self._snapshot_for_undo(game, f"fix: {instruction[:60]}")
-
-
         player_idx = game.get_player_index(ctx.author.id)
         if player_idx is None:
             await ctx.send("You're not in this game!")
             return
+        if await self._reject_eliminated_seat(ctx, game, player_idx):
+            return
         
         player = game.players[player_idx]
-        opponent = game.players[1 - player_idx]
         instruction_lower = instruction.lower()
+        living_opponents = [
+            candidate for index, candidate in enumerate(game.players)
+            if index != player_idx and not candidate.eliminated
+        ]
+        opponent = living_opponents[0] if len(living_opponents) == 1 else None
+        claude_targets = [
+            candidate for candidate in living_opponents
+            if candidate.is_claude
+        ]
+        claude_target = claude_targets[0] if len(claude_targets) == 1 else None
+        if (game.is_multiplayer and opponent is None
+                and re.search(r"\bopponent(?:'s)?\b", instruction_lower)):
+            await ctx.send(
+                "`opponent` is ambiguous in multiplayer. Use the player's "
+                "exact name in this fix instruction.")
+            return
+
+        # Undo snapshot: !fix is the bluntest state-mutation command — take it
+        # only after authorization and multiplayer target disambiguation.
+        self._snapshot_for_undo(game, f"fix: {instruction[:60]}")
         
         # Parse common fix patterns
         result_msg = None
@@ -4795,17 +5615,40 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
                 }
                 
                 # Also check opponent zones if specified
-                if 'claude' in card_name or 'opponent' in card_name:
-                    card_name = re.sub(r"(claude'?s?|opponent'?s?)\s*", '', card_name).strip()
-                    zone_map = {
-                        'hand': (opponent.hand, 'hand'),
-                        'battlefield': (opponent.battlefield, 'battlefield'),
-                        'graveyard': (opponent.graveyard, 'graveyard'),
-                        'exile': (opponent.exile, 'exile'),
-                        'library': (opponent.library, 'library'),
-                    }
+                named_zone_player = next(
+                    (candidate for candidate in game.players
+                     if card_name.startswith(candidate.name.casefold() + " ")
+                     or card_name.startswith(candidate.name.casefold() + "'s ")),
+                    None,
+                )
+                if (named_zone_player is not None or 'claude' in card_name
+                        or 'opponent' in card_name):
+                    if named_zone_player is not None:
+                        prefix = named_zone_player.name.casefold()
+                        card_name = card_name[len(prefix):].lstrip("'s ").strip()
+                        zone_player = named_zone_player
+                    else:
+                        card_name = re.sub(
+                            r"(claude'?s?|opponent'?s?)\s*", '',
+                            card_name).strip()
+                        zone_player = (claude_target if 'claude' in
+                                       move_match.group(1) else opponent)
+                    if zone_player is None:
+                        result_msg = (
+                            "❌ Couldn't resolve that multiplayer player; "
+                            "use their exact name.")
+                    else:
+                        zone_map = {
+                            'hand': (zone_player.hand, 'hand'),
+                            'battlefield': (zone_player.battlefield, 'battlefield'),
+                            'graveyard': (zone_player.graveyard, 'graveyard'),
+                            'exile': (zone_player.exile, 'exile'),
+                            'library': (zone_player.library, 'library'),
+                        }
                 
-                if from_zone in zone_map and to_zone in zone_map:
+                if result_msg:
+                    pass
+                elif from_zone in zone_map and to_zone in zone_map:
                     from_list, from_name = zone_map[from_zone]
                     to_list, to_name = zone_map[to_zone]
                     
@@ -4940,7 +5783,7 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
                 
                 target = player
                 if target_name and target_name.lower() == 'claude':
-                    target = opponent if opponent.is_claude else player
+                    target = claude_target or player
                 elif target_name and target_name.lower() not in ['my', 'me']:
                     target = next((p for p in game.players if target_name in p.name.lower()), player)
                 
@@ -4958,7 +5801,7 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
                 
                 target = None
                 if target_name == 'claude':
-                    target = opponent if opponent.is_claude else None
+                    target = claude_target
                 elif target_name in ['me', 'myself']:
                     target = player
                 else:
@@ -5322,10 +6165,13 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
 
     async def _run_single_autoplay(self, channel, game_format: str, deck1_name: str, deck2_name: str,
                                    matchup_label: str = None, force_claude: bool = False,
-                                   openrouter_model: str = None) -> dict:
+                                   openrouter_model: str = None,
+                                   seed_cards: Optional[List[str]] = None) -> dict:
         """Delegates to mtg.autoplay._run_single_autoplay (Phase 2F)."""
         from mtg.autoplay import _run_single_autoplay
-        return await _run_single_autoplay(self, channel, game_format, deck1_name, deck2_name, matchup_label, force_claude, openrouter_model)
+        return await _run_single_autoplay(
+            self, channel, game_format, deck1_name, deck2_name,
+            matchup_label, force_claude, openrouter_model, seed_cards)
     def _parse_openrouter_flag(self, args: list) -> str | None:
         """Extract --openrouter <model> from args list. Mutates args in place
         to remove the model name (the --openrouter flag itself gets stripped
@@ -5494,13 +6340,25 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
             !autoplay commander surrak rashmi                     - Specific decks
             !autoplay --claude commander surrak rashmi             - Force Claude
             !autoplay --openrouter optimus-alpha commander res rashmi  - OpenRouter model
+            !autoplay commander res rashmi --seed-card "Cathar's Crusade"
         """
         if self._batch_running:
             await ctx.send("\u274c A batch is running. Use `!autoplay-stop` first.")
             return
 
-        parts = ctx.message.content.split()
+        try:
+            parts = shlex.split(ctx.message.content)
+        except ValueError as exc:
+            await ctx.send(f"❌ Invalid autoplay arguments: {exc}")
+            return
         args = parts[1:] if len(parts) > 1 else []
+
+        from mtg.autoplay import extract_seed_card_flags
+        try:
+            args, seed_cards = extract_seed_card_flags(args)
+        except ValueError as exc:
+            await ctx.send(f"❌ {exc}")
+            return
 
         # Parse provider flags
         force_claude = "--claude" in args or "--anthropic" in args
@@ -5524,7 +6382,9 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
         ai_label = self._get_ai_label(force_claude, openrouter_model)
         await ctx.send(f"\U0001f916\U0001f19a\U0001f916 Starting autoplay: **Rick Deckard** ({p1}) vs **{ai_label}** ({p2}) \u2014 {game_format}")
         await self._run_single_autoplay(ctx.channel, game_format, deck1_name, deck2_name,
-                                        force_claude=force_claude, openrouter_model=openrouter_model)
+                                        force_claude=force_claude,
+                                        openrouter_model=openrouter_model,
+                                        seed_cards=seed_cards)
 
     @commands.command(name="autoplay-batch")
     async def autoplay_batch(self, ctx, spec: str = "all", start: str = None):
@@ -5987,6 +6847,117 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
         """Get the game for the current thread."""
         return self.engine.games.get(ctx.channel.id)
 
+    async def _reject_eliminated_seat(
+            self, ctx, game: GameState, player_idx: Optional[int]) -> bool:
+        """Keep eliminated players as spectators, never mutation authors."""
+        if (player_idx is None or not 0 <= player_idx < len(game.players)
+                or not game.players[player_idx].eliminated):
+            return False
+        await ctx.send(
+            "Your seat has been eliminated. You can still spectate with "
+            "`!state`, `!board`, `!graveyard`, `!exile`, and `!priority`, "
+            "but you can't change the game state.")
+        return True
+
+    def _bind_deck_to_lobby(self, ctx, deck_data: Dict) -> bool:
+        """Persist a newly loaded !mydeck into this thread's lobby seat."""
+        lobby = self.lobbies.get(ctx.channel.id)
+        if lobby is None or lobby.seat_for_user(ctx.author.id) is None:
+            return False
+        lobby.bind_deck(ctx.author.id, deck_data)
+        self.lobbies.save(lobby)
+        return True
+
+    @staticmethod
+    def _opening_hands_pending(game: GameState) -> bool:
+        """Whether a human multiplayer game is still in London mulligans."""
+        return bool(
+            game.is_multiplayer and game.opening_hands_pending
+            and any(not player.eliminated and not player.has_kept_hand
+                    for player in game.players)
+        )
+
+    async def _reject_during_opening_hands(self, ctx, game: GameState) -> bool:
+        if not self._opening_hands_pending(game):
+            return False
+        waiting = [player.name for player in game.players
+                   if not player.eliminated and not player.has_kept_hand]
+        await ctx.send(
+            "Opening hands are still being chosen. Waiting for: " +
+            ", ".join(waiting) + ". Use `!mulligan` or `!keephand`.")
+        return True
+
+    @staticmethod
+    def _resolve_defending_seat(game: GameState, raw: str) -> Tuple[Optional[int], str]:
+        """Resolve a combat defender from mention, stable seat, or name."""
+        value = raw.strip()
+        mention = re.fullmatch(r"<@!?(\d+)>", value)
+        if mention:
+            user_id = int(mention.group(1))
+            index = game.get_player_index(user_id)
+            if index is None or game.players[index].eliminated:
+                return None, "That Discord user is not a living player."
+            return index, ""
+
+        seat_match = re.fullmatch(r"(?:seat\s*)?#?(\d+)", value, re.IGNORECASE)
+        if seat_match:
+            shown_seat = int(seat_match.group(1)) - 1
+            matches = [index for index, player in enumerate(game.players)
+                       if player.seat_id == shown_seat and not player.eliminated]
+            if len(matches) == 1:
+                return matches[0], ""
+            return None, f"No living player has seat {shown_seat + 1}."
+
+        matches = [index for index, player in enumerate(game.players)
+                   if player.name.casefold() == value.casefold()
+                   and not player.eliminated]
+        if len(matches) == 1:
+            return matches[0], ""
+        if len(matches) > 1:
+            return None, "That name is ambiguous; use a Discord mention or seat number."
+        return None, f"Couldn't find living defender '{value}'."
+
+    @staticmethod
+    def _combat_defender_indices(game: GameState) -> List[int]:
+        defenders = []
+        for attacker_id in game.attackers:
+            found = game.find_card_global(attacker_id)
+            if not found:
+                continue
+            seat = getattr(found[0], "attacking_player", None)
+            if (isinstance(seat, int) and 0 <= seat < len(game.players)
+                    and not game.players[seat].eliminated
+                    and seat not in defenders):
+                defenders.append(seat)
+        return defenders
+
+    async def _finish_defender_blocks(self, ctx, game: GameState,
+                                      player_idx: int) -> None:
+        """Record one defender's submission; resolve only after all submit."""
+        defenders = self._combat_defender_indices(game)
+        if player_idx not in defenders:
+            await ctx.send("No creature is attacking your seat this combat.")
+            return
+        if player_idx in game.combat_defenders_done:
+            await ctx.send("Your blockers are already finalized this combat.")
+            return
+        game.combat_defenders_done.append(player_idx)
+        remaining = [index for index in defenders
+                     if index not in game.combat_defenders_done]
+        if remaining:
+            game.waiting_for_human_blocks = True
+            self.engine.save_game(game)
+            await ctx.send(
+                "Blockers recorded. Waiting for: " +
+                ", ".join(game.players[index].name for index in remaining))
+            return
+
+        game.waiting_for_human_blocks = False
+        if game.stack_enabled:
+            await self.engine._combat_priority_round(
+                game, ctx.send, "after blockers declared")
+        await self._resolve_combat(ctx, game)
+
     # =========================================================================
     # !undo — snapshot stack for risky commands
     # =========================================================================
@@ -6068,6 +7039,17 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
         if not game:
             await ctx.send("No active game in this thread!")
             return
+        player_idx = game.get_player_index(ctx.author.id)
+        if player_idx is None:
+            await ctx.send("You're not in this game!")
+            return
+        if await self._reject_eliminated_seat(ctx, game, player_idx):
+            return
+        if game.pending_choices:
+            await ctx.send(
+                "Finish the pending choice before undoing; its live resolver "
+                "cannot be moved to a different snapshot safely.")
+            return
         stack = getattr(game, '_undo_stack', None)
         if not stack:
             await ctx.send("⏪ Nothing to undo.")
@@ -6091,7 +7073,25 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
         for attr in ('is_autoplay', '_autoplay_thread'):
             if hasattr(game, attr):
                 setattr(restored, attr, getattr(game, attr))
+        restored._rules_engine = self.engine.rules
+        old_priority = getattr(game, '_priority_system', None)
+        if old_priority is not None:
+            old_priority._cancel_pass_timer()
         self.engine.games[ctx.channel.id] = restored
+        if restored.stack_enabled:
+            async def _undo_send(content):
+                await ctx.send(content)
+            self.engine.setup_stack(
+                restored,
+                auto_pass_seconds=8.0,
+                send_func=_undo_send,
+                ai_response_enabled=any(
+                    player.is_claude or player.user_id == 99999
+                    for player in restored.players
+                    if not player.eliminated
+                ),
+            )
+        self.engine.save_game(restored)
         depth_left = len(stack)
         label = snapshot.get("label", "previous action")
         await ctx.send(

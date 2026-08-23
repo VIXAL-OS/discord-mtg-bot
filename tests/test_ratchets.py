@@ -38,7 +38,10 @@ MTG_FILES = sorted((REPO / "mtg").glob("*.py"))
 
 # Baseline June 10, 2026 (after declaring the 14 load-bearing transient
 # fields on Card/Player/GameState, which removed ~55 sites from the census).
-STAPLE_BASELINE = 101
+# Aug 23 sync: +1 for the Q-G/Q-H/Q-I multiplayer slices (lobby,
+# choices, resolution jobs). The private repo carries its own,
+# higher baseline; this one only ever ratchets DOWN from here.
+STAPLE_BASELINE = 102
 
 _STAPLE_RE = re.compile(r"\b(game|player|card)\.(_[a-z0-9_]+)\s*=[^=]")
 

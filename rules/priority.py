@@ -110,6 +110,37 @@ class StackObject:
     trigger_source: Optional[str] = None
     trigger_event: Optional[str] = None
 
+    def to_dict(self) -> Dict[str, Any]:
+        """JSON-safe mirror state for save/undo and reconnect recovery."""
+        return {
+            "id": self.id,
+            "controller": self.controller,
+            "name": self.name,
+            "is_spell": self.is_spell,
+            "targets": list(self.targets),
+            "timestamp": self.timestamp.isoformat(),
+            "trigger_source": self.trigger_source,
+            "trigger_event": self.trigger_event,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'StackObject':
+        timestamp = data.get("timestamp")
+        try:
+            parsed_timestamp = datetime.fromisoformat(timestamp) if timestamp else datetime.now()
+        except (TypeError, ValueError):
+            parsed_timestamp = datetime.now()
+        return cls(
+            id=str(data.get("id", "")),
+            controller=str(data.get("controller", "")),
+            name=str(data.get("name", "Unknown")),
+            is_spell=bool(data.get("is_spell", True)),
+            targets=list(data.get("targets", []) or []),
+            timestamp=parsed_timestamp,
+            trigger_source=data.get("trigger_source"),
+            trigger_event=data.get("trigger_event"),
+        )
+
 
 @dataclass
 class AutoPassConfig:
@@ -120,6 +151,33 @@ class AutoPassConfig:
     until_my_turn: bool = False
     break_on_opponent_action: bool = True
     break_on_targeting_me: bool = True
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "until_phase": self.until_phase.name if self.until_phase else None,
+            "until_stack_empty": self.until_stack_empty,
+            "until_my_turn": self.until_my_turn,
+            "break_on_opponent_action": self.break_on_opponent_action,
+            "break_on_targeting_me": self.break_on_targeting_me,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'AutoPassConfig':
+        phase_name = data.get("until_phase")
+        try:
+            phase = Phase[phase_name] if phase_name else None
+        except KeyError:
+            phase = None
+        return cls(
+            enabled=bool(data.get("enabled", False)),
+            until_phase=phase,
+            until_stack_empty=bool(data.get("until_stack_empty", False)),
+            until_my_turn=bool(data.get("until_my_turn", False)),
+            break_on_opponent_action=bool(
+                data.get("break_on_opponent_action", True)),
+            break_on_targeting_me=bool(data.get("break_on_targeting_me", True)),
+        )
 
 
 class PrioritySystem:
@@ -141,6 +199,8 @@ class PrioritySystem:
         on_stack_resolve: Optional[Callable[[StackObject], Awaitable[None]]] = None,
         on_phase_change: Optional[Callable[[Phase], Awaitable[None]]] = None,
         on_combat_done: Optional[Callable[[], Awaitable[None]]] = None,
+        reconnect_grace_seconds: float = 120.0,
+        display_names: Optional[Dict[str, str]] = None,
     ):
         """
         Initialize priority system.
@@ -154,7 +214,12 @@ class PrioritySystem:
             on_combat_done: Callback when combat priority window completes (all pass on empty stack)
         """
         self.players = players
+        self.display_names = {
+            player: (display_names or {}).get(player, player)
+            for player in players
+        }
         self.auto_pass_seconds = auto_pass_seconds
+        self.reconnect_grace_seconds = reconnect_grace_seconds
 
         # Callbacks
         self._on_priority_change = on_priority_change
@@ -177,7 +242,14 @@ class PrioritySystem:
 
         # Auto-pass timer
         self._pass_timer: Optional[asyncio.Task] = None
+        self._pass_deadline: Optional[datetime] = None
+        self._timer_player: Optional[str] = None
         self._holds: Set[str] = set()  # Players who said "hold"
+
+        # Discord presence is deliberately separate from game liveness. A
+        # disconnected seat remains in the APNAP ring and receives a bounded
+        # reconnect grace period before silence becomes a pass.
+        self._connected: Dict[str, bool] = {p: True for p in players}
 
         # Auto-pass configs per player (F6 mode)
         self._auto_pass_configs: Dict[str, AutoPassConfig] = {
@@ -190,6 +262,12 @@ class PrioritySystem:
 
         # Lock for state modifications
         self._lock = asyncio.Lock()
+
+    def display_name(self, player: Optional[str]) -> str:
+        """Presentation label for a stable internal player identifier."""
+        if player is None:
+            return "none"
+        return self.display_names.get(player, player)
     
     # =========================================================================
     # Public API
@@ -210,7 +288,9 @@ class PrioritySystem:
             if player != self.priority_holder:
                 return {
                     "success": False,
-                    "message": f"It's not your priority. {self.priority_holder} has priority.",
+                    "message": ("It's not your priority. "
+                                f"{self.display_name(self.priority_holder)} "
+                                "has priority."),
                     "priority_holder": self.priority_holder,
                     "stack_size": len(self.stack)
                 }
@@ -298,26 +378,160 @@ class PrioritySystem:
     
     def get_state(self) -> Dict[str, Any]:
         """Get current priority state for display."""
+        stack = []
+        for obj in reversed(self.stack):
+            payload = obj.to_dict()
+            payload["controller_id"] = payload.get("controller")
+            payload["controller"] = self.display_name(payload.get("controller"))
+            stack.append(payload)
         return {
-            "active_player": self.active_player,
-            "priority_holder": self.priority_holder,
+            "active_player": self.display_name(self.active_player),
+            "active_player_id": self.active_player,
+            "priority_holder": (self.display_name(self.priority_holder)
+                                if self.priority_holder else None),
+            "priority_holder_id": self.priority_holder,
             "phase": self.phase.name,
             "turn": self.turn_number,
-            "stack": [
-                {
-                    "id": obj.id,
-                    "name": obj.name,
-                    "controller": obj.controller,
-                    "is_spell": obj.is_spell,
-                    "targets": obj.targets
-                }
-                for obj in reversed(self.stack)  # Top of stack first
-            ],
-            "waiting_for": self.priority_holder,
+            "stack": stack,
+            "waiting_for": (self.display_name(self.priority_holder)
+                            if self.priority_holder else None),
+            "passes_in_succession": list(self._passes_in_succession),
+            "connected": {
+                self.display_name(player): connected
+                for player, connected in self._connected.items()
+            },
+            "deadline": (self._pass_deadline.isoformat()
+                         if self._pass_deadline else None),
             "auto_pass_active": {
                 p: self._auto_pass_configs[p].enabled 
                 for p in self.players
             }
+        }
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Persist the exact priority window without asyncio runtime objects."""
+        return {
+            "version": 2,
+            "players": list(self.players),
+            "active_player": self.active_player,
+            "priority_holder": self.priority_holder,
+            "phase": self.phase.name,
+            "turn_number": self.turn_number,
+            "stack": [obj.to_dict() for obj in self.stack],
+            "stack_id_counter": self._stack_id_counter,
+            "passes_in_succession": list(self._passes_in_succession),
+            "holds": sorted(self._holds),
+            "auto_pass_configs": {
+                player: config.to_dict()
+                for player, config in self._auto_pass_configs.items()
+            },
+            "connected": dict(self._connected),
+            "combat_window": self.combat_window,
+            "pass_deadline": (self._pass_deadline.isoformat()
+                              if self._pass_deadline else None),
+            "display_names": dict(self.display_names),
+        }
+
+    def restore_state(self, data: Optional[Dict[str, Any]],
+                      living_players: Optional[List[str]] = None) -> None:
+        """Restore a saved priority window while retaining live callbacks."""
+        if not data:
+            return
+        allowed = list(
+            living_players if living_players is not None else self.players)
+        saved_players = [p for p in data.get("players", []) if p in allowed]
+        self.players = saved_players + [p for p in allowed if p not in saved_players]
+        saved_display_names = data.get("display_names", {})
+        self.display_names = {
+            player: saved_display_names.get(
+                player, self.display_names.get(player, player))
+            for player in self.players
+        }
+        if not self.players:
+            self.priority_holder = None
+            self.stack = []
+            return
+
+        active = data.get("active_player")
+        holder = data.get("priority_holder")
+        self.active_player = active if active in self.players else self.players[0]
+        self.priority_holder = holder if holder in self.players else self.active_player
+        try:
+            self.phase = Phase[str(data.get("phase", "MAIN1"))]
+        except KeyError:
+            self.phase = Phase.MAIN1
+        self.turn_number = int(data.get("turn_number", 1))
+        self.stack = [
+            StackObject.from_dict(item) for item in data.get("stack", [])
+            if isinstance(item, dict)
+        ]
+        self._stack_id_counter = max(
+            int(data.get("stack_id_counter", 0)),
+            max((int(obj.id.rsplit("_", 1)[-1])
+                 for obj in self.stack
+                 if obj.id.rsplit("_", 1)[-1].isdigit()), default=0),
+        )
+        self._passes_in_succession = [
+            p for p in data.get("passes_in_succession", []) if p in self.players
+        ]
+        self._holds = {p for p in data.get("holds", []) if p in self.players}
+        saved_configs = data.get("auto_pass_configs", {})
+        self._auto_pass_configs = {
+            p: AutoPassConfig.from_dict(saved_configs.get(p, {}))
+            for p in self.players
+        }
+        saved_connected = data.get("connected", {})
+        self._connected = {
+            p: bool(saved_connected.get(p, True)) for p in self.players
+        }
+        self.combat_window = bool(data.get("combat_window", False))
+        deadline = data.get("pass_deadline")
+        try:
+            self._pass_deadline = datetime.fromisoformat(deadline) if deadline else None
+        except (TypeError, ValueError):
+            self._pass_deadline = None
+        self._timer_player = self.priority_holder if self._pass_deadline else None
+
+    async def resume(self) -> Dict[str, Any]:
+        """Re-issue the current window and restart its remaining timer."""
+        if not self.priority_holder:
+            return self.get_state()
+        if self._pass_deadline:
+            remaining = max(
+                0.0, (self._pass_deadline - datetime.now()).total_seconds())
+            self._start_pass_timer(seconds=remaining)
+        else:
+            self._start_pass_timer()
+        await self._notify_priority_change()
+        return self.get_state()
+
+    def mark_disconnected(self, player: str) -> Dict[str, Any]:
+        """Keep a seat live while granting a bounded reconnect window."""
+        if player not in self.players:
+            return {"success": False, "message": "Unknown priority seat."}
+        self._connected[player] = False
+        if self.priority_holder == player:
+            self._start_pass_timer(seconds=self.reconnect_grace_seconds)
+        return {
+            "success": True,
+            "message": (f"{self.display_name(player)} disconnected; "
+                        "reconnect grace started."),
+            "deadline": (self._pass_deadline.isoformat()
+                         if self._pass_deadline else None),
+        }
+
+    async def mark_reconnected(self, player: str) -> Dict[str, Any]:
+        """Rebind a seat to the live window without changing APNAP order."""
+        if player not in self.players:
+            return {"success": False, "message": "Unknown priority seat."}
+        self._connected[player] = True
+        if self.priority_holder == player:
+            self._start_pass_timer()
+            await self._notify_priority_change()
+        return {
+            "success": True,
+            "message": f"{self.display_name(player)} reconnected.",
+            "state": self.get_state(),
         }
     
     # =========================================================================
@@ -615,32 +829,57 @@ class PrioritySystem:
     # Auto-Pass Timer
     # =========================================================================
     
-    def _start_pass_timer(self):
+    def _start_pass_timer(self, seconds: Optional[float] = None):
         """Start the auto-pass countdown timer."""
-        if self.auto_pass_seconds <= 0:
+        if seconds is None:
+            delay = (
+                self.reconnect_grace_seconds
+                if self.priority_holder
+                and not self._connected.get(self.priority_holder, True)
+                else self.auto_pass_seconds
+            )
+        else:
+            delay = max(0.0, seconds)
+        if seconds is None and delay <= 0:
+            self._pass_deadline = None
+            self._timer_player = None
             return
         
         if self.priority_holder in self._holds:
             return  # Player requested hold
         
         self._cancel_pass_timer()
-        self._pass_timer = asyncio.create_task(self._pass_timer_countdown())
+        holder = self.priority_holder
+        if holder is None:
+            return
+        self._timer_player = holder
+        self._pass_deadline = datetime.now() + timedelta(seconds=delay)
+        self._pass_timer = asyncio.create_task(
+            self._pass_timer_countdown(holder, delay))
     
     def _cancel_pass_timer(self):
         """Cancel the auto-pass timer."""
-        if self._pass_timer:
-            self._pass_timer.cancel()
-            self._pass_timer = None
-    
-    async def _pass_timer_countdown(self):
+        timer = self._pass_timer
+        self._pass_timer = None
+        try:
+            current = asyncio.current_task()
+        except RuntimeError:
+            current = None
+        if timer and timer is not current:
+            timer.cancel()
+        self._pass_deadline = None
+        self._timer_player = None
+
+    async def _pass_timer_countdown(self, player: str, delay: float):
         """Countdown for auto-pass."""
         try:
-            await asyncio.sleep(self.auto_pass_seconds)
+            await asyncio.sleep(delay)
             
             # Time's up - auto-pass if still this player's priority
-            if self.priority_holder and self.priority_holder not in self._holds:
+            if (self.priority_holder == player
+                    and player not in self._holds):
                 await self.player_action(
-                    self.priority_holder, 
+                    player,
                     PriorityAction.pass_priority()
                 )
         except asyncio.CancelledError:

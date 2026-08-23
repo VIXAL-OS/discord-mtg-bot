@@ -374,7 +374,7 @@ def build_sba_state(game, rules_engine=None):
                 getattr(player, 'attempted_draw_from_empty', False)
                 or player.name in getattr(game, '_library_loss', set())
             ),
-            has_lost=False,
+            has_lost=bool(getattr(player, 'eliminated', False)),
         )
         sba_state.library[str(i)] = len(player.library)
 

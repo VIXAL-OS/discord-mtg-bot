@@ -136,6 +136,30 @@ def _format_destroyed_list(names: List[str], max_chars: int = 350) -> str:
     return ", ".join(out_parts) + suffix
 
 
+def _headless_library_card_value(card: Card, player: Player) -> float:
+    """Stable, cheap value heuristic for mandatory headless card choices.
+
+    This is decision policy, not a rules shortcut: the real card objects still
+    move through the exact printed zones. It stands in for the opponent/player
+    choices on Fact or Fiction and Dig Through Time during autoplay.
+    """
+    try:
+        mana_value = float(getattr(card, 'cmc', 0) or 0)
+    except (TypeError, ValueError):
+        mana_value = 0.0
+    type_line = (getattr(card, 'type_line', '') or '').lower()
+    if 'land' in type_line:
+        land_count = sum(1 for permanent in player.battlefield
+                         if permanent.is_land())
+        return 5.0 if land_count < 4 else 0.5
+    value = mana_value
+    if 'planeswalker' in type_line:
+        value += 2.0
+    elif 'creature' in type_line:
+        value += 1.0
+    return value
+
+
 def _snapshot_copy_source(card) -> None:
     """Save the printed object before a battlefield copy effect mutates it."""
     if card._pre_copy_snapshot is not None:
@@ -239,23 +263,33 @@ def _fire_noncast_battlefield_entry(rules, game: GameState,
             except ImportError:
                 pass
             else:
-                opponent = next((p for p in game.players if p is not player), player)
-                ctx = build_game_context(game, player, opponent, card=card)
-                actions, explanation = get_effect_library().resolve_etb(
-                    card_name=card.name,
-                    oracle_text='\n'.join(etb_paragraphs),
-                    controller=player.name,
-                    opponent=opponent.name,
-                    game_context=ctx,
-                )
-                if actions is not None:
-                    for generated_action in actions:
-                        if generated_action.get('action') == 'no_action':
-                            continue
-                        msg = rules._execute_action_on_state(game, generated_action)
-                        if msg:
-                            messages.append(msg)
-                    print(f"[NONCAST-ETB-TEMPLATE] Resolved {card.name}: {explanation}")
+                # Aug 14 live FFA follow-up: eliminated players intentionally
+                # remain in ``game.players`` so stable seat IDs survive. A
+                # Genesis Wave Inferno Titan picked dead seat 0 here and its
+                # mandatory damage vanished. Use the shared living-opponent
+                # policy; with no opponent, fail closed instead of retargeting
+                # the controller or an eliminated seat.
+                opponent = game.default_opponent_for(player)
+                if opponent is None:
+                    print(f"[NONCAST-ETB-TEMPLATE] {card.name}: no living "
+                          "opponent for automated target")
+                else:
+                    ctx = build_game_context(game, player, opponent, card=card)
+                    actions, explanation = get_effect_library().resolve_etb(
+                        card_name=card.name,
+                        oracle_text='\n'.join(etb_paragraphs),
+                        controller=player.name,
+                        opponent=opponent.name,
+                        game_context=ctx,
+                    )
+                    if actions is not None:
+                        for generated_action in actions:
+                            if generated_action.get('action') == 'no_action':
+                                continue
+                            msg = rules._execute_action_on_state(game, generated_action)
+                            if msg:
+                                messages.append(msg)
+                        print(f"[NONCAST-ETB-TEMPLATE] Resolved {card.name}: {explanation}")
 
     # The engine helper covers Soul Warden-style creature-enter watchers and
     # the remaining hardcoded ETB observers (Warstorm Surge, Guardian Project).
@@ -462,6 +496,43 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
             action["_source_controller"] = src_ctx[1]
 
     action_type = action.get("action", "")
+    _id_target_player = None
+    _id_player = None
+
+    # Q-E: deterministic multiplayer action references.  Exact IDs win over
+    # display names and fail closed if the referenced seat/object is stale.
+    # Normalizing here gives every Tier 1.5/2/3 action handler the contract
+    # without duplicating four-seat lookup logic across the action vocabulary.
+    if action.get('target_player_id') is not None:
+        target_player = game.get_player_by_stable_id(
+            action.get('target_player_id'), living_only=True)
+        if target_player is None:
+            print(f"[CHOICE-STALE] target player seat "
+                  f"{action.get('target_player_id')} is no longer legal")
+            return None
+        _id_target_player = target_player
+        action['target_player'] = target_player.name
+    if action.get('player_id') is not None:
+        referenced_player = game.get_player_by_stable_id(
+            action.get('player_id'), living_only=True)
+        if referenced_player is None:
+            print(f"[CHOICE-STALE] player seat {action.get('player_id')} "
+                  "is no longer legal")
+            return None
+        _id_player = referenced_player
+        action['player'] = referenced_player.name
+    if action.get('target_card_id') is not None:
+        found_target = game.find_battlefield_card_by_id(
+            action.get('target_card_id'), living_only=True)
+        if found_target is None:
+            print(f"[CHOICE-STALE] battlefield card "
+                  f"{action.get('target_card_id')} is no longer legal")
+            return None
+        target_card, target_owner = found_target
+        action.setdefault('target_card', target_card.name)
+        action.setdefault('card', target_card.name)
+        action.setdefault('card_id', target_card.id)
+        action.setdefault('target_controller', target_owner.name)
 
     # Helper: is this player under Teferi's Protection-style life lock?
     # Set by prevent_all_damage(lock_life_total=True); expires on the
@@ -479,21 +550,60 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
     def find_player(name: str) -> Optional[Player]:
         if not name:
             return None
+        if (_id_target_player is not None
+                and name == action.get('target_player')):
+            return _id_target_player
+        if _id_player is not None and name == action.get('player'):
+            return _id_player
         name_lower = name.lower()
         for p in game.players:
-            if p.name.lower() == name_lower:
+            if not p.eliminated and p.name.lower() == name_lower:
                 return p
         # Fuzzy match
         for p in game.players:
-            if name_lower in p.name.lower():
+            if not p.eliminated and name_lower in p.name.lower():
                 return p
         return None
+
+    # Multiplayer selector fan-out.  Template/Tier-3 actions may describe a
+    # single state mutation, while Oracle says "each opponent".  Expanding at
+    # the shared interpreter is both cheaper and safer than teaching every
+    # damage/life/discard handler about N players independently.
+    _each_opponent_values = {'each opponent', 'all opponents', 'opponents'}
+    _fanout_keys = [
+        key for key in ('target_player', 'player')
+        if str(action.get(key, '')).strip().lower() in _each_opponent_values
+    ]
+    if _fanout_keys and not action.get('_multiplayer_fanout_done'):
+        controller_name = (
+            action.get('_source_controller')
+            or action.get('controller')
+            or (getattr(game, '_current_resolution_source', None) or (None, None))[1]
+        )
+        controller = find_player(str(controller_name or '')) or game.active_player
+        messages = []
+        for opponent in game.opponents_of(controller):
+            expanded = dict(action)
+            expanded['_multiplayer_fanout_done'] = True
+            for key in _fanout_keys:
+                expanded[key] = opponent.name
+            message = execute_action_on_state(rules, game, expanded)
+            if message:
+                messages.append(message)
+        return "\n".join(messages) if messages else None
     
     # Helper: find card on battlefield
     def find_card_on_battlefield(card_name: str, controller: str = None,
                                  card_id: str = None) -> Optional[Tuple[Card, Player]]:
         if not card_name and not card_id:
             return None
+        # An explicit object ID is global and authoritative.  Resolve it
+        # before the display-name controller filter, whose names need not be
+        # unique in a headless fixture or future external client.
+        if card_id:
+            found = game.find_battlefield_card_by_id(
+                card_id, living_only=True)
+            return found
         name_lower = card_name.lower()
         search_players = game.players
         if controller:
@@ -511,8 +621,6 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
             for c in p.battlefield:
                 if getattr(c, '_phased_out', False):
                     continue
-                if card_id and c.id == card_id:
-                    return c, p
                 cn = c.name.lower()
                 is_tok = getattr(c, 'is_token', False)
                 if cn == name_lower:
@@ -611,7 +719,10 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
             player = find_player(action["target_player"])
             if player:
                 # [TARGETING] Check player hexproof (Leyline of Sanctity, etc.)
-                if HAS_TARGETING and action.get("_source_card_name") and action.get("_source_controller"):
+                if (HAS_TARGETING
+                        and not action.get("_non_targeting", False)
+                        and action.get("_source_card_name")
+                        and action.get("_source_controller")):
                     legal, reason = _validate_player_target_for_action(
                         game, player, action["_source_card_name"], action["_source_controller"])
                     if not legal:
@@ -661,18 +772,30 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
 
         # Damage to creature/planeswalker
         if "target_card" in action:
-            result = find_card_on_battlefield(action["target_card"], action.get("target_controller"))
+            result = find_card_on_battlefield(
+                action["target_card"], action.get("target_controller"),
+                action.get("target_card_id"))
             if result:
                 card, owner = result
                 # [TARGETING] Check hexproof/protection/shroud before dealing damage
-                if HAS_TARGETING and action.get("_source_card_name") and action.get("_source_controller"):
+                if (HAS_TARGETING
+                        and not action.get("_non_targeting", False)
+                        and action.get("_source_card_name")
+                        and action.get("_source_controller")):
                     legal, reason = _validate_target_for_action(
                         game, card, owner, action["_source_card_name"], action["_source_controller"])
                     if not legal:
                         print(f"[TARGETING] Damage to creature blocked: {card.name} — {reason}")
                         return f"🛡️ Damage to **{card.name}** blocked ({reason})"
+                # Aug 23 cube-FFA audit: attribute the source, matching the
+                # player branch above. Inferno Titan's ETB printed a bare
+                # "3 damage to Emmara" with no hint of what dealt it.
+                _src = (source_name or action.get("_source_card_name", "") or "")
                 if card.is_planeswalker():
                     card.loyalty_counters = max(0, getattr(card, 'loyalty_counters', 0) - amount)
+                    if _src:
+                        return (f"🔥 **{_src}** deals {amount} damage to "
+                                f"**{card.name}** (loyalty: {card.loyalty_counters})")
                     return f"💥 {amount} damage to **{card.name}** (loyalty: {card.loyalty_counters})"
                 else:
                     card.damage_marked = getattr(card, 'damage_marked', 0) + amount
@@ -690,7 +813,9 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                                          if p is not owner), None))
                     _dt_msgs = scan_damaged_creature(
                         rules, game, card, amount, _dt_ctrl)
-                    _dmg_line = f"💥 {amount} damage to **{card.name}**"
+                    _dmg_line = (
+                        f"🔥 **{_src}** deals {amount} damage to **{card.name}**"
+                        if _src else f"💥 {amount} damage to **{card.name}**")
                     if _dt_msgs:
                         _dmg_line += "\n" + "\n".join(_dt_msgs)
                     return _dmg_line
@@ -704,6 +829,62 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
         target_name = action.get("target_card") or action.get("target_player") or "unknown"
         print(f"[DAMAGE] target not found: target={target_name!r}, action={action}")
         return None
+
+    elif action_type == "damage_each_opponent_board":
+        # Goblin Chainwhirler-class effects are one simultaneous, non-targeting
+        # damage event: each living opponent plus every creature and
+        # planeswalker they control.  The old fixed JSON template emitted only
+        # one player-damage action, so a live 1/1 Akroan Crusader survived.
+        # Re-enter the shared damage handler for replacement/prevention,
+        # damage-trigger, loyalty, and narration behavior.  No SBA runs inside
+        # this handler, so every marked object is still processed as one batch
+        # when the enclosing effect finishes.
+        amount = int(action.get("amount", 0) or 0)
+        controller = find_player(
+            action.get("controller", "")
+            or action.get("_source_controller", ""))
+        if amount <= 0 or controller is None:
+            return None
+
+        source_name = (action.get("source", "")
+                       or action.get("_source_card_name", "")
+                       or "spell/ability")
+        messages = []
+        for opponent in game.opponents_of(controller):
+            # Snapshot first: all of this damage is simultaneous even though
+            # the action interpreter applies the individual mutations in a
+            # deterministic order.
+            permanents = [
+                permanent for permanent in list(opponent.battlefield)
+                if (permanent.is_creature(game)
+                    or permanent.is_planeswalker())
+            ]
+            player_message = execute_action_on_state(rules, game, {
+                "action": "deal_damage",
+                "amount": amount,
+                "target_player": opponent.name,
+                "source": source_name,
+                "_source_card_name": source_name,
+                "_source_controller": controller.name,
+                "_non_targeting": True,
+            })
+            if player_message:
+                messages.append(player_message)
+            for permanent in permanents:
+                permanent_message = execute_action_on_state(rules, game, {
+                    "action": "deal_damage",
+                    "amount": amount,
+                    "target_card": permanent.name,
+                    "target_card_id": permanent.id,
+                    "target_controller": opponent.name,
+                    "source": source_name,
+                    "_source_card_name": source_name,
+                    "_source_controller": controller.name,
+                    "_non_targeting": True,
+                })
+                if permanent_message:
+                    messages.append(permanent_message)
+        return "\n".join(messages) if messages else None
     
     # ---- GAIN/LOSE LIFE ----
     elif action_type == "gain_life":
@@ -765,21 +946,32 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
 
     elif action_type == "extort_drain":
         controller = find_player(action.get("player", ""))
-        opponent = find_player(action.get("opponent", ""))
         amount = int(action.get("amount", 1))
-        if not controller or not opponent or amount <= 0:
+        opponent_selector = str(action.get("opponent", ""))
+        if not controller or amount <= 0:
             return None
-        before = opponent.life
-        loss_msg = execute_action_on_state(rules, game, {
-            "action": "lose_life", "player": opponent.name,
-            "amount": amount, "source": action.get("source", "Extort")})
-        actual_lost = max(0, before - opponent.life)
+        if opponent_selector.strip().lower() in _each_opponent_values:
+            opponents = game.opponents_of(controller)
+        else:
+            opponent = find_player(opponent_selector)
+            opponents = [opponent] if opponent else []
+        loss_messages = []
+        actual_lost = 0
+        for opponent in opponents:
+            before = opponent.life
+            loss_msg = execute_action_on_state(rules, game, {
+                "action": "lose_life", "player": opponent.name,
+                "amount": amount,
+                "source": action.get("source", "Extort")})
+            actual_lost += max(0, before - opponent.life)
+            if loss_msg:
+                loss_messages.append(loss_msg)
         gain_msg = None
         if actual_lost:
             gain_msg = execute_action_on_state(rules, game, {
                 "action": "gain_life", "player": controller.name,
                 "amount": actual_lost, "source": action.get("source", "Extort")})
-        return "\n".join(msg for msg in (loss_msg, gain_msg) if msg)
+        return "\n".join(loss_messages + ([gain_msg] if gain_msg else []))
 
     # ---- LOSE THE GAME ----
     # Pact of Negation, Phage the Untouchable, Door to Nothingness, etc.
@@ -794,6 +986,11 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
             # pact deaths displayed "Final life: 0" for a player at 26).
             player._final_life_before_loss = player.life
             player.life = 0
+            if game.is_multiplayer:
+                messages = game.eliminate_player(
+                    game.players.index(player), reason)
+                rules.log_event(f"{player.name} loses the game ({reason})")
+                return "\n".join(messages)
             game.ended = True
             try:
                 game.winner = 1 - game.players.index(player)
@@ -822,6 +1019,11 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                 return f"💰 **{player.name}** pays {cost} for {source}"
             player._final_life_before_loss = player.life
             player.life = 0
+            if game.is_multiplayer:
+                messages = game.eliminate_player(
+                    game.players.index(player), reason)
+                rules.log_event(f"{player.name} loses the game ({reason})")
+                return "\n".join(messages)
             game.ended = True
             try:
                 game.winner = 1 - game.players.index(player)
@@ -1573,6 +1775,86 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
         if chosen:
             return f"👁️ {player.name} reveals {chosen.name} and puts it into their hand"
         return f"👁️ {player.name} finds no {card_type} among the top {len(top_n)} cards"
+
+    elif action_type == "select_cards_from_top":
+        # Dig Through Time family: inspect exactly the top N objects, put the
+        # chosen number into hand, and put every unchosen object on the bottom.
+        # Keeping this atomic avoids duplicate-name lookups moving the wrong
+        # copy and prevents draw replacement effects from touching "put into
+        # hand" instructions.
+        player = find_player(action.get("player", ""))
+        try:
+            amount = max(0, int(action.get("amount", 1) or 0))
+            choose_count = max(0, int(action.get("choose_count", 1) or 0))
+        except (TypeError, ValueError):
+            return None
+        if not player or amount <= 0 or not player.library:
+            return None
+        revealed = list(player.library[:amount])
+        del player.library[:len(revealed)]
+        ranked = sorted(
+            enumerate(revealed),
+            key=lambda pair: (
+                _headless_library_card_value(pair[1], player),
+                -pair[0],
+            ),
+            reverse=True,
+        )
+        chosen_ids = {id(card) for _, card in ranked[:choose_count]}
+        chosen = [card for card in revealed if id(card) in chosen_ids]
+        rest = [card for card in revealed if id(card) not in chosen_ids]
+        player.hand.extend(chosen)
+        # "In any order" permits the original reveal order as the deterministic
+        # headless choice. The cards go after the pre-existing library.
+        player.library.extend(rest)
+        chosen_names = ", ".join(card.name for card in chosen) or "none"
+        return (f"🔎 {player.name} looks at {len(revealed)} card(s), puts "
+                f"{chosen_names} into hand, and puts {len(rest)} on the bottom")
+
+    elif action_type == "fact_or_fiction":
+        # Reveal the actual top five, let the named opponent's deterministic
+        # policy split them into two nonempty piles, then let the controller's
+        # policy choose the more valuable pile. This preserves the full zone
+        # semantics; the prior fixed draw-3/mill-2 shortcut did not model
+        # either player's choice and could select entirely different cards.
+        player = find_player(action.get("player", ""))
+        opponent = find_player(action.get("opponent", ""))
+        if not player or not player.library:
+            return None
+        revealed = list(player.library[:5])
+        del player.library[:len(revealed)]
+        if len(revealed) == 1:
+            pile_a, pile_b = revealed, []
+        else:
+            pile_a, pile_b = [], []
+            score_a = score_b = 0.0
+            # A reasonable adversarial split: distribute high-value cards to
+            # keep the two pile values as even as possible.
+            for card in sorted(
+                    revealed,
+                    key=lambda c: (_headless_library_card_value(c, player),
+                                   c.name),
+                    reverse=True):
+                value = _headless_library_card_value(card, player)
+                if score_a <= score_b:
+                    pile_a.append(card)
+                    score_a += value
+                else:
+                    pile_b.append(card)
+                    score_b += value
+        value_a = sum(_headless_library_card_value(c, player) for c in pile_a)
+        value_b = sum(_headless_library_card_value(c, player) for c in pile_b)
+        if (value_b, len(pile_b)) > (value_a, len(pile_a)):
+            chosen, rejected = pile_b, pile_a
+        else:
+            chosen, rejected = pile_a, pile_b
+        player.hand.extend(chosen)
+        player.graveyard.extend(rejected)
+        chooser = opponent.name if opponent is not None else "an opponent"
+        chosen_names = ", ".join(card.name for card in chosen) or "empty pile"
+        return (f"🗂️ {chooser} separates {len(revealed)} card(s); "
+                f"{player.name} chooses {chosen_names} "
+                f"({len(rejected)} card(s) to graveyard)")
 
     elif action_type == "manifest_top":
         # CR 701.34: move actual cards from the top of the library onto the
@@ -2345,6 +2627,30 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
         print(f"[EQUIP-ACTION] {equip_card.name} attached to {target_creature.name}")
         return f"⚔️ **{equip_card.name}** equipped to **{target_creature.name}**"
 
+    # ---- COMBAT RESTRICTIONS ----
+    elif action_type == "cant_block_this_turn":
+        result = find_card_on_battlefield(
+            action.get("target_card", ""), action.get("target_controller"),
+            action.get("target_card_id"))
+        if not result:
+            return None
+        card, owner = result
+        if not card.is_creature(game):
+            return None
+        # Recheck target legality at resolution.  The template chooses a legal
+        # object when the trigger is created, but shroud/protection can change
+        # before resolution (CR 608.2b).
+        if (HAS_TARGETING and action.get("_source_card_name")
+                and action.get("_source_controller")):
+            legal, reason = _validate_target_for_action(
+                game, card, owner, action["_source_card_name"],
+                action["_source_controller"])
+            if not legal:
+                print(f"[TARGETING] Can't-block effect fizzles: {card.name} — {reason}")
+                return f"🛡️ **{card.name}** can't be targeted ({reason})"
+        card.cant_block_this_turn = True
+        return f"🚫 **{card.name}** can't block this turn"
+
     # ---- TAP/UNTAP ----
     elif action_type == "tap":
         # Bulk variant: tap a category of an opponent's permanents (Icebreaker
@@ -2715,6 +3021,11 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                 from mtg.triggers import fire_counters_a_spell_triggers
                 _loot = fire_counters_a_spell_triggers(
                     game, action.get("_source_controller"))
+                # The target spell's suspended cast coroutine later owns the
+                # zone move.  Record that this resolving effect already queued
+                # the user-visible counter announcement so that coroutine does
+                # not narrate the same event a second time.
+                target._counter_narration_queued = True
                 _base = f"🚫 **{t_name}** on the stack is countered!"
                 return _base + ("\n" + "\n".join(_loot) if _loot else "")
             else:
@@ -2776,6 +3087,7 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
             from mtg.triggers import fire_counters_a_spell_triggers
             _loot = fire_counters_a_spell_triggers(
                 game, action.get("_source_controller"))
+            target._counter_narration_queued = True
             _base = f"🚫 **{t_name}** is countered! (controller couldn't pay {pay_cost})"
             return _base + ("\n" + "\n".join(_loot) if _loot else "")
         return None
@@ -2792,6 +3104,7 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                     break
             if target_entry:
                 target_entry.countered = True
+                target_entry._counter_narration_queued = True
                 source_name = getattr(target_entry, 'trigger_source', None)
                 trigger_text = getattr(target_entry, 'trigger_text', '')
                 ability_desc = source_name or trigger_text[:60] or "ability"
@@ -2825,6 +3138,7 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                             return (f"🚫 Counter ability fizzles — target "
                                     f"spell is not legendary")
                     top.countered = True
+                    top._counter_narration_queued = True
                     target_name = top.card.name if hasattr(top, 'card') and top.card else "spell"
                     from mtg.triggers import fire_counters_a_spell_triggers
                     _loot = fire_counters_a_spell_triggers(
@@ -4536,6 +4850,85 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
               f"queued copy of {chosen.name}")
         return (f"🔥 Capricious Hellraiser exiles {names} and copies "
                 f"**{chosen.name}**")
+
+    elif action_type == "bloodthirsty_adversary_etb":
+        # Aug 14 live cube FFA: Tier 3 claimed the optional {2}{R} payment
+        # without spending mana, selected creature-card Ragavan as an
+        # instant/sorcery, then fabricated a Ragavan token.  Resolve the
+        # printed effect deterministically and queue real spell copies through
+        # the established free-cast funnel.
+        p = find_player(action.get("player", ""))
+        if not p:
+            return None
+        source_id = action.get("source_card_id", "")
+        source = next(
+            (card for card in p.battlefield
+             if ((source_id and card.id == source_id)
+                 or (not source_id
+                     and card.name.lower() == "bloodthirsty adversary"))),
+            None,
+        )
+        if source is None:
+            print("[BLOODTHIRSTY-ADVERSARY] Source is no longer on battlefield")
+            return None
+        eligible = sorted(
+            (
+                card for card in p.graveyard
+                if (card.is_instant() or card.is_sorcery())
+                and int(getattr(card, 'cmc', 0) or 0) <= 3
+            ),
+            key=lambda card: (-int(getattr(card, 'cmc', 0) or 0),
+                              card.name, card.id),
+        )
+        if not eligible:
+            print(f"[BLOODTHIRSTY-ADVERSARY] {p.name}: no legal MV<=3 "
+                  "instant/sorcery in graveyard")
+            return (f"🩸 {source.name}: no legal instant or sorcery "
+                    "card to copy")
+
+        chosen = []
+        for candidate in eligible:
+            try:
+                can_pay, _reason = p.can_pay_mana_cost('{2}{R}')
+            except (TypeError, ValueError):
+                can_pay = False
+            if not can_pay or not p.tap_sources_for_cost('{2}{R}'):
+                break
+            chosen.append(candidate)
+
+        if not chosen:
+            print(f"[BLOODTHIRSTY-ADVERSARY] {p.name}: declined/cannot pay "
+                  "{2}{R}")
+            return f"🩸 {source.name}: {p.name} does not pay {{2}}{{R}}"
+
+        import copy as _copy
+        import uuid as _uuid
+        source.counters['+1/+1'] = source.counters.get('+1/+1', 0) + len(chosen)
+        for original in chosen:
+            p.graveyard.remove(original)
+            p.exile.append(original)
+            spell_copy = _copy.deepcopy(original)
+            spell_copy.id = f"spellcopy_{_uuid.uuid4().hex[:10]}"
+            spell_copy.owner_index = game.players.index(p)
+            spell_copy._is_spell_copy = True
+            spell_copy._is_copy = True
+            spell_copy._copy_of = original.name
+            spell_copy.is_token = False
+            spell_copy._spell_resolved = False
+            game._free_cast_pending.append({
+                "card": spell_copy,
+                "owner_index": game.players.index(p),
+                "from_zone": "generated",
+                "fallback_zone": "cease",
+                "source": "Bloodthirsty Adversary",
+                "is_copy": True,
+            })
+        names = ", ".join(card.name for card in chosen)
+        print(f"[BLOODTHIRSTY-ADVERSARY] {p.name} paid {len(chosen)}x; "
+              f"exiled/copied {names}")
+        return (f"🩸 {source.name}: {p.name} pays {{2}}{{R}} "
+                f"{len(chosen)} time(s), gets {len(chosen)} +1/+1 counter(s), "
+                f"and copies **{names}**")
     elif action_type == "schedule_death_trigger":
         # Register a "if this creature dies this turn" watcher (Searing Blood, etc.)
         if not hasattr(game, '_death_watchers'):
@@ -5422,6 +5815,7 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
 
             found_names = []
             entry_msgs = []
+            positioned_cards = []
             for chosen_card in chosen:
                 p.library.remove(chosen_card)
                 if to_zone == "battlefield":
@@ -5445,11 +5839,30 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                     events.emit(events.PERMANENT_ENTERED, game, card=chosen_card,
                                 controller=p, via="search_library", rules=rules)
                     try:
-                        entry_msgs.extend(
-                            _fire_noncast_battlefield_entry(rules, game, p, chosen_card))
+                        # Lands use the dedicated entry funnel: it owns
+                        # landfall accounting, land-specific ETBs, and all
+                        # "whenever a land enters" watchers. Sending a
+                        # searched land through the generic permanent funnel
+                        # skipped all of those (notably Primeval Titan's two
+                        # fetched lands). Nonlands retain the established
+                        # noncast-entry path.
+                        if chosen_card.is_land():
+                            engine = getattr(rules, 'engine_ref', None)
+                            if engine is not None:
+                                entry_msgs.extend(
+                                    engine._handle_land_etb(game, p, chosen_card))
+                        else:
+                            entry_msgs.extend(
+                                _fire_noncast_battlefield_entry(
+                                    rules, game, p, chosen_card))
                     except Exception as e:
                         maybe_reraise(e)
                         print(f"[SEARCH-LIBRARY] entry triggers failed for {chosen_card.name}: {e}")
+                elif to_zone == "library_position":
+                    # Long-Term Plans: the library must be shuffled before
+                    # the found card is inserted third from the top. Defer the
+                    # insertion until after the common shuffle below.
+                    positioned_cards.append(chosen_card)
                 elif to_zone == "library_top":
                     p.library.insert(0, chosen_card)
                 elif to_zone == "graveyard":
@@ -5468,6 +5881,16 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
             if do_shuffle and to_zone != "library_top":
                 _rng.shuffle(p.library)
 
+            if positioned_cards:
+                try:
+                    requested_position = max(
+                        1, int(action.get("position", 1) or 1))
+                except (TypeError, ValueError):
+                    requested_position = 1
+                insert_at = min(len(p.library), requested_position - 1)
+                for offset, positioned_card in enumerate(positioned_cards):
+                    p.library.insert(insert_at + offset, positioned_card)
+
             names_str = ", ".join(f"**{n}**" for n in found_names)
             if to_zone == "battlefield":
                 base = (f"🔍 {p.name} searches library and puts {names_str} "
@@ -5477,6 +5900,10 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                 return base
             if to_zone == "library_top":
                 return f"🔍 {p.name} searches library and places {names_str} on top"
+            if to_zone == "library_position":
+                ordinal = action.get("position", 1)
+                return (f"🔍 {p.name} searches library, shuffles, and places "
+                        f"{names_str} at position {ordinal} from the top")
             return f"🔍 {p.name} searches library and finds {names_str}"
         return None
 
@@ -5615,9 +6042,13 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
         fallback = action.get("fallback")  # "discard" for Plaguecrafter
         opponents_only = action.get("opponents_only", False)
         source = action.get("source", "edict effect")
+        source_controller = find_player(
+            action.get('_source_controller', '')) or game.active_player
         msgs = []
         for p in game.players:
-            if opponents_only and p == game.active_player:
+            if p.eliminated:
+                continue
+            if opponents_only and p is source_controller:
                 continue
             candidates = [c for c in p.creatures() if not getattr(c, 'is_commander', False)]
             if "planeswalker" in types:

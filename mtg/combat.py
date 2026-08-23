@@ -121,7 +121,12 @@ def drain_combat_damage_triggers(rules, game: GameState,
     # lost, no further game actions occur.
     combat_damage_dealt = getattr(game, '_combat_damage_to_player', [])
     if combat_damage_dealt and HAS_EFFECT_TEMPLATES and not game.ended:
-        for attacker, attacker_owner, damage_amount in combat_damage_dealt:
+        for entry in combat_damage_dealt:
+            attacker, attacker_owner, damage_amount = entry[:3]
+            damaged_player = (entry[3] if len(entry) > 3 else
+                              game.default_opponent_for(attacker_owner))
+            if damaged_player is None:
+                continue
             # Slice 5b (July 31, 2026): the old name-gated Ohran Frostfang
             # block generalized to the whole battlefield-watcher family —
             # "Whenever a [qualifier] creature(s)/[subtype(s)] you control
@@ -181,8 +186,7 @@ def drain_combat_damage_triggers(rules, game: GameState,
                         not in _att.oracle_text.lower()):
                     continue
                 try:
-                    _opp_idx = 1 - game.players.index(attacker_owner)
-                    _opp = game.players[_opp_idx]
+                    _opp = damaged_player
                     _ctx = build_game_context(game, attacker_owner, _opp,
                                               card=_att,
                                               attacking_creature=attacker)
@@ -274,8 +278,7 @@ def drain_combat_damage_triggers(rules, game: GameState,
                     for para in oracle_lower.split('\n') for s in para.split('.')):
                 continue
             try:
-                opp_idx = 1 - game.players.index(attacker_owner)
-                opp = game.players[opp_idx]
+                opp = damaged_player
                 ctx = build_game_context(game, attacker_owner, opp,
                                          card=attacker, attacking_creature=attacker)
                 ctx['damage_dealt'] = damage_amount
@@ -348,11 +351,11 @@ def drain_combat_damage_triggers(rules, game: GameState,
                      if any(c.id == getattr(source_card, 'id', None)
                             for c in p.battlefield)),
                     None)
-                if _src_owner is None and _damaged_owner is not None:
-                    # The source died mid-combat (FS trades) — in 2-player
-                    # combat the dealer's controller is the other player.
-                    _src_owner = next(p for p in game.players
-                                      if p is not _damaged_owner)
+                if _src_owner is None:
+                    _owner_index = getattr(source_card, 'owner_index', None)
+                    if (isinstance(_owner_index, int)
+                            and 0 <= _owner_index < len(game.players)):
+                        _src_owner = game.players[_owner_index]
             messages.extend(scan_damaged_creature(
                 rules, game, damaged, dmg_amount, _src_owner))
         game._combat_damage_to_creature = []
@@ -364,7 +367,9 @@ def resolve_combat_damage(rules, game: GameState) -> List[str]:
     Returns list of messages describing what happened.
     """
     messages = []
-    lifelink_healing = {0: 0, 1: 0}  # player_index -> life to gain
+    lifelink_healing = {
+        index: 0 for index in range(len(game.players))
+    }  # player_index -> life to gain
 
     # Aug 11 audit (reviewer D, F5): "whenever this creature blocks" had no
     # scan anywhere. Fired here — the one choke point every combat flows
@@ -1179,53 +1184,57 @@ def apply_noncombat_damage_to_player(rules, game: GameState, player: 'PlayerStat
     return amount
 
 
-def make_replacement_callback(rules, game: GameState, channel=None):
-    """Create an async callback for player choice when multiple replacement effects compete.
-
-    Returns a coroutine that:
-    1. Sets game.pending_action with type 'choose_replacement'
-    2. Sends a choice prompt to the Discord channel (if provided)
-    3. Awaits the player's !replacement command via asyncio.Future
-    4. Returns the chosen ReplacementEffect
-
-    Used as choose_callback for ReplacementEngine.process_event() (async path).
-    """
-    import asyncio
+def make_replacement_callback(rules, game: GameState, channel=None,
+                              private_send=None, timeout_seconds: float = 120.0):
+    """Return a private, durable CR 616 replacement-order chooser."""
 
     async def callback(chooser: str, effects):
-        # Create a future to wait for the player's choice
-        loop = asyncio.get_event_loop()
-        future = loop.create_future()
+        player_idx = next(
+            (i for i, player in enumerate(game.players)
+             if chooser and player.name.lower() == chooser.lower()),
+            None,
+        )
+        if player_idx is None:
+            # Never hand an unknown affected player's choice to seat zero.
+            return sorted(effects, key=lambda effect: effect.timestamp)[0]
 
-        # Determine which player is choosing
-        player_idx = 0
-        for i, p in enumerate(game.players):
-            if p.name.lower() == chooser.lower():
-                player_idx = i
-                break
+        from mtg.choices import create_choice, format_choice_prompt, wait_for_choice
+        record = create_choice(
+            game,
+            choice_type="replacement_order",
+            chooser_indices=[player_idx],
+            options_by_player=[
+                {
+                    "label": (
+                        f"{effect.source_name}: "
+                        f"{getattr(effect, 'description', None) or effect.condition_text or effect.replacement_type}"
+                    ),
+                    "value": effect.id,
+                    "payload": effect,
+                }
+                for effect in effects
+            ],
+            private=True,
+            timeout_seconds=timeout_seconds,
+            metadata={"chooser": chooser},
+        )
+        chooser_id = game.players[player_idx].seat_id
+        prompt = format_choice_prompt(record, chooser_id)
 
-        # Build the choice list
-        effect_descs = []
-        for i, eff in enumerate(effects):
-            effect_descs.append(f"  `{i}` - {eff.source_name}: {eff.description}")
-
-        game.pending_action = {
-            'type': 'choose_replacement',
-            'player_idx': player_idx,
-            'effects': effects,
-            'future': future,
-        }
-
-        # Send prompt if channel is available
+        delivered = False
+        if private_send:
+            await private_send(player_idx, prompt)
+            delivered = True
         if channel:
-            lines = [f"⚡ **Multiple replacement effects can apply.** {chooser}, choose one:"]
-            lines.extend(effect_descs)
-            lines.append(f"\n*Reply with `!replacement <number>` to select*")
-            await channel.send("\n".join(lines))
+            # The shared thread gets status, never private option text. If no
+            # Discord-specific private sender was provided, !choice performs
+            # the DM retry through the cog.
+            await channel.send(
+                f"🔒 **{chooser}** has a private replacement-order choice. "
+                + ("Check your DMs." if delivered
+                   else "Use `!choice` to retry the private prompt."))
 
-        # Wait for player choice
-        chosen_effect = await future
-        return chosen_effect
+        return await wait_for_choice(game, record['choice_id'])
 
     return callback
 
@@ -1238,9 +1247,7 @@ def deal_combat_damage(rules, game: GameState, attackers: List[Tuple[Card, Playe
     deal damage (used in regular step when all attackers already dealt FS damage).
     """
     messages = []
-    lifelink_healing = {0: 0, 1: 0}
-    defending_player_idx = 1 - game.active_player_index
-    defending_player = game.players[defending_player_idx]
+    lifelink_healing = {index: 0 for index in range(len(game.players))}
 
     # May 25 audit (F19): build a name-disambiguation table for this combat
     # resolution so "Thassa, Deep-Dwelling deals 6 damage to Thassa, Deep-Dwelling"
@@ -1292,9 +1299,24 @@ def deal_combat_damage(rules, game: GameState, attackers: List[Tuple[Card, Playe
             print(f"[COMBAT-DAMAGE] Skipping {attacker.name} — no longer on battlefield (died in first-strike step)")
             continue
 
+        # A multiplayer defender can leave between the first-strike and
+        # regular damage steps. regular_attackers is a pre-first-strike
+        # snapshot, so consult the live combat list again. eliminate_player
+        # removes attackers assigned to a departed seat; they do not get to
+        # retarget their regular damage to another living opponent.
+        if attacker.id not in game.attackers:
+            print(f"[COMBAT-DAMAGE] Skipping {attacker.name} - removed from combat")
+            continue
+
         if getattr(attacker, '_phased_out', False):
             print(f"[COMBAT-DAMAGE] Skipping {attacker.name} - phased out")
             continue
+
+        defending_player = game.defender_for(attacker)
+        if defending_player is None:
+            print(f"[COMBAT] Skipping {attacker.name}: no living defender")
+            continue
+        defending_player_idx = game.players.index(defending_player)
 
         # Use get_effective_power which includes base, counters, modifiers,
         # equipment, CDA resolution, and anthem/continuous effects
@@ -1314,13 +1336,24 @@ def deal_combat_damage(rules, game: GameState, attackers: List[Tuple[Card, Playe
         # A phased-out or departed blocker deals/receives no damage, but the
         # attacking creature remains blocked (CR 509.1h). Keep that historical
         # fact separate from the active damage-assignment list.
-        was_blocked = bool(blocker_ids)
+        was_blocked = False
         active_blocker_ids = []
         for blocker_id in blocker_ids:
             result = game.find_card_global(blocker_id)
             if not result:
+                # A token blocker can cease to exist before damage; the
+                # attacker remains blocked even though the object is gone.
+                was_blocked = True
                 continue
             blocker, _blocker_owner, zone = result
+            if _blocker_owner is not defending_player:
+                print(
+                    f"[COMBAT] Rejecting {blocker.name} as blocker for "
+                    f"{attacker.name}: controlled by {_blocker_owner.name}, "
+                    f"defender is {defending_player.name}"
+                )
+                continue
+            was_blocked = True
             if zone != Zone.BATTLEFIELD or getattr(blocker, '_phased_out', False):
                 print(f"[COMBAT-DAMAGE] Skipping blocker {blocker.name} - inactive")
                 continue
@@ -1367,7 +1400,7 @@ def deal_combat_damage(rules, game: GameState, attackers: List[Tuple[Card, Playe
                 messages.append(f"🛡️ {attacker.name}'s damage to {defending_player.name} was prevented")
 
             if attacker.has_lifelink(game=game) and actual_damage > 0:
-                owner_idx = game.active_player_index
+                owner_idx = game.players.index(attacker_owner)
                 lifelink_healing[owner_idx] += actual_damage
                 print(f"[LIFELINK] {attacker.name} unblocked → {game.players[owner_idx].name} queued +{actual_damage}")
         
@@ -1574,12 +1607,12 @@ def deal_combat_damage(rules, game: GameState, attackers: List[Tuple[Card, Playe
                         messages.append(f"🛡️ {_dispname(blocker)} deals {actual_blocker_dmg} damage to {_dispname(attacker)}")
 
                     if blocker.has_lifelink(game=game) and actual_blocker_dmg > 0:
-                        blocker_owner_idx = 1 - game.active_player_index
+                        blocker_owner_idx = game.players.index(blocker_owner)
                         lifelink_healing[blocker_owner_idx] += actual_blocker_dmg
                         print(f"[LIFELINK] {blocker.name} blocking → {game.players[blocker_owner_idx].name} queued +{actual_blocker_dmg}")
 
                 if attacker.has_lifelink(game=game) and actual_dmg > 0:
-                    owner_idx = game.active_player_index
+                    owner_idx = game.players.index(attacker_owner)
                     lifelink_healing[owner_idx] += actual_dmg
                     print(f"[LIFELINK] {attacker.name} → blocker → {game.players[owner_idx].name} queued +{actual_dmg}")
 
@@ -1618,7 +1651,7 @@ def deal_combat_damage(rules, game: GameState, attackers: List[Tuple[Card, Playe
                 else:
                     messages.append(f"🛡️ {attacker.name}'s trample damage to {defending_player.name} was prevented")
                 if attacker.has_lifelink(game=game) and actual_trample > 0:
-                    owner_idx = game.active_player_index
+                    owner_idx = game.players.index(attacker_owner)
                     lifelink_healing[owner_idx] += actual_trample
                     print(f"[LIFELINK] {attacker.name} trample → {game.players[owner_idx].name} queued +{actual_trample}")
 

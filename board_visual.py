@@ -59,6 +59,29 @@ COLOR_DIVIDER = (80, 80, 90)  # Divider lines
 CACHE_DIR = Path(__file__).parent / "data" / "card_cache"
 
 
+def _player_area_layout(
+        player_heights: List[int], divider_height: int = 30
+) -> Tuple[Dict[int, int], List[int], int]:
+    """Lay out every stable seat once, with seat 0 at the bottom.
+
+    The original renderer calculated only ``p2_base_y`` and ``p1_base_y``;
+    indices 2 and 3 were consequently painted directly over seat 1.  A pure
+    layout helper makes the N-seat invariant cheap to pin without fetching
+    card images in tests.
+    """
+    base_by_index: Dict[int, int] = {}
+    divider_starts: List[int] = []
+    cursor = 0
+    visual_order = list(reversed(range(len(player_heights))))
+    for visual_position, player_index in enumerate(visual_order):
+        base_by_index[player_index] = cursor
+        cursor += player_heights[player_index]
+        if visual_position < len(visual_order) - 1:
+            divider_starts.append(cursor)
+            cursor += divider_height
+    return base_by_index, divider_starts, cursor
+
+
 # =============================================================================
 # CARD IMAGE FETCHER
 # =============================================================================
@@ -410,38 +433,23 @@ class BoardRenderer:
             player_heights.append(h)
             player_layouts.append((land_layout, perm_layout))
 
-        divider_height = 30  # Space for turn info divider
-        total_height = sum(player_heights) + divider_height
+        divider_height = 30  # Space between adjacent player areas
+        player_base_y, divider_starts, total_height = _player_area_layout(
+            player_heights, divider_height)
 
         # Create board image with dynamic height
         board = Image.new('RGB', (BOARD_WIDTH, total_height), COLOR_BG)
         draw = ImageDraw.Draw(board)
 
-        # --- Layout: Player 2 (top), divider, Player 1 (bottom) ---
-        # Player ordering: index 1 is top (opponent), index 0 is bottom (active player's perspective)
-        # We render top player first, then bottom player
-
-        # Player 2 (top) starts at y=0
-        p2_base_y = 0
-        p2_height = player_heights[1] if len(game.players) > 1 else 0
-        # Divider at p2_base_y + p2_height
-        divider_y = p2_base_y + p2_height
-        # Player 1 (bottom) starts after divider
-        p1_base_y = divider_y + divider_height
-
         for player_idx, player in enumerate(game.players):
             land_layout, perm_layout = player_layouts[player_idx]
-
-            if player_idx == 0:
-                base_y = p1_base_y
-                player_height = player_heights[0]
-            else:
-                base_y = p2_base_y
-                player_height = player_heights[1]
+            base_y = player_base_y[player_idx]
+            player_height = player_heights[player_idx]
 
             # Background for this player's area
             is_active = player_idx == game.active_player_index
-            bg_color = COLOR_PLAYER1_BG if player_idx == 0 else COLOR_PLAYER2_BG
+            bg_color = (COLOR_PLAYER1_BG if player_idx % 2 == 0
+                        else COLOR_PLAYER2_BG)
             draw.rectangle(
                 [0, base_y, MAIN_AREA_WIDTH, base_y + player_height - 1],
                 fill=bg_color
@@ -469,6 +477,8 @@ class BoardRenderer:
 
             # Player info bar with color emoji
             name_prefix = "> " if is_active else ""
+            if getattr(player, 'eliminated', False):
+                name_prefix += "[OUT] "
             name_text = f"{name_prefix}{player.name}"
             has_poison = player.poison > 0
 
@@ -608,9 +618,15 @@ class BoardRenderer:
                                  fill=COLOR_TEXT, font=font_small)
                         suspend_y += 15
 
-        # --- Center divider with turn info ---
-        center_y = divider_y + divider_height // 2
-        draw.line([(0, center_y), (MAIN_AREA_WIDTH, center_y)], fill=COLOR_DIVIDER, width=2)
+        # --- Dividers and turn info ---
+        divider_centers = [
+            start + divider_height // 2 for start in divider_starts
+        ]
+        for center in divider_centers:
+            draw.line([(0, center), (MAIN_AREA_WIDTH, center)],
+                      fill=COLOR_DIVIDER, width=2)
+        center_y = (divider_centers[len(divider_centers) // 2]
+                    if divider_centers else total_height // 2)
 
         # Turn and phase info
         phase_name = game.phase.value.replace("_", " ").title()

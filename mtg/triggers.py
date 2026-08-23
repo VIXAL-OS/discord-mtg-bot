@@ -541,8 +541,12 @@ def _check_creature_etb_triggers_sync(engine, game: GameState, entering_player: 
                 and entering_creature.is_creature(game)
                 and 'dragon' in (entering_creature.type_line or '').lower()
             )
+            _is_risen_reef_trigger = (
+                card.name.lower() == "risen reef"
+                and 'elemental' in (entering_creature.type_line or '').lower()
+            )
             has_creature_enters = (
-                _is_scourge_dragon_trigger or
+                _is_scourge_dragon_trigger or _is_risen_reef_trigger or
                 # Aug 9 audit (A-2): the old bare-substring literals
                 # ("whenever a creature" in oracle AND "enters" in oracle)
                 # matched ACROSS sentences — Species Specialist ("As this
@@ -565,6 +569,11 @@ def _check_creature_etb_triggers_sync(engine, game: GameState, entering_player: 
             # Skip the entering creature itself UNLESS the trigger says "or another"
             # (e.g. Gruul Ragebeast: "Whenever Gruul Ragebeast or another creature enters")
             if card.id == entering_creature.id:
+                # Its own entrance is already resolved by the entering
+                # permanent's name-keyed template. This watcher branch is for
+                # later Elementals; collecting the Reef here would double it.
+                if _is_risen_reef_trigger:
+                    continue
                 # Only allow engine-trigger if oracle says "[Name] or another"
                 if "or another" not in oracle_lower:
                     continue
@@ -573,10 +582,27 @@ def _check_creature_etb_triggers_sync(engine, game: GameState, entering_player: 
             # fires when the entering creature is controlled by the trigger's controller.
             # Covers: "another creature you control enters", "a creature enters the
             # battlefield under your control" (Aura Shards), etc.
+            # Qualify the actual enters-trigger sentence, not the card's
+            # entire Oracle text.  Selvala's separate mana ability says
+            # "creatures you control"; the old whole-card scan therefore
+            # misread her global "another creature enters" trigger as a
+            # controller-only trigger and skipped opposing entrants in FFA.
+            enters_trigger_text = next(
+                (
+                    sentence.strip()
+                    for sentence in re.split(r'(?<=[.!?])\s+|\n+', oracle_lower)
+                    if re.search(
+                        r'whenever (?:a|another)\b[^.]*?\bcreature\b'
+                        r'[^.]*?\benters\b', sentence)
+                ),
+                oracle_lower,
+            )
             trigger_requires_your_control = (
-                "another creature you control" in oracle_lower or
-                "under your control" in oracle_lower or
-                ("you control" in oracle_lower and "creature" in oracle_lower and "enters" in oracle_lower)
+                "another creature you control" in enters_trigger_text or
+                "under your control" in enters_trigger_text or
+                ("you control" in enters_trigger_text
+                 and "creature" in enters_trigger_text
+                 and "enters" in enters_trigger_text)
             )
             if trigger_requires_your_control and _ci != entering_player_idx:
                 continue
@@ -604,8 +630,12 @@ def _check_creature_etb_triggers_sync(engine, game: GameState, entering_player: 
     # of this function reverses it. The stack-placement branch (Phase 3)
     # keeps the AP-first order since `_place_triggers_on_stack` already
     # respects CR APNAP stack-placement semantics.
-    _ai = game.active_player_index
-    _etb_collected.sort(key=lambda t: (0 if t[2] == _ai else 1, t[2]))
+    _apnap_rank = {
+        player_index: position
+        for position, player_index in enumerate(game.apnap_player_indices())
+    }
+    _etb_collected.sort(
+        key=lambda t: _apnap_rank.get(t[2], len(_apnap_rank)))
     # May 17 audit: tag was previously a bare "[ETB-APNAP]" which auditors
     # confused with non-ETB events that share this code path. Be explicit
     # about it being the creature-enters trigger scan and name the entering
@@ -653,7 +683,9 @@ def _check_creature_etb_triggers_sync(engine, game: GameState, entering_player: 
         if getattr(game, 'ended', False):
             break
         oracle_lower = card.oracle_text.lower()
-        opponent = game.players[1 - _ctrl_idx]
+        opponent = game.default_opponent_for(_ctrl_player)
+        if opponent is None:
+            continue
         player_idx = _ctrl_idx
 
         handled = False
@@ -706,39 +738,64 @@ def _check_creature_etb_triggers_sync(engine, game: GameState, entering_player: 
             dmg_match = re.search(r'deals\s+(\d+)\s+damage', oracle_lower)
             if dmg_match:
                 dmg = int(dmg_match.group(1))
-                actual_dmg = engine.rules._apply_noncombat_damage_to_player(game, opponent, dmg, card.name)
-                messages.append(f"🔥 {card.name} deals {actual_dmg} damage to {opponent.name}!")
+                out = engine.rules._execute_action_on_state(game, {
+                    "action": "deal_damage",
+                    "amount": dmg,
+                    "target_player": "each opponent",
+                    "source": card.name,
+                    "_source_card_name": card.name,
+                    "_source_controller": _ctrl_player.name,
+                    "_source_oracle": card.oracle_text or "",
+                })
+                if out:
+                    messages.append(out)
 
-                if actual_dmg > 0 and opponent.life <= 0:
+                # Preserve the legacy immediate 1v1 terminal line. FFA loss
+                # is handled by the shared SBA/elimination pass so one victim
+                # never ends the whole multiplayer game.
+                if not game.is_multiplayer and opponent.life <= 0:
                     game.ended = True
                     game.winner = player_idx
                     messages.append(f"💀 {opponent.name} loses the game!")
                 handled = True
         
-        # Selvala, Heart of the Wilds: draw only if entering creature has greatest power
+        # Selvala, Heart of the Wilds: the entering creature's controller may
+        # draw only when its power is greater than EVERY other creature's
+        # power.  "Other" means other than the entrant — it does not exclude
+        # Selvala, and the comparison is global, not controller-only.
         elif "selvala" in card.name.lower() and "power is greater than" in oracle_lower:
             try:
                 enter_power = entering_creature.get_effective_power(game) if hasattr(entering_creature, 'get_effective_power') else 0
             except (ValueError, TypeError):
                 enter_power = 0
-            # Check if entering creature's power > each other creature you control
+            # Aug 14 live FFA follow-up: the old scan skipped Selvala and only
+            # inspected her controller's battlefield.  It granted illegal
+            # draws for Eternal Witness (2 tied Selvala and was below an
+            # opposing 3) and Capricious Hellraiser (4 below opposing
+            # Stonehoof Chieftain's 8).
             is_greatest = True
-            for other in _ctrl_player.battlefield:
-                if other.id == entering_creature.id or not other.is_creature():
+            for battlefield_player in game.players:
+                if getattr(battlefield_player, 'eliminated', False):
                     continue
-                if other.id == card.id:
-                    continue  # Don't compare to Selvala herself
-                try:
-                    other_power = other.get_effective_power(game) if hasattr(other, 'get_effective_power') else 0
-                except (ValueError, TypeError):
-                    other_power = 0
-                if other_power >= enter_power:
-                    is_greatest = False
+                for other in battlefield_player.battlefield:
+                    if (other.id == entering_creature.id
+                            or not other.is_creature(game)
+                            or getattr(other, '_phased_out', False)):
+                        continue
+                    try:
+                        other_power = other.get_effective_power(game)
+                    except (ValueError, TypeError, AttributeError):
+                        other_power = int(getattr(other, 'power', 0) or 0)
+                    if other_power >= enter_power:
+                        is_greatest = False
+                        break
+                if not is_greatest:
                     break
             if is_greatest and enter_power > 0:
-                drawn_cards = engine.draw_cards(_ctrl_player, 1, game=game)
+                drawn_cards = engine.draw_cards(entering_player, 1, game=game)
                 if drawn_cards:
-                    messages.append(f"🃏 {card.name} — {_ctrl_player.name} draws a card")
+                    messages.append(
+                        f"🃏 {card.name} — {entering_player.name} draws a card")
             handled = True
 
         # Soul of the Harvest / Beast Whisperer / Garruk's Packleader / Garruk's Uprising: draw a card
@@ -800,7 +857,9 @@ def _check_creature_etb_triggers_sync(engine, game: GameState, entering_player: 
             trigger_text = ""
             for paragraph in card.oracle_text.split('\n'):
                 p_lower = paragraph.lower().strip()
-                if "whenever" in p_lower and "creature" in p_lower and "enters" in p_lower:
+                if ("whenever" in p_lower and "enters" in p_lower
+                        and ("creature" in p_lower
+                             or card.name.lower() == "risen reef")):
                     trigger_text = paragraph.strip()
                     break
             
@@ -1133,7 +1192,12 @@ _SUSPEND_REMINDER_RE = re.compile(
 
 def has_battlefield_upkeep_trigger(oracle_text: str) -> bool:
     """Whether a permanent ON THE BATTLEFIELD has an upkeep trigger."""
-    lowered = (oracle_text or "").lower()
+    # Quoted abilities granted by an activated ability belong to the target,
+    # not the source permanent. Obsidian Fireheart's activated line contains
+    # a quoted upkeep ability for the marked land and previously made
+    # Fireheart itself emit a fabricated upkeep trigger.
+    from rules.effect_templates import strip_activated_ability_lines
+    lowered = strip_activated_ability_lines(oracle_text or "").lower()
     if "upkeep" not in lowered:
         return False
     scan = _SUSPEND_REMINDER_RE.sub(' ', lowered)
@@ -1352,8 +1416,7 @@ async def _check_cast_triggers(engine, game: GameState, caster: Player, card: Ca
             # Try hardcoded handlers first for known patterns
             handled = False
             caster_idx = game.players.index(caster) if caster in game.players else 0
-            opponent_idx = 1 - caster_idx
-            opponent = game.players[opponent_idx]
+            opponent = game.default_opponent_for(caster)
 
             # "target opponent exiles the top N cards of their library.
             #  You may put any number of land cards ... onto the battlefield"
@@ -1537,8 +1600,7 @@ async def _check_cast_triggers(engine, game: GameState, caster: Player, card: Ca
                             # module-level import and causes UnboundLocalError later in this function)
                             lib = get_effect_library()
                             etb_text = found_card.oracle_text
-                            opponent = (game.players[1 - game.players.index(caster)]
-                                        if len(game.players) > 1 else caster)
+                            opponent = game.default_opponent_for(caster) or caster
                             cascade_ctx = build_game_context(
                                 game, caster, opponent, card=found_card,
                                 entering_creature=found_card, entering_player=caster)
@@ -1601,8 +1663,7 @@ async def _check_cast_triggers(engine, game: GameState, caster: Player, card: Ca
                         try:
                             lib = get_effect_library()
                             etb_text = found_card.oracle_text
-                            opponent = (game.players[1 - game.players.index(caster)]
-                                        if len(game.players) > 1 else caster)
+                            opponent = game.default_opponent_for(caster) or caster
                             cascade_ctx = build_game_context(
                                 game, caster, opponent, card=found_card,
                                 entering_player=caster)
@@ -1646,8 +1707,7 @@ async def _check_cast_triggers(engine, game: GameState, caster: Player, card: Ca
                             # Use module-level get_effect_library (don't re-import locally — shadows the
                             # module-level import and causes UnboundLocalError later in this function)
                             lib = get_effect_library()
-                            opp_idx = 1 - game.players.index(caster) if caster in game.players else 1
-                            opponent = game.players[opp_idx] if 0 <= opp_idx < len(game.players) else None
+                            opponent = game.default_opponent_for(caster)
                             opponent_name = opponent.name if opponent else "Opponent"
                             # Apr 30 audit: build the FULL game context (not a stub) so
                             # discard-target / damage-target / opponent_hand templates can
@@ -2050,16 +2110,38 @@ async def _check_cast_triggers(engine, game: GameState, caster: Player, card: Ca
                     dmg_match = re.search(r'deals? (\d+) damage to (?:any target|each opponent|that player)', sentence_lower)
                     if dmg_match:
                         dmg = int(dmg_match.group(1))
-                        caster_idx = game.players.index(caster) if caster in game.players else 0
                         # "that player" = the caster (for Eidolon-style triggers)
                         # "each opponent" = opponent of the trigger's controller
                         if 'that player' in sentence_lower:
                             target_player = caster  # Eidolon damages the caster of the spell
+                            actual = engine.rules._apply_noncombat_damage_to_player(
+                                game, target_player, dmg, bf_card.name)
+                            messages.append(f"⚡ {bf_card.name} deals {actual} damage to "
+                                            f"{target_player.name} (life: {max(0, target_player.life)})")
+                        elif 'each opponent' in sentence_lower:
+                            # Aug 14 cube-FFA audit: this handler bypassed the
+                            # action interpreter's multiplayer fan-out and used
+                            # default_opponent_for(caster), so Guttersnipe hit
+                            # only one of three opponents. Route the Oracle
+                            # selector through the shared interpreter. In a
+                            # two-player game it expands to the same one target.
+                            out = engine.rules._execute_action_on_state(game, {
+                                "action": "deal_damage",
+                                "amount": dmg,
+                                "target_player": "each opponent",
+                                "source": bf_card.name,
+                                "_source_card_name": bf_card.name,
+                                "_source_controller": caster.name,
+                                "_source_oracle": bf_card.oracle_text or "",
+                            })
+                            if out:
+                                messages.append(out)
                         else:
-                            target_player = game.players[1 - caster_idx]
-                        actual = engine.rules._apply_noncombat_damage_to_player(game, target_player, dmg, bf_card.name)
-                        messages.append(f"⚡ {bf_card.name} deals {actual} damage to "
-                                        f"{target_player.name} (life: {max(0, target_player.life)})")
+                            target_player = game.default_opponent_for(caster)
+                            actual = engine.rules._apply_noncombat_damage_to_player(
+                                game, target_player, dmg, bf_card.name)
+                            messages.append(f"⚡ {bf_card.name} deals {actual} damage to "
+                                            f"{target_player.name} (life: {max(0, target_player.life)})")
                         executed_trigger = True
 
 
@@ -2137,7 +2219,7 @@ async def _check_cast_triggers(engine, game: GameState, caster: Player, card: Ca
                 if not executed_trigger and HAS_EFFECT_TEMPLATES:
                     try:
                         caster_idx = game.players.index(caster) if caster in game.players else 0
-                        opponent = game.players[1 - caster_idx]
+                        opponent = game.default_opponent_for(caster)
                         ctx = build_game_context(game, caster, opponent, card=bf_card)
                         # Inject the triggering spell's mana value so templates like
                         # Shark Typhoon can size X/X tokens by the cast spell's MV.
@@ -2415,12 +2497,26 @@ async def _check_cast_triggers(engine, game: GameState, caster: Player, card: Ca
                     dmg_match = re.search(r'deals? (\d+) damage to', sentence_lower)
                     if dmg_match:
                         dmg = int(dmg_match.group(1))
-                        # "that player" = the caster (who triggered Eidolon)
-                        # "each opponent" = the caster (opponent of the controller)
-                        target_player = caster
-                        actual = engine.rules._apply_noncombat_damage_to_player(game, target_player, dmg, bf_card.name)
-                        messages.append(f"⚡ {bf_card.name} deals {actual} damage to "
-                                        f"{target_player.name} (life: {max(0, target_player.life)})")
+                        if 'each opponent' in sentence_lower:
+                            out = engine.rules._execute_action_on_state(game, {
+                                "action": "deal_damage",
+                                "amount": dmg,
+                                "target_player": "each opponent",
+                                "source": bf_card.name,
+                                "_source_card_name": bf_card.name,
+                                "_source_controller": opp_player.name,
+                                "_source_oracle": bf_card.oracle_text or "",
+                            })
+                            if out:
+                                messages.append(out)
+                        else:
+                            # "that player" = the caster who caused the
+                            # opponent-controlled trigger (Eidolon family).
+                            target_player = caster
+                            actual = engine.rules._apply_noncombat_damage_to_player(
+                                game, target_player, dmg, bf_card.name)
+                            messages.append(f"⚡ {bf_card.name} deals {actual} damage to "
+                                            f"{target_player.name} (life: {max(0, target_player.life)})")
                 else:
                     # Generic opponent-cast trigger — try template library first
                     opp_trigger_resolved = False
@@ -2508,7 +2604,7 @@ def _dispatch_creature_entered(engine, game: GameState, controller: Player,
     still_unhandled = []
     if unhandled and engine._xmage_translator:
         ctrl_idx = game.players.index(controller) if controller in game.players else 0
-        opponent = game.players[1 - ctrl_idx]
+        opponent = game.default_opponent_for(controller)
         entering_power = 0
         try:
             entering_power = card.get_effective_power(game) if hasattr(card, 'get_effective_power') else 0
@@ -2680,8 +2776,7 @@ async def _check_creature_etb_triggers(engine, game: GameState, entering_player:
     still_unhandled = []
     if unhandled and engine._xmage_translator:
         player_idx = game.players.index(entering_player) if entering_player in game.players else 0
-        opponent_idx = 1 - player_idx
-        opponent = game.players[opponent_idx]
+        opponent = game.default_opponent_for(entering_player)
 
         # Calculate entering creature's effective power
         entering_power = 0
@@ -2912,8 +3007,7 @@ def _check_dies_triggers_sync(engine, game: GameState, dying_card: Card, dying_p
     messages = []
     unhandled = []
     player_idx = game.players.index(dying_player) if dying_player in game.players else 0
-    opponent_idx = 1 - player_idx
-    opponent = game.players[opponent_idx]
+    opponent = game.default_opponent_for(dying_player)
     trigger_count = 0
     MAX_DIES_TRIGGERS = 20  # Depth guard: prevent Blood Artist infinite loops
     allowed_source_ids = game._dies_source_ids_by_dead_id.get(dying_card.id)
@@ -2979,9 +3073,8 @@ def _check_dies_triggers_sync(engine, game: GameState, dying_card: Card, dying_p
             continue
 
         # Determine who controls this trigger source
-        ctrl_idx = game.players.index(player) if player in game.players else 0
         ctrl = player
-        opp = game.players[1 - ctrl_idx]
+        opp = game.default_opponent_for(ctrl)
 
         # Skip "whenever ANOTHER creature dies" triggers from the dying card
         # (but allow "whenever a creature dies" or engine-referencing triggers like Blood Artist)
@@ -3130,13 +3223,19 @@ def _check_dies_triggers_sync(engine, game: GameState, dying_card: Card, dying_p
 
         # Syr Konrad, the Grim: deal 1 damage to each opponent
         elif card.name.lower() == "syr konrad, the grim":
-            opp.life -= 1
-            opp.record_life_loss(1, game=game)
-            # June 10 audit (V31a): clamp the console print like the Discord
-            # twin below — this was one of the two negative-life leak sites.
-            print(f"[DIES-TRIGGER] Syr Konrad, the Grim: deals 1 damage to {opp.name} (life: {max(0, opp.life)})")
-            _log_life_change(opp, -1, "Syr Konrad, the Grim")  # May 30 audit: canonical tag
-            messages.append(f"💀 Syr Konrad: deals 1 damage to {opp.name} ({max(0, opp.life)} life)")
+            out = engine.rules._execute_action_on_state(game, {
+                "action": "deal_damage",
+                "amount": 1,
+                "target_player": "each opponent",
+                "source": card.name,
+                "_source_card_name": card.name,
+                "_source_controller": ctrl.name,
+                "_source_oracle": card.oracle_text or "",
+            })
+            if out:
+                messages.append(out)
+            print("[DIES-TRIGGER] Syr Konrad, the Grim: dealt 1 damage "
+                  "to each living opponent")
             trigger_count += 1
             handled = True
 
@@ -3540,8 +3639,7 @@ def _check_ltb_triggers_sync(engine, game: GameState, leaving_card: Card, leavin
     if has_ltb:
         print(f"[LTB-TRIGGER] {leaving_card.name}: {ltb_text[:150]}")
         player_idx = game.players.index(leaving_player) if leaving_player in game.players else 0
-        opponent_idx = 1 - player_idx
-        opponent = game.players[opponent_idx]
+        opponent = game.default_opponent_for(leaving_player)
 
         # May 14 audit (L4): reanimation auras (Animate Dead, Dance of the Dead,
         # Necromancy) have their LTB sacrifice handled by the SBA at
@@ -4073,8 +4171,7 @@ def _check_attack_triggers_sync(engine, game: GameState, attacker_card: Card, at
     messages = []
     unhandled = []
     player_idx = game.players.index(attacking_player) if attacking_player in game.players else 0
-    opponent_idx = 1 - player_idx
-    opponent = game.players[opponent_idx]
+    opponent = game.defender_for(attacker_card)
 
     # Calculate attacking creature's power for context
     attacking_power = 0
@@ -4109,8 +4206,43 @@ def _check_attack_triggers_sync(engine, game: GameState, attacker_card: Card, at
 
             handled = False
 
+            # Lightning Runner: deterministic energy + optional extra combat.
+            # The generic Tier-3 combat guard correctly rejects fabricated
+            # combat damage, but this printed attack trigger is fully
+            # modelable. Autoplay pays eight whenever possible because the
+            # untap plus additional combat is strictly beneficial.
+            if attacker_card.name.lower() == "lightning runner":
+                attacking_player.energy = (
+                    int(getattr(attacking_player, 'energy', 0) or 0) + 2)
+                messages.append(
+                    f"⚡ Lightning Runner: {attacking_player.name} gets 2 energy "
+                    f"({attacking_player.energy} total)")
+                if attacking_player.energy >= 8:
+                    attacking_player.energy -= 8
+                    from mtg.helpers import untap_permanent
+                    untapped = []
+                    for creature in list(attacking_player.battlefield):
+                        if (creature.is_creature(game)
+                                and untap_permanent(creature)):
+                            untapped.append((creature, attacking_player))
+                    messages.extend(fire_becomes_untapped_triggers(
+                        game, untapped))
+                    game._additional_combats = (
+                        getattr(game, '_additional_combats', 0) + 1)
+                    messages.append(
+                        f"⚔️ Lightning Runner: pays 8 energy, untaps "
+                        f"{len(untapped)} creature(s), and grants an additional "
+                        f"combat phase ({attacking_player.energy} energy remains)")
+                    print(f"[ATTACK-TEMPLATE] Lightning Runner: paid 8 energy; "
+                          f"untapped {len(untapped)} creature(s); extra combat "
+                          f"#{game._additional_combats}")
+                else:
+                    print(f"[ATTACK-TEMPLATE] Lightning Runner: +2 energy -> "
+                          f"{attacking_player.energy}; cannot pay 8")
+                handled = True
+
             # ---- TIER 1.5: Template library ----
-            if HAS_EFFECT_TEMPLATES:
+            if not handled and HAS_EFFECT_TEMPLATES:
                 trigger_text = self_attack_text
 
                 if trigger_text:
@@ -4383,8 +4515,6 @@ def _check_day_night_and_werewolf_transforms(engine, game: GameState) -> List[st
                         messages.extend(_fire_transforms_into_triggers(
                             engine, game, player, card))
     # Classic werewolf transform triggers (non-daybound)
-    opponent_idx = 1 - game.active_player_index
-    opponent = game.players[opponent_idx]
     # Classic werewolves ask whether NO spells were cast during the previous
     # turn (by anyone), which is the same single turn the day/night check reads
     # — not the sum of two players' own-turn counts from different turns.
@@ -4442,7 +4572,7 @@ def _check_upkeep_triggers_sync(engine, game: GameState) -> Tuple[List[str], Lis
     unhandled = []
     active = game.active_player
     active_idx = game.active_player_index
-    opponent = game.players[1 - active_idx]
+    opponent = game.default_opponent_for(active)
 
     # NOTE (May 20 audit, APNAP-2): the post-batch audit flagged this Phase 1
     # scan as missing NAP's "each player's upkeep" triggers because it walks
@@ -4729,9 +4859,8 @@ def _check_upkeep_triggers_sync(engine, game: GameState) -> Tuple[List[str], Lis
             if "at the beginning of each" not in oracle_lower or "upkeep" not in oracle_lower:
                 continue
 
-            ctrl_idx = game.players.index(player)
             ctrl = player
-            opp = game.players[1 - ctrl_idx]
+            opp = game.default_opponent_for(ctrl)
 
             if HAS_EFFECT_TEMPLATES:
                 trigger_text = ""
@@ -4803,7 +4932,7 @@ def _check_beginning_combat_triggers_sync(engine, game: GameState) -> Tuple[List
     unhandled = []
     active = game.active_player
     active_idx = game.active_player_index
-    opponent = game.players[1 - active_idx]
+    opponent = game.default_opponent_for(active)
     lib = get_effect_library() if HAS_EFFECT_TEMPLATES else None
 
     # Aug 2 batch-14: a few beginning-of-combat triggers function FROM THE
@@ -4885,7 +5014,7 @@ def _check_main_phase_triggers_sync(engine, game: GameState,
     unhandled = []
     active = game.active_player
     active_idx = game.active_player_index
-    opponent = game.players[1 - active_idx]
+    opponent = game.default_opponent_for(active)
     lib = get_effect_library() if HAS_EFFECT_TEMPLATES else None
     want = 'precombat main phase' if precombat else 'postcombat main phase'
     tag = 'MAIN1' if precombat else 'MAIN2'
@@ -4962,7 +5091,7 @@ def _check_end_step_triggers_sync(engine, game: GameState) -> Tuple[List[str], L
     unhandled = []
     active = game.active_player
     active_idx = game.active_player_index
-    opponent = game.players[1 - active_idx]
+    opponent = game.default_opponent_for(active)
 
     # Gisela's conditional paragraph is a deterministic, controller-end-step
     # meld. Resolve it before the generic end-step ladder so Tier 3 can never
@@ -5089,7 +5218,7 @@ def _check_end_step_triggers_sync(engine, game: GameState) -> Tuple[List[str], L
             if trigger_text:
                 try:
                     trigger_ctrl = card_owner
-                    trigger_opp = game.players[1 - game.players.index(trigger_ctrl)] if len(game.players) == 2 else opponent
+                    trigger_opp = game.default_opponent_for(trigger_ctrl)
                     ctx = build_game_context(game, trigger_ctrl, trigger_opp, card=card)
                     ctx['_trigger_source'] = card.name
                     lib = get_effect_library()
@@ -5325,11 +5454,11 @@ def _handle_etb_triggers(engine, game: GameState, player: Player, card: Card) ->
                     power = card.get_effective_power(game)
                     if power > 0:
                         player_idx = game.players.index(player)
-                        opponent = game.players[1 - player_idx]
+                        opponent = game.default_opponent_for(player)
                         actual_dmg = engine.rules._apply_noncombat_damage_to_player(game, opponent, power, "Warstorm Surge")
                         if actual_dmg > 0:
                             messages.append(f"🔥 Warstorm Surge deals {actual_dmg} damage to {opponent.name}!")
-                            if opponent.life <= 0:
+                            if opponent.life <= 0 and not game.is_multiplayer:
                                 game.ended = True
                                 game.winner = player_idx
                                 messages.append(f"💀 {opponent.name} loses the game!")
@@ -5349,7 +5478,7 @@ def _handle_land_etb(engine, game: GameState, player: Player, card: Card) -> Lis
     oracle = card.oracle_text.lower() if card.oracle_text else ""
     card_lower = card.name.lower()
     player_idx = game.players.index(player) if player in game.players else 0
-    opponent = game.players[1 - player_idx]
+    opponent = game.default_opponent_for(player)
 
     # Track landfall count for Omnath and similar multi-landfall cards
     player.landfall_count_this_turn += 1
@@ -5391,14 +5520,16 @@ def _handle_land_etb(engine, game: GameState, player: Player, card: Card) -> Lis
         else:
             messages.append(f"⚰️ Bojuka Bog enters (opponent's graveyard was empty).")
     
-    # Halimar Depths / similar: "look at top 3 cards, put them back in any order".
-    # We don't model library order, so this is effectively a no-op. The previous
-    # message added a "Use !judge to resolve manually" hint that was misleading
-    # (the !judge path also no-ops). Brief informational announcement instead.
+    # Halimar Depths: Player.library is ordered state. Use the shared
+    # deterministic headless reorder policy instead of a success-shaped no-op.
     elif "halimar depths" in card_lower:
-        messages.append(
-            f"🔍 **Halimar Depths** enters (looks at top 3 of library)."
-        )
+        msg = engine.rules._execute_action_on_state(game, {
+            "action": "reorder_library", "player": player.name, "amount": 3,
+        })
+        if msg:
+            messages.append(f"🔍 **Halimar Depths** — {msg}")
+        else:
+            messages.append("🔍 **Halimar Depths** — library is empty")
     
     # Kabira Takedown (MDFC lands don't usually have ETBs but just in case)
     # Radiant Fountain: "gain 2 life"
@@ -5559,11 +5690,37 @@ def _handle_land_etb(engine, game: GameState, player: Player, card: Card) -> Lis
             continue
         perm_oracle = perm.oracle_text.lower()
         
-        # Lotus Cobra: "Whenever a land enters the battlefield under your control, add one mana"
+        # Lotus Cobra: "Whenever a land enters the battlefield under your
+        # control, add one mana of any color."  Pick a deterministic color
+        # needed by cards in hand and put real floating mana in the pool.
         if "lotus cobra" in perm.name.lower() or (
             "whenever a land enters" in perm_oracle and "add" in perm_oracle
         ):
-            messages.append(f"🐍 {perm.name}: Landfall! Add one mana of any color.")
+            color_order = "WUBRG"
+            demand = {color: 0 for color in color_order}
+            for hand_card in player.hand:
+                for color in re.findall(r'\{([WUBRG])\}',
+                                        hand_card.mana_cost or '', re.IGNORECASE):
+                    demand[color.upper()] += 1
+            # Highest outstanding colored demand wins.  Current floating
+            # mana reduces the shortfall; stable WUBRG order breaks ties.
+            chosen_color = max(
+                color_order,
+                key=lambda color: (
+                    max(0, demand[color] - player.mana_pool.get(color, 0)),
+                    demand[color], -color_order.index(color)))
+            if not any(demand.values()):
+                source_colors = [
+                    color for color in color_order
+                    if color in (getattr(perm, 'color_identity', []) or [])
+                    or color in (getattr(perm, 'colors', []) or [])
+                ]
+                chosen_color = source_colors[0] if source_colors else 'G'
+            player.grant_pool_mana(chosen_color, 1, source=perm)
+            messages.append(
+                f"🐍 {perm.name}: Landfall! Adds {{{chosen_color}}}.")
+            print(f"[LANDFALL] {perm.name}: added {{{chosen_color}}} to "
+                  f"{player.name}'s mana pool")
 
         # Quest-counter landfall (Khalni Heart Expedition): "you may put a
         # quest counter on this enchantment" — autoplay always says yes.
@@ -5755,19 +5912,20 @@ def _handle_land_etb(engine, game: GameState, player: Player, card: Card) -> Lis
             "landfall" in perm_oracle and "gain control" in perm_oracle
         ):
             # Steal best opponent creature
-            opp_idx = 1 - player_idx
-            opp = game.players[opp_idx]
+            opp = None
             best_target = None
             best_power = -1
-            for c in opp.battlefield:
-                if c.is_creature() and not getattr(c, '_phased_out', False):
-                    try:
-                        p = c.get_effective_power(game) if hasattr(c, 'get_effective_power') else (int(c.power) if c.power else 0)
-                    except (ValueError, TypeError):
-                        p = 0
-                    if p > best_power:
-                        best_power = p
-                        best_target = c
+            for candidate_owner in game.opponents_of(player):
+                for c in candidate_owner.battlefield:
+                    if c.is_creature() and not getattr(c, '_phased_out', False):
+                        try:
+                            p = c.get_effective_power(game) if hasattr(c, 'get_effective_power') else (int(c.power) if c.power else 0)
+                        except (ValueError, TypeError):
+                            p = 0
+                        if p > best_power:
+                            best_power = p
+                            best_target = c
+                            opp = candidate_owner
             if best_target:
                 game.unregister_static_effects(best_target)
                 opp.battlefield.remove(best_target)
@@ -5781,16 +5939,64 @@ def _handle_land_etb(engine, game: GameState, player: Player, card: Card) -> Lis
             else:
                 messages.append(f"🌊 {perm.name}: Landfall triggers (no creature to steal)")
 
-        # Phylath, World Sculptor: landfall → +1/+1 on Plants (same as Avenger)
+        # Phylath, World Sculptor: landfall → four +1/+1 counters on ONE
+        # target Plant. This is deliberately not the Avenger handler:
+        # Avenger puts one counter on EACH Plant. The old flattened branch
+        # did exactly that, so two live triggers made the sole survivor 2/3
+        # rather than 8/9 in cube FFA game 1537874009453240366.
         elif "phylath" in perm.name.lower() and "plant" in perm_oracle:
-            plant_count = sum(1 for c in player.battlefield
-                            if c.type_line and "plant" in c.type_line.lower())
-            if plant_count > 0:
-                for c in player.battlefield:
-                    if c.type_line and "plant" in c.type_line.lower():
-                        c.counters['+1/+1'] = c.counters.get('+1/+1', 0) + 1
-                messages.append(f"🌱 {perm.name}: Landfall! {plant_count} Plant(s) each get a +1/+1 counter!")
-                print(f"[LANDFALL] {perm.name}: +1/+1 on {plant_count} Plants")
+            legal_plants = []
+            for candidate in player.battlefield:
+                if (not candidate.type_line
+                        or "plant" not in candidate.type_line.lower()
+                        or getattr(candidate, '_phased_out', False)):
+                    continue
+                if HAS_TARGETING:
+                    legal, _reason = _validate_target_for_action(
+                        game, candidate, player, perm, player.name)
+                    if not legal:
+                        continue
+                legal_plants.append(candidate)
+            if legal_plants:
+                # Headless landfall has no interactive trigger-target prompt.
+                # Concentrate on the strongest legal Plant; battlefield order
+                # is the stable tie-break.
+                def _plant_score(candidate):
+                    try:
+                        power = candidate.get_effective_power(game)
+                        toughness = candidate.get_effective_toughness(game)
+                    except (ValueError, TypeError, AttributeError):
+                        power = toughness = 0
+                    return power, toughness
+
+                target = max(legal_plants, key=_plant_score)
+                amount = 4
+                replacement = getattr(game, '_replacement_engine', None)
+                if replacement is not None and getattr(replacement, 'effects', None):
+                    try:
+                        # Other landfall branches import these inside this
+                        # function, making the names function-local in Python.
+                        from rules.replacement import GameEvent, EventType
+                        event = GameEvent(
+                            event_type=EventType.COUNTER_PLACED,
+                            affected_object=target.id,
+                            affected_object_name=target.name,
+                            affected_player=player.name,
+                            amount=amount,
+                            counter_type='+1/+1',
+                            source_name=perm.name,
+                        )
+                        amount = replacement.process_event_sync(event).amount
+                    except (ImportError, ValueError, KeyError, AttributeError, TypeError) as rep_err:
+                        print(f"[LANDFALL] Phylath replacement check failed: {rep_err}")
+                target.counters['+1/+1'] = (
+                    target.counters.get('+1/+1', 0) + amount)
+                game.recalculate_power_toughness()
+                messages.append(
+                    f"🌱 {perm.name}: Landfall! {target.name} gets {amount} "
+                    f"+1/+1 counter(s)!")
+                print(f"[LANDFALL] {perm.name}: +{amount} +1/+1 counters "
+                      f"on {target.name} ({target.id})")
 
         # Scute Swarm: landfall → create token (copy if 6+ lands)
         elif "scute swarm" in perm.name.lower():
@@ -6733,12 +6939,18 @@ def _accumulate_combat_damage_subscriber(game, source=None, target=None,
                     for c in p.battlefield)),
             None)
         if src_owner is None:
-            # Dealer already left the battlefield (FS trades). In 2-player
-            # combat the dealer's controller is the non-target player.
+            owner_index = getattr(source, 'owner_index', None)
+            if (isinstance(owner_index, int)
+                    and 0 <= owner_index < len(game.players)):
+                src_owner = game.players[owner_index]
+        if src_owner is None and len(game.players) == 2:
+            # Backward-compatible two-seat last-known-information fallback
+            # for synthetic/departed objects without an owner stamp.
             src_owner = next((p for p in game.players if p is not target), None)
         if src_owner is None:
             return
-        game._combat_damage_to_player.append((source, src_owner, amount))
+        game._combat_damage_to_player.append(
+            (source, src_owner, amount, target))
     elif target_kind == "creature":
         # Aug 2 batch-14 audit (I-1): resolve the SOURCE's controller at
         # ACCUMULATION time, exactly like the player branch above — at drain

@@ -1557,10 +1557,13 @@ def get_legal_planeswalker_targets(game, player, ability: PlaneswalkerAbility) -
     # Get all potential targets
     all_creatures = []
     all_permanents = []
-    all_players = list(game.players)
+    all_players = [p for p in game.players
+                   if not getattr(p, 'eliminated', False)]
     all_planeswalkers = []
 
     for p in game.players:
+        if getattr(p, 'eliminated', False):
+            continue
         for card in p.battlefield:
             all_permanents.append((card, p))
             if card.is_creature():

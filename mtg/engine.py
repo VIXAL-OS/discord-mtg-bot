@@ -29,6 +29,7 @@ import logging
 import os
 import random
 import re
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -435,16 +436,44 @@ class GameEngine:
                   f"(>{stale_hours}h untouched — likely crashed/aborted sessions)")
     
     def save_game(self, game: GameState):
-        """Save a game to disk."""
+        """Atomically save a game to disk.
+
+        A process death during the old direct ``json.dump(filepath)`` could
+        truncate the only recovery record.  Write, flush, and fsync a unique
+        sibling first; ``os.replace`` then publishes either the complete old
+        snapshot or the complete new one.
+        """
         filepath = os.path.join(self.GAMES_DIR, f"{game.thread_id}.json")
+        os.makedirs(self.GAMES_DIR, exist_ok=True)
+        temp_path = None
         try:
-            with open(filepath, 'w', encoding='utf-8') as f:
+            with tempfile.NamedTemporaryFile(
+                    mode='w', encoding='utf-8', dir=self.GAMES_DIR,
+                    prefix=f".{game.thread_id}.", suffix=".tmp",
+                    delete=False) as f:
+                temp_path = f.name
                 json.dump(game.to_dict(), f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temp_path, filepath)
+            temp_path = None
         except Exception as e:
             print(f"⚠️ Failed to save game {game.thread_id}: {e}")
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
     
-    def delete_game(self, thread_id: int):
-        """Delete a saved game but keep it in ended_games for chat context."""
+    def delete_game(self, thread_id: int, *, preserve_logging: bool = False):
+        """Delete a saved game but keep it in ended_games for chat context.
+
+        ``preserve_logging`` is consumed by the cog's logging wrapper.  The
+        state-only engine deliberately ignores it, but accepting the keyword
+        lets a multi-game container (the cube bracket) retire one GameState
+        without closing the shared thread logger between matches.
+        """
         # Store in ended_games before removing (for the bot to comment on)
         if thread_id in self.games:
             self.ended_games[thread_id] = self.games.pop(thread_id)
@@ -529,7 +558,9 @@ class GameEngine:
             ai_response_enabled: If True, AI players auto-respond via on_priority_change
         """
         try:
-            from rules.priority import PrioritySystem, PriorityAction
+            from rules.priority import (
+                PrioritySystem, PriorityAction, Phase as PriorityPhase,
+            )
 
             game.stack_enabled = True
             game._stack_resolution_event = asyncio.Event()
@@ -593,11 +624,16 @@ class GameEngine:
                             # [TRIGGER-RESOLVE] Resolve triggered ability from stack
                             if entry.countered:
                                 print(f"[STIFLE] {entry.trigger_source}'s ability was countered")
-                                if send_func:
+                                if (send_func and not getattr(
+                                        entry, '_counter_narration_queued', False)):
                                     try:
                                         await send_func(f"🚫 **{entry.trigger_source}**'s triggered ability is countered!")
                                     except Exception:
                                         pass
+                                elif getattr(entry, '_counter_narration_queued', False):
+                                    print(f"[COUNTER-NARRATION-DEDUP] "
+                                          f"{entry.trigger_source} ability counter "
+                                          f"already announced by resolving effect")
                             else:
                                 # [TARGETING] Set resolution source for triggered ability
                                 game._current_resolution_source = (
@@ -609,9 +645,8 @@ class GameEngine:
                                 if HAS_EFFECT_TEMPLATES and entry.trigger_text:
                                     ctrl_name = entry.controller_name
                                     ctrl_idx = entry.controller_index
-                                    opp_idx = 1 - ctrl_idx
                                     ctrl = game.players[ctrl_idx]
-                                    opp = game.players[opp_idx]
+                                    opp = game.default_opponent_for(ctrl)
                                     try:
                                         ctx = build_game_context(game, ctrl, opp, card=entry.card)
                                         lib = get_effect_library()
@@ -657,6 +692,9 @@ class GameEngine:
                             break
 
                         if entry.resolution_event:
+                            from mtg.resolution import ResolutionCoordinator
+                            ResolutionCoordinator.for_game(
+                                engine, game).note_priority_completed(entry)
                             entry.resolution_event.set()
                             print(f"[STACK] Fired resolution event for {stack_obj.name} (priority_id={stack_obj.id})")
                         matched = True
@@ -676,9 +714,10 @@ class GameEngine:
                     if game._stack_resolution_event:
                         game._stack_resolution_event.set()
 
-            async def on_priority_change(player_name):
+            async def on_priority_change(player_key):
                 """Called when priority passes to a different player."""
-                print(f"[STACK] Priority → {player_name}")
+                player_label = game.priority_display_name(player_key)
+                print(f"[STACK] Priority → {player_label} ({player_key})")
 
                 if not ai_response_enabled:
                     return  # Human games: wait for !pass / !respond commands
@@ -691,11 +730,8 @@ class GameEngine:
                 # synchronously inside the callback — before the create_task —
                 # closes that race. If the AI ultimately declines / passes,
                 # _handle_ai_priority manually passes priority itself.
-                target_player = None
-                for p in game.players:
-                    if p.name == player_name:
-                        target_player = p
-                        break
+                target_player = game.player_from_priority_identifier(
+                    player_key, living_only=True, allow_legacy_name=False)
                 if target_player is not None and (target_player.is_claude or target_player.user_id == 99999):
                     ps_local = game._priority_system
                     if ps_local:
@@ -705,24 +741,22 @@ class GameEngine:
                             pass
 
                 # Schedule AI response as a separate task (avoids lock deadlock)
-                asyncio.create_task(_handle_ai_priority(player_name))
+                asyncio.create_task(_handle_ai_priority(player_key))
 
-            async def _handle_ai_priority(player_name):
+            async def _handle_ai_priority(player_key):
                 """Check if AI player wants to respond, then pass or cast."""
                 # Yield to ensure the lock from player_action is released
                 await asyncio.sleep(0.01)
 
                 # Find the player
-                player = None
-                player_idx = None
-                for i, p in enumerate(game.players):
-                    if p.name == player_name:
-                        player = p
-                        player_idx = i
-                        break
+                player = game.player_from_priority_identifier(
+                    player_key, living_only=True, allow_legacy_name=False)
+                player_idx = (game.players.index(player)
+                              if player in game.players else None)
 
                 if player is None:
                     return
+                player_name = player.name
 
                 # Only handle AI players (is_claude or pretend human with id=99999)
                 if not player.is_claude and player.user_id != 99999:
@@ -769,7 +803,7 @@ class GameEngine:
                         print(f"[STACK-AI] {player_name} auto-pass on already "
                               f"countered entry: {spell_name}")
                         await ps.player_action(
-                            player_name, PriorityAction.pass_priority())
+                            player_key, PriorityAction.pass_priority())
                         return
 
                     # Auto-pass on triggered abilities (non-spell stack entries)
@@ -794,13 +828,13 @@ class GameEngine:
                             print(f"[STACK-AI] {player_name} has Stifle-type card — evaluating response to ability: {spell_name}")
                         else:
                             print(f"[STACK-AI] {player_name} auto-pass on triggered ability: {spell_name}")
-                            await ps.player_action(player_name, PriorityAction.pass_priority())
+                            await ps.player_action(player_key, PriorityAction.pass_priority())
                             return
 
                     # Don't respond to own spells — just pass
-                    if caster_name == player_name:
+                    if top_stack.controller_index == player_idx:
                         try:
-                            await ps.player_action(player_name, PriorityAction.pass_priority())
+                            await ps.player_action(player_key, PriorityAction.pass_priority())
                         except Exception as e:
                             print(f"[STACK-AI] Error auto-passing own spell: {e}")
                         return
@@ -814,7 +848,7 @@ class GameEngine:
                 instants = engine.claude_ai.has_instant_speed_cards(player, game)
                 if not instants:
                     print(f"[STACK-AI] {player_name} has no instant-speed cards — auto-pass")
-                    await ps.player_action(player_name, PriorityAction.pass_priority())
+                    await ps.player_action(player_key, PriorityAction.pass_priority())
                     return
 
                 # Check affordability (July 20: alternate-cost aware — FoW class)
@@ -823,7 +857,7 @@ class GameEngine:
                                   player, c, game)]
                 if not affordable:
                     print(f"[STACK-AI] {player_name} has instants but can't afford any — auto-pass")
-                    await ps.player_action(player_name, PriorityAction.pass_priority())
+                    await ps.player_action(player_key, PriorityAction.pass_priority())
                     return
 
                 # Cancel auto-pass timer while AI is deciding (prevents race condition
@@ -860,7 +894,7 @@ class GameEngine:
 
                 if not decision:
                     print(f"[STACK-AI] {player_name} passes on {spell_name}")
-                    await ps.player_action(player_name, PriorityAction.pass_priority())
+                    await ps.player_action(player_key, PriorityAction.pass_priority())
                     return
 
                 # AI wants to cast a response — go through cast_spell_async for full
@@ -876,14 +910,14 @@ class GameEngine:
 
                 if not response_card:
                     print(f"[STACK-AI] {player_name} tried '{response_card_name}' but not found in hand")
-                    await ps.player_action(player_name, PriorityAction.pass_priority())
+                    await ps.player_action(player_key, PriorityAction.pass_priority())
                     return
 
                 # Final mana check
                 can_pay, reason = player.can_pay_mana_cost(response_card.mana_cost)
                 if not can_pay:
                     print(f"[STACK-AI] {player_name} can't afford {response_card.name}: {reason}")
-                    await ps.player_action(player_name, PriorityAction.pass_priority())
+                    await ps.player_action(player_key, PriorityAction.pass_priority())
                     return
 
                 # === Cast the response through the full stack flow ===
@@ -921,7 +955,7 @@ class GameEngine:
                     print(f"[STACK-AI] {player_name} can't target {spell_name} "
                           f"with {response_card.name} — printed restriction "
                           f"not met (CR 601.2c); passing instead")
-                    await ps.player_action(player_name, PriorityAction.pass_priority())
+                    await ps.player_action(player_key, PriorityAction.pass_priority())
                     return
                 response_target = top_stack.card if (top_stack and _targets_a_spell) else None
                 print(f"[STACK-AI] {player_name} casting response: {response_card.name}"
@@ -946,12 +980,53 @@ class GameEngine:
                 # cast_spell_async already handled priority, resolution, and SBA.
                 # Don't pass priority here — the spell went through the full cycle.
 
+            all_priority_players = [
+                game.priority_identifier(index)
+                for index, player in enumerate(game.players)
+            ]
+            priority_labels = {
+                game.priority_identifier(index): game.priority_display_name(
+                    game.priority_identifier(index))
+                for index, player in enumerate(game.players)
+                if not getattr(player, 'eliminated', False)
+            }
             game._priority_system = PrioritySystem(
-                players=[p.name for p in game.players],
+                players=all_priority_players,
                 auto_pass_seconds=auto_pass_seconds,
                 on_stack_resolve=on_stack_resolve,
                 on_priority_change=on_priority_change,
+                display_names=priority_labels,
             )
+            living_keys = [
+                game.priority_identifier(index)
+                for index, player in enumerate(game.players)
+                if not getattr(player, 'eliminated', False)
+            ]
+            restored_priority = getattr(game, '_restored_priority_state', None)
+            if restored_priority:
+                game._priority_system.restore_state(
+                    game.normalize_priority_state(restored_priority),
+                    living_players=living_keys)
+                game._restored_priority_state = None
+                # setup_stack is intentionally synchronous, but every Discord
+                # load/undo call site has a running loop. Resume the remaining
+                # per-seat deadline without making headless constructors await.
+                try:
+                    asyncio.get_running_loop().create_task(
+                        game._priority_system.resume())
+                except RuntimeError:
+                    pass
+            elif living_keys:
+                active_key = game.priority_identifier(game.active_player_index)
+                game._priority_system.active_player = active_key
+                game._priority_system.priority_holder = active_key
+                game._priority_system.phase = PriorityPhase[game.phase.name]
+                game._priority_system.turn_number = game.turn_number
+            # Q-I: runtime events/callbacks are intentionally absent from the
+            # JSON snapshot. Rebind them only after both the exact StackEntry
+            # objects and PrioritySystem stack have been reconstructed.
+            from mtg.resolution import ResolutionCoordinator
+            ResolutionCoordinator.for_game(self, game).bind_restored_stack()
             print(f"[STACK] PrioritySystem initialized for game {game.thread_id} "
                   f"(auto-pass: {auto_pass_seconds}s, ai_response: {ai_response_enabled})")
         except ImportError as e:
@@ -977,6 +1052,8 @@ class GameEngine:
         # This avoids unnecessary delays in autoplay
         any_instants = False
         for p in game.players:
+            if getattr(p, 'eliminated', False):
+                continue
             instants = self.claude_ai.has_instant_speed_cards(p, game) if self.claude_ai else []
             if instants:
                 # July 20: alternate-cost aware — FoW class
@@ -1007,7 +1084,15 @@ class GameEngine:
 
         # Give active player priority and start the timer
         ps._passes_in_succession = []
-        ps.priority_holder = ps.active_player
+        active_key = game.priority_identifier(game.active_player_index)
+        ps.active_player = active_key
+        ps.priority_holder = active_key
+        ps.turn_number = game.turn_number
+        try:
+            from rules.priority import Phase as PriorityPhase
+            ps.phase = PriorityPhase[game.phase.name]
+        except KeyError:
+            pass
         await ps._notify_priority_change()
         ps._start_pass_timer()
 
@@ -1036,38 +1121,106 @@ class GameEngine:
     ) -> GameState:
         """Create a game where players already have their cards (e.g., from draft).
         Unlike create_game(), this skips deck loading — cards are pre-built."""
+        return await self.create_game_from_card_sets(
+            thread_id,
+            [
+                {
+                    "name": player1_name,
+                    "user_id": player1_id,
+                    "cards": player1_cards,
+                },
+                {
+                    "name": player2_name,
+                    "user_id": player2_id,
+                    "cards": player2_cards,
+                },
+            ],
+            format_name=format_name,
+        )
+
+    async def create_game_from_decks(
+        self,
+        thread_id: int,
+        player_specs: List[Dict],
+        format_name: str = "commander",
+    ) -> GameState:
+        """Create an arbitrary-seat constructed game from deck JSON.
+
+        ``create_game`` remains the compatibility wrapper for duels. Human
+        multiplayer lobbies use this seam so every seat receives the same
+        commander/partner/companion handling as an ordinary loaded deck.
+        Discord user ids, rather than display names, own the seats.
+        """
+        if len(player_specs) not in (3, 4):
+            raise ValueError("Human multiplayer games require 3 or 4 seats")
         starting_life = FORMAT_STARTING_LIFE.get(format_name, 20)
+        players: List[Player] = []
 
-        player1 = Player(
-            name=player1_name,
-            user_id=player1_id,
-            is_claude=player1_id is None,
-            life=starting_life,
-        )
-        player2 = Player(
-            name=player2_name,
-            user_id=player2_id,
-            is_claude=player2_id is None,
-            life=starting_life,
-        )
-
-        # Set owner indices and load cards directly into libraries
-        for card in player1_cards:
-            card.owner_index = 0
-        player1.library = player1_cards
-        player1.deck_name = "Draft Deck"
-        random.shuffle(player1.library)
-
-        for card in player2_cards:
-            card.owner_index = 1
-        player2.library = player2_cards
-        player2.deck_name = "Draft Deck"
-        random.shuffle(player2.library)
+        for player_index, spec in enumerate(player_specs):
+            deck_data = spec.get("deck_data")
+            if not isinstance(deck_data, dict):
+                raise ValueError(
+                    f"Seat {spec.get('seat_id', player_index)} has no loaded deck")
+            player = Player(
+                name=str(spec["name"]),
+                user_id=int(spec["user_id"]),
+                is_claude=False,
+                life=int(spec.get("life", starting_life)),
+                seat_id=int(spec.get("seat_id", player_index)),
+            )
+            await self._load_player_deck(
+                player, deck_data, owner_index=player_index)
+            players.append(player)
 
         game = GameState(
             thread_id=thread_id,
             format=format_name,
-            players=[player1, player2],
+            players=players,
+            turn_number=0,
+        )
+        game._rules_engine = self.rules
+        self.games[thread_id] = game
+        self.save_game(game)
+        return game
+
+    async def create_game_from_card_sets(
+        self,
+        thread_id: int,
+        player_specs: List[Dict],
+        format_name: str = "limited",
+    ) -> GameState:
+        """Create a limited game with any bounded number of stable seats.
+
+        This is the multiplayer construction seam.  The two-player wrapper
+        above deliberately delegates here so draft cards receive identical
+        ownership, shuffle, persistence, and rules-engine wiring.
+        """
+        if len(player_specs) < 2:
+            raise ValueError("A game requires at least two player seats")
+        starting_life = FORMAT_STARTING_LIFE.get(format_name, 20)
+
+        players = []
+        for seat_index, spec in enumerate(player_specs):
+            user_id = spec.get("user_id")
+            player = Player(
+                name=str(spec["name"]),
+                user_id=user_id,
+                is_claude=bool(spec.get("is_claude", user_id is None)),
+                life=int(spec.get("life", starting_life)),
+                seat_id=int(spec.get("seat_id", seat_index)),
+            )
+            cards = list(spec.get("cards", []))
+            for card in cards:
+                card.owner_index = seat_index
+            player.library = cards
+            player.deck_name = str(spec.get("deck_name", "Draft Deck"))
+            random.shuffle(player.library)
+            players.append(player)
+
+        game = GameState(
+            thread_id=thread_id,
+            format=format_name,
+            players=players,
             turn_number=0,
         )
 
@@ -1184,6 +1337,11 @@ class GameEngine:
         game.turn_number = 1
         game.active_player_index = first_player_index
         game.priority_player_index = first_player_index
+        if game._priority_system is not None:
+            first_key = game.priority_identifier(first_player_index)
+            game._priority_system.active_player = first_key
+            game._priority_system.priority_holder = first_key
+            game._priority_system._passes_in_succession = []
         # via='game_start' is excluded from phase-hook parity: the battlefield
         # is empty at this point, so there are no main-phase triggers to run.
         game.set_phase(Phase.MAIN1, via="game_start")
@@ -1191,7 +1349,10 @@ class GameEngine:
         # Draw opening hands
         for player in game.players:
             self.draw_cards(player, 7)
-            player.has_drawn_for_turn = True  # Don't draw on first turn
+            # CR 103.8: only a two-player game's starting player skips the
+            # first draw step. Keep the legacy flag aligned with the phase
+            # gate below even though advance_phase is authoritative.
+            player.has_drawn_for_turn = not game.is_multiplayer
             # The opening hand is not "cards you drew this turn" — leaving the
             # count at 7 means no card drawn on turn 1 can ever be the first
             # one (CR 702.94a), so miracle could never fire that turn and any
@@ -1676,7 +1837,9 @@ class GameEngine:
         """Async version: runs sync core + Tier 3 Claude API fallback for unhandled dies triggers."""
         messages, unhandled = self._check_dies_triggers_sync(game, dying_card, dying_player)
         player_idx = game.players.index(dying_player) if dying_player in game.players else 0
-        opponent = game.players[1 - player_idx]
+        opponent = game.default_opponent_for(dying_player)
+        if opponent is None:
+            return messages
 
         for card, trigger_text in unhandled:
             if self.rules.client:
@@ -2097,6 +2260,7 @@ class GameEngine:
                 card.temp_keywords = []
                 # G2-1 (Aug 7): "lose <keyword> until end of turn" expires here.
                 card.temp_removed_keywords = []
+                card.cant_block_this_turn = False
             # Clear playable from exile
             # Aug 2 batch-13 (delve reviewer): "until the end of your NEXT
             # turn" — the unconditional every-player clear ended the impulse
@@ -2423,7 +2587,9 @@ class GameEngine:
             if skip_source:
                 messages.append(f"🎴 **Draw Step** - {game.active_player.name} skips draw ({skip_source})")
                 print(f"[SKIP-DRAW] {game.active_player.name} skips draw step ({skip_source})")
-            elif game.turn_number > 1:  # First player skips draw on turn 1
+            elif game.is_multiplayer or game.turn_number > 1:
+                # CR 103.8: the starting-player draw skip applies only to a
+                # two-player game. Multiplayer's first player draws normally.
                 drawn = self.draw_cards(game.active_player, 1, game=game)
                 if drawn:
                     messages.append(f"🎴 **Draw Step** - {game.active_player.name} draws a card")
@@ -2915,10 +3081,23 @@ class GameEngine:
         if not game.ended:
             end_step_msgs.extend(self.check_state_based_actions(game))
 
-        # Switch active player
-        game.active_player_index = 1 - game.active_player_index
+        # Switch to the next living stable seat.  In a multiplayer game a
+        # dead seat is skipped without renumbering ownership references.
+        next_player_index = game.next_living_player_index(
+            game.active_player_index)
+        if next_player_index is None:
+            game.finalize_eliminations()
+            return end_step_msgs or []
+        game.active_player_index = next_player_index
         game.priority_player_index = game.active_player_index
         game.turn_number += 1
+        game._default_opponent_index = None
+        priority = game._priority_system
+        if priority is not None:
+            active_key = game.priority_identifier(game.active_player_index)
+            priority.active_player = active_key
+            priority.priority_holder = active_key
+            priority._passes_in_succession = []
         # "Until your next turn" animations (Sylvan Awakening) expire as
         # their controller's turn BEGINS — the new active player is now
         # known, so revert any animation waiting on this turn. (Aug 1; the
@@ -3106,6 +3285,11 @@ class GameEngine:
             game._last_exec_cast_like = {'turn': game.turn_number, 'type': 'cast',
                                          'card': card_name}
             target_name = _normalize_action_target(action)  # May be None
+            target_player_id = action.get('target_player_id')
+            target_card_id = action.get('target_card_id')
+            target_declared = (bool(target_name)
+                               or target_player_id is not None
+                               or target_card_id is not None)
             adventure_name = action.get("adventure")  # Adventure/split half name
             if not isinstance(adventure_name, str):
                 # Provider schema drift: Qwen emitted ``adventure: true``.
@@ -3151,7 +3335,7 @@ class GameEngine:
                     _has_self_target_clause = bool(
                         _SELF_TARGET_CLAUSE_RE.search(_o))
                     if _is_detrimental_targeted and not _has_self_target_clause:
-                        opp = game.players[1 - game.players.index(player)]
+                        opp = game.default_opponent_for(player)
                         action["target_controller"] = opp.name
                         print(f"[CAST-TARGET] Inferred target_controller={opp.name} "
                               f"for detrimental cast {card_name} → {target_name}")
@@ -3424,23 +3608,30 @@ class GameEngine:
                     # Multi-target templates (Ghostly Flicker et al.) resolve
                     # the individual names; do not throw the second one away.
                     target = target_name
-                elif target_name:
+                elif target_declared:
                     # Shared with the autoplay cast path (mtg/helpers.py) —
                     # stack -> battlefield -> graveyard -> player/pronoun.
                     # These were two divergent copies until the July 27 fanout;
                     # see resolve_cast_target for what each one was missing.
                     from mtg.helpers import resolve_cast_target
-                    target = resolve_cast_target(game, player, card, target_name)
+                    target = resolve_cast_target(
+                        game, player, card, target_name,
+                        target_player_id=target_player_id,
+                        target_card_id=target_card_id)
 
                 # Guard: don't cast counterspells when there's nothing on the stack
                 # Exception 1: modal spells (Mystic Confluence, Cryptic Command) have other modes
-                if (target_name and target is None and HAS_TARGETING
+                if (target_declared and target is None and HAS_TARGETING
                         and _spell_requires_targets(spell_face_for_gates(card))):
                     _stash_name = (card.adventure_name
                                    if getattr(card, 'cast_as_adventure', False)
                                    and getattr(card, 'adventure_name', None)
                                    else card.name)
-                    reason = (f"declared target '{target_name}' is not a legal "
+                    target_label = (target_name or
+                                    (f"player_id={target_player_id}"
+                                     if target_player_id is not None
+                                     else f"card_id={target_card_id}"))
+                    reason = (f"declared target '{target_label}' is not a legal "
                               f"target for {_stash_name} (CR 601.2c)")
                     print(f"[TARGETING] {reason}")
                     game._last_cast_failure = (game.turn_number, _stash_name, reason)
@@ -3988,9 +4179,18 @@ class GameEngine:
                     # When plan contains {"type":"activate","permanent":"Aminatou","ability":1,"target":"Mulldrifter"},
                     # resolve the target name to the actual card/player object and pass it to activate().
                     explicit_target_name = _normalize_action_target(action)
+                    explicit_player_id = action.get('target_player_id')
+                    explicit_card_id = action.get('target_card_id')
+                    explicit_target_declared = (
+                        bool(explicit_target_name)
+                        or explicit_player_id is not None
+                        or explicit_card_id is not None)
                     auto_targets = None
-                    if explicit_target_name:
-                        target_obj = _resolve_player_or_card_target(game, player, explicit_target_name)
+                    if explicit_target_declared:
+                        target_obj = _resolve_player_or_card_target(
+                            game, player, explicit_target_name,
+                            target_player_id=explicit_player_id,
+                            target_card_id=explicit_card_id)
                         if target_obj is not None:
                             # July 30: CR 109.5 — "any target" abilities must
                             # not forward a land (Wrenn -1 hit one live).
@@ -4005,7 +4205,10 @@ class GameEngine:
                             tname = target_obj.name if hasattr(target_obj, 'name') else target_obj
                             print(f"[ACTIVATE-PW] Forwarding explicit target '{explicit_target_name}' → {tname}")
                         else:
-                            print(f"[ACTIVATE-PW] Could not resolve explicit target '{explicit_target_name}' — proceeding without target")
+                            print("[CHOICE-STALE] Could not resolve explicit PW target")
+                            game._last_pw_target_error = (
+                                f"{perm.name} explicit target is no longer legal")
+                            return None
                     result = await self.planeswalker_manager.activate(game, player, perm, ability_idx, auto_targets)
                     if result and result.success:
                         msgs = "\n".join(result.messages) if result.messages else ""
@@ -5181,7 +5384,7 @@ class GameEngine:
                 # === TIER 1.5: Try effect template library before falling through ===
                 if HAS_EFFECT_TEMPLATES:
                     try:
-                        opponent = game.players[1 - player_index]
+                        opponent = game.default_opponent_for(player)
                         ctx_dict = build_game_context(game, player, opponent, card=perm)
                         lib = get_effect_library()
                         # Apr 29 audit: event_type="activated" skips the
@@ -5364,7 +5567,9 @@ class GameEngine:
                         # opponent, so a self-mill deck (Grinding Station
                         # under Meren/escape) could never mill itself even
                         # when it asked to.
-                        _mill_target = game.players[1 - player_index].name
+                        _default_target = game.default_opponent_for(player)
+                        _mill_target = (
+                            _default_target.name if _default_target else player.name)
                         _decl = (action.get('target') or '').strip().lower()
                         if _decl:
                             for _tp in game.players:
@@ -5656,10 +5861,12 @@ class GameEngine:
                     source_card = card.name
                     break
             if not source_card:
-                opponent = game.players[1 - player_index]
-                for card in opponent.battlefield:
-                    if card.name.lower() in description.lower():
-                        source_card = card.name
+                for opponent in game.opponents_of(player):
+                    for card in opponent.battlefield:
+                        if card.name.lower() in description.lower():
+                            source_card = card.name
+                            break
+                    if source_card:
                         break
 
             # May 16 audit: short-circuit if this card's ETB was already

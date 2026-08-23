@@ -257,8 +257,9 @@ class TestKokushoDiesRegistry:
             controller="Rick", opponent="Claude",
             game_context={}, event_type="dies")
         assert actions == [
-            {"action": "lose_life", "player": "Claude", "amount": 5},
-            {"action": "gain_life", "player": "Rick", "amount": 5},
+            {"action": "extort_drain", "player": "Rick",
+             "opponent": "each opponent", "amount": 5,
+             "source": "Kokusho, the Evening Star"},
         ], "every Kokusho death was a real Tier 3 call before this"
 
 

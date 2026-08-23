@@ -36,7 +36,10 @@ class GameDisplay:
             active_marker = "👉 " if is_active else "   "
             claude_marker = " 🤖" if player.is_claude else ""
             
-            lines.append(f"{active_marker}**{player.name}**{claude_marker}")
+            eliminated_marker = " ☠️ eliminated" if player.eliminated else ""
+            lines.append(
+                f"{active_marker}**{player.name}**{claude_marker}"
+                f"{eliminated_marker}")
             lines.append(f"   ❤️ {player.life} | ☠️ {player.poison} | 🎴 {len(player.hand)} cards")
             
             # Commander damage received
@@ -130,7 +133,9 @@ class GameDisplay:
         
         for i, player in enumerate(game.players):
             is_active = i == game.active_player_index
-            name = f"{'👉 ' if is_active else ''}{player.name}{'🤖' if player.is_claude else ''}"
+            name = (f"{'👉 ' if is_active else ''}{player.name}"
+                    f"{'🤖' if player.is_claude else ''}"
+                    f"{' ☠️ eliminated' if player.eliminated else ''}")
             
             # Build field value
             value_parts = [f"❤️ {player.life} | ☠️ {player.poison} | 🎴 {len(player.hand)} in hand"]

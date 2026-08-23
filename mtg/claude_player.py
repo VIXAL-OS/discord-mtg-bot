@@ -497,9 +497,15 @@ class ClaudePlayer:
 
         Phase 2 of the Parallel CoT Architecture (see CLAUDE.md).
         """
+        if getattr(game, 'experimental_ffa', False):
+            # The strategist memo is deliberately a two-player briefing and
+            # would hide two boards while adding four background calls per
+            # table rotation. The actor receives the complete multiplayer
+            # state instead; keep the smoke bounded and honest.
+            return
         try:
             player = game.players[player_index]
-            opponent = game.players[1 - player_index]
+            opponent = game.default_opponent_for(player)
 
             # Build compact board state for strategist (smaller than full state).
             # Use effective P/T so variable creatures (Beanstalk Giant, Mortivore,
@@ -686,7 +692,6 @@ class ClaudePlayer:
                 opp_taken = 0
                 try:
                     your_idx = game.players.index(player)
-                    opp_idx = 1 - your_idx
                     you_taken = max(player.commander_damage.values()) if player.commander_damage else 0
                     opp_taken = max(opponent.commander_damage.values()) if opponent.commander_damage else 0
                 except Exception:
@@ -1696,6 +1701,7 @@ Respond with a JSON action. Examples:
 {"type": "cast", "card": "Demonic Tutor", "tutor_card": "Craterhoof Behemoth"}
 {"type": "cast", "card": "Tooth and Nail", "tutor_cards": ["Craterhoof Behemoth", "Avenger of Zendikar"]}
 {"type": "cast", "card": "Primal Command", "modes": [2, 4], "target": ["Sol Ring"], "tutor_card": "Craterhoof Behemoth"}
+{"type": "cast", "card": "Curse of the Swine", "x": 2, "target": ["Creature A", "Creature B"]}
 {"type": "suspend", "card": "Rift Bolt"}
 {"type": "foretell", "card": "Quakebringer"}
 {"type": "graveyard_activate", "card": "Angel of Sanctions", "mechanic": "embalm"}
@@ -1814,7 +1820,7 @@ What is your best play? Respond with a JSON action."""
         """Build a compact delta message for subsequent calls in a conversation.
         Instead of re-sending full state, describe what changed."""
         player = game.players[player_index]
-        opponent = game.players[1 - player_index]
+        opponent = game.default_opponent_for(player)
 
         parts = [f"Action result: {action_result}"]
 
@@ -1877,7 +1883,7 @@ What is your best play? Respond with a JSON action."""
         if self._api_disabled:
             return {"type": "pass"}, conversation
         player = game.players[player_index]
-        opponent = game.players[1 - player_index]
+        opponent = game.default_opponent_for(player)
         
         # Calculate available mana BY COLOR (not just total)
         # Track 'any'-color mana separately — it can fill colored requirements
@@ -2338,7 +2344,7 @@ Based on this game state, what is your best play?
             return [{"type": "pass"}]
 
         player = game.players[player_index]
-        opponent = game.players[1 - player_index]
+        opponent = game.default_opponent_for(player)
 
         # --- Reuse the same state-building as decide_action ---
         mana_by_color = {'W': 0, 'U': 0, 'B': 0, 'R': 0, 'G': 0, 'C': 0}
@@ -2679,6 +2685,9 @@ ACTION GRAMMAR:
 - {"type": "cast", "card": "Demonic Tutor", "tutor_card": "Craterhoof Behemoth"}
 - {"type": "cast", "card": "Tooth and Nail", "tutor_card": "Craterhoof Behemoth", "tutor_card2": "Avenger of Zendikar"}
 - {"type": "cast", "card": "Primal Command", "modes": [2, 4], "target": ["Sol Ring"], "tutor_card": "Craterhoof Behemoth"}
+- X target spells use ONE cast and a target list: {"type": "cast", "card": "Curse of the Swine", "x": 2, "target": ["Creature A", "Creature B"]}
+- Multiplayer exact player target: {"type": "cast", "card": "Lightning Bolt", "target_player_id": 2}
+- Multiplayer exact permanent target: {"type": "cast", "card": "Murder", "target_card_id": "<displayed card_id>"}
 - {"type": "suspend", "card": "Rift Bolt"} — pay the Suspend cost, exile with time counters, casts free later (the ⏳ hint lists candidates)
 - {"type": "crew", "vehicle": "Smuggler's Copter"} — tap creatures with total power ≥ the crew cost; the Vehicle becomes an artifact creature until end of turn (the 🚗 hint lists candidates; crew BEFORE attacking)
 - {"type": "foretell", "card": "Quakebringer"} — pay {2} to exile it face down; cast it on a LATER turn for its (cheaper) foretell cost. The castable list marks these [FORETELL ...] and, once foretold, [FORETOLD — cast from exile]
@@ -2689,6 +2698,11 @@ ACTION GRAMMAR:
 - {"type": "activate", "permanent": "Chandra, Pyromaster", "ability": 0}
 - {"type": "resolve", "description": "<one short imperative clause, no reasoning>"}
 - {"type": "pass"}
+
+When multiplayer state displays `player_id` or `card_id`, copy that exact ID
+into the matching target field. Never invent an ID. Explicit IDs are strict:
+if that seat is eliminated or that object moves before resolution, the action
+fails instead of being redirected by name.
 
 `resolve` is a FALLBACK — use it only when no other action type fits. The most
 common misuse the engine sees in audits (May 24): the AI emits
@@ -2912,7 +2926,7 @@ IMPORTANT: Always end with {"type": "pass"}. No text outside the JSON array."""
         if self._api_disabled:
             return []  # Circuit breaker tripped — no API calls
         player = game.players[player_index]
-        opponent = game.players[1 - player_index]
+        opponent = game.default_opponent_for(player)
 
         # Find eligible attackers (untapped, non-summoning-sick, non-phased-out creatures)
         eligible = []
@@ -3749,6 +3763,11 @@ Respond with ONLY "keep" or "mulligan"."""
         Only called when the player actually has instants/flash in hand (pre-filtered).
         """
         player = game.players[player_index]
+        opponent = (
+            game.default_opponent_for(player)
+            if hasattr(game, 'default_opponent_for') else
+            next((p for p in game.players if p is not player), player)
+        )
         instants = self.has_instant_speed_cards(player, game)
         if not instants:
             return None  # No instants — auto-pass
@@ -3945,7 +3964,7 @@ Respond with ONLY "keep" or "mulligan"."""
             f"MTG instant-speed response window.\n"
             f"{combat_header}\n"
             f"{stack_context}{combat_context}\n"
-            f"Your life: {player.life}. Opponent life: {game.players[1 - player_index].life}.\n"
+            f"Your life: {player.life}. Opponent life: {opponent.life}.\n"
             f"Mana available: {available_mana}\n"
             f"Instant-speed options:\n{instant_list}\n"
             f"{memo_section}\n"
@@ -4061,9 +4080,9 @@ Respond with ONLY "keep" or "mulligan"."""
                         # opponent's spell at empty board, wasting the card.
                         if chosen_card_obj:
                             co = (chosen_card_obj.oracle_text or '').lower()
-                            opp_idx = 1 - player_index
                             opp_creatures = [
-                                c for c in game.players[opp_idx].battlefield
+                                c for opp in game.opponents_of(player)
+                                for c in opp.battlefield
                                 if c.is_creature() and not getattr(c, '_phased_out', False)
                             ]
                             is_targeted_removal = (
@@ -4173,16 +4192,17 @@ Respond with ONLY "keep" or "mulligan"."""
     def _describe_game_state(self, game: GameState, player_index: int) -> str:
         """Describe game state from a player's perspective."""
         player = game.players[player_index]
-        opponent = game.players[1 - player_index]
+        opponent = game.default_opponent_for(player)
+        opponents = game.opponents_of(player)
         
         # Count creatures for strategic decisions
         my_creatures = [c for c in player.battlefield if c.is_creature()]
-        opp_creatures = [c for c in opponent.battlefield if c.is_creature()]
         
         lines = [
             f"GAME STATE (Turn {game.turn_number}):",
             f"",
-            f"YOU ({player.name}):",
+            (f"YOU ({player.name}) [player_id={game.stable_player_id(player)}]:"
+             if game.is_multiplayer else f"YOU ({player.name}):"),
             f"  Life: {player.life}, Poison: {player.poison}",
             f"  Library: {len(player.library)} cards",
             f"  Hand: {len(player.hand)} cards",
@@ -4193,7 +4213,8 @@ Respond with ONLY "keep" or "mulligan"."""
             # Bug #35: Show tapped, P/T, summoning sick, and counters for AI visibility
             bf_parts = []
             for c in player.battlefield:
-                desc = c.name
+                desc = (f"{c.name} [card_id={c.id}]"
+                        if game.is_multiplayer else c.name)
                 if c.is_creature():
                     p = c.get_effective_power(game)
                     t = c.get_effective_toughness(game)
@@ -4210,7 +4231,9 @@ Respond with ONLY "keep" or "mulligan"."""
             lines.append(f"  Battlefield: {', '.join(bf_parts)}")
 
         if player.graveyard:
-            gy = [c.name for c in player.graveyard[-5:]]
+            gy = [(f"{c.name} [card_id={c.id}]"
+                   if game.is_multiplayer else c.name)
+                  for c in player.graveyard[-5:]]
             lines.append(f"  Graveyard (recent): {', '.join(gy)}")
 
         # Command zone (Commander format)
@@ -4227,30 +4250,52 @@ Respond with ONLY "keep" or "mulligan"."""
             comp_parts = [f"{c.name} ({c.mana_cost}) [pay {{3}} to move to hand]" for c in player.companion_zone]
             lines.append(f"  COMPANION: {', '.join(comp_parts)}")
 
-        lines.extend([
-            f"",
-            f"OPPONENT ({opponent.name}):",
-            f"  Life: {opponent.life}, Poison: {opponent.poison}",
-            f"  Hand: {len(opponent.hand)} cards",
-            f"  Creatures they control: {len(opp_creatures)}",
-        ])
-        
-        if opponent.battlefield:
-            bf_parts = []
-            for c in opponent.battlefield:
-                desc = c.name
-                if c.is_creature():
-                    p = c.get_effective_power(game)
-                    t = c.get_effective_toughness(game)
-                    desc += f" {p}/{t}"
-                if c.tapped:
-                    desc += "(T)"
-                counters = {k: v for k, v in c.counters.items() if v > 0}
-                if counters:
-                    counter_str = ", ".join(f"{v} {k}" for k, v in counters.items())
-                    desc += f"[{counter_str}]"
-                bf_parts.append(desc)
-            lines.append(f"  Battlefield: {', '.join(bf_parts)}")
+        if game.is_multiplayer and opponent is not None:
+            lines.extend([
+                "",
+                f"MULTIPLAYER: {len(opponents)} living opponents. Use the "
+                "displayed player_id/card_id when a target is required.",
+                f"Default singular automated target: {opponent.name}.",
+            ])
+
+        for opposing_player in opponents:
+            opp_creatures = [
+                c for c in opposing_player.battlefield if c.is_creature()]
+            seat_number = (
+                opposing_player.seat_id + 1
+                if opposing_player.seat_id is not None
+                else game.players.index(opposing_player) + 1)
+            heading = ("OPPONENT" if len(opponents) == 1
+                       else f"OPPONENT SEAT {seat_number}")
+            lines.extend([
+                "",
+                ((f"{heading} ({opposing_player.name}) "
+                  f"[player_id={game.stable_player_id(opposing_player)}]:")
+                 if game.is_multiplayer
+                 else f"{heading} ({opposing_player.name}):"),
+                f"  Life: {opposing_player.life}, Poison: {opposing_player.poison}",
+                f"  Hand: {len(opposing_player.hand)} cards",
+                f"  Creatures they control: {len(opp_creatures)}",
+            ])
+
+            if opposing_player.battlefield:
+                bf_parts = []
+                for c in opposing_player.battlefield:
+                    desc = (f"{c.name} [card_id={c.id}]"
+                            if game.is_multiplayer else c.name)
+                    if c.is_creature():
+                        p = c.get_effective_power(game)
+                        t = c.get_effective_toughness(game)
+                        desc += f" {p}/{t}"
+                    if c.tapped:
+                        desc += "(T)"
+                    counters = {k: v for k, v in c.counters.items() if v > 0}
+                    if counters:
+                        counter_str = ", ".join(
+                            f"{v} {k}" for k, v in counters.items())
+                        desc += f"[{counter_str}]"
+                    bf_parts.append(desc)
+                lines.append(f"  Battlefield: {', '.join(bf_parts)}")
 
         # Show pending unresolved effects the AI should handle
         if game.pending_resolves:

@@ -49,6 +49,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from mtg.constants import Phase, Zone
 from mtg.helpers import response_text
 from mtg.models import Card, Player, GameState
+from rules.effect_templates import has_residual_clause_beyond_library_look
 
 
 # May 20 audit: the AI sometimes attaches a synthetic combat description to a
@@ -719,6 +720,11 @@ async def resolve_effect(rules, game: GameState, effect_description: str,
     )
     is_library_look = (
         any(phrase in effect_lower for phrase in library_look_phrases)
+        # A top-library instruction is not necessarily a pure reorder. Keep
+        # compound effects in the normal resolver whenever they also move
+        # cards or otherwise mutate state (Risen Reef is the live exemplar).
+        and not has_residual_clause_beyond_library_look(
+            effect_description or "")
         and "draw" not in effect_lower
         and "destroy" not in effect_lower
         and "exile" not in effect_lower
@@ -832,10 +838,27 @@ async def resolve_effect(rules, game: GameState, effect_description: str,
         rules._cached_judge_fingerprint = current_fp
     recent_log = "\n".join(rules.game_log[-10:]) if rules.game_log else "No recent events"
     
-    # Build player name mapping
-    player_names = [p.name for p in game.players]
+    # Build a multiplayer-safe player mapping. Eliminated seats remain in
+    # GameState for stable ownership/indexing, but they are not opponents and
+    # must never be offered as action targets to Tier 3.
     controller_name = controller or (game.active_player.name if game.players else "Unknown")
-    opponent_name = next((p.name for p in game.players if p.name != controller_name), "Unknown")
+    controller_player = next(
+        (p for p in game.players
+         if p.name == controller_name and not getattr(p, 'eliminated', False)),
+        None,
+    )
+    if controller_player is not None:
+        opponent_names = [p.name for p in game.opponents_of(controller_player)]
+    else:
+        opponent_names = [
+            p.name for p in game.players
+            if p.name != controller_name and not getattr(p, 'eliminated', False)
+        ]
+    living_player_names = [
+        p.name for p in game.players if not getattr(p, 'eliminated', False)
+    ]
+    opponents_label = ", ".join(opponent_names) or "None"
+    living_names_label = '\", \"'.join(living_player_names)
     
     prompt = f"""You are an MTG rules engine. Resolve this effect by returning JSON actions that modify the game state.
 
@@ -848,7 +871,7 @@ RECENT EVENTS:
 EFFECT TO RESOLVE:
 Source: {source_card}
 Controller: {controller_name}
-Opponent: {opponent_name}
+Living opponent(s): {opponents_label}
 Effect text: {effect_description}
 {f"Additional context: {context}" if context else ""}
 
@@ -887,7 +910,8 @@ IMPORTANT: "add_counters" is for PERMANENT +1/+1 counters. For "gets +N/+N until
 CRITICAL RULES:
 - You MUST return valid JSON with "explanation" and "actions" keys
 - Use exact card names as shown in the game state
-- Use exact player names as shown: "{controller_name}" and "{opponent_name}"  
+- Use exact living player names as shown: "{living_names_label}"
+- "Each opponent" means every player in Living opponent(s); never target an eliminated player
 - For "any target" effects, pick the strategically best target for the controller
 - If the effect is optional ("may"), assume the controller chooses to do it unless clearly disadvantageous
 - If a trigger doesn't apply (e.g., "whenever another creature enters" but no creature entered), return no_action
@@ -1429,7 +1453,14 @@ def describe_game_for_judge(rules, game: GameState) -> str:
     ]
     
     for i, player in enumerate(game.players):
-        lines.append(f"=== {player.name} (Player {i+1}) ===")
+        if getattr(player, 'eliminated', False):
+            lines.append(
+                f"=== {player.name} (Player {i+1}, ELIMINATED) ===")
+            lines.append(
+                f"Status: Eliminated ({getattr(player, 'loss_reason', '') or 'lost the game'})")
+            lines.append("")
+            continue
+        lines.append(f"=== {player.name} (Player {i+1}, LIVING) ===")
         lines.append(f"Life: {player.life}, Poison: {player.poison}")
         
         if player.battlefield:

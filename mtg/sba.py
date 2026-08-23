@@ -175,6 +175,8 @@ def check_state_based_actions(rules, game: GameState) -> List[Dict]:
 
     # === INLINE: Game-specific checks not in rules module ===
     for i, player in enumerate(game.players):
+        if getattr(player, 'eliminated', False):
+            continue
         # Commander damage (21+) — game-specific, not in CR 704.5
         cant_lose_source = rules._player_cant_lose(game, i)
         commander_damage = (player.commander_damage
@@ -241,6 +243,8 @@ def check_sba_inline_fallback(rules, game: GameState) -> List[Dict]:
     """Inline SBA checks — fallback when rules module is unavailable."""
     actions = []
     for i, player in enumerate(game.players):
+        if getattr(player, 'eliminated', False):
+            continue
         cant_lose_source = rules._player_cant_lose(game, i)
         if player.life <= 0 and not cant_lose_source:
             actions.append({'type': 'player_loses', 'player_index': i, 'reason': 'life total is 0 or less'})
@@ -534,7 +538,7 @@ def process_state_based_actions(rules, game: GameState) -> List[str]:
         # that's still one player losing, not a draw.
         loss_actions = [a for a in actions if a.get('type') == 'player_loses']
         unique_losers = {a['player_index']: a for a in loss_actions}
-        if len(unique_losers) >= 2:
+        if len(unique_losers) >= 2 and not game.is_multiplayer:
             losers = [game.players[idx].name for idx in unique_losers]
             reasons = ', '.join(f"{game.players[idx].name}: {a['reason']}" for idx, a in unique_losers.items())
             messages.append(f"🤝 **Draw!** {len(losers)} players lose simultaneously ({reasons})")
@@ -550,10 +554,20 @@ def process_state_based_actions(rules, game: GameState) -> List[str]:
         # the battlefield in the final snapshot, game_1532532179492536430).
         # Process the loss LAST so same-batch mutations land; the post-end
         # trigger gate (CR 104.2a) still suppresses their triggers.
+        eliminated_this_pass = set()
         for action in sorted(actions, key=lambda a: a.get('type') == 'player_loses'):
             if action['type'] == 'player_loses':
                 idx = action['player_index']
                 player = game.players[idx]
+                if game.is_multiplayer:
+                    if idx not in eliminated_this_pass:
+                        messages.extend(game.eliminate_player(
+                            idx,
+                            action.get('reason', 'state-based action'),
+                            finalize=False,
+                        ))
+                        eliminated_this_pass.add(idx)
+                    continue
                 # Aug 7 batch audit (G3-2): trigger messages buffered by an
                 # EARLIER action (a Mayhem Devil ping from an Altar
                 # activation) were still sitting in _pending_messages and
@@ -1092,6 +1106,11 @@ def process_state_based_actions(rules, game: GameState) -> List[str]:
                     messages.append(f"{card.name} falls off ({action.get('reason', 'invalid attachment')})")
                     print(f"[SBA-UNATTACH] {card.name} unattached via delegated SBA ({action.get('reason', 'invalid target')})")
                     needs_layers_recalc = True
+
+        if eliminated_this_pass:
+            game.finalize_eliminations()
+            if game.ended and game.winner is not None:
+                messages.append(f"🏆 **{game.players[game.winner].name}** wins the game!")
 
         # Break outer loop if game ended
         if game.ended:
