@@ -4276,6 +4276,10 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
         if game.is_multiplayer:
             defenders = self._combat_defender_indices(game)
             game.waiting_for_human_blocks = True
+            # The next thing this command does is tell defenders to !block,
+            # and can_block_with() refuses outside DECLARE_BLOCKERS — so
+            # without this the instruction cannot be followed.
+            game.set_phase(Phase.DECLARE_BLOCKERS, via="cog:attack_cmd:human_blocks")
             self.engine.save_game(game)
             await ctx.send(
                 "Defending seats: " +
@@ -4370,6 +4374,13 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
             # Resolve combat damage
             await self._resolve_combat(ctx, game)
         else:
+            # Same reason as the multiplayer branch above: !block is gated on
+            # DECLARE_BLOCKERS, so a human defender could never act on this
+            # prompt. The Claude branch does not need it — it applies its own
+            # blocks and never calls the command.
+            game.waiting_for_human_blocks = True
+            game.set_phase(Phase.DECLARE_BLOCKERS, via="cog:attack_cmd:human_blocks")
+            self.engine.save_game(game)
             await ctx.send(f"{opponent.name}, declare blockers with `!block <attacker> with <blocker>`, then `!doneblocking` (or `!noblock` for no blocks)")
     
     @commands.command(name="block")
