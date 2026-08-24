@@ -1081,6 +1081,54 @@ async def probe_adapter_latency(adapter, samples: int = 2,
             "errors": errors, "detail": last_err}
 
 
+# ---------------------------------------------------------------------------
+# DeepSeek peak / off-peak billing window (announced Aug 22, 2026)
+# ---------------------------------------------------------------------------
+# Beijing weekday peak windows. Weekends are exempt entirely as of Aug 23.
+_DS_PEAK_WINDOWS_BEIJING = ((9, 12), (14, 18))
+
+# The one unknown, deliberately isolated. DeepSeek has published the WINDOWS
+# but never the peak RATES -- its Aug 6 notice said "a significant increase"
+# with no figure and no effective date. 1.0 == today's behaviour, so nothing
+# changes until a real number is known. Set MTG_DS_PEAK_MULTIPLIER once the
+# official pricing page carries it, and update MODEL_RATES in the same commit.
+DEEPSEEK_PEAK_MULTIPLIER = float(
+    os.getenv("MTG_DS_PEAK_MULTIPLIER", "1.0"))
+
+
+def deepseek_pricing_window(now_utc=None) -> str:
+    """'peak' or 'off_peak' for DeepSeek DIRECT billing, right now.
+
+    Weekend is decided in BEIJING time, not local: a Friday evening in the US
+    is already Saturday in Beijing and therefore off-peak, which is exactly
+    the case an overnight batch hits.
+    """
+    import datetime as _dt
+
+    now = now_utc or _dt.datetime.now(_dt.timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=_dt.timezone.utc)
+    beijing = now.astimezone(_dt.timezone(_dt.timedelta(hours=8)))
+    if beijing.weekday() >= 5:          # Sat/Sun in Beijing
+        return "off_peak"
+    hour = beijing.hour
+    for start, end in _DS_PEAK_WINDOWS_BEIJING:
+        if start <= hour < end:
+            return "peak"
+    return "off_peak"
+
+
+def _is_direct_deepseek(model: str) -> bool:
+    """Direct DeepSeek only.
+
+    The surcharge is DeepSeek's own billing. DashScope resells the same model
+    names at Alibaba's rates, and those adapters carry a `dashscope:` rate_key
+    precisely so the two price separately.
+    """
+    return "deepseek" in (model or "").lower() and not (
+        model or "").lower().startswith("dashscope:")
+
+
 def provider_cost_score(adapter) -> float:
     """Heuristic $-per-token-mix score for ORDERING providers by price.
 
@@ -1105,7 +1153,14 @@ def provider_cost_score(adapter) -> float:
     # units so the probe log line is legible (qwen ~0.34, DS ~1.02,
     # DS-via-Alibaba ~1.39 at today's table).
     blended_in = 0.75 * hit + 0.25 * miss
-    return (blended_in * 20.0 + out) * 1_000_000
+    score = (blended_in * 20.0 + out) * 1_000_000
+    # Aug 22, 2026: DeepSeek bills a weekday peak surcharge. The multiplier is
+    # 1.0 until the real figure is published, so this is structure rather than
+    # a guess -- but the window is real, and the day a number lands the
+    # ordering corrects itself without touching this function.
+    if _is_direct_deepseek(model) and deepseek_pricing_window() == "peak":
+        score *= DEEPSEEK_PEAK_MULTIPLIER
+    return score
 
 
 async def choose_fastest_provider(candidates: list, samples: int = 2,
@@ -1148,8 +1203,12 @@ async def choose_fastest_provider(candidates: list, samples: int = 2,
         if r["median_ms"] is None:
             print(f"[PROVIDER-PROBE] {n}: UNUSABLE — {r['detail']}")
         elif r["ok"]:
+            _ad = adapters_by_name[n]
+            _mdl = getattr(_ad, "rate_key", None) or getattr(_ad, "model", "")
+            _win = (" %s" % deepseek_pricing_window()
+                    if _is_direct_deepseek(_mdl) else "")
             print(f"[PROVIDER-PROBE] {n}: median {r['median_ms']:.0f}ms "
-                  f"(cost score {provider_cost_score(adapters_by_name[n]):.3f})")
+                  f"(cost score {provider_cost_score(_ad):.3f}{_win})")
         else:
             print(f"[PROVIDER-PROBE] {n}: median {r['median_ms']:.0f}ms "
                   f"but {r['errors']} error(s) — disqualified: {r['detail']}")

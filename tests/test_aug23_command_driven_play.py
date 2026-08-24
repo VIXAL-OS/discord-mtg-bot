@@ -622,3 +622,266 @@ class TestRefusedAttacks:
             "fixture check: the engine must actually be refusing")
         assert not driver.said("No creature is attacking your seat"), (
             "the driver blocked after a refused attack")
+
+
+# --------------------------------------------------------------------------
+# The three command parsers nothing had ever executed
+# --------------------------------------------------------------------------
+
+MIND_STONE = ("{T}: Add {C}.\n"
+              "{1}, {T}, Sacrifice this artifact: Draw a card.")
+
+JACE_TMS = (
+    "+2: Look at the top card of target player's library. You may put that "
+    "card on the bottom of that player's library.\n"
+    "0: Draw three cards, then put two cards from your hand on top of your "
+    "library in any order.\n"
+    "−1: Return target creature to its owner's hand.\n"
+    "−12: Exile all cards from target player's library, then that player "
+    "shuffles their hand into their library.")
+
+
+def _artifact(driver, seat, name="Mind Stone", oracle=MIND_STONE):
+    from mtg.models import Card
+
+    card = Card(name=name, id="art_%d" % seat, type_line="Artifact",
+                mana_cost="{2}", cmc=2, oracle_text=oracle,
+                summoning_sick=False)
+    driver.game.players[seat].battlefield.append(card)
+    return card
+
+
+def _walker(driver, seat, name="Jace, the Mind Sculptor", oracle=JACE_TMS):
+    from mtg.models import Card
+
+    card = Card(name=name, id="pw_%d" % seat,
+                type_line="Legendary Planeswalker — Jace",
+                mana_cost="{2}{U}{U}", cmc=4, oracle_text=oracle,
+                loyalty="3", summoning_sick=False)
+    card.loyalty_counters = 3
+    driver.game.players[seat].battlefield.append(card)
+    return card
+
+
+class TestActivateParser:
+    """`!activate` has three distinct parse shapes -- bare, named, and
+    named-with-an-index -- and a separate planeswalker branch. The register
+    records the "two activation paths diverge" family six times, and this is
+    the human one."""
+
+    def test_bare_activate_lists_what_can_be_activated(self, tmp_path,
+                                                       monkeypatch):
+        driver = CommandDriver(tmp_path, monkeypatch)
+        _artifact(driver, 0)
+
+        ctx = driver.run("activate_ability", 0, args="")
+
+        assert any("Mind Stone" in line for line in ctx.sent), ctx.sent
+
+    def test_naming_a_permanent_lists_its_abilities(self, tmp_path,
+                                                    monkeypatch):
+        driver = CommandDriver(tmp_path, monkeypatch)
+        _artifact(driver, 0)
+
+        ctx = driver.run("activate_ability", 0, args="Mind Stone")
+
+        joined = " ".join(ctx.sent)
+        assert "Mind Stone" in joined, ctx.sent
+        assert "Draw a card" in joined or "Sacrifice" in joined, ctx.sent
+
+    def test_a_permanent_not_on_the_battlefield_is_refused(self, tmp_path,
+                                                           monkeypatch):
+        driver = CommandDriver(tmp_path, monkeypatch)
+        _artifact(driver, 0)
+
+        ctx = driver.run("activate_ability", 0, args="Black Lotus")
+
+        assert ctx.sent, "the command said nothing at all"
+        assert not any("Mind Stone" in line for line in ctx.sent), (
+            "a miss must not silently activate a different permanent")
+
+    def test_the_planeswalker_branch_reads_a_signed_loyalty_cost(
+            self, tmp_path, monkeypatch):
+        """A separate parser from the ability-index one: `+2` is a loyalty
+        cost, `1` is an index, and confusing them must be visible."""
+        driver = CommandDriver(tmp_path, monkeypatch)
+        _walker(driver, 0)
+
+        ctx = driver.run("activate_ability", 0, args="Jace 1")
+
+        assert any("no [+1] ability" in line for line in ctx.sent), ctx.sent
+
+    def test_activate_then_target_pays_the_loyalty(self, tmp_path,
+                                                   monkeypatch):
+        """The full human chain, and the reason the loyalty is not paid at
+        activation: Jace's +2 targets a PLAYER, and targets are chosen before
+        costs are paid (CR 601.2b). So `!activate` prompts and `!target`
+        resolves -- neither command is testable without the other."""
+        driver = CommandDriver(tmp_path, monkeypatch)
+        jace = _walker(driver, 0)
+        before = jace.loyalty_counters
+
+        ctx = driver.run("activate_ability", 0, args="Jace +2")
+        assert any("!target" in line for line in ctx.sent), (
+            "the +2 must ask for its target")
+        assert jace.loyalty_counters == before, (
+            "loyalty is paid on resolution, not on announcement")
+
+        driver.run("select_target", 0, 0)
+
+        assert jace.loyalty_counters == before + 2, (
+            "the +2 must add loyalty once its target is chosen")
+        assert driver.game.pending_action is None, (
+            "the prompt must be consumed")
+
+
+class TestTargetParser:
+    """`!target` only exists to answer a pending prompt, so it cannot be
+    driven in isolation -- it has to be reached through a real activation."""
+
+    def test_target_without_a_pending_prompt_is_refused(self, tmp_path,
+                                                        monkeypatch):
+        driver = CommandDriver(tmp_path, monkeypatch)
+
+        ctx = driver.run("select_target", 0, 0)
+
+        assert any("No pending" in line for line in ctx.sent), ctx.sent
+
+    def test_a_targeted_planeswalker_ability_opens_a_prompt(self, tmp_path,
+                                                            monkeypatch):
+        """Jace's -1 returns TARGET creature, so activating it must ask."""
+        from mtg.models import Card
+
+        driver = CommandDriver(tmp_path, monkeypatch)
+        _walker(driver, 0)
+        bear = Card(name="Grizzly Bears", id="victim",
+                    type_line="Creature — Bear", power="2", toughness="2",
+                    summoning_sick=False)
+        driver.game.players[1].battlefield.append(bear)
+
+        driver.run("activate_ability", 0, args="Jace -1")
+
+        pending = driver.game.pending_action
+        if pending is None:
+            # The ability resolved without a prompt -- acceptable only if it
+            # actually did the thing, which is what we really care about.
+            assert bear not in driver.game.players[1].battlefield, (
+                "Jace -1 neither prompted for a target nor bounced anything")
+        else:
+            assert pending.get("type"), pending
+
+    def test_the_wrong_seat_cannot_answer_a_prompt(self, tmp_path,
+                                                   monkeypatch):
+        """A pending choice belongs to its chooser; another seat answering it
+        would decide someone else's choice for them."""
+        driver = CommandDriver(tmp_path, monkeypatch)
+        driver.game.pending_action = {
+            "type": "planeswalker_target",
+            "player_idx": 0,
+            "targets": [],
+        }
+
+        ctx = driver.run("select_target", 1, 0)
+
+        assert ctx.sent, "the wrong seat was answered with silence"
+        assert driver.game.pending_action is not None, (
+            "the wrong seat consumed another player's prompt")
+
+
+class TestDiscardParser:
+    """`!discard` is free-form: it takes a name and matches it against the
+    hand. It is also the entry point for madness (CR 702.35)."""
+
+    def test_discard_moves_the_named_card_to_the_graveyard(self, tmp_path,
+                                                           monkeypatch):
+        driver = CommandDriver(tmp_path, monkeypatch)
+        player = driver.game.players[0]
+        target = player.hand[0]
+        before = len(player.hand)
+
+        driver.run("discard_card", 0, card_name=target.name)
+
+        assert len(player.hand) == before - 1
+        assert target in player.graveyard
+
+    def test_discard_refuses_a_card_not_in_hand(self, tmp_path, monkeypatch):
+        driver = CommandDriver(tmp_path, monkeypatch)
+        player = driver.game.players[0]
+        before = len(player.hand)
+
+        ctx = driver.run("discard_card", 0, card_name="Black Lotus")
+
+        assert any("Couldn't find" in line for line in ctx.sent), ctx.sent
+        assert len(player.hand) == before, "a miss must not discard anything"
+
+    def test_discard_removes_exactly_one_copy(self, tmp_path, monkeypatch):
+        """The same-name family again: the hand routinely holds several cards
+        with one name, and a discard must consume exactly one."""
+        driver = CommandDriver(tmp_path, monkeypatch)
+        player = driver.game.players[0]
+        name = player.hand[0].name
+        copies = [c for c in player.hand if c.name == name]
+        assert len(copies) >= 2, "fixture check: need duplicates in hand"
+
+        driver.run("discard_card", 0, card_name=name)
+
+        left = [c for c in player.hand if c.name == name]
+        assert len(left) == len(copies) - 1
+        assert len(player.graveyard) == 1
+
+
+class TestDrivenActivation:
+    """Targeted pins prove a parser accepts what you thought to send it.
+    Ordinary play is what found the !block hand-off and both same-name bugs,
+    so the loop matters more: it emits combinations nobody designed."""
+
+    @staticmethod
+    def _stone_policy():
+        class _Activates(HeuristicPolicy):
+            @staticmethod
+            def activations(game, player):
+                return [(c.name, "")
+                        for c in player.battlefield
+                        if c.name == "Mind Stone" and not c.tapped]
+
+        return _Activates()
+
+    def test_a_driven_game_reaches_the_activate_parser(self, tmp_path,
+                                                       monkeypatch):
+        deck = []
+        for _ in range(10):
+            deck += ["Forest", "Forest", "Mind Stone"]
+
+        driver = CommandDriver(tmp_path, monkeypatch,
+                               policy=self._stone_policy(),
+                               deck=deck).play_turns(12)
+
+        assert driver.issued("activate_ability"), (
+            "the loop never reached !activate")
+        joined = " ".join(driver.transcript)
+        assert "Mind Stone" in joined, "the artifact never appeared"
+
+    def test_driven_activation_raises_no_unexpected_rejections(self, tmp_path,
+                                                               monkeypatch):
+        deck = []
+        for _ in range(10):
+            deck += ["Forest", "Forest", "Mind Stone"]
+
+        driver = CommandDriver(tmp_path, monkeypatch,
+                               policy=self._stone_policy(),
+                               deck=deck).play_turns(12)
+
+        allowed = ("Not enough mana", "No valid attackers")
+        unexpected = [line for _cmd, line in driver.rejections
+                      if not any(a in line for a in allowed)]
+        assert unexpected == [], "unexpected rejections: %s" % unexpected[:3]
+
+
+def test_driven_games_emit_no_phase_bus_warning(tmp_path, monkeypatch, capsys):
+    """`[PHASE-BUS]` means a MAIN entry ran with no engine ref, so main-phase
+    trigger dispatch was skipped. The watch table says it must be zero, and
+    the driver used to print one per game by attaching its engine AFTER the
+    opening set_phase."""
+    CommandDriver(tmp_path, monkeypatch).play_turns(4)
+
+    assert "[PHASE-BUS]" not in capsys.readouterr().out

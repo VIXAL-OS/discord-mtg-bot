@@ -95,8 +95,11 @@ class HeuristicPolicy:
         the command's error path, which is exactly the kind of thing a
         scripted test never reaches.
         """
-        castable = [c for c in player.hand
-                    if not c.is_land() and c.is_creature()]
+        # Non-land, not "creature": the docstring's own rule is to let the
+        # command reject what it will, and a creature-only filter silently
+        # excluded every artifact -- so !activate could never be reached by
+        # ordinary play.
+        castable = [c for c in player.hand if not c.is_land()]
         return sorted(castable, key=lambda c: getattr(c, "cmc", 0) or 0)
 
     @staticmethod
@@ -104,6 +107,16 @@ class HeuristicPolicy:
         return [c for c in player.battlefield
                 if c.is_creature(game=game) and not c.tapped
                 and not c.summoning_sick]
+
+    @staticmethod
+    def activations(game, player):
+        """Which abilities to activate, as (permanent name, ability arg).
+
+        Empty by default so existing driven games are unchanged -- an
+        activation policy is opt-in, because activating changes the shape of
+        every downstream turn.
+        """
+        return []
 
     @staticmethod
     def defenders(game, player, attackers):
@@ -165,6 +178,9 @@ class AIPolicy:
     def defenders(self, game, player, attackers):
         return HeuristicPolicy.defenders(game, player, attackers)
 
+    def activations(self, game, player):
+        return HeuristicPolicy.activations(game, player)
+
 
 # --------------------------------------------------------------------------
 # The driver
@@ -198,11 +214,14 @@ class CommandDriver:
             for _ in range(7):
                 if player.library:
                     player.hand.append(player.library.pop(0))
-        game.set_phase(Phase.MAIN1, via="driver:start")
-
         engine = GameEngine(None)
         engine.games[self.THREAD_ID] = game
         game._rules_engine = engine.rules
+        # set_phase AFTER the engine is attached. The other way round, the
+        # opening MAIN1 has no engine ref, so main-phase trigger dispatch is
+        # skipped and every driven game prints a [PHASE-BUS] line -- a signal
+        # the watch table says must be zero.
+        game.set_phase(Phase.MAIN1, via="driver:start")
 
         cog = object.__new__(MTGGameCog)
         cog.engine = engine
@@ -237,6 +256,12 @@ class CommandDriver:
         if name == "Forest":
             return Card(name="Forest", id="F_%d_%d" % (owner, seq),
                         type_line="Basic Land — Forest", mana_cost="")
+        if name == "Mind Stone":
+            # Real text, from data/card_data_cache.json.
+            return Card(name="Mind Stone", id="A_%d_%d" % (owner, seq),
+                        type_line="Artifact", mana_cost="{2}", cmc=2,
+                        oracle_text="{T}: Add {C}.\n{1}, {T}, Sacrifice this "
+                                    "artifact: Draw a card.")
         return Card(name=name, id="C_%d_%d" % (owner, seq),
                     type_line="Creature — Bear", mana_cost="{1}{G}", cmc=2,
                     power="2", toughness="2")
@@ -282,6 +307,12 @@ class CommandDriver:
         for spell in self.policy.spells_to_cast(self.game, player)[:1]:
             self.run("play_card", seat, card_name=spell.name)
 
+        # --- activated abilities, through the real !activate parser
+        for name, ability in self.policy.activations(self.game, player)[:2]:
+            self.run("activate_ability", seat,
+                     args=("%s %s" % (name, ability)).strip())
+            self._answer_pending(seat)
+
         # --- walk into combat with !pass, exactly as a player must
         self._pass_until(seat, Phase.DECLARE_ATTACKERS, limit=4)
 
@@ -304,6 +335,21 @@ class CommandDriver:
         self._pass_until(seat, Phase.MAIN2, limit=5)
         if not self.game.ended:
             self.run("end_turn", seat)
+
+    def _answer_pending(self, seat):
+        """Answer a target prompt if the last command raised one.
+
+        `!target` cannot be driven on its own -- it only ever answers a
+        pending choice -- so the loop has to reach it through an activation,
+        which is exactly how a human gets there.
+        """
+        pending = getattr(self.game, "pending_action", None)
+        if not pending:
+            return
+        options = pending.get("targets") or pending.get("options") or []
+        if not options:
+            return
+        self.run("select_target", seat, 0)
 
     def _render_attack(self, seat, player, chosen):
         """Turn chosen attackers into command TEXT.
