@@ -20,7 +20,9 @@ gateway reconnect or rate limits. Those remain the human pilot's job. It does
 check the one constraint a fake context can honestly enforce — the 2000-char
 message limit — because the register has truncation bugs on record.
 """
-from mtg.constants import Phase
+from types import SimpleNamespace
+
+from mtg.constants import Phase, Zone
 
 from _command_driver import CommandDriver, HeuristicPolicy
 
@@ -272,3 +274,351 @@ def test_the_ai_choice_reaches_the_attack_command(tmp_path, monkeypatch):
     assert driver.issued("declare_attackers"), (
         "the AI chose attackers and none were declared")
     assert driver.said("attacks with")
+
+
+# --------------------------------------------------------------------------
+# 4-seat: two command surfaces the 2-player driver cannot reach
+# --------------------------------------------------------------------------
+
+FOUR = ("Alice", "Bob", "Carol", "Dave")
+
+
+def _four(tmp_path, monkeypatch, turns=24):
+    return CommandDriver(tmp_path, monkeypatch, names=FOUR).play_turns(turns)
+
+
+class TestFourSeatDrivenPlay:
+    """Multiplayer REQUIRES `at <defender>` per group and holds damage until
+    every attacked seat submits its own blocks. Neither grammar nor protocol
+    exists in a 2-player game, so neither had any coverage."""
+
+    def test_a_full_four_seat_game_plays_through_the_commands(self, tmp_path,
+                                                              monkeypatch):
+        driver = _four(tmp_path, monkeypatch)
+
+        assert driver.game.is_multiplayer
+        assert driver.game.turn_number >= 20
+        for command in ("play_card", "declare_attackers", "end_turn"):
+            assert driver.issued(command), "%s never ran" % command
+
+    def test_attacks_use_the_at_defender_grammar(self, tmp_path, monkeypatch):
+        """The only thing that ever produces the `at` syntax, and therefore
+        the only thing that tests the parser for it."""
+        driver = _four(tmp_path, monkeypatch)
+
+        attacks = driver.said("attacks with")
+        assert attacks, "nobody attacked"
+        assert all(" at " in line for line in attacks), (
+            "multiplayer attacks must name a defender: %s" % attacks[:2])
+        # And the command ACCEPTED them — a refusal leaves no attack line.
+        assert not driver.said("Multiplayer attacks require a defender")
+
+    def test_every_attacked_seat_submits_its_own_blocks(self, tmp_path,
+                                                        monkeypatch):
+        """Damage waits on combat_defenders_done, so a defender that never
+        submits hangs the combat."""
+        driver = _four(tmp_path, monkeypatch)
+
+        assert driver.issued("no_blockers") or driver.issued("done_blocking")
+        assert not driver.said("No creature is attacking your seat"), (
+            "the driver submitted blocks for a seat nobody attacked")
+
+    def test_only_expected_rejections_in_four_seats(self, tmp_path, monkeypatch):
+        driver = _four(tmp_path, monkeypatch)
+        unexpected = [line for _cmd, line in driver.rejections
+                      if "Not enough mana" not in line]
+        assert unexpected == [], "unexpected rejections: %s" % unexpected
+
+    def test_a_seat_is_eliminated_and_play_continues(self, tmp_path,
+                                                     monkeypatch):
+        """The policy concentrates damage on the lowest-life opponent
+        specifically so elimination gets exercised."""
+        driver = _four(tmp_path, monkeypatch)
+
+        dead = [p for p in driver.game.players if p.eliminated]
+        assert dead, "no seat was eliminated in 24 turns"
+        assert not driver.game.ended, "the game should continue past one death"
+        assert len(driver.game.living_player_indices()) >= 2
+
+    def test_no_message_exceeds_the_discord_limit_at_four_seats(self, tmp_path,
+                                                                monkeypatch):
+        """Four battlefields make the long-message risk real, not notional."""
+        driver = _four(tmp_path, monkeypatch)
+        assert max(len(line) for line in driver.transcript) <= 2000
+
+
+# --------------------------------------------------------------------------
+# Same-name creatures — two bugs the 4-seat work surfaced
+# --------------------------------------------------------------------------
+
+def _twins(driver, seat, name="Grizzly Bears", tapped_first=False):
+    """Give a seat two identically-named creatures, both able to act."""
+    from mtg.models import Card
+
+    made = []
+    for index in (1, 2):
+        card = Card(name=name, id="twin_%d_%d" % (seat, index),
+                    type_line="Creature — Bear", power="2", toughness="2",
+                    summoning_sick=False)
+        driver.game.players[seat].battlefield.append(card)
+        made.append(card)
+    if tapped_first:
+        made[0].tapped = True
+    return made
+
+
+class TestSameNameCreatures:
+    """`find_card` returns the FIRST exact match, which is wrong whenever a
+    player controls several creatures with one name. Both combat commands
+    resolved names that way."""
+
+    def test_naming_a_creature_twice_declares_two_distinct_attackers(
+            self, tmp_path, monkeypatch):
+        """THE BUG: `!attack Grizzly Bears, Grizzly Bears` produced
+        game.attackers == ['dup_1', 'dup_1'] — one creature declared twice,
+        dealing its damage TWICE, while the second Bears never attacked
+        (CR 508.1)."""
+        driver = CommandDriver(tmp_path, monkeypatch)
+        twins = _twins(driver, 0)
+        driver.game.set_phase(Phase.DECLARE_ATTACKERS, via="test")
+
+        driver.run("declare_attackers", 0,
+                   creatures="Grizzly Bears, Grizzly Bears")
+
+        assert len(driver.game.attackers) == 2
+        assert len(set(driver.game.attackers)) == 2, (
+            "the same creature was declared as two attackers")
+        assert set(driver.game.attackers) == {t.id for t in twins}
+
+    def test_the_duplicate_attacker_deals_damage_once_each(self, tmp_path,
+                                                           monkeypatch):
+        """The impact, measured: two 2/2s deal 4, not one creature twice."""
+        driver = CommandDriver(tmp_path, monkeypatch)
+        _twins(driver, 0)
+        driver.game.set_phase(Phase.DECLARE_ATTACKERS, via="test")
+
+        driver.run("declare_attackers", 0,
+                   creatures="Grizzly Bears, Grizzly Bears")
+        before = driver.game.players[1].life
+        driver.run("no_blockers", 1)
+
+        assert before - driver.game.players[1].life == 4
+
+    def test_naming_one_creature_twice_when_only_one_exists(self, tmp_path,
+                                                            monkeypatch):
+        """Adverse control: the fix must not invent a second attacker."""
+        from mtg.models import Card
+
+        driver = CommandDriver(tmp_path, monkeypatch)
+        only = Card(name="Grizzly Bears", id="lonely",
+                    type_line="Creature — Bear", power="2", toughness="2",
+                    summoning_sick=False)
+        driver.game.players[0].battlefield.append(only)
+        driver.game.set_phase(Phase.DECLARE_ATTACKERS, via="test")
+
+        driver.run("declare_attackers", 0,
+                   creatures="Grizzly Bears, Grizzly Bears")
+
+        assert driver.game.attackers == ["lonely"]
+
+    def test_multiplayer_can_send_twins_at_different_defenders(
+            self, tmp_path, monkeypatch):
+        """`Bears at Bob; Bears at Carol` is legal and was refused outright
+        with 'was assigned to more than one defender'."""
+        driver = CommandDriver(tmp_path, monkeypatch, names=FOUR)
+        twins = _twins(driver, 0)
+        driver.game.set_phase(Phase.DECLARE_ATTACKERS, via="test")
+
+        driver.run("declare_attackers", 0,
+                   creatures="Grizzly Bears at Bob; Grizzly Bears at Carol")
+
+        assert set(driver.game.attackers) == {t.id for t in twins}
+        seats = sorted(c.attacking_player for c in twins)
+        assert seats == [1, 2], "the twins must hit DIFFERENT defenders"
+
+    def test_multiplayer_names_twice_in_one_group_declares_two(self, tmp_path,
+                                                                monkeypatch):
+        """The multiplayer branch has its own selection loop, and its own copy
+        of the bug. The separate-groups test does not cover it: the trailing
+        dedup loop already handled that shape, so only a duplicate WITHIN one
+        group exercises the in-loop claim."""
+        driver = CommandDriver(tmp_path, monkeypatch, names=FOUR)
+        twins = _twins(driver, 0)
+        driver.game.set_phase(Phase.DECLARE_ATTACKERS, via="test")
+
+        driver.run("declare_attackers", 0,
+                   creatures="Grizzly Bears, Grizzly Bears at Bob")
+
+        assert len(driver.game.attackers) == 2
+        assert set(driver.game.attackers) == {t.id for t in twins}
+        assert all(c.attacking_player == 1 for c in twins)
+
+    def test_blocking_picks_the_legal_copy_not_the_first(self, tmp_path,
+                                                          monkeypatch):
+        """THE SECOND BUG, same family: with a tapped and an untapped Bears,
+        `!block ... with Grizzly Bears` resolved to the TAPPED one and
+        answered 'Grizzly Bears is tapped' — the player could not block at
+        all despite holding a legal blocker."""
+        from mtg.models import Card
+
+        driver = CommandDriver(tmp_path, monkeypatch)
+        ogre = Card(name="Ogre", id="ogre", type_line="Creature — Ogre",
+                    power="3", toughness="3", summoning_sick=False)
+        driver.game.players[0].battlefield.append(ogre)
+        twins = _twins(driver, 1, tapped_first=True)
+        driver.game.set_phase(Phase.DECLARE_ATTACKERS, via="test")
+
+        driver.run("declare_attackers", 0, creatures="Ogre")
+        ctx = driver.run("declare_blocker", 1,
+                         block_str="Ogre with Grizzly Bears")
+
+        assert not any("is tapped" in line for line in ctx.sent), ctx.sent
+        assert driver.game.blockers.get("ogre") == [twins[1].id], (
+            "the untapped copy must be chosen")
+
+    def test_blocking_still_refuses_when_no_copy_is_legal(self, tmp_path,
+                                                          monkeypatch):
+        """Adverse control: preferring a legal copy must not become
+        'blocking always works'."""
+        from mtg.models import Card
+
+        driver = CommandDriver(tmp_path, monkeypatch)
+        ogre = Card(name="Ogre", id="ogre", type_line="Creature — Ogre",
+                    power="3", toughness="3", summoning_sick=False)
+        driver.game.players[0].battlefield.append(ogre)
+        twins = _twins(driver, 1, tapped_first=True)
+        twins[1].tapped = True  # now BOTH are tapped
+        driver.game.set_phase(Phase.DECLARE_ATTACKERS, via="test")
+
+        driver.run("declare_attackers", 0, creatures="Ogre")
+        ctx = driver.run("declare_blocker", 1,
+                         block_str="Ogre with Grizzly Bears")
+
+        assert any("is tapped" in line for line in ctx.sent), ctx.sent
+        assert not driver.game.blockers.get("ogre")
+
+    def test_over_assigning_one_creature_is_refused_not_silent(self, tmp_path,
+                                                               monkeypatch):
+        """The exclude_ids fix must not turn a clear refusal into a silent
+        half-attack: with ONE Bears, `Bears at Bob; Bears at Carol` asks for
+        something impossible and has to say so."""
+        from mtg.models import Card
+
+        driver = CommandDriver(tmp_path, monkeypatch, names=FOUR)
+        only = Card(name="Grizzly Bears", id="lonely",
+                    type_line="Creature - Bear", power="2", toughness="2",
+                    summoning_sick=False)
+        driver.game.players[0].battlefield.append(only)
+        driver.game.set_phase(Phase.DECLARE_ATTACKERS, via="test")
+
+        ctx = driver.run("declare_attackers", 0,
+                         creatures="Grizzly Bears at Bob; "
+                                   "Grizzly Bears at Carol")
+
+        assert any("more than one defender" in line for line in ctx.sent),             ctx.sent
+        assert driver.game.attackers == [], (
+            "a refused attack must declare nobody")
+
+    def test_a_name_that_does_not_exist_is_still_skipped_quietly(
+            self, tmp_path, monkeypatch):
+        """Adverse control: the refusal fires on CLAIMED copies, not on any
+        empty lookup. A typo keeps its long-standing silent skip."""
+        from mtg.models import Card
+
+        driver = CommandDriver(tmp_path, monkeypatch, names=FOUR)
+        real = Card(name="Grizzly Bears", id="real",
+                    type_line="Creature - Bear", power="2", toughness="2",
+                    summoning_sick=False)
+        driver.game.players[0].battlefield.append(real)
+        driver.game.set_phase(Phase.DECLARE_ATTACKERS, via="test")
+
+        ctx = driver.run("declare_attackers", 0,
+                         creatures="Grizzly Bears at Bob; Wurm at Carol")
+
+        assert not any("more than one defender" in line for line in ctx.sent)
+        assert driver.game.attackers == ["real"]
+
+    def test_the_name_loop_terminates_even_if_find_card_misbehaves(self):
+        """The `while True` must not depend on a collaborator keeping a
+        promise. Under a correct find_card this guard is unreachable, so the
+        only fixture that can exercise it is one that breaks the promise --
+        which is exactly what the mutation sweep did by accident, spinning for
+        a quarter of an hour instead of failing.
+
+        The stub counts calls so a regression FAILS here rather than hanging
+        the suite.
+        """
+        from mtg.cog import MTGGameCog
+
+        class _Stubborn:
+            """Ignores exclude_ids, always answering with the same card."""
+
+            def __init__(self):
+                self.calls = 0
+
+            def find_card(self, name, zone, exclude_ids=None):
+                self.calls += 1
+                if self.calls > 50:
+                    raise AssertionError("_find_qualifying did not terminate")
+                return SimpleNamespace(id="same", name=name)
+
+        stubborn = _Stubborn()
+        result = MTGGameCog._find_qualifying(
+            stubborn, "Grizzly Bears", Zone.BATTLEFIELD, lambda c: False)
+
+        assert result is None
+        assert stubborn.calls <= 3, (
+            "it should give up as soon as a card repeats, not grind")
+
+    def test_blocking_finds_the_attacking_copy(self, tmp_path, monkeypatch):
+        """The attacker side of the same collision: with two same-named
+        creatures and only one attacking, the command answered
+        "'Grizzly Bears' isn't attacking!"."""
+        from mtg.models import Card
+
+        driver = CommandDriver(tmp_path, monkeypatch)
+        attackers = _twins(driver, 0)
+        wall = Card(name="Wall", id="wall", type_line="Creature — Wall",
+                    power="0", toughness="4", summoning_sick=False)
+        driver.game.players[1].battlefield.append(wall)
+        driver.game.set_phase(Phase.DECLARE_ATTACKERS, via="test")
+
+        # Declare by ID so the attacking copy is NOT the first name match.
+        # Declaring by NAME would resolve to the first twin, the plain
+        # fallback would find it too, and the pin would pass either way --
+        # which is exactly how it first slipped past its own mutant.
+        driver.run("declare_attackers", 0, creatures=attackers[1].id)
+        assert driver.game.attackers == [attackers[1].id], (
+            "fixture check: the SECOND twin must be the one attacking")
+        assert driver.game.players[0].battlefield[0] is attackers[0], (
+            "fixture check: the non-attacking twin must be the first match")
+
+        ctx = driver.run("declare_blocker", 1, block_str="Grizzly Bears with Wall")
+        assert not any("isn't attacking" in line for line in ctx.sent), ctx.sent
+        assert driver.game.blockers.get(attackers[1].id) == ["wall"]
+
+
+class TestRefusedAttacks:
+    """The driver must not run the block protocol after an attack the engine
+    refused. In ordinary driven play no attack is refused any more -- that was
+    the duplicate-name bug -- so the guard needs a policy that deliberately
+    proposes an illegal attacker."""
+
+    def test_no_block_protocol_after_a_refused_attack(self, tmp_path,
+                                                      monkeypatch):
+        class _SickPolicy(HeuristicPolicy):
+            @staticmethod
+            def attackers(game, player):
+                # Summoning-sick creatures pass the driver's own selection and
+                # are then refused by the engine, which is the shape that used
+                # to leave "No creature is attacking your seat" in the log.
+                return [c for c in player.battlefield
+                        if c.is_creature(game=game) and c.summoning_sick][:1]
+
+        driver = CommandDriver(tmp_path, monkeypatch, policy=_SickPolicy(),
+                               names=FOUR).play_turns(8)
+
+        assert driver.said("No valid attackers"), (
+            "fixture check: the engine must actually be refusing")
+        assert not driver.said("No creature is attacking your seat"), (
+            "the driver blocked after a refused attack")

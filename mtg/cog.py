@@ -4147,14 +4147,26 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
                 else:
                     selected = []
                     for name in (part.strip() for part in card_text.split(",")):
-                        card = player.find_card(name, Zone.BATTLEFIELD)
+                        # exclude_ids: the Nth mention of a name must find the
+                        # Nth distinct creature, or "Bears at Alice; Bears at
+                        # Bob" collapses onto one card. `all` was always fine
+                        # because it takes objects, not names.
+                        card = player.find_card(name, Zone.BATTLEFIELD,
+                                                exclude_ids=seen_ids)
+                        if card is None and player.find_card(
+                                name, Zone.BATTLEFIELD) is not None:
+                            # Every copy of this name is already spoken for by
+                            # an earlier group -- the over-assignment the old
+                            # duplicate check caught. Refuse rather than
+                            # half-execute the attack in silence.
+                            await ctx.send(
+                                f"**{name}** was assigned to more than one "
+                                f"defender.")
+                            return
                         if card and card.is_creature(game=game):
                             selected.append(card)
+                            seen_ids.add(card.id)
                 for card in selected:
-                    if card.id in seen_ids:
-                        await ctx.send(
-                            f"**{card.name}** was assigned to more than one defender.")
-                        return
                     seen_ids.add(card.id)
                     potential_attackers.append((card, defender_idx, defender_pw))
         else:
@@ -4185,10 +4197,17 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
                                 f"type_line='{card.type_line}')")
             else:
                 selected = []
+                claimed = set()
                 for name in (part.strip() for part in creatures.split(",")):
-                    card = player.find_card(name, Zone.BATTLEFIELD)
+                    # Same reason as the multiplayer branch: without this,
+                    # "Grizzly Bears, Grizzly Bears" declared ONE creature
+                    # twice — it dealt damage twice and the second Bears never
+                    # attacked (CR 508.1).
+                    card = player.find_card(name, Zone.BATTLEFIELD,
+                                            exclude_ids=claimed)
                     if card and card.is_creature(game=game):
                         selected.append(card)
+                        claimed.add(card.id)
             potential_attackers = [(card, defender_idx, defender_pw)
                                    for card in selected]
 
@@ -4416,6 +4435,8 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
         if player_idx in game.combat_defenders_done:
             await ctx.send("Your blockers are already finalized this combat.")
             return
+        # Existence only; the LEGAL copy among same-named creatures is chosen
+        # once the attacker is known, just below.
         blocker = player.find_card(blocker_name, Zone.BATTLEFIELD)
         
         if not blocker or not blocker.is_creature():
@@ -4424,8 +4445,18 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
         
         # Attackers always belong to the active player, but only the exact
         # stable defending seat assigned at declaration may block one.
-        attacker = game.active_player.find_card(
-            attacker_name, Zone.BATTLEFIELD)
+        # Attackers always belong to the active player, but only the exact
+        # stable defending seat assigned at declaration may block one.
+        # Prefer a copy that is ACTUALLY attacking this seat: with two
+        # same-named creatures, first-match picked the wrong one and answered
+        # "isn't attacking!" while a real attacker sat there.
+        attacker = self._find_qualifying(
+            game.active_player, attacker_name, Zone.BATTLEFIELD,
+            lambda c: (c.id in game.attackers
+                       and game.defender_for(c) is player))
+        if attacker is None:
+            attacker = game.active_player.find_card(
+                attacker_name, Zone.BATTLEFIELD)
         
         if not attacker or attacker.id not in game.attackers:
             await ctx.send(f"'{attacker_name}' isn't attacking!")
@@ -4438,6 +4469,17 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
             return
         
         # Rules check for blocking
+        # Among same-named creatures, prefer one that can actually block this
+        # attacker — otherwise a tapped or already-committed copy shadows a
+        # legal one and the player is told they cannot block when they can.
+        _legal = self._find_qualifying(
+            player, blocker_name, Zone.BATTLEFIELD,
+            lambda c: (c.is_creature(game=game)
+                       and self.engine.rules.can_block_with(
+                           game, player, c, attacker)[0]))
+        if _legal is not None:
+            blocker = _legal
+
         can_block, reason = self.engine.rules.can_block_with(game, player, blocker, attacker)
         if not can_block:
             await ctx.send(f"⚠️ {reason}")
@@ -7033,6 +7075,31 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
         # Neither a seat nor a walker — surface the seat resolver's message,
         # which is the more common mistake.
         return None, None, error
+
+    @staticmethod
+    def _find_qualifying(player, name, zone, predicate):
+        """First card matching `name` that ALSO satisfies `predicate`.
+
+        `find_card` returns the first exact match, which is wrong whenever a
+        player controls several creatures with the same name and only some of
+        them qualify — the tapped copy shadows the untapped one, the
+        non-attacking copy shadows the attacking one. Returns None when none
+        qualify, so the caller can fall back and keep its error message.
+        """
+        claimed = set()
+        while True:
+            card = player.find_card(name, zone, exclude_ids=claimed)
+            if card is None:
+                return None
+            if predicate(card):
+                return card
+            if card.id in claimed:
+                # find_card handed back a card we already rejected, so it is
+                # not honouring exclude_ids (or two cards share an id). Bail
+                # rather than spin: this loop must terminate on its own terms,
+                # not on a collaborator keeping a promise.
+                return None
+            claimed.add(card.id)
 
     @staticmethod
     def _combat_defender_indices(game: GameState) -> List[int]:

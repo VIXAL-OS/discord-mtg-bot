@@ -2549,7 +2549,8 @@ class Player:
             Zone.COMMAND: self.command_zone,
         }.get(zone, [])
     
-    def find_card(self, name_or_id, zone: Zone = None) -> Optional[Card]:
+    def find_card(self, name_or_id, zone: Zone = None,
+                  exclude_ids=None) -> Optional[Card]:
         """Find a card by name or ID, optionally in a specific zone.
 
         Handles P/T annotations like 'Insect(1/1)' that Claude's AI sometimes
@@ -2575,10 +2576,16 @@ class Player:
         import re as _re
         name_lower = _re.sub(r'\s*\([^)]*\)\s*$', '', name_lower)
 
+        skip = set(exclude_ids or ())
         for z in zones:
             for card in self.get_zone(z):
                 # Skip phased-out permanents on battlefield (they don't exist per CR 702.26)
                 if z == Zone.BATTLEFIELD and getattr(card, '_phased_out', False):
+                    continue
+                # Already claimed by this command. Without it the Nth mention
+                # of a name returns the SAME card every time, which let one
+                # creature be declared as several attackers (CR 508.1).
+                if card.id in skip:
                     continue
                 if card.id == name_or_id or card.name.lower() == name_lower:
                     return card

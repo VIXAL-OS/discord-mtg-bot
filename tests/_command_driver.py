@@ -106,6 +106,21 @@ class HeuristicPolicy:
                 and not c.summoning_sick]
 
     @staticmethod
+    def defenders(game, player, attackers):
+        """Who each attacker hits: the living opponent on the lowest life.
+
+        Spreading damage would be better play; concentrating it is better
+        TESTING, because it drives a seat to zero and exercises elimination
+        and the shrinking turn rotation.
+        """
+        seat = game.players.index(player)
+        living = [i for i in game.living_player_indices() if i != seat]
+        if not living:
+            return []
+        target = min(living, key=lambda i: game.players[i].life)
+        return [(card, target) for card in attackers]
+
+    @staticmethod
     def blocks(game, defender, attacker_names):
         """Block the first attacker with the first free creature, once."""
         free = [c for c in defender.battlefield
@@ -146,6 +161,9 @@ class AIPolicy:
 
     def blocks(self, game, defender, attacker_names):
         return HeuristicPolicy.blocks(game, defender, attacker_names)
+
+    def defenders(self, game, player, attackers):
+        return HeuristicPolicy.defenders(game, player, attackers)
 
 
 # --------------------------------------------------------------------------
@@ -247,7 +265,12 @@ class CommandDriver:
         for _ in range(count):
             if self.game.ended:
                 break
-            self.take_turn(self.game.active_player_index)
+            seat = self.game.active_player_index
+            if self.game.players[seat].eliminated:
+                # Rotation should already skip the dead; if it has not, do not
+                # drive them — every mutating command would refuse anyway.
+                break
+            self.take_turn(seat)
         return self
 
     def take_turn(self, seat):
@@ -266,14 +289,44 @@ class CommandDriver:
         if self.game.phase == Phase.DECLARE_ATTACKERS and not self.game.ended:
             chosen = self.policy.attackers(self.game, player)
             if chosen:
-                self.run("declare_attackers", seat,
-                         creatures=", ".join(c.name for c in chosen))
-                self._resolve_blocks(seat, [c.name for c in chosen])
+                text, defender_seats = self._render_attack(seat, player, chosen)
+                if text is not None:
+                    self.run("declare_attackers", seat, creatures=text)
+                    # Only run the block protocol if the attack was ACCEPTED.
+                    # A refused !attack leaves game.attackers empty, and
+                    # submitting blocks anyway earns "No creature is attacking
+                    # your seat" — noise that hides the real refusal.
+                    if self.game.attackers:
+                        self._resolve_blocks(seat, [c.name for c in chosen],
+                                             defender_seats)
 
         # --- out of combat and end the turn
         self._pass_until(seat, Phase.MAIN2, limit=5)
         if not self.game.ended:
             self.run("end_turn", seat)
+
+    def _render_attack(self, seat, player, chosen):
+        """Turn chosen attackers into command TEXT.
+
+        Multiplayer REQUIRES `at <defender>` per group and refuses the whole
+        command without it, so this is the only place the semicolon/`at`
+        grammar is ever produced — and therefore the only thing that tests
+        the parser for it. Two-player keeps the bare comma list, which is the
+        form that command has always accepted.
+        """
+        if not self.game.is_multiplayer:
+            return ", ".join(c.name for c in chosen), [1 - seat]
+
+        assignments = self.policy.defenders(self.game, player, chosen)
+        if not assignments:
+            return None, []
+        groups = {}
+        for card, defender_seat in assignments:
+            groups.setdefault(defender_seat, []).append(card.name)
+        text = "; ".join(
+            "%s at %s" % (", ".join(names), self.game.players[d].name)
+            for d, names in groups.items())
+        return text, list(groups)
 
     def _pass_until(self, seat, target, limit):
         for _ in range(limit):
@@ -284,16 +337,25 @@ class CommandDriver:
             if self.game.phase == before:
                 return  # the command refused; do not spin
 
-    def _resolve_blocks(self, attacker_seat, attacker_names):
-        defender_seat = 1 - attacker_seat
-        defender = self.game.players[defender_seat]
-        if self.game.ended:
-            return
-        chosen = self.policy.blocks(self.game, defender, attacker_names)
-        for attacker_name, blocker_name in chosen:
-            self.run("declare_blocker", defender_seat,
-                     block_str="%s with %s" % (attacker_name, blocker_name))
-        if chosen:
-            self.run("done_blocking", defender_seat)
-        else:
-            self.run("no_blockers", defender_seat)
+    def _resolve_blocks(self, attacker_seat, attacker_names, defender_seats):
+        """Every attacked seat submits its OWN blocks.
+
+        Multiplayer holds damage until each defender has finalized
+        (`combat_defenders_done`), so a driver that submitted once would hang
+        the combat — and a driver that submitted for an UNATTACKED seat would
+        be told "No creature is attacking your seat".
+        """
+        for defender_seat in defender_seats:
+            if self.game.ended:
+                return
+            if self.game.players[defender_seat].eliminated:
+                continue
+            defender = self.game.players[defender_seat]
+            chosen = self.policy.blocks(self.game, defender, attacker_names)
+            for attacker_name, blocker_name in chosen:
+                self.run("declare_blocker", defender_seat,
+                         block_str="%s with %s" % (attacker_name, blocker_name))
+            if chosen:
+                self.run("done_blocking", defender_seat)
+            else:
+                self.run("no_blockers", defender_seat)
