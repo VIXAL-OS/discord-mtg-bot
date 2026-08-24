@@ -164,6 +164,55 @@ def make_token_action(player: str, token_key: str, count: int = 1) -> Dict:
     return action
 
 
+def _toxic_deluge_x(ctx):
+    """X for Toxic Deluge when the caster did not name one.
+
+    Unlike Blue Sun's Zenith, this card is {2}{B}: its X is "pay X life", an
+    ADDITIONAL cost, so it never reaches the branch in cast_spell_async that
+    stamps _x_value for X-in-mana-cost spells. Only an explicit X from the
+    caster threads through, so an unspecified cast genuinely has no X.
+
+    The old stand-in was a flat 4, which is a guess that can be both too
+    small to kill anything and large enough to kill your own board. Deriving
+    it is a real choice: enough to kill the biggest creature an opponent
+    controls, bounded by what the controller can actually pay (CR 118.4 --
+    you cannot pay more life than you have).
+
+    Returns 0 only when there is nothing to kill, where -0/-0 is the correct
+    resolution rather than a silent failure.
+    """
+    explicit = ctx.get('x_value')
+    if explicit is not None:
+        try:
+            return max(0, int(explicit))
+        except (TypeError, ValueError):
+            pass
+
+    # opponent_battlefield holds Card objects (there is no
+    # 'opponent_creatures' key -- reading one would be the producer-less-key
+    # class this audit trail has found three times).
+    toughest = 0
+    for card in (ctx.get('opponent_battlefield') or []):
+        # No 'noncreature' guard: that trap lives in ORACLE TEXT, and this
+        # reads a TYPE LINE -- measured, 0 of 1269 cached cards have
+        # "noncreature" in a type line. Defence against an impossible case is
+        # dead code, which is this codebase's most expensive bug class.
+        type_line = (getattr(card, 'type_line', '') or '').lower()
+        if 'creature' in type_line:
+            try:
+                toughest = max(toughest, int(getattr(card, 'toughness', 0) or 0))
+            except (TypeError, ValueError):
+                continue
+
+    try:
+        life = int(ctx.get('controller_life') or 0)
+    except (TypeError, ValueError):
+        life = 0
+    # Never pay your last point of life for a board wipe.
+    affordable = max(0, life - 1)
+    return min(toughest, affordable)
+
+
 def _find_player_by_name(game, name: Optional[str]):
     """Find a player object on `game` whose name matches `name` (case-insensitive).
     Returns None if game is None or no match. Used by templates that need to
@@ -2789,7 +2838,7 @@ class EffectTemplateLibrary:
                 {"action": "pump_all_creatures", "player": "all",
                  "power": -_x, "toughness": -_x,
                  "duration": "end_of_turn", "source": "Toxic Deluge"},
-            ])(max(1, int(ctx.get('x_value') or 4))),
+            ])(_toxic_deluge_x(ctx)),
         ))
 
         # --- Dread Return: single-target reanimate from graveyard. The
@@ -6715,11 +6764,16 @@ class EffectTemplateLibrary:
         # Default X=3 if no context. Template targets controller (not opponent).
         self._add_card("blue sun's zenith", EffectTemplate(
             name="Blue Sun's Zenith",
-            description="Draw X cards (default X=3), shuffle Blue Sun's Zenith into library",
+            description="Draw X cards, shuffle Blue Sun's Zenith into library",
             action_generator=lambda ctrl, opp, ctx: [
                 {"action": "draw_cards",
                  "player": ctx.get('explicit_target_player') or ctx.get('explicit_target_name') or ctrl,  # B-2 (Aug 7): player key first
-                 "amount": max(1, ctx.get('x_value', 3))},
+                 # No max(1, ...) floor: this card is {X}{U}{U}{U}, and
+                 # cast_spell_async stamps _x_value unconditionally for any
+                 # spell with X in its mana cost, so the floor stood in for a
+                 # case that cannot occur. Verified by driving the template
+                 # with and without the stamp (tests/test_aug24_x_threading).
+                 "amount": int(ctx.get('x_value') or 0)},
             ],
         ))
 
@@ -6948,6 +7002,12 @@ class EffectTemplateLibrary:
         )
 
         # Chandra, Flamecaller -X: "Chandra, Flamecaller deals X damage to each creature your opponents control."
+        # The max(1, ...) floor below STAYS, and is now recorded as such
+        # rather than left unverified: this card is in no deck (it is absent
+        # from data/card_data_cache.json entirely), and its X arrives from
+        # the planeswalker ACTIVATION path rather than a cast, so the
+        # spell-cast verification that cleared Blue Sun's Zenith says nothing
+        # about it. Verify that path before dropping this floor.
         self._pw_ability_templates[("chandra, flamecaller", "damage to each creature")] = EffectTemplate(
             name="Chandra Flamecaller -X",
             description="Deal X damage to each creature opponents control",

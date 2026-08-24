@@ -3870,3 +3870,99 @@ def creature_damage_after_prevention(game, creature, source_card, amount,
             absorbed, creature._damage_shield)
 
     return amount, ""
+
+
+def sunforger_search_and_free_cast(game, player, source_card):
+    """Sunforger's activated effect. (message, handled).
+
+    "Search your library for a red or white instant card with mana value 4 or
+    less and cast that card without paying its mana cost. Then shuffle."
+
+    Held back on Aug 10 until its COST existed, and the ordering was the whole
+    point: 'Unattach this Equipment' was recognised as a cost keyword by
+    neither activation path, so shipping the effect first would have turned a
+    dead card into a repeatable free-instant engine -- once per turn, forever,
+    with nothing consuming the activation. The cost landed first; this is the
+    other half.
+
+    Named rather than pattern-matched on purpose. Sweeping every cached card
+    for "search your library for a <X> card ... and cast that card without
+    paying" returns exactly ONE card, so a general pattern would be
+    speculative generality for a family of one -- and a wrong general pattern
+    that hands out free casts is the worst possible direction to be wrong in.
+
+    Reuses queue_free_cast (which has a real drain in mtg/spells.py) rather
+    than casting inline, so the freed spell goes on the stack through the
+    ordinary path and gets its cast triggers, targeting and priority window.
+    """
+    if game is None or player is None:
+        return None, False
+
+    # Fast pre-filter. Behaviourally EQUIVALENT to the regex below (anything
+    # failing this also fails the regex), so its mutant survives by
+    # construction -- kept because it skips a regex on every activation of
+    # every permanent, not because it is load-bearing.
+    oracle = strip_reminder_text(getattr(source_card, 'oracle_text', '') or '')
+    if 'search your library' not in oracle.lower() \
+            or 'without paying' not in oracle.lower():
+        return None, False
+
+    import re as _re
+    m = _re.search(
+        r"search your library for an? ([a-z ]*?)\s*(instant|sorcery|creature|"
+        r"artifact|enchantment)\s+card\s+with mana value (\d+) or less",
+        oracle, _re.I)
+    if not m:
+        return None, False
+    colour_words = [w for w in _re.split(r'\s+or\s+|\s+', m.group(1).strip())
+                    if w]
+    card_type = m.group(2).lower()
+    max_mv = int(m.group(3))
+
+    _COLOUR_LETTERS = {'white': 'W', 'blue': 'U', 'black': 'B',
+                       'red': 'R', 'green': 'G'}
+    wanted = {_COLOUR_LETTERS[w.lower()] for w in colour_words
+              if w.lower() in _COLOUR_LETTERS}
+
+    def _matches(card):
+        if card_type not in (getattr(card, 'type_line', '') or '').lower():
+            return False
+        try:
+            if int(getattr(card, 'cmc', 0) or 0) > max_mv:
+                return False
+        except (TypeError, ValueError):
+            return False
+        if not wanted:
+            return True
+        colours = set(spell_colors_from_cost(
+            getattr(card, 'mana_cost', '') or '') or [])
+        return bool(colours & wanted)
+
+    candidates = [c for c in player.library if _matches(c)]
+    if not candidates:
+        # CR 701.19c: a search that finds nothing is still a legal resolution.
+        print(f"[SUNFORGER] {player.name}: no matching card in library "
+              f"({'/'.join(sorted(wanted)) or 'any'} {card_type} MV<={max_mv})")
+        return (f"🔍 **{source_card.name}**: no matching {card_type} found",
+                True)
+
+    # Highest mana value first — a free cast wants the biggest thing it can
+    # legally take, and the MV cap already bounds it.
+    chosen = max(candidates, key=lambda c: int(getattr(c, 'cmc', 0) or 0))
+    print(f"[SUNFORGER] {player.name} finds {chosen.name} "
+          f"(MV {getattr(chosen, 'cmc', 0)}) and casts it free")
+    game._free_cast_pending.append({
+        "card": chosen,
+        "owner_index": game.players.index(player),
+        "from_zone": "library",
+        "fallback_zone": "hand",
+        "source": source_card.name,
+        "is_copy": False,
+    })
+    try:
+        import random as _rnd
+        _rnd.shuffle(player.library)
+    except (TypeError, ValueError):
+        pass
+    return (f"🔍 **{source_card.name}**: finds **{chosen.name}** and casts it "
+            f"without paying its mana cost", True)

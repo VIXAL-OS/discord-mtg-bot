@@ -5737,6 +5737,20 @@ class GameEngine:
                         print(f"[ACTIVATE-CLAUDE-INLINE] {perm.name}: opponents' "
                               f"permanents lose {', '.join(_kws)} (inline)")
 
+                # (d2) Sunforger: search the library for a matching
+                # instant and cast it free. Its COST (unattach) shipped on
+                # Aug 10 and this was held back deliberately -- the other
+                # order would have made it a repeatable free-instant engine.
+                if not inline_msgs:
+                    from mtg.helpers import sunforger_search_and_free_cast
+                    _smsg, _shandled = sunforger_search_and_free_cast(
+                        game, player, perm)
+                    if _shandled:
+                        if _smsg:
+                            inline_msgs.append(_smsg)
+                        print(f"[ACTIVATE-CLAUDE-INLINE] {perm.name}: "
+                              f"library search + free cast")
+
                 # (e) Necropotence-class: "Exile the top card of your library
                 # face down. Put that card into your hand at the beginning of
                 # your next end step." July 23 audit (#7): no handler existed

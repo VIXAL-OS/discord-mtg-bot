@@ -3274,6 +3274,22 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
             print(f"[ACTIVATE-TOP-CYCLE] {card.name} drew 1 + returned to top of library")
             effect_resolved = True
 
+        # Sunforger: search the library for a matching instant and cast it
+        # free. Named rather than templated because a named key cannot fire
+        # for event_type="activated" (it is deliberately absent from
+        # _NAME_KEYED_EVENT_TYPES), and pattern-matching a free cast for a
+        # family of ONE is the wrong direction to be wrong in. The AI twin
+        # lives in mtg/engine.py; both were done together, because these two
+        # paths have a documented history of diverging.
+        if not effect_resolved:
+            from mtg.helpers import sunforger_search_and_free_cast
+            _smsg, _shandled = sunforger_search_and_free_cast(
+                game, player, card)
+            if _shandled:
+                if _smsg:
+                    messages.append(_smsg)
+                effect_resolved = True
+
         # === TIER 1.5: Try effect template library (card name + pattern matching) ===
         if not effect_resolved and HAS_EFFECT_TEMPLATES:
             try:
