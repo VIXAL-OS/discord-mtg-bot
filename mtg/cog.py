@@ -6181,9 +6181,17 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
                         # Emit a single sentinel on the 3rd to flag the burst,
                         # then go silent on subsequent fires.
                         if seen == 2:
+                            # Quote the value the dedup key threw away. Rule 1
+                            # strips "(total: 5)" along with "(life: 27)", so a
+                            # counter total used to climb and then vanish. The
+                            # dedup is deliberately untouched — narrowing it is
+                            # what caused the V19 regression on that function —
+                            # so the magnitude is restored here, at a cost of
+                            # one line rather than nine.
+                            from mtg.helpers import burst_suppression_sentinel
                             await self._thread_send(
                                 thread,
-                                f"_(…suppressing further identical fires this turn)_",
+                                burst_suppression_sentinel(content),
                             )
                             try:
                                 g._last_bot_message_time = time.time()

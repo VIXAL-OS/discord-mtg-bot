@@ -236,6 +236,39 @@ def check_state_based_actions(rules, game: GameState) -> List[Dict]:
                 if card.id in getattr(_eq_target, 'attachments', []):
                     _eq_target.attachments.remove(card.id)
 
+        # CR 702.16 + 704.5m: protection means "can't be enchanted by", so an
+        # Aura on a permanent that GAINS protection becomes illegally attached
+        # and is put into its owner's graveyard. The last letter of DEBA this
+        # engine was missing -- damage, blocking and targeting all closed on
+        # Aug 10.
+        #
+        # It lives HERE, in the always-run inline section, rather than beside
+        # the other aura checks in check_sba_inline_fallback: that function
+        # runs only when the rules module is absent or delegation raises, so a
+        # check placed there is dead on every healthy game. The delegated
+        # checker cannot do this itself -- its Permanent DTO carries no
+        # protection data -- which is what "game-specific checks not in rules
+        # module" means.
+        for card in list(player.battlefield):
+            if not card.is_enchantment() or 'Aura' not in (card.type_line or ''):
+                continue
+            if not card.attached_to:
+                continue
+            _att = game.find_card_global(card.attached_to)
+            if not _att or _att[2] != Zone.BATTLEFIELD:
+                continue    # 'target gone' is the delegated checker's job
+            from mtg.helpers import protection_forbids_attachment
+            _forbidden, _why = protection_forbids_attachment(game, _att[0], card)
+            if _forbidden:
+                print(f"[SBA-PROTECTION] {card.name} falls off "
+                      f"{_att[0].name}: {_why} (CR 702.16/704.5m)")
+                actions.append({'type': 'aura_invalid',
+                                'card_id': card.id,
+                                'card_name': card.name,
+                                'player_index': i,
+                                'reason': f"{card.name} can't enchant "
+                                          f"{_att[0].name} ({_why})"})
+
     return actions
 
 

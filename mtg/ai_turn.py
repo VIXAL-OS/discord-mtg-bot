@@ -210,6 +210,73 @@ _BASIC_LAND_COLORS = {
 }
 
 
+def _adjusted_plan_cost(game, player, card, cost_str, printed_cost, card_name):
+    """Printed cost -> the cost the engine will actually charge.
+
+    _compute_alt_costs applies four adjustment helpers at cast time; plan
+    validation applied none, so the two disagreed on every board with a
+    Medallion, a Thalia, an affinity card or a self-discounter.
+
+    Deliberately approximate in ONE direction only. Alternative costs
+    (madness, spectacle, escape, flashback) are already resolved into
+    `cost_str` upstream, so this handles only the ADJUSTMENTS -- and when a
+    helper raises, the printed cost stands, which is the conservative answer
+    for a validator whose job is to avoid promising an unpayable plan.
+    """
+    if card is None:
+        return printed_cost
+    try:
+        from mtg.helpers import (compute_affinity_reduction,
+                                 compute_cost_increase,
+                                 compute_cost_reduction,
+                                 compute_self_cost_reduction)
+    except ImportError:
+        return printed_cost
+
+    try:
+        increase, inc_sources = compute_cost_increase(game, player, card)
+    except (AttributeError, TypeError, ValueError, KeyError):
+        increase, inc_sources = 0, []
+    try:
+        reduction, red_sources = compute_cost_reduction(player, card)
+    except (AttributeError, TypeError, ValueError, KeyError):
+        reduction, red_sources = 0, []
+    for _fn, _args in ((compute_affinity_reduction, (player, card)),
+                       (compute_self_cost_reduction, (game, player, card))):
+        try:
+            _amt, _label = _fn(*_args)
+        except (AttributeError, TypeError, ValueError, KeyError):
+            continue
+        if _amt:
+            reduction += _amt
+            red_sources = list(red_sources) + [str(_label)]
+
+    if not increase and not reduction:
+        return printed_cost
+
+    # CR 601.2f: a reduction may only eat the GENERIC portion, never a
+    # coloured pip -- so a Medallion cannot make {B}{B} free. Computed the
+    # same way the cast path computes it (mtg/spells.py's printed_generic),
+    # so the validator and the payer cannot drift apart.
+    import re as _re
+    _cost_text = cost_str or getattr(card, 'mana_cost', '') or ''
+    printed_generic = sum(int(s) for s in _re.findall(r'\{(\d+)\}', _cost_text))
+    headroom = max(0, printed_generic + increase)
+    adjusted = printed_cost + increase - min(reduction, headroom)
+
+    if adjusted != printed_cost:
+        _bits = []
+        if increase:
+            _bits.append("+%d (%s)" % (increase, ", ".join(inc_sources) or "tax"))
+        if reduction:
+            _bits.append("-%d (%s)" % (reduction,
+                                       ", ".join(str(s) for s in red_sources)
+                                       or "reduction"))
+        print("[PLAN-VALIDATE] %s costs %d, not %d: %s"
+              % (card_name, adjusted, printed_cost, "; ".join(_bits)))
+    return adjusted
+
+
 def _validate_plan_mana(engine, game: GameState, player_idx: int, plan: list) -> list:
     """Pre-validate a plan_turn action sequence against available mana.
 
@@ -583,6 +650,13 @@ def _validate_plan_mana(engine, game: GameState, player_idx: int, plan: list) ->
                              else _sim_cost.split(' // ')[0])
                     _sim_cost = _half
                     cost = cmc_of_cost_string(_half)
+                # Cost adjustments, which this validator used to ignore
+                # entirely (it priced the PRINTED cost). Over-pricing rejects
+                # casts the engine would make; under-pricing fails later in
+                # the same plan. CR 601.2f: increases first, then reductions,
+                # and a reduction may only eat the GENERIC portion.
+                cost = _adjusted_plan_cost(game, player, card_obj, _sim_cost,
+                                           cost, card_name)
                 if cost > mana_remaining:
                     # Plan-stale (snapshot mismatch). Don't record.
                     print(f"[PLAN-VALIDATE] Rejected cast {card_name} (CMC {cost}) — only {mana_remaining} mana left")

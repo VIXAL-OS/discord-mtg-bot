@@ -906,6 +906,19 @@ def apply_combat_damage_to_creature(rules, game: GameState, creature: Card,
         return 0
     if _why:
         print(f"  [DAMAGE-PREVENTED] {creature.name}: {_why} — damage stands")
+    # Recipient-scoped prevention (Iroas) and fixed-amount shields (Eiganjo
+    # Castle). A different primitive from the flag above: scoped per
+    # permanent rather than per player, and PARTIAL rather than
+    # all-or-nothing, so it returns an amount instead of a bool.
+    from mtg.helpers import creature_damage_after_prevention
+    _after, _scoped_why = creature_damage_after_prevention(
+        game, creature, source_card, amount, is_combat=True)
+    if _scoped_why:
+        print(f"  [DAMAGE-PREVENTED] {creature.name}: {_scoped_why} "
+              f"({amount} -> {_after})")
+    if _after <= 0:
+        return 0
+    amount = _after
     # Aug 10 deferred (E2) — CR 702.16e.
     from mtg.helpers import protection_prevents_damage
     _prot, _prot_why = protection_prevents_damage(game, creature,
@@ -1083,6 +1096,15 @@ def apply_noncombat_damage_to_creature(rules, game: GameState, creature: Card,
         print(f"  [DAMAGE-PREVENTED] {source_name or '?'} → {creature.name}: "
               f"{amount} noncombat damage prevented")
         return 0, []
+    from mtg.helpers import creature_damage_after_prevention
+    _after, _scoped_why = creature_damage_after_prevention(
+        game, creature, None, amount, is_combat=False)
+    if _scoped_why:
+        print(f"  [DAMAGE-PREVENTED] {creature.name}: {_scoped_why} "
+              f"({amount} -> {_after})")
+    if _after <= 0:
+        return 0, []
+    amount = _after
     # Aug 10 deferred (E2) — CR 702.16e. THIS is the funnel the live defect ran
     # through: Akroma (protection from black and from red) was killed by a RED
     # Blasphemous Act. The source has already left the stack by now, which is

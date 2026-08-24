@@ -2969,6 +2969,38 @@ def burst_dedup_key(content: str) -> str:
     return key
 
 
+def burst_dedup_payload(content: str) -> str:
+    """The trailing numeric parenthetical `burst_dedup_key` throws away.
+
+    Rule 1 of the dedup key strips "(life: 27)" so a running total does not
+    defeat bucketing -- correct, but it also strips "(total: 5)", where the
+    number IS the information rather than incidental noise (mtg/actions.py's
+    counter lines). Suppressing those left the player watching a counter
+    total climb and then vanish.
+
+    The dedup itself is deliberately unchanged: narrowing it is what caused
+    the V19 regression on this exact function, and volume control is the
+    point of the feature. Instead the suppression sentinel quotes this, so
+    the magnitude survives at a cost of one line rather than nine.
+    """
+    import re as _re
+    m = _re.search(r"\(([^)]*\d[^)]*)\)\s*$", content or "")
+    return m.group(1) if m else ""
+
+
+def burst_suppression_sentinel(content: str) -> str:
+    """The one line emitted when a burst is suppressed for the rest of a turn.
+
+    Extracted so it can be driven directly: the send site is an async Discord
+    path, and a pin that only asserted the source CONTAINED
+    "burst_dedup_payload" survived a mutant that blanked the call and left
+    the import, which is the "structural pin a mutant can dodge" failure.
+    """
+    payload = burst_dedup_payload(content)
+    tail = " — latest %s" % payload if payload else ""
+    return "_(…suppressing further identical fires this turn%s)_" % tail
+
+
 def apnap_order_died(died_pairs, game):
     """Order simultaneous deaths NAP-first for immediate-mode dies-trigger
     resolution.
@@ -3750,3 +3782,91 @@ def is_castable_from_exile(game, player, card) -> bool:
         return False
     return (int(record.get('controller_index', -1)) == controller_index
             and int(record.get('expires_turn', -1)) == game.turn_number)
+
+
+def protection_forbids_attachment(game, permanent, aura_card):
+    """CR 702.16 — protection from a quality means "can't be enchanted by"
+    Auras with that quality. (bool, why).
+
+    The fourth letter of DEBA, and the last one this engine was missing:
+    Damage (protection_prevents_damage), Enchant/Equip (here), Block
+    (protection_blocks_from), Target (targeting_helpers' prot_list).
+
+    An Aura already attached to a permanent that GAINS protection becomes
+    illegally attached, and CR 704.5m then puts it into its owner's graveyard
+    as a state-based action — which is why this is consulted from the SBA
+    sweep rather than only at attach time.
+
+    Delegates the qualities comparison to protection_blocks_from so the two
+    cannot drift: the test is identical (does the protected permanent's
+    protection match the other object's colour/type/mana value), only the CR
+    that consumes the answer differs.
+    """
+    if permanent is None or aura_card is None:
+        return False, ""
+    forbidden, why = protection_blocks_from(game, permanent, aura_card)
+    if not forbidden:
+        return False, ""
+    return True, why
+
+
+def creature_damage_after_prevention(game, creature, source_card, amount,
+                                     is_combat: bool):
+    """Recipient-scoped prevention and fixed-amount shields. (amount, why).
+
+    The primitive `damage_prevented_for`'s docstring names as missing. It is
+    genuinely different from the flag it sits beside in two ways, which is
+    why it could not be folded in:
+
+      * the flag is a PLAYER-level boolean; this is scoped to individual
+        permanents ("attacking creatures you control"), so it must be asked
+        per creature rather than per controller.
+      * the flag is all-or-nothing; a shield ("prevent the next 2 damage")
+        is PARTIAL and CONSUMABLE, so this returns an amount rather than a
+        bool and mutates the shield as it absorbs.
+
+    Scope is measured, not guessed: sweeping every cached card for "prevent
+    all damage that would be dealt to <X>" yields exactly three scopes, and
+    only ONE is creature-scoped — Iroas, God of Victory. So the static match
+    is deliberately exact rather than a general parser that could misread
+    Glacial Chasm's "dealt to you" as covering a board.
+    """
+    try:
+        amount = int(amount or 0)
+    except (TypeError, ValueError):
+        return amount, ""
+    if amount <= 0 or creature is None or game is None:
+        return amount, ""
+
+    controller = None
+    try:
+        controller = creature._find_controller(game)
+    except (AttributeError, TypeError):
+        controller = None
+
+    # 1. Static, recipient-scoped prevention (Iroas). Only applies while the
+    #    creature actually matches the printed scope, so a non-attacking
+    #    creature under Iroas takes damage normally.
+    if controller is not None and getattr(creature, 'attacking', False):
+        for perm in list(getattr(controller, 'battlefield', []) or []):
+            oracle = (getattr(perm, 'oracle_text', '') or '').lower()
+            if 'prevent all damage that would be dealt to attacking ' \
+               'creatures you control' not in oracle:
+                continue
+            # A devotion-gated god that is not currently a creature still has
+            # its static abilities (CR 604.3) — being a creature is not a
+            # condition of the ability, so no is_creature() gate here.
+            return 0, "%s prevents damage to attacking creatures" % (
+                getattr(perm, 'name', 'a permanent'),)
+
+    # 2. Fixed-amount shields, e.g. Eiganjo Castle's "prevent the next 2
+    #    damage". Consumable: what it absorbs is spent.
+    shield = int(getattr(creature, '_damage_shield', 0) or 0)
+    if shield > 0:
+        absorbed = min(shield, amount)
+        creature._damage_shield = shield - absorbed
+        remaining = amount - absorbed
+        return remaining, "shield absorbed %d (%d left)" % (
+            absorbed, creature._damage_shield)
+
+    return amount, ""

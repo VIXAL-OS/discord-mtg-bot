@@ -225,6 +225,7 @@ PART 2 - ACTIONS: A JSON array of game state changes to apply. Use these action 
 - {{"action": "move_card", "card": "X", "from_zone": "zone", "to_zone": "zone", "player": "name"}}
 - {{"action": "move_card", "card": "X", "from_zone": "graveyard", "to_zone": "library", "position": "top", "player": "name"}}
 - {{"action": "create_token", "player": "name", "name": "N", "power": P, "toughness": T, "types": "...", "count": N, "keywords": ["defender", "flying"]}} — ALWAYS include the token's keywords (defender, flying, etc.); omitting them creates a token WITHOUT those abilities
+- {{"action": "prevent_next_damage", "card": "Name", "amount": N}} — "prevent the next N damage that would be dealt to X this turn" (Eiganjo Castle). A consumable shield, NOT a full prevention: it absorbs N and lets the rest through.
 - {{"action": "add_counters", "card": "X", "counter_type": "+1/+1", "amount": N}}
 - {{"action": "remove_keywords", "card": "X", "keywords": ["Hexproof"]}} — a permanent LOSES keywords until end of turn; use "player": "name" (omit "card") for "permanents your opponents control lose ..." effects
 - {{"action": "pump_all_creatures", "player": "name", "power": N, "toughness": N}} — TEMPORARY +N/+N until end of turn (NOT counters). Add "card": "Name" to pump ONLY that one creature — "this creature gets +N/+N" MUST be scoped with "card", never applied to the whole team
@@ -897,6 +898,7 @@ zones: hand, battlefield, graveyard, exile, library
 - {{"action": "pump_all_creatures", "player": "name", "power": N, "toughness": N}} — TEMPORARY +N/+N until end of turn. Add "card": "Name" to pump ONLY that one creature — "this creature gets +N/+N" MUST be scoped with "card", never applied to the whole team
 - {{"action": "scry", "player": "name", "amount": N}} — scry N (look at top N, reorder/bottom)
 - {{"action": "create_token", "player": "name", "name": "Token Name", "power": N, "toughness": N, "types": "Creature — Type", "count": N, "keywords": ["defender", "flying"]}} — ALWAYS include the token's printed keywords; a "0/4 Wall with defender" created without "keywords" can illegally attack
+- {{"action": "prevent_next_damage", "card": "Name", "amount": N}} — "prevent the next N damage that would be dealt to X this turn" (Eiganjo Castle). A consumable shield, NOT a full prevention: it absorbs N and lets the rest through.
 - {{"action": "tap", "card": "Card Name"}}
 - {{"action": "untap", "card": "Card Name"}}
 - {{"action": "add_mana", "player": "name", "color": "R", "amount": N}} — colors: W/U/B/R/G/C

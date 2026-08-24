@@ -687,6 +687,12 @@ class Card:
     # undeclared-staple sites and fails CI if the count grows. compare=False
     # keeps equality semantics identical to pre-declaration behavior (staples
     # never participated in ==, and `card in zone` / `.remove(card)` rely on it).
+    # Fixed-amount damage shield, e.g. Eiganjo Castle's "prevent the next 2
+    # damage that would be dealt to target legendary creature this turn".
+    # Consumable: creature_damage_after_prevention spends what it absorbs.
+    # Distinct from the player-level _damage_prevented flag, which is
+    # all-or-nothing and cannot express a partial absorb.
+    _damage_shield: int = field(default=0, compare=False)
     # Set by Tier 1/1.5/3 handlers when a cast's effect has resolved; cleared at
     # the start of every cast (Lingering Souls re-cast bug, May 13 audit).
     _spell_resolved: bool = field(default=False, repr=False, compare=False)

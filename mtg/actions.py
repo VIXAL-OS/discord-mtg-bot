@@ -886,6 +886,32 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                     messages.append(permanent_message)
         return "\n".join(messages) if messages else None
     
+    # ---- FIXED-AMOUNT DAMAGE SHIELD ----
+    elif action_type == "prevent_next_damage":
+        # "Prevent the next N damage that would be dealt to X this turn"
+        # (Eiganjo Castle, Shield of the Realm). The PRODUCER for
+        # Card._damage_shield, which the two creature damage funnels consume
+        # via helpers.creature_damage_after_prevention. Shipped together on
+        # purpose: a consumer with no producer is dead code, and a producer
+        # with no consumer is worse -- it reports success and does nothing.
+        from mtg.helpers import names_match
+        target_name = action.get("card") or action.get("target_card") or ""
+        amount = int(action.get("amount", 0) or 0)
+        target = None
+        for _p in game.players:
+            for _c in _p.battlefield:
+                if names_match(_c.name, target_name) or _c.id == target_name:
+                    target = _c
+                    break
+            if target:
+                break
+        if target is None or amount <= 0:
+            return None
+        target._damage_shield = int(getattr(target, "_damage_shield", 0) or 0) + amount
+        print(f"  [DAMAGE-SHIELD] {target.name}: prevent the next {amount} "
+              f"damage (shield now {target._damage_shield})")
+        return f"🛡️ Prevent the next {amount} damage to **{target.name}**"
+
     # ---- GAIN/LOSE LIFE ----
     elif action_type == "gain_life":
         player = find_player(action.get("player", ""))
