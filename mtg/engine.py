@@ -2232,6 +2232,70 @@ class GameEngine:
             if card.blocked_by:
                 card.blocked_by = []
     
+    def revert_temporary_control(self, game: GameState) -> List[str]:
+        """End "until end of turn" control effects (Act of Treason family).
+
+        Aug 26: consumed marker is Card.temp_control_revert_to, stamped by the
+        steal_permanent action's until_end_of_turn branch. Runs in the same
+        cleanup window as the other EOT temps (CR 514.2) — after end-step
+        triggers saw the stolen board, before end_turn's tail SBA check
+        re-evaluates the reverted one. A card that DIED, was bounced, or was
+        flickered mid-turn is a different/absent battlefield object, so the
+        scan simply never finds it — no resurrection path exists by
+        construction (reset_battlefield_state also clears the marker on
+        re-entry, CR 400.7).
+        """
+        from mtg.helpers import strip_combat_state
+        msgs: List[str] = []
+        moved_any = False
+        for p in game.players:
+            for c in list(p.battlefield):
+                rt = getattr(c, 'temp_control_revert_to', None)
+                if rt is None:
+                    continue
+                c.temp_control_revert_to = None
+                if not isinstance(rt, int) or rt < 0 or rt >= len(game.players):
+                    continue
+                home = game.players[rt]
+                if home is p:
+                    # Already there (e.g. elimination cleanup returned it to
+                    # its owner mid-turn) — nothing to move.
+                    continue
+                if getattr(home, 'eliminated', False):
+                    # CR 800.4: the previous controller left the game; their
+                    # OWNED objects left with them, so an object still here
+                    # belongs to someone else. Control stays where it is.
+                    print(f"[TEMP-CONTROL] {c.name}: previous controller "
+                          f"{home.name} eliminated — control stays with {p.name}")
+                    continue
+                game.unregister_static_effects(c)
+                p.battlefield.remove(c)
+                home.battlefield.append(c)
+                # The creature may have attacked under the thief; combat is
+                # over by cleanup but the flags must not travel (the stale
+                # .attacking leak class, Aug 2 [COMBAT-SWEEP]).
+                strip_combat_state(game, c)
+                # Re-register the permanent's own statics under the controller
+                # it reverts to — bare, exactly like the [LTB-STEAL-RETURN]
+                # sibling in mtg/triggers.py (CR 611.3).
+                game.register_static_keyword_grants(c, home.name)
+                game.register_static_pt_effects(c, home.name)
+                game.register_replacement_effects(c, home.name)
+                if c.original_controller_index == rt:
+                    # The card is home — no steal outstanding. (A temp steal
+                    # of a PERMANENTLY stolen card keeps the older marker so
+                    # the thief's own LTB return still knows the original.)
+                    c.original_controller_index = None
+                moved_any = True
+                print(f"[TEMP-CONTROL] Control of {c.name} reverts to "
+                      f"{home.name} (end of turn)")
+                msgs.append(f"↩️ Control of **{c.name}** reverts to "
+                            f"{home.name} (end of turn)")
+        if moved_any:
+            game.recalculate_granted_keywords()
+            game.recalculate_power_toughness()
+        return msgs
+
     def clear_end_of_turn_effects(self, game: GameState):
         """Clear all end-of-turn effects (pump spells, temp keywords, etc.)."""
         # Clear turn effects
@@ -3101,6 +3165,12 @@ class GameEngine:
 
         # Clear all end-of-turn effects (pump spells, temp keywords, turn triggers)
         self.clear_end_of_turn_effects(game)
+
+        # Aug 26: "until end of turn" control effects (Act of Treason family)
+        # end in the same cleanup window (CR 514.2) — after the end-step
+        # triggers above saw the stolen board, before the tail SBA check
+        # below re-evaluates the reverted one.
+        endstep_trigger_msgs.extend(self.revert_temporary_control(game))
 
         end_step_msgs = self.rules.on_end_step(game)
         end_step_msgs = endstep_trigger_msgs + end_step_msgs

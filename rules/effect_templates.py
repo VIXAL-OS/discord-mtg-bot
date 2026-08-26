@@ -4387,6 +4387,31 @@ class EffectTemplateLibrary:
             )
         )
 
+        # Temporary theft (Act of Treason family, Aug 26). Two printed shapes
+        # — modern "Gain control of target X until end of turn" and the older
+        # Threaten wording "Untap target X and gain control of it until end
+        # of turn". The "of target" anchor is load-bearing: it excludes every
+        # mass form ("of all/each creatures", "of any number of target",
+        # "of up to one target", "of another target", "of enchanted/that
+        # creature") by construction — verified against the full bulk sweep
+        # (76 + 11 matching printings, 44 excluded OTHER/MASS shapes). The
+        # generator carries the event-condition, quote, rider-decline, and
+        # qualifier guards; see _gen_temp_control.
+        self._add_pattern(
+            # Digits belong in the capture class: "creature with power 4 or
+            # less" must be capturable or Wrangle/Claim the Firstborn never
+            # match at all (caught by the qualifier pins on first run).
+            r"(?:gain control of target ([a-z][a-z0-9'\- ]*?) until end of turn"
+            r"|untap target ([a-z][a-z0-9'\- ]*?) and gain control of "
+            r"(?:it|that [a-z]+) until end of turn)",
+            EffectTemplate(
+                name="Temporary Control",
+                description="Gain control of a permanent until end of turn (untap/haste riders)",
+                action_generator=self._gen_temp_control,
+                needs_target=True,
+            )
+        )
+
         # July 20 audit (CRITICAL): populate had no lower-tier handler — Song
         # of the Worldsoul escalated to Tier 3, which FABRICATED a Human token
         # on a zero-token board (CR 701.34a: no token → populate does
@@ -9254,6 +9279,219 @@ class EffectTemplateLibrary:
             if 'enters' not in head[-60:]:
                 return None
         return [{"action": "proliferate", "player": ctrl}]
+
+    def _gen_temp_control(self, ctrl: str, opp: str, ctx: Dict) -> Optional[List[Dict]]:
+        """Temporary theft (Act of Treason family, Aug 26): "gain control of
+        target X until end of turn" plus the older Threaten wording "untap
+        target X and gain control of it until end of turn", with the printed
+        untap / haste / +1/+1-counter / scry riders.
+
+        Swept against the full Scryfall bulk BEFORE the regex was written
+        (the alt-cost discipline): 76 shape-A + 11 shape-B printings. Mass
+        forms ("all"/"each"/"any number of"/"up to one"/"another target") are
+        excluded by the target-anchored regex itself; lines carrying riders
+        this generator cannot deliver (sacrifice-at-end-of-turn — Angrath −3,
+        tap-on-lose-control — Ray of Command, conditional/X pumps — Goatnap /
+        Unwilling Recruit, Kari Zev's free-cast) DECLINE to Tier 3 rather
+        than resolving without them — the compound-clause-drop class. Target
+        qualifiers are enforced when parseable ("with power N or less", "with
+        mana value N or less") and DECLINE when not (Vampire counts,
+        graveyard counts — undeliverable here).
+        """
+        m = ctx.get('_match')
+        oracle = ctx.get('_oracle', '') or ''
+        if m is None:
+            return None
+        # Riders are LINE-scoped (the Jitte line-discipline lesson): another
+        # ability's "gains haste" must not become this steal's rider.
+        ls = oracle.rfind('\n', 0, m.start()) + 1
+        le = oracle.find('\n', m.end())
+        line = oracle[ls: le if le != -1 else len(oracle)]
+        pos_in_line = m.start() - ls
+        # Granted-ability quote guard: 'Enchanted land has "{T}, Discard a
+        # card: Gain control of target creature until end of turn."'
+        # (Chamber of Manipulation) — text inside quotes is an ability the
+        # PERMANENT'S controller activates later, never this resolution.
+        if '"' in line[:pos_in_line]:
+            return None
+        # Unmodeled-rider decline list — resolving the steal WITHOUT these
+        # printed clauses would be strictly wrong (a creature that must be
+        # sacrificed survives; Kari Zev's free cast vanishes; Caught
+        # Red-Handed's suspect / In Thrall to the Pit's kicked rider drop).
+        _decline = ("sacrifice", "lose control", "gets +", "get +",
+                    "was spent", "without paying", "you may cast",
+                    "suspect", "kicked")
+        if any(t in line for t in _decline):
+            return None
+        # Event-condition guard: the clause may be a triggered ability's
+        # effect — fire only on the matching dispatch, so a flicker's ETB
+        # scan can never resolve an attack trigger (and vice versa).
+        event = ctx.get('_event_type', 'etb') or 'etb'
+        cond = ""
+        if line.lstrip().startswith(("when ", "whenever ", "at ")):
+            cond = line.split(",", 1)[0]
+        if cond:
+            if "attack" in cond:
+                if event != "attacks":
+                    return None
+            elif "enters" in cond:
+                if event != "etb":
+                    return None
+            elif "upkeep" in cond:
+                if event != "upkeep":
+                    return None
+            else:
+                # dies / cast / turned-face-up / scheme conditions — decline.
+                return None
+        elif event not in ("etb", "activated"):
+            # Bare imperative text (a spell, or an activated ability's
+            # effect) must not fire from dies/upkeep/attacks dispatches.
+            return None
+        if not cond and event == "etb":
+            # SPELL resolution: every non-reminder line of the text IS part
+            # of this resolution, so an unrecognized sibling line means
+            # resolving the steal would silently DROP it (Kari Zev's free
+            # cast, Twisted Fealty's Role token, Press into Service's
+            # support, Spreading Insurrection's storm — the compound-drop
+            # class). Cast-property/keyword lines are safe: they are not
+            # resolution effects. Bulk-verified against all 14 multiline
+            # family spells (Aug 26).
+            _SAFE_LINE_MARKS = (
+                "devoid", "split second (", "cycling ", "madness ",
+                "kicker ", "has flash", "flash (", "this spell costs",
+                "this spell can't be countered", "suspend ",
+            )
+            for other in oracle.split('\n'):
+                other = other.strip()
+                if not other or other.startswith('(') or other == line.strip():
+                    continue
+                if not any(mk in other for mk in _SAFE_LINE_MARKS):
+                    return None
+        # Target class from whichever alternation matched.
+        raw_cls = (m.group(1) or m.group(2) or "").strip()
+        qual_power = qual_mv = None
+        cls = raw_cls
+        mq = re.search(r"\bwith power (\w+) or less\b", cls)
+        if mq:
+            qual_power = word_to_num(mq.group(1))
+            cls = cls[:mq.start()].strip()
+        mq = re.search(r"\bwith mana value (\w+) or less\b", cls)
+        if mq:
+            qual_mv = word_to_num(mq.group(1))
+            cls = cls[:mq.start()].strip()
+        if " with " in f" {cls} " or " that " in f" {cls} ":
+            return None  # unparsed qualifier survived — Tier 3's problem
+        nonlegendary = False
+        if cls.startswith("nonlegendary "):
+            nonlegendary = True
+            cls = cls[len("nonlegendary "):]
+        _ACCEPT = {
+            "creature", "creature an opponent controls",
+            "creature you don't control", "permanent", "nonland permanent",
+            "artifact", "artifact or creature", "creature or planeswalker",
+        }
+        if cls not in _ACCEPT:
+            return None
+        game = ctx.get('_game')
+
+        def _cls_ok(c):
+            tl = (getattr(c, 'type_line', '') or '').lower()
+            # Negation FIRST: 'legendary' is a substring of 'nonlegendary',
+            # 'land' of 'nonland' — the documented trap family.
+            if nonlegendary and 'legendary' in tl:
+                return False
+            if cls in ("creature", "creature an opponent controls",
+                       "creature you don't control"):
+                return c.is_creature(game) if hasattr(c, 'is_creature') else 'creature' in tl
+            if cls == "permanent":
+                return True
+            if cls == "nonland permanent":
+                return not (c.is_land() if hasattr(c, 'is_land') else 'land' in tl)
+            if cls == "artifact":
+                return 'artifact' in tl
+            if cls == "artifact or creature":
+                return 'artifact' in tl or (c.is_creature(game) if hasattr(c, 'is_creature') else False)
+            if cls == "creature or planeswalker":
+                return 'planeswalker' in tl or (c.is_creature(game) if hasattr(c, 'is_creature') else False)
+            return False
+
+        def _qual_ok(c):
+            if qual_power is not None:
+                try:
+                    pw = (c.get_effective_power(game)
+                          if game is not None and hasattr(c, 'get_effective_power')
+                          else int(getattr(c, 'power', 0) or 0))
+                except (TypeError, ValueError):
+                    pw = 0
+                if pw > qual_power:
+                    return False
+            if qual_mv is not None:
+                try:
+                    if int(getattr(c, 'cmc', 0) or 0) > qual_mv:
+                        return False
+                except (TypeError, ValueError):
+                    pass
+            return True
+
+        _ct = ctx.get('_can_target')
+        _opp_pl = ctx.get('_opponent_player')
+
+        def _legal(c):
+            if getattr(c, '_phased_out', False):
+                return False
+            if not _cls_ok(c) or not _qual_ok(c):
+                return False
+            if _ct is not None and not _ct(c, _opp_pl):
+                return False
+            return True
+
+        opp_bf = [c for c in (ctx.get('opponent_battlefield') or [])
+                  if hasattr(c, 'name')]
+        explicit = (ctx.get('explicit_target_name') or '').strip()
+        target = None
+        if explicit:
+            for c in opp_bf:
+                if c.name.lower() == explicit.lower():
+                    target = c
+                    break
+            if target is None or not _legal(target):
+                # Declared target absent or illegal for the printed class —
+                # never silently retarget (the Abrupt Decay precedent).
+                return None
+        else:
+            candidates = [c for c in opp_bf if _legal(c)]
+            if not candidates:
+                # A trigger with no legal target fizzles (CR 603.3c) — a
+                # deliberate handled no-op, not an unhandled escalation.
+                return []
+
+            def _rank(c):
+                is_cre = c.is_creature(game) if hasattr(c, 'is_creature') else False
+                try:
+                    pw = (c.get_effective_power(game)
+                          if game is not None and hasattr(c, 'get_effective_power')
+                          else int(getattr(c, 'power', 0) or 0))
+                except (TypeError, ValueError):
+                    pw = 0
+                return (1 if is_cre else 0, pw, int(getattr(c, 'cmc', 0) or 0))
+            target = max(candidates, key=_rank)
+        untap = bool(m.group(2)) or bool(re.search(r"\buntap (it|that|target)\b", line))
+        haste = "gains haste" in line
+        src = getattr(ctx.get('_source_card'), 'name', None) or "temporary control effect"
+        actions = [{
+            "action": "steal_permanent", "player": ctrl,
+            "from_player": ctx.get('explicit_target_owner') or opp,
+            "card": target.name, "until_end_of_turn": True,
+            "untap": untap, "gain_haste": haste, "source": src,
+        }]
+        if "+1/+1 counter" in line:  # Mark of Mutiny's rider
+            actions.append({"action": "add_counters", "card": target.name,
+                            "counter_type": "+1/+1", "amount": 1})
+        ms = re.search(r"\bscry (\d+)", line)
+        if ms:  # Portent of Betrayal's rider
+            actions.append({"action": "scry", "player": ctrl,
+                            "amount": int(ms.group(1))})
+        return actions
 
     def _gen_finale_of_devastation(self, ctrl: str, opp: str, ctx: Dict) -> List[Dict]:
         """Finale of Devastation ({X}{G}{G}): creatures you control get +X/+X and

@@ -69,18 +69,24 @@ _TRANSFORMING_SAGA_BACK_FACES: Dict[str, Dict[str, str]] = {
         "power": "",
         "toughness": "",
     },
-    # Kamigawa: Neon Dynasty modal DFC sagas — front face is a Saga, back
-    # face is the matching land. All follow the same shape.
+    # Kamigawa: Neon Dynasty transforming sagas. Aug 26, 2026: the whole
+    # table was re-verified against the Scryfall bulk after the Kami War
+    # entry turned out to carry a FABRICATED oracle (a "gain control of
+    # target nonland permanent until end of turn" theft trigger that exists
+    # on no printing — the May 20 Aminatou hallucinated-text class, in a
+    # hardcoded table this time). Four entries were wrong (Kami War, Fable's
+    # back face, both Invasions); all are now byte-exact bulk text. A
+    # documented fix is not evidence the data is right — check the bulk.
     "the kami war": {
         "name": "O-Kagachi Made Manifest",
-        "type_line": "Legendary Creature — Dragon Spirit",
-        "oracle_text": "Flying, trample\nWhenever O-Kagachi Made Manifest attacks, gain control of target nonland permanent until end of turn. Untap it. It gains haste until end of turn.",
+        "type_line": "Enchantment Creature — Dragon Spirit",
+        "oracle_text": "O-Kagachi Made Manifest is all colors.\nFlying, trample\nWhenever this creature attacks, defending player chooses a nonland card in your graveyard. Return that card to your hand. This creature gets +X/+0 until end of turn, where X is the mana value of that card.",
         "power": "6", "toughness": "6",
     },
     "fable of the mirror-breaker": {
         "name": "Reflection of Kiki-Jiki",
-        "type_line": "Legendary Creature — Goblin Shaman",
-        "oracle_text": "{T}: Create a token that's a copy of another target creature you control, except it's a 1/1 red Goblin Shaman with 'When this creature enters, tap target creature an opponent controls.' Sacrifice it at the beginning of the next end step.",
+        "type_line": "Enchantment Creature — Goblin Shaman",
+        "oracle_text": "{1}, {T}: Create a token that's a copy of another target nonlegendary creature you control, except it has haste. Sacrifice it at the beginning of the next end step.",
         "power": "2", "toughness": "2",
     },
     "the akroan war": {
@@ -96,7 +102,9 @@ _TRANSFORMING_SAGA_BACK_FACES: Dict[str, Dict[str, str]] = {
     "teachings of the kirin": {
         "name": "Kirin-Touched Orochi",
         "type_line": "Enchantment Creature — Snake Monk",
-        "oracle_text": "Whenever this creature attacks, choose one — Exile target creature card from a graveyard. When you do, create a 1/1 colorless Spirit creature token. Exile target noncreature card from a graveyard. When you do, put a +1/+1 counter on target creature you control.",
+        # Aug 26: bullets restored to the printed modal layout (the old entry
+        # flattened them into one run-on sentence, defeating modal parsing).
+        "oracle_text": "Whenever this creature attacks, choose one —\n• Exile target creature card from a graveyard. When you do, create a 1/1 colorless Spirit creature token.\n• Exile target noncreature card from a graveyard. When you do, put a +1/+1 counter on target creature you control.",
         "power": "1", "toughness": "1",
     },
     # March of the Machine battles converted to sagas — the Invasion family.
@@ -105,15 +113,15 @@ _TRANSFORMING_SAGA_BACK_FACES: Dict[str, Dict[str, str]] = {
     # fires the transform action.
     "invasion of zendikar": {
         "name": "Awakened Skyclave",
-        "type_line": "Land Creature — Vampire Knight",
-        "oracle_text": "Awakened Skyclave is also a land.\n{T}: Add {W} or {B}.",
-        "power": "3", "toughness": "3",
+        "type_line": "Creature — Elemental",
+        "oracle_text": "Vigilance, haste\nAs long as this creature is on the battlefield, it's a land in addition to its other types.\n{T}: Add one mana of any color.",
+        "power": "4", "toughness": "4",
     },
     "invasion of tarkir": {
         "name": "Defiant Thundermaw",
-        "type_line": "Legendary Creature — Dragon",
-        "oracle_text": "Flying, haste\nWhen this creature enters, it deals 5 damage to target creature an opponent controls.",
-        "power": "5", "toughness": "5",
+        "type_line": "Creature — Dragon",
+        "oracle_text": "Flying, trample\nWhenever a Dragon you control attacks, it deals 2 damage to any target.",
+        "power": "4", "toughness": "4",
     },
     # Fall of the Thran is intentionally absent: it sacrifices at chapter III
     # (no transform) and the is_transforming detector in saga handling will

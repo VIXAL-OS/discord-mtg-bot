@@ -956,6 +956,14 @@ class Card:
     # Control-change tracking (for Agent of Treachery, Act of Treason, etc.)
     original_controller_index: Optional[int] = None  # Player index before steal
     control_gained_by: Optional[str] = None  # Card name that stole this (for LTB return)
+    # Aug 26: "until end of turn" control (Act of Treason family, CR 702-adjacent
+    # temporary theft). Player index control reverts to at the next cleanup
+    # (engine.revert_temporary_control, called from end_turn). Set only when
+    # None so chained temp steals revert to the FIRST previous controller —
+    # matching original_controller_index's convention. Serialized (to_dict /
+    # from_dict) because !undo snapshots mid-turn: dropping it would make the
+    # steal permanent through an undo.
+    temp_control_revert_to: Optional[int] = None
 
     # Mutate tracking
     mutated_cards: List['Card'] = field(default_factory=list)  # Cards merged via mutate
@@ -1034,6 +1042,14 @@ class Card:
         self._imprinted_card_id = None
         self._imprinted_card_name = ""
         self._imprinted_owner_index = None
+        # Aug 26: control-change bookkeeping is battlefield history the new
+        # object must not remember (CR 400.7). A reanimated formerly-stolen
+        # creature carrying a stale control_gained_by would be MOVED by the
+        # old thief's LTB return; a stale temp_control_revert_to would bounce
+        # it at the next cleanup.
+        self.original_controller_index = None
+        self.control_gained_by = None
+        self.temp_control_revert_to = None
         # Reset transform state — cards re-enter on their front face (CR 712.10a)
         if self.is_transformed and self.has_transform:
             self.transform()
@@ -2304,6 +2320,13 @@ class Card:
             "mutated_cards": [c.to_dict() for c in self.mutated_cards],
             "mutated_under": self.mutated_under,
             "suspended": self.suspended,
+            # Aug 26: control-change bookkeeping must survive save/load and
+            # !undo — dropping temp_control_revert_to makes an Act of Treason
+            # steal PERMANENT through an undo, and dropping the two older
+            # fields silently broke the Sower/Roil LTB return the same way.
+            "original_controller_index": self.original_controller_index,
+            "control_gained_by": self.control_gained_by,
+            "temp_control_revert_to": self.temp_control_revert_to,
         }
     
     @classmethod
@@ -2348,6 +2371,9 @@ class Card:
             times_cast_from_command_zone=data.get("times_cast_from_command_zone", 0),
             mutated_under=data.get("mutated_under", False),
             suspended=data.get("suspended", False),
+            original_controller_index=data.get("original_controller_index"),
+            control_gained_by=data.get("control_gained_by"),
+            temp_control_revert_to=data.get("temp_control_revert_to"),
         )
         # Restore mutated cards list
         card.mutated_cards = [Card.from_dict(mc) for mc in data.get("mutated_cards", [])]

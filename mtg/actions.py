@@ -5595,6 +5595,12 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                         target_card = c
                         break
             if target_card and target_card in fp.battlefield:
+                # Aug 26: "until end of turn" control (Act of Treason family).
+                # The move/re-registration below is shared with permanent
+                # steals; the temp branch additionally stamps the revert
+                # marker (consumed by engine.revert_temporary_control at the
+                # cleanup step) and applies the printed untap/haste riders.
+                until_eot = bool(action.get("until_end_of_turn", False))
                 # Steal effects don't physically leave the battlefield (CR 800.4),
                 # but the new controller's static effects need to re-evaluate.
                 # Unregister + re-register handles ownership-tied effects cleanly.
@@ -5608,7 +5614,27 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                 target_card.control_gained_by = (
                     action.get("source", "steal effect")
                     if action.get("until_source_leaves", False) else None)
+                if until_eot and target_card.temp_control_revert_to is None:
+                    # Only-if-None: chained temp steals revert to the FIRST
+                    # previous controller when both effects end simultaneously
+                    # in cleanup (matching original_controller_index above).
+                    target_card.temp_control_revert_to = game.players.index(fp)
                 p.battlefield.append(target_card)
+                if until_eot:
+                    # CR 302.6: the creature hasn't been under the thief's
+                    # control since their turn began — the printed haste rider
+                    # is what makes it attackable, exactly as designed.
+                    # (Permanent steals keep the pre-existing no-re-sick
+                    # simplification; changing that path is a separate call.)
+                    target_card.summoning_sick = True
+                if action.get("untap", False):
+                    target_card.tapped = False
+                if action.get("gain_haste", False):
+                    # temp_keywords, never card.keywords — the printed-keywords
+                    # list aliases the card cache (phantom-Haste pollution,
+                    # Aug 2 B4). Expires with the other EOT temps.
+                    if 'Haste' not in target_card.temp_keywords:
+                        target_card.temp_keywords.append('Haste')
                 # May 25 audit (F27): re-register the stolen permanent's OWN
                 # static abilities under the new controller. Painter's Servant
                 # was previously dropping its Layer 5 color-add effect on
@@ -5634,13 +5660,20 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                         source_id=f"steal_{target_card.id}_{p.name}",
                         controller=p.name, target_id=target_card.id,
                         new_controller=p.name)
+                    if until_eot:
+                        # Tagged so the existing clear_temporary_effects
+                        # ("end_of_turn") pass in clear_end_of_turn_effects
+                        # removes the layers half in the same cleanup window
+                        # the battlefield revert runs in.
+                        _ctrl_eff.duration = "end_of_turn"
                     game.layers_engine.add_effect(_ctrl_eff)
                     print(f"[LAYERS-L2] Registered control change: {target_card.name} -> {p.name}")
                 game.recalculate_granted_keywords()
                 game.recalculate_power_toughness()
-                print(f"[STEAL] {p.name} gains control of {target_card.name} from {fp.name} "
-                      f"(source: {action.get('source', 'steal effect')})")
-                return f"🎭 {p.name} gains control of {target_card.name}!"
+                _dur = " until end of turn" if until_eot else ""
+                print(f"[STEAL] {p.name} gains control of {target_card.name} from {fp.name}"
+                      f"{_dur} (source: {action.get('source', 'steal effect')})")
+                return f"🎭 {p.name} gains control of {target_card.name}{_dur}!"
             else:
                 print(f"[STEAL] Could not find '{target_name}' on {fp.name}'s battlefield")
                 return None

@@ -228,6 +228,7 @@ PART 2 - ACTIONS: A JSON array of game state changes to apply. Use these action 
 - {{"action": "prevent_next_damage", "card": "Name", "amount": N}} — "prevent the next N damage that would be dealt to X this turn" (Eiganjo Castle). A consumable shield, NOT a full prevention: it absorbs N and lets the rest through.
 - {{"action": "add_counters", "card": "X", "counter_type": "+1/+1", "amount": N}}
 - {{"action": "remove_keywords", "card": "X", "keywords": ["Hexproof"]}} — a permanent LOSES keywords until end of turn; use "player": "name" (omit "card") for "permanents your opponents control lose ..." effects
+- {{"action": "steal_permanent", "player": "thief", "from_player": "current controller", "card": "Card Name"}} — PERMANENT control change (Agent of Treachery). For "gain control ... UNTIL END OF TURN" (Act of Treason family) you MUST add "until_end_of_turn": true — control then reverts automatically at end of turn; add "untap": true and "gain_haste": true when the printed effect untaps it / grants haste
 - {{"action": "pump_all_creatures", "player": "name", "power": N, "toughness": N}} — TEMPORARY +N/+N until end of turn (NOT counters). Add "card": "Name" to pump ONLY that one creature — "this creature gets +N/+N" MUST be scoped with "card", never applied to the whole team
 - {{"action": "scry", "player": "name", "amount": N}}
 - {{"action": "tap", "card": "X"}}
@@ -895,6 +896,7 @@ zones: hand, battlefield, graveyard, exile, library
 - {{"action": "add_counters", "card": "Card Name", "counter_type": "+1/+1", "amount": N}} — PERMANENT counters only
 - {{"action": "remove_counters", "card": "Card Name", "counter_type": "+1/+1", "amount": N}}
 - {{"action": "remove_keywords", "card": "Card Name", "keywords": ["Hexproof", "Indestructible"]}} — permanent LOSES keywords until end of turn; "player": "name" without "card" = all permanents that player's OPPONENTS control lose them
+- {{"action": "steal_permanent", "player": "thief", "from_player": "current controller", "card": "Card Name"}} — PERMANENT control change (Agent of Treachery). For "gain control ... UNTIL END OF TURN" (Act of Treason family) you MUST add "until_end_of_turn": true — control then reverts automatically at end of turn; add "untap": true and "gain_haste": true when the printed effect untaps it / grants haste
 - {{"action": "pump_all_creatures", "player": "name", "power": N, "toughness": N}} — TEMPORARY +N/+N until end of turn. Add "card": "Name" to pump ONLY that one creature — "this creature gets +N/+N" MUST be scoped with "card", never applied to the whole team
 - {{"action": "scry", "player": "name", "amount": N}} — scry N (look at top N, reorder/bottom)
 - {{"action": "create_token", "player": "name", "name": "Token Name", "power": N, "toughness": N, "types": "Creature — Type", "count": N, "keywords": ["defender", "flying"]}} — ALWAYS include the token's printed keywords; a "0/4 Wall with defender" created without "keywords" can illegally attack

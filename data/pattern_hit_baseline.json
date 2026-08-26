@@ -1,6 +1,7 @@
 {
  "(?:^|[,.:\u2014]\\s*|then\\s+)populate\\b\\.?\\s*(?:\\(|$)": 19,
  "(?:^|[,.:\u2014]\\s*|then\\s+)proliferate\\b\\.?\\s*(?:\\(|$)": 68,
+ "(?:gain control of target ([a-z][a-z0-9'\\- ]*?) until end of turn|untap target ([a-z][a-z0-9'\\- ]*?) and gain control of (?:it|that [a-z]+) until end of turn)": 86,
  "(?:mill|puts? the top) (\\w+) cards?": 329,
  "(?:when(?:ever)? this creature mutates|whenever .*? mutates).*?deals? (\\d+) damage": 1,
  "(?:when(?:ever)? this creature mutates|whenever .*? mutates).*?destroy target ([\\w\\s]+)": 3,
