@@ -276,14 +276,22 @@ def test_the_cycling_suffix_is_known_to_the_card_name_validator():
 
     This pin is the cheap half: if someone removes the suffix, the break shows
     up here in seconds instead of on the next push.
+
+    Aug 26: the validator now DERIVES its list from the library's
+    SANCTIONED_KEY_SUFFIXES enum (one vocabulary, three consumers — see
+    tests/test_aug26_suffix_enum.py for the agreement pins), so this pin
+    asserts against the LIVE value rather than a source-text tuple literal —
+    strictly stronger, and it survives any future representation change.
     """
-    import re
+    import importlib.util
     from pathlib import Path
 
-    source = Path("tools/validate_card_names.py").read_text(encoding="utf-8")
-    block = re.search(r"SYNTHETIC_SUFFIXES = \((.*?)\n\)", source, re.S)
-    assert block, "SYNTHETIC_SUFFIXES tuple not found — did it get renamed?"
-    suffixes = re.findall(r'"([^"]+)"', block.group(1))
+    spec = importlib.util.spec_from_file_location(
+        "validate_card_names",
+        Path("tools/validate_card_names.py").resolve())
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    suffixes = list(mod.SYNTHETIC_SUFFIXES)
     assert " cycling" in suffixes
 
     key = "decree of justice cycling"

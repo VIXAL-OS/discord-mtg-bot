@@ -1,0 +1,391 @@
+{
+  "_doc": [
+    "The coverage skeleton (Aug 26, 2026 — the MaRo design-skeleton import):",
+    "mechanic -> its designated live vehicle (deck, card). The pin",
+    "(tests/test_coverage_skeleton.py) asserts each slot's card (a) exists",
+    "in the named deck JSON, (b) is in data/card_data_cache.json, and (c)",
+    "where check is set, the mechanic's parser/classifier recognizes it.",
+    "This converts the Aug-9 seeding sweep into a standing invariant: a",
+    "deck edit that removes a mechanic's only vehicle now fails a test",
+    "instead of surfacing four audit cycles later (the Shard Volley",
+    "near-miss). Editing a deck? Either keep the slot's card, or move the",
+    "slot to the new vehicle IN THE SAME COMMIT.",
+    "check vocabulary: 'parse_*' = a mtg.helpers parser must accept the",
+    "card's cache oracle; 'text:<sig>' = signature in oracle (lowercase);",
+    "'tier15' = the template library classifies it template/pattern;",
+    "'adventure_faces'/'transform_layout' = cache-entry structure; null =",
+    "membership+cache only.",
+    "Fork note: deck filenames are mapped to this repo's names (surrak_stompy / mythic_sanity / mythic_madness)."
+  ],
+  "slots": [
+    {
+      "mechanic": "suspend",
+      "card": "Rift Bolt",
+      "deck": "test_burn_modern.json",
+      "check": "parse_suspend"
+    },
+    {
+      "mechanic": "prowess",
+      "card": "Monastery Swiftspear",
+      "deck": "test_burn_modern.json",
+      "check": "text:prowess"
+    },
+    {
+      "mechanic": "spectacle",
+      "card": "Light Up the Stage",
+      "deck": "test_burn_modern.json",
+      "check": "parse_spectacle_cost"
+    },
+    {
+      "mechanic": "alt_sacrifice_cost",
+      "card": "Shard Volley",
+      "deck": "test_burn_pauper.json",
+      "check": "text:sacrifice a land",
+      "note": "The documented near-miss: burn_pauper's description names this card as the alt-sac vehicle."
+    },
+    {
+      "mechanic": "splice",
+      "card": "Glacial Ray",
+      "deck": "test_burn_pauper.json",
+      "check": "parse_splice"
+    },
+    {
+      "mechanic": "madness",
+      "card": "Alms of the Vein",
+      "deck": "test_madness_anje.json",
+      "check": "parse_madness_cost"
+    },
+    {
+      "mechanic": "escape",
+      "card": "Kroxa, Titan of Death's Hunger",
+      "deck": "test_escape_kroxa.json",
+      "check": "parse_escape_cost"
+    },
+    {
+      "mechanic": "adventure",
+      "card": "Beanstalk Giant",
+      "deck": "test_adventure_chulane.json",
+      "check": "adventure_faces"
+    },
+    {
+      "mechanic": "transform_daybound",
+      "card": "Tovolar, Dire Overlord",
+      "deck": "test_transform_werewolves.json",
+      "check": "transform_layout"
+    },
+    {
+      "mechanic": "partner",
+      "card": "Thrasios, Triton Hero",
+      "deck": "test_partner_thrasios_tymna.json",
+      "check": "text:partner"
+    },
+    {
+      "mechanic": "partner_with",
+      "card": "Brallin, Skyshark Rider",
+      "deck": "test_partner_brallin_shabraz.json",
+      "check": "text:partner with"
+    },
+    {
+      "mechanic": "companion",
+      "card": "Lurrus of the Dream-Den",
+      "deck": "test_companion_lurrus.json",
+      "check": "text:companion"
+    },
+    {
+      "mechanic": "foretell",
+      "card": "Behold the Multiverse",
+      "deck": "claude_deck_baral.json",
+      "check": "parse_foretell"
+    },
+    {
+      "mechanic": "unearth",
+      "card": "Dregscape Zombie",
+      "deck": "test_graveyard_meren.json",
+      "check": "parse_graveyard_activation"
+    },
+    {
+      "mechanic": "crew",
+      "card": "Smuggler's Copter",
+      "deck": "test_partner_brallin_shabraz.json",
+      "check": "parse_crew"
+    },
+    {
+      "mechanic": "meld",
+      "card": "Gisela, the Broken Blade",
+      "deck": "test_replacement_chain_gisela.json",
+      "check": "text:meld them into"
+    },
+    {
+      "mechanic": "meld_partner",
+      "card": "Bruna, the Fading Light",
+      "deck": "test_replacement_chain_gisela.json",
+      "check": "text:melds with",
+      "note": "Both meld halves must share this deck or the pair can never coexist. Bruna carries only the '(Melds with ...)' reminder — the meld trigger is printed on Gisela's face."
+    },
+    {
+      "mechanic": "kicker",
+      "card": "Gatekeeper of Malakir",
+      "deck": "test_devotion_erebos.json",
+      "check": "parse_kicker"
+    },
+    {
+      "mechanic": "multikicker",
+      "card": "Everflowing Chalice",
+      "deck": "claude_deck_baral.json",
+      "check": "parse_multikicker"
+    },
+    {
+      "mechanic": "entwine",
+      "card": "Tooth and Nail",
+      "deck": "claude_deck_rashmi.json",
+      "check": "parse_entwine"
+    },
+    {
+      "mechanic": "buyback",
+      "card": "Forbid",
+      "deck": "claude_deck_baral.json",
+      "check": "parse_buyback"
+    },
+    {
+      "mechanic": "jump_start",
+      "card": "Risk Factor",
+      "deck": "test_cube_360.json",
+      "check": "text:jump-start",
+      "note": "Cube-only — lottery-grade live coverage."
+    },
+    {
+      "mechanic": "embalm",
+      "card": "Angel of Sanctions",
+      "deck": "test_replacement_chain_gisela.json",
+      "check": "parse_graveyard_activation"
+    },
+    {
+      "mechanic": "eternalize",
+      "card": "Timeless Witness",
+      "deck": "claude_deck_rashmi.json",
+      "check": "parse_graveyard_activation"
+    },
+    {
+      "mechanic": "aftermath",
+      "card": "Commit // Memory",
+      "deck": "claude_deck_baral.json",
+      "check": null,
+      "note": "Split faces — no single-face text signature; membership + cache only."
+    },
+    {
+      "mechanic": "flashback",
+      "card": "Faithless Looting",
+      "deck": "test_escape_kroxa.json",
+      "check": "text:flashback"
+    },
+    {
+      "mechanic": "cycling",
+      "card": "Shark Typhoon",
+      "deck": "test_stifle_talrand.json",
+      "check": "text:cycling"
+    },
+    {
+      "mechanic": "miracle",
+      "card": "Entreat the Angels",
+      "deck": "test_partner_brallin_shabraz.json",
+      "check": "parse_miracle"
+    },
+    {
+      "mechanic": "dredge",
+      "card": "Life from the Loam",
+      "deck": "test_cube_360.json",
+      "check": "parse_dredge",
+      "note": "Cube-only — lottery-grade live coverage."
+    },
+    {
+      "mechanic": "devour",
+      "card": "Mycoloth",
+      "deck": "test_tokens_rhys.json",
+      "check": "text:devour"
+    },
+    {
+      "mechanic": "ascend",
+      "card": "Wayward Swordtooth",
+      "deck": "surrak_stompy.json",
+      "check": "text:city's blessing"
+    },
+    {
+      "mechanic": "affinity",
+      "card": "Icebreaker Kraken",
+      "deck": "test_snow_jorn.json",
+      "check": "parse_affinity"
+    },
+    {
+      "mechanic": "converge",
+      "card": "Prismatic Ending",
+      "deck": "test_cube_360.json",
+      "check": "text:converge",
+      "note": "Cube-only — lottery-grade live coverage."
+    },
+    {
+      "mechanic": "impending",
+      "card": "Overlord of the Boilerbilges",
+      "deck": "mythic_madness.json",
+      "check": "parse_impending",
+      "note": "Only vehicle sits in the by-design-unplayable deck — effectively no live coverage; seeding decision deferred."
+    },
+    {
+      "mechanic": "bolster",
+      "card": "Anafenza, Kin-Tree Spirit",
+      "deck": "test_layers_humility.json",
+      "check": "text:bolster"
+    },
+    {
+      "mechanic": "battle_cry",
+      "card": "Hero of Bladehold",
+      "deck": "test_replacement_fog.json",
+      "check": "text:battle cry"
+    },
+    {
+      "mechanic": "annihilator",
+      "card": "Ulamog's Crusher",
+      "deck": "mythic_sanity.json",
+      "check": "text:annihilator",
+      "note": "Seeded Aug 26 — the deck's modern Eldrazi carry no printed annihilator; its forced-attack rider makes the trigger actually fire."
+    },
+    {
+      "mechanic": "annihilator_granted",
+      "card": "Eldrazi Conscription",
+      "deck": "test_aura_equipment_combo.json",
+      "check": "text:annihilator",
+      "note": "GRANTED form — the granted-keywords-invisible-to-the-attack-resolver gap is the open carried item."
+    },
+    {
+      "mechanic": "devotion",
+      "card": "Erebos, God of the Dead",
+      "deck": "test_devotion_erebos.json",
+      "check": "text:devotion"
+    },
+    {
+      "mechanic": "coven",
+      "card": "Augur of Autumn",
+      "deck": "claude_deck_rashmi.json",
+      "check": "text:coven"
+    },
+    {
+      "mechanic": "vivid_mana",
+      "card": "Bloom Tender",
+      "deck": "test_partner_thrasios_tymna.json",
+      "check": null
+    },
+    {
+      "mechanic": "cascade",
+      "card": "Apex Devastator",
+      "deck": "test_cascade.json",
+      "check": "text:cascade"
+    },
+    {
+      "mechanic": "convoke",
+      "card": "March of the Multitudes",
+      "deck": "test_cube_360.json",
+      "check": "text:convoke",
+      "note": "Cube-only — lottery-grade live coverage."
+    },
+    {
+      "mechanic": "delve",
+      "card": "Tasigur, the Golden Fang",
+      "deck": "test_delve_improvise.json",
+      "check": "text:delve"
+    },
+    {
+      "mechanic": "improvise",
+      "card": "Herald of Anguish",
+      "deck": "test_madness_anje.json",
+      "check": "text:improvise"
+    },
+    {
+      "mechanic": "extort",
+      "card": "Crypt Ghast",
+      "deck": "test_devotion_erebos.json",
+      "check": "text:extort"
+    },
+    {
+      "mechanic": "undying",
+      "card": "Geralf's Messenger",
+      "deck": "test_death_replacement.json",
+      "check": "text:undying"
+    },
+    {
+      "mechanic": "persist",
+      "card": "Kitchen Finks",
+      "deck": "test_death_replacement.json",
+      "check": "text:persist"
+    },
+    {
+      "mechanic": "shield_counter",
+      "card": "Sanctuary Warden",
+      "deck": "test_death_replacement.json",
+      "check": "text:shield counter"
+    },
+    {
+      "mechanic": "totem_armor",
+      "card": "Boar Umbra",
+      "deck": "test_death_replacement.json",
+      "check": "text:umbra armor"
+    },
+    {
+      "mechanic": "monstrosity",
+      "card": "Polukranos, World Eater",
+      "deck": "test_combat_keywords_glissa.json",
+      "check": "text:monstrosity"
+    },
+    {
+      "mechanic": "landwalk_granted",
+      "card": "Trailblazer's Boots",
+      "deck": "test_voltron_sram.json",
+      "check": "text:landwalk",
+      "note": "GRANTED nonbasic landwalk — no printed-landwalk creature is vehicled anywhere."
+    },
+    {
+      "mechanic": "pack_tactics",
+      "card": "Werewolf Pack Leader",
+      "deck": "test_transform_werewolves.json",
+      "check": "text:pack tactics"
+    },
+    {
+      "mechanic": "stifle_family",
+      "card": "Stifle",
+      "deck": "test_stifle_talrand.json",
+      "check": null
+    },
+    {
+      "mechanic": "temp_control",
+      "card": "Act of Treason",
+      "deck": "test_aristocrats_korvold.json",
+      "check": "tier15",
+      "note": "Seeded Aug 26 — steal + sac outlets exercises the died-mid-turn revert no-op."
+    },
+    {
+      "mechanic": "frozen_tap",
+      "card": "Frost Lynx",
+      "deck": "claude_deck_aminatou.json",
+      "check": "tier15",
+      "note": "Seeded Aug 26 — flicker re-fires the freeze via the noncast entry funnel."
+    },
+    {
+      "mechanic": "qualified_destroy_keyword",
+      "card": "Plummet",
+      "deck": "test_transform_werewolves.json",
+      "check": "tier15",
+      "note": "Seeded Aug 26 — the with-flying qualifier branch."
+    },
+    {
+      "mechanic": "qualified_destroy_power",
+      "card": "Smite the Monstrous",
+      "deck": "test_voltron_sram.json",
+      "check": "tier15",
+      "note": "Seeded Aug 26 — the power-bound qualifier branch."
+    },
+    {
+      "mechanic": "team_pump_spell",
+      "card": "Overrun",
+      "deck": "test_brawl_tatyova.json",
+      "check": "tier15"
+    }
+  ]
+}

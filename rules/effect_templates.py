@@ -301,6 +301,32 @@ def word_to_num(word: str) -> int:
         return mapping.get(word.lower(), 1)
 
 
+# ---------------------------------------------------------------------------
+# The sanctioned registry-key suffix vocabulary (Aug 26, 2026).
+#
+# A BARE name key answers a scoped lookup for EVERY ability of that card (the
+# Wrenn and Seven class), so a card whose scheduled/zone/cycling trigger
+# differs from its main effect is keyed "<name> <suffix>". The vocabulary
+# grew one incident at a time — "ltb" was missing from the lookup tuple
+# (Aug 2 I-7, Spell Queller doubly dead), "cycling" broke card-names CI when
+# the validator hadn't learned it (Aug 23/24) — so it is now ONE constant
+# consumed by all three parties: the suffix-key lookup in resolve_etb, the
+# bespoke key-construction sites (the cycle handler, the sacrifice-trigger
+# scan), and tools/validate_card_names.py's suffix stripping. Adding a
+# suffix here is the one sanctioned way; a new suffix used anywhere else
+# fails the agreement pins in tests/test_aug26_suffix_enum.py.
+# ---------------------------------------------------------------------------
+SANCTIONED_KEY_SUFFIXES = (
+    "endstep", "upkeep", "beginningcombat", "ltb", "cycling", "sacrifice",
+)
+
+# Event types whose dispatch performs the suffix-key lookup (resolve_etb).
+# Their space-stripped forms must be members of SANCTIONED_KEY_SUFFIXES —
+# pinned, so an event added here without its suffix being sanctioned (or
+# vice versa) fails loudly instead of going doubly dead like "ltb" did.
+SUFFIX_LOOKUP_EVENT_TYPES = ("upkeep", "end_step", "beginning_combat", "ltb")
+
+
 class EffectTemplateLibrary:
     """
     Resolves effects by matching against known patterns.
@@ -473,7 +499,7 @@ class EffectTemplateLibrary:
         # nothing about the linked exile. The JSON key also carried an
         # underscore ("spell queller_ltb") where this lookup builds
         # space-separated keys — both halves fixed together.
-        if event_type in ("upkeep", "end_step", "beginning_combat", "ltb"):
+        if event_type in SUFFIX_LOOKUP_EVENT_TYPES:
             suffix_key = f"{card_key} {event_type.replace('_', '')}"
             # Also try the "card_name endstep"-style key (no underscore) which
             # matches the registration convention used at line ~6138.
@@ -4409,6 +4435,60 @@ class EffectTemplateLibrary:
                 description="Gain control of a permanent until end of turn (untap/haste riders)",
                 action_generator=self._gen_temp_control,
                 needs_target=True,
+            )
+        )
+
+        # Aug 26 taxonomy audit (the MaRo design-skeleton pass): four common
+        # spell-category families that resolved at Tier 3 (or dropped a
+        # printed rider there) despite being fully deterministic.
+        # Frost Lynx / Frost Breath: tap + "doesn't untap during its
+        # controller's next untap step" — Tier 3's tap vocabulary had no
+        # frozen flag, so the rider silently dropped.
+        self._add_pattern(
+            r"tap (?:up to (\w+) )?target creatures?(?: an opponent controls)?"
+            r"\.\s*(?:that creature|those creatures) (?:doesn't|don't) untap "
+            r"during (?:its|their) controllers?'?s? next untap steps?",
+            EffectTemplate(
+                name="Tap and Freeze",
+                description="Tap target creature(s); they don't untap next untap step",
+                action_generator=self._gen_tap_and_freeze,
+                needs_target=True,
+            )
+        )
+        # Mind Rot: "Target player discards two cards." — deterministic,
+        # was a Tier 3 call.
+        self._add_pattern(
+            r"^target (player|opponent) discards (\w+) cards?",
+            EffectTemplate(
+                name="Targeted Discard",
+                description="Target player discards N cards",
+                action_generator=self._gen_target_player_discards,
+                needs_target=True,
+            )
+        )
+        # Raise Dead: full-line anchored so "up to two" / multi-type
+        # variants decline to Tier 3 instead of dropping a clause.
+        self._add_pattern(
+            r"^return target creature card from your graveyard to your hand\.?$",
+            EffectTemplate(
+                name="Raise Dead",
+                description="Return a creature card from your graveyard to your hand",
+                action_generator=self._gen_raise_dead,
+                needs_target=True,
+            )
+        )
+        # Inspired Charge / Trumpet Blast / Overrun: team pump until EOT.
+        # Tier 2's pump exec reaches targets through the restriction
+        # machinery, which has no "your whole team" concept — the vetted
+        # pump_all_creatures action (with only_attacking) is the right
+        # vehicle, and Trumpet Blast must never pump defenders.
+        self._add_pattern(
+            r"(creatures you control|attacking creatures) get "
+            r"\+(\d+)/\+(\d+)(?: and gain (\w+))? until end of turn",
+            EffectTemplate(
+                name="Team Pump Until EOT",
+                description="Your creatures get +X/+Y until end of turn",
+                action_generator=self._gen_team_pump_until_eot,
             )
         )
 
@@ -9493,6 +9573,208 @@ class EffectTemplateLibrary:
                             "amount": int(ms.group(1))})
         return actions
 
+    def _temp_line_and_cond(self, ctx):
+        """Shared line/condition extraction for the Aug 26 taxonomy patterns
+        (frozen-tap, team pump). Returns (line, cond, event) or None to
+        decline — same guard shape as _gen_temp_control: a triggered
+        clause fires only on its matching dispatch, bare imperative text
+        only on etb/activated."""
+        m = ctx.get('_match')
+        oracle = ctx.get('_oracle', '') or ''
+        if m is None:
+            return None
+        ls = oracle.rfind('\n', 0, m.start()) + 1
+        le = oracle.find('\n', m.end())
+        line = oracle[ls: le if le != -1 else len(oracle)]
+        if '"' in line[:m.start() - ls]:
+            return None  # granted-ability quote guard
+        event = ctx.get('_event_type', 'etb') or 'etb'
+        cond = ""
+        if line.lstrip().startswith(("when ", "whenever ", "at ")):
+            cond = line.split(",", 1)[0]
+        if cond:
+            if "attack" in cond:
+                if event != "attacks":
+                    return None
+            elif "enters" in cond:
+                if event != "etb":
+                    return None
+            elif "upkeep" in cond:
+                if event != "upkeep":
+                    return None
+            else:
+                return None
+        elif event not in ("etb", "activated"):
+            return None
+        return line, cond, event
+
+    def _gen_tap_and_freeze(self, ctrl, opp, ctx) -> Optional[List[Dict]]:
+        """Frost Lynx / Frost Breath family (Aug 26 taxonomy audit): "tap
+        [up to N] target creature(s). It/They don't untap during its/their
+        controller's next untap step." Was COMPLEX → Tier 3, whose tap
+        vocabulary had no frozen flag — the rider silently dropped. The tap
+        ACTION has supported skip_next_untap all along (the Kraken work);
+        this makes the family reach it deterministically."""
+        got = self._temp_line_and_cond(ctx)
+        if got is None:
+            return None
+        line, cond, event = got
+        m = ctx.get('_match')
+        # Same-sentence compound guard: an extra clause after the frozen
+        # sentence would silently drop (the team-pump guard's sibling).
+        idx = line.find(m.group(0))
+        if idx >= 0:
+            tail = line[idx + len(m.group(0)):].split('.', 1)[0].strip()
+            if tail:
+                return None
+        count_word = m.group(1) or "one"
+        if count_word.lower() == "x":
+            return None  # Icy Blast-class X counts — unthreaded here
+        n = word_to_num(count_word)
+        game = ctx.get('_game')
+        _ct = ctx.get('_can_target')
+        _opp_pl = ctx.get('_opponent_player')
+
+        def _legal(c):
+            if getattr(c, '_phased_out', False):
+                return False
+            if not (c.is_creature(game) if hasattr(c, 'is_creature') else False):
+                return False
+            if _ct is not None and not _ct(c, _opp_pl):
+                return False
+            return True
+
+        opp_bf = [c for c in (ctx.get('opponent_battlefield') or [])
+                  if hasattr(c, 'name')]
+        explicit = (ctx.get('explicit_target_name') or '').strip()
+        picks = []
+        if explicit:
+            for c in opp_bf:
+                if c.name.lower() == explicit.lower():
+                    if not _legal(c):
+                        return None  # declared but illegal — decline
+                    picks = [c]
+                    break
+            if not picks:
+                return None
+        else:
+            def _pw(c):
+                try:
+                    return (c.get_effective_power(game)
+                            if game is not None and hasattr(c, 'get_effective_power')
+                            else int(getattr(c, 'power', 0) or 0))
+                except (TypeError, ValueError):
+                    return 0
+            # Prefer UNTAPPED creatures — tapping an already-tapped creature
+            # wastes the tap half (the frozen rider still lands, but the
+            # pick should maximize both halves).
+            candidates = sorted([c for c in opp_bf if _legal(c)],
+                                key=lambda c: (not c.tapped, _pw(c)),
+                                reverse=True)
+            picks = candidates[:n]
+            if not picks:
+                return []  # "up to" with no legal target: handled no-op
+        return [{"action": "tap", "card": c.name, "skip_next_untap": True}
+                for c in picks]
+
+    def _gen_target_player_discards(self, ctrl, opp, ctx) -> Optional[List[Dict]]:
+        """Mind Rot family (Aug 26 taxonomy audit): "Target player/opponent
+        discards N cards." Was COMPLEX → a Tier 3 call for a fully
+        deterministic shape. The discard action's 'worst' selector models
+        the discarding player's own choice (the established convention)."""
+        m = ctx.get('_match')
+        oracle = ctx.get('_oracle', '') or ''
+        if m is None:
+            return None
+        # Spell-shaped only (^-anchored registration); decline if anything
+        # substantive FOLLOWS the matched sentence (the compound-drop class).
+        rest = oracle[m.end():]
+        rest = re.sub(r"\([^)]*\)", "", rest).strip().strip('.')
+        if rest:
+            return None
+        n = word_to_num(m.group(2))
+        target = opp
+        if ctx.get('explicit_target_is_player') and ctx.get('explicit_target_player'):
+            target = ctx['explicit_target_player']
+        return [{"action": "discard", "player": target, "card": "worst"}
+                for _ in range(max(1, n))]
+
+    def _gen_raise_dead(self, ctrl, opp, ctx) -> Optional[List[Dict]]:
+        """Raise Dead family (Aug 26 taxonomy audit): "Return target creature
+        card from your graveyard to your hand." — full-line anchored, so
+        "up to two"/multi-type variants decline to Tier 3 rather than
+        dropping a clause."""
+        gy = [c for c in (ctx.get('controller_graveyard') or [])
+              if hasattr(c, 'name')]
+        game = ctx.get('_game')
+        explicit = (ctx.get('explicit_target_name') or '').strip()
+        pick = None
+        creatures = [c for c in gy
+                     if (c.is_creature(game) if hasattr(c, 'is_creature')
+                         else 'creature' in (getattr(c, 'type_line', '') or '').lower())]
+        if explicit:
+            for c in creatures:
+                if c.name.lower() == explicit.lower():
+                    pick = c
+                    break
+            if pick is None:
+                return None  # declared target not a creature card in the graveyard
+        elif creatures:
+            def _pw(c):
+                try:
+                    return int(getattr(c, 'power', 0) or 0)
+                except (TypeError, ValueError):
+                    return 0
+            pick = max(creatures, key=lambda c: (_pw(c), int(getattr(c, 'cmc', 0) or 0)))
+        if pick is None:
+            return []  # no creature card in the graveyard: handled fizzle
+        return [{"action": "move_card", "card": pick.name,
+                 "from_zone": "graveyard", "to_zone": "hand",
+                 "player": ctrl}]
+
+    def _gen_team_pump_until_eot(self, ctrl, opp, ctx) -> Optional[List[Dict]]:
+        """Team pump spells (Aug 26 taxonomy audit): "Creatures you control /
+        Attacking creatures get +X/+Y [and gain <kw>] until end of turn"
+        (Inspired Charge, Trumpet Blast, Overrun). Emits the vetted
+        pump_all_creatures action — with only_attacking for the attacking
+        form, so Trumpet Blast never pumps defenders."""
+        got = self._temp_line_and_cond(ctx)
+        if got is None:
+            return None
+        line, cond, event = got
+        m = ctx.get('_match')
+        if not cond:
+            # Spell-shaped: the matched line must BE the whole effect —
+            # a compound spell ("Draw a card. Creatures you control get…")
+            # must not resolve one clause and drop the other.
+            oracle = ctx.get('_oracle', '') or ''
+            others = [l for l in oracle.split('\n')
+                      if l.strip() and not l.strip().startswith('(')
+                      and l.strip() != line.strip()]
+            if others:
+                return None
+            before = line[:line.find(m.group(0))].strip() if m.group(0) in line else ""
+            after = line[line.find(m.group(0)) + len(m.group(0)):]
+            after = re.sub(r"\([^)]*\)", "", after).strip().strip('.')
+            if before or after:
+                return None
+        # Same-SENTENCE compound guard (both trigger and spell forms): "…get
+        # +1/+1 until end of turn and you gain 1 life" must decline rather
+        # than drop its tail — the 325-bulk-card family is wide enough to
+        # contain every compound shape.
+        idx = line.find(m.group(0))
+        if idx >= 0:
+            tail = line[idx + len(m.group(0)):].split('.', 1)[0].strip()
+            if tail:
+                return None
+        action = {"action": "pump_all_creatures", "player": ctrl,
+                  "power": int(m.group(2)), "toughness": int(m.group(3))}
+        if m.group(1).startswith("attacking"):
+            action["only_attacking"] = True
+        if m.lastindex and m.lastindex >= 4 and m.group(4):
+            action["keywords"] = [m.group(4).capitalize()]
+        return [action]
+
     def _gen_finale_of_devastation(self, ctrl: str, opp: str, ctx: Dict) -> List[Dict]:
         """Finale of Devastation ({X}{G}{G}): creatures you control get +X/+X and
         gain trample until end of turn; if X >= 10, search your library for a
@@ -10099,36 +10381,192 @@ class EffectTemplateLibrary:
             ]
         return None
     
+    def _destroy_qualifier_predicate(self, target_type: str, ctx):
+        """Parse the printed qualifier tail of a destroy/exile capture.
+
+        Aug 26 taxonomy audit: BOTH destroy generators auto-picked with no
+        qualifier awareness — Smite the Monstrous ("power 4 or greater")
+        destroyed a 2/2 (CR 601.2c). Returns (base_type, predicate) where
+        predicate is a Card filter, or (base_type, None) when the qualifier
+        exists but is UNPARSEABLE — the caller must DECLINE so the cast-side
+        targeting (which is restriction-aware) stays the authority. A
+        target_type with no " with " tail returns (type, lambda: True).
+        """
+        game = ctx.get('_game')
+        if " with " not in f" {target_type} ":
+            return target_type, (lambda c: True)
+        base, _, qual = target_type.partition(" with ")
+        base = base.strip()
+        qual = qual.strip()
+        checks = []
+        m = re.search(r"^power (\w+) or (greater|less)$", qual)
+        if m:
+            bound = word_to_num(m.group(1))
+            gt = m.group(2) == "greater"
+
+            def _pw_ok(c, bound=bound, gt=gt):
+                try:
+                    pw = (c.get_effective_power(game)
+                          if game is not None and hasattr(c, 'get_effective_power')
+                          else int(getattr(c, 'power', 0) or 0))
+                except (TypeError, ValueError):
+                    pw = 0
+                return pw >= bound if gt else pw <= bound
+            checks.append(_pw_ok)
+        elif re.search(r"^toughness (\w+) or (greater|less)$", qual):
+            m = re.search(r"^toughness (\w+) or (greater|less)$", qual)
+            bound = word_to_num(m.group(1))
+            gt = m.group(2) == "greater"
+
+            def _tg_ok(c, bound=bound, gt=gt):
+                try:
+                    tg = (c.get_effective_toughness(game)
+                          if game is not None and hasattr(c, 'get_effective_toughness')
+                          else int(getattr(c, 'toughness', 0) or 0))
+                except (TypeError, ValueError):
+                    tg = 0
+                return tg >= bound if gt else tg <= bound
+            checks.append(_tg_ok)
+        elif re.search(r"^mana value (\w+) or (greater|less)$", qual):
+            m = re.search(r"^mana value (\w+) or (greater|less)$", qual)
+            bound = word_to_num(m.group(1))
+            gt = m.group(2) == "greater"
+
+            def _mv_ok(c, bound=bound, gt=gt):
+                try:
+                    mv = int(getattr(c, 'cmc', 0) or 0)
+                except (TypeError, ValueError):
+                    mv = 0
+                return mv >= bound if gt else mv <= bound
+            checks.append(_mv_ok)
+        elif qual in ("flying", "reach", "trample", "deathtouch", "lifelink",
+                      "haste", "vigilance", "menace", "defender"):
+            kw = qual.capitalize()
+
+            def _kw_ok(c, kw=kw):
+                try:
+                    return c.has_keyword(kw, game=game)
+                except TypeError:
+                    return c.has_keyword(kw) if hasattr(c, 'has_keyword') else False
+            checks.append(_kw_ok)
+        else:
+            # Unparseable qualifier (counter references, name refs, compound
+            # clauses) — the caller declines to the restriction-aware tiers.
+            return base, None
+        return base, checks[0]
+
+    def _pick_destroy_target(self, ctx, opp, target_type_raw):
+        """Shared class- and qualifier-aware pick for the destroy family.
+
+        Honors a declared target (validated against the printed class and
+        qualifier — never silently retargets, the Abrupt Decay precedent),
+        else auto-picks the best LEGAL candidate: _can_target-filtered (the
+        Aug 9 B-2b discipline), class-checked with negation-first matching
+        (the Woodfall 'noncreature' trap), qualifier-enforced.
+
+        Returns (name, owner_name) | ("", "") for no legal target |
+        (None, None) meaning DECLINE the pattern entirely.
+        """
+        target_type = (target_type_raw or "permanent").strip().rstrip('.')
+        for tail in (" an opponent controls", " you don't control"):
+            if target_type.endswith(tail):
+                target_type = target_type[:-len(tail)]
+        base, qual_ok = self._destroy_qualifier_predicate(target_type, ctx)
+        if qual_ok is None:
+            return None, None
+
+        def _wants(t: str) -> bool:
+            return t in base and f"non{t}" not in base
+
+        game = ctx.get('_game')
+
+        def _cls_ok(c):
+            tl = (getattr(c, 'type_line', '') or '').lower()
+            is_cre = (c.is_creature(game) if hasattr(c, 'is_creature')
+                      else 'creature' in tl)
+            if "noncreature" in base and is_cre:
+                return False
+            if "nonland" in base and ('land' in tl):
+                return False
+            if _wants("creature") and not is_cre:
+                return False
+            if _wants("artifact") and not _wants("enchantment") and 'artifact' not in tl:
+                return False
+            if _wants("enchantment") and not _wants("artifact") and 'enchantment' not in tl:
+                return False
+            if _wants("artifact") and _wants("enchantment") and not (
+                    'artifact' in tl or 'enchantment' in tl):
+                return False
+            if _wants("planeswalker") and 'planeswalker' not in tl:
+                return False
+            if base == "land" and 'land' not in tl:
+                return False
+            return True
+
+        _ct = ctx.get('_can_target')
+        _opp_pl = ctx.get('_opponent_player')
+
+        def _legal(c):
+            if getattr(c, '_phased_out', False):
+                return False
+            if not _cls_ok(c) or not qual_ok(c):
+                return False
+            if _ct is not None and not _ct(c, _opp_pl):
+                return False
+            return True
+
+        opp_bf = [c for c in (ctx.get('opponent_battlefield') or [])
+                  if hasattr(c, 'name')]
+        own_bf = [c for c in (ctx.get('controller_battlefield') or [])
+                  if hasattr(c, 'name')]
+        explicit = (ctx.get('explicit_target_name') or '').strip()
+        if explicit:
+            _ctrl_name = getattr(ctx.get('_controller_player'), 'name', '') or ''
+            for pool, owner in ((opp_bf, opp), (own_bf, _ctrl_name)):
+                for c in pool:
+                    if c.name.lower() != explicit.lower():
+                        continue
+                    # A declared OWN permanent skips the _can_target opponent
+                    # filter (you may destroy your own); class + qualifier
+                    # still bind.
+                    ok = _legal(c) if pool is opp_bf else (_cls_ok(c) and qual_ok(c))
+                    if ok:
+                        return c.name, (ctx.get('explicit_target_owner') or owner or opp)
+                    return None, None  # declared but illegal — decline
+            return None, None  # declared but absent — decline
+        candidates = [c for c in opp_bf if _legal(c)]
+        if not candidates:
+            return "", ""
+
+        def _rank(c):
+            is_cre = c.is_creature(game) if hasattr(c, 'is_creature') else False
+            try:
+                pw = (c.get_effective_power(game)
+                      if game is not None and hasattr(c, 'get_effective_power')
+                      else int(getattr(c, 'power', 0) or 0))
+            except (TypeError, ValueError):
+                pw = 0
+            return (1 if is_cre else 0, pw, int(getattr(c, 'cmc', 0) or 0))
+        best = max(candidates, key=_rank)
+        return best.name, opp
+
     def _gen_destroy_from_match(self, ctrl, opp, ctx) -> List[Dict]:
-        """Generic destroy from oracle text pattern."""
+        """Generic destroy from oracle text pattern.
+
+        July 24 batch-6 (reviewer D1): negation-first type matching (the
+        'noncreature' substring trap). Aug 26 taxonomy audit: rebuilt on the
+        shared qualifier-aware picker — the auto-pick ignored printed
+        qualifiers AND never honored a declared target (unlike its exile/
+        bounce siblings).
+        """
         match = ctx.get('_match')
         target_type = match.group(1).strip() if match else "permanent"
-
-        # July 24 batch-6 audit (reviewer D1, CRITICAL): 'creature' is a
-        # SUBSTRING of 'noncreature', so Woodfall Primus's "destroy target
-        # noncreature permanent" destroyed a CREATURE (Doomed Traveler,
-        # game_1529985418743910420 — CR 601.2c) while legal artifact/
-        # enchantment targets sat on the board. Credit a type only when it
-        # isn't negated by a 'non' prefix.
-        def _wants(t: str) -> bool:
-            return t in target_type and f"non{t}" not in target_type
-
-        # Try to find a target on opponent's board from context
-        if _wants("creature"):
-            target = ctx.get('best_opponent_creature')
-        elif (_wants("artifact") or _wants("enchantment")
-                or "noncreature" in target_type):
-            # "noncreature permanent" restrictions route here too — the
-            # artifact/enchantment pick is the best noncreature choice we
-            # have a ctx key for (no opponent-land key; lands are legal
-            # targets but blowing up lands is not modeled here).
-            target = ctx.get('best_opponent_artifact_enchantment')
-        else:
-            target = ctx.get('best_opponent_nonland')
-
-        if target:
-            return [{"action": "destroy", "card": target}]
-        return [{"action": "no_action", "reason": f"No valid {target_type} target"}]
+        name, _owner = self._pick_destroy_target(ctx, opp, target_type)
+        if name is None:
+            return None
+        if name:
+            return [{"action": "destroy", "card": name}]
+        return [{"action": "no_action", "reason": f"No valid {self._sanitize_target_type(target_type)} target"}]
     
     @staticmethod
     def _sanitize_target_type(raw: str) -> str:
@@ -10905,14 +11343,24 @@ class EffectTemplateLibrary:
         return [{"action": "draw_cards", "player": ctrl, "amount": 2}]
 
     def _gen_spell_destroy_target(self, ctrl, opp, ctx) -> List[Dict]:
-        """Destroy target permanent — for instant/sorcery spells like Vindicate, Hero's Downfall."""
-        target = ctx.get('explicit_target_name') or ctx.get('best_opponent_nonland')
-        target_owner = ctx.get('explicit_target_owner') or opp
-        if target:
-            return [{"action": "destroy", "card": target}]
+        """Destroy target permanent — for instant/sorcery spells like Vindicate,
+        Hero's Downfall.
+
+        Aug 26 taxonomy audit: rebuilt on the shared class- and
+        qualifier-aware picker — the old explicit-or-best_opponent_nonland
+        pick ignored BOTH the printed class ("destroy target creature" could
+        pick an artifact) and the printed qualifier (Smite the Monstrous
+        destroyed a 2/2 against "power 4 or greater", CR 601.2c).
+        """
         match = ctx.get('_match')
-        target_type = self._sanitize_target_type(match.group(1).strip()) if match else "permanent"
-        return [{"action": "no_action", "reason": f"No valid {target_type} to destroy"}]
+        target_type = match.group(1).strip() if match else "permanent"
+        name, _owner = self._pick_destroy_target(ctx, opp, target_type)
+        if name is None:
+            return None
+        if name:
+            return [{"action": "destroy", "card": name}]
+        return [{"action": "no_action",
+                 "reason": f"No valid {self._sanitize_target_type(target_type)} to destroy"}]
 
     def _gen_counters_from_match(self, ctrl, opp, ctx) -> List[Dict]:
         match = ctx.get('_match')

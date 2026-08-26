@@ -667,6 +667,79 @@ def score_card_for_deck(card, main_colors):
     return score
 
 
+# Aug 26, 2026 (the MaRo design-skeleton import): soft curve constraints for
+# the built 23. The skeleton's common creature curves are PRESCRIPTIVE
+# because "smooth progression prevents mana curve problems in limited" — and
+# auto_build_deck took the top 23 purely by score, so a top-heavy pool built
+# a deck of six-drops. These are SOFT floors/caps: each repair loop stops
+# when no fixing swap exists, and a pool whose score-greedy top 23 already
+# satisfies them is returned UNCHANGED (pinned — the curve term must never
+# distort a healthy build).
+CURVE_MIN_CHEAP = 6       # at least this many nonlands at MV <= 2
+CURVE_MAX_TOP = 4         # at most this many nonlands at MV >= 6
+CURVE_MIN_CREATURES = 13  # limited decks win with bodies (~15-17 typical)
+
+
+def apply_curve_repair(scored: List[Tuple[Card, float]],
+                       num_nonlands: int) -> Tuple[List[Card], List[Card]]:
+    """Curve-aware selection over (card, score) pairs sorted score-desc.
+
+    Starts from the score-greedy top-N and repairs toward the soft
+    constraints above, always swapping the lowest-scored offender in the
+    deck for the highest-scored bench card that fixes the constraint.
+    Module-level and shared with its tests — a copied predicate passes no
+    matter what production does (the Aug 2 score_card_for_deck lesson).
+    """
+    deck = [c for c, _ in scored[:num_nonlands]]
+    bench = [c for c, _ in scored[num_nonlands:]]
+    score_of = {id(c): s for c, s in scored}
+
+    def _mv(c):
+        try:
+            return int(getattr(c, 'cmc', 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _is_creature(c):
+        return 'creature' in (getattr(c, 'type_line', '') or '').lower()
+
+    def _swap(out_card, in_card):
+        deck[deck.index(out_card)] = in_card
+        bench[bench.index(in_card)] = out_card
+
+    # 1. Cap the top end: > CURVE_MAX_TOP cards at MV >= 6 is unkeepable.
+    while sum(1 for c in deck if _mv(c) >= 6) > CURVE_MAX_TOP:
+        outs = [c for c in deck if _mv(c) >= 6]
+        ins = [c for c in bench if _mv(c) < 6]
+        if not ins:
+            break
+        _swap(min(outs, key=lambda c: score_of[id(c)]),
+              max(ins, key=lambda c: score_of[id(c)]))
+    # 2. Floor the cheap end. Swap-outs prefer non-creature mid-cost cards
+    #    so this repair doesn't fight the creature floor below.
+    while sum(1 for c in deck if _mv(c) <= 2) < CURVE_MIN_CHEAP:
+        ins = [c for c in bench if _mv(c) <= 2]
+        outs = ([c for c in deck if _mv(c) >= 3 and not _is_creature(c)]
+                or [c for c in deck if _mv(c) >= 3])
+        if not ins or not outs:
+            break
+        _swap(min(outs, key=lambda c: score_of[id(c)]),
+              max(ins, key=lambda c: score_of[id(c)]))
+    # 3. Creature floor. Swap-ins prefer MV <= 5 creatures (don't reopen the
+    #    top-end cap); swap-outs prefer MV >= 3 non-creatures (don't reopen
+    #    the cheap floor).
+    while sum(1 for c in deck if _is_creature(c)) < CURVE_MIN_CREATURES:
+        ins = ([c for c in bench if _is_creature(c) and _mv(c) <= 5]
+               or [c for c in bench if _is_creature(c)])
+        outs = ([c for c in deck if not _is_creature(c) and _mv(c) >= 3]
+                or [c for c in deck if not _is_creature(c)])
+        if not ins or not outs:
+            break
+        _swap(min(outs, key=lambda c: score_of[id(c)]),
+              max(ins, key=lambda c: score_of[id(c)]))
+    return deck, bench
+
+
 def auto_build_deck(pool: List[Card], deck_size: int = 40) -> Tuple[List[Card], List[Card]]:
     """
     Automatically build a limited deck from a draft pool.
@@ -707,10 +780,10 @@ def auto_build_deck(pool: List[Card], deck_size: int = 40) -> Tuple[List[Card], 
 
     scored.sort(key=lambda x: x[1], reverse=True)
 
-    # Take top ~23 nonlands (deck_size - 17 lands)
+    # Take ~23 nonlands (deck_size - 17 lands) — score-greedy start, then
+    # the Aug 26 soft curve repair (see apply_curve_repair).
     num_nonlands = deck_size - 17
-    deck_nonlands = [card for card, _ in scored[:num_nonlands]]
-    sideboard_nonlands = [card for card, _ in scored[num_nonlands:]]
+    deck_nonlands, sideboard_nonlands = apply_curve_repair(scored, num_nonlands)
 
     # Also add any special lands from the pool. Now that this loop is
     # reachable (F4) it needs the cap it never needed while dead: a seat can
