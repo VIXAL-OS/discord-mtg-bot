@@ -742,6 +742,49 @@ def _validate_cast(engine, game: GameState, player: Player, card: Card,
                              f"Illegal target for {_gate_card.name}: "
                              f"{target_reason}", []),
                             _cast_from_graveyard, target)
+
+    # Aug 27 batch audit (B3): the carve-out above deliberately skips the
+    # battlefield-oriented validator for graveyard-reaching spells (it would
+    # wrongly reject legal graveyard targets, July 20) — but that left the
+    # whole family with NO pre-payment type check: Reanimate accepted a LAND
+    # card (Graven Cairns), paid {B}, and fizzled at resolution with the
+    # card wasted (game_1542344959280152586, CR 601.2c). Graveyard-scoped
+    # gate: when the declared name resolves to a graveyard card that fails
+    # the printed "target <type> card" restriction, reject BEFORE payment.
+    # A name found nowhere keeps current behavior (resolve_cast_target's
+    # job); 'permanent' maps to the any-permanent-type test because no type
+    # line contains the word.
+    if target is not None and any(_p in _oracle_lower for _p in
+                                  ('in a graveyard', 'from a graveyard',
+                                   'in your graveyard', 'from your graveyard')):
+        _gy_type_m = re.search(
+            r'target ([a-z ]*?)cards? (?:in|from) '
+            r'(?:a|your|an opponent.s) graveyard', _oracle_lower)
+        if _gy_type_m:
+            _known = ('creature', 'artifact', 'enchantment', 'land',
+                      'instant', 'sorcery', 'planeswalker', 'permanent')
+            _type_words = [w for w in _gy_type_m.group(1).split()
+                           if w in _known]
+            for _decl in (list(target) if isinstance(target, (list, tuple))
+                          else [target]):
+                _tname = (getattr(_decl, 'name', None) or str(_decl)).lower()
+                _gy_card = next(
+                    (_gc for _p2 in game.players for _gc in _p2.graveyard
+                     if (_gc.name or '').lower() == _tname), None)
+                if _gy_card is None or not _type_words:
+                    continue
+                _tl = (_gy_card.type_line or '').lower()
+                for _w in _type_words:
+                    _ok = (any(_pt in _tl for _pt in
+                               ('creature', 'artifact', 'enchantment',
+                                'land', 'planeswalker'))
+                           if _w == 'permanent' else _w in _tl)
+                    if not _ok:
+                        return ((False,
+                                 f"{card.name}: declared target "
+                                 f"{_gy_card.name} is not a {_w} card "
+                                 f"(CR 601.2c)", []),
+                                _cast_from_graveyard, target)
     return None, _cast_from_graveyard, target
 
 

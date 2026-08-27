@@ -307,6 +307,18 @@ def _player_to_targetable(player):
         if 'you have hexproof' in o or "you can't be the target" in o:
             hx = True
             break
+        # Aug 27 batch audit (D5): Shalai's list form — "You, planeswalkers
+        # you control, and other creatures you control have hexproof" —
+        # defeats both adjacency substrings above. Sentence-scoped: a
+        # sentence that BEGINS with "you," (the list opener) and grants
+        # hexproof covers the player. Leyline of Sanctity-class adjacency
+        # stays on the fast substring; a sentence like "creatures you
+        # control have hexproof" never starts with "you," so creature-only
+        # grants cannot leak onto the player.
+        if any(s.strip().startswith('you,') and 'have hexproof' in s
+               for s in re.split(r'[.\n]', o)):
+            hx = True
+            break
     return Targetable(
         id=player.name,
         name=player.name,
@@ -843,6 +855,19 @@ def _check_resolution_targets(game, stack_entry):
         return False, ""
 
 
+# Aug 27 batch audit (A1): predicate verbs that END a "target ..." noun
+# phrase. Module-scope so the pins drive the same object production uses
+# (the mirrored-predicate rule). "can" deliberately matches the "can" in
+# "can't" (word boundary before the apostrophe) — "target creature can't be
+# blocked" is effect text, not a target qualifier.
+_TARGET_PREDICATE_VERBS = re.compile(
+    r'\b(discards?|sacrifices?|loses?|gains?|gets?|draws?|mills?|reveals?|'
+    r'returns?|puts?|exiles?|deals?|dealt|becomes?|takes?|shuffles?|'
+    r'creates?|untaps?|taps?|attacks?|blocks?|fights?|regenerates?|'
+    r'transforms?|explores?|investigates?|scries|surveils?|has|have|had|'
+    r'is|are|was|were|can|may|must)\b')
+
+
 def _parse_target_restriction_from_oracle(card):
     """Parse a TargetRestriction from a card's oracle text using TargetTextParser.
 
@@ -896,7 +921,26 @@ def _parse_target_restriction_from_oracle(card):
         tm = re.search(r"target\s+([\w\s,/'-]+?)(?:\.|;|\band\b|\bor\b|$)", stripped)
         if not tm:
             return None
-        restriction = TargetTextParser.parse(tm.group(0).strip().rstrip('.,;'))
+        # Aug 27 batch audit (A1): the capture runs to the sentence end when
+        # no and/or intervenes, swallowing the PREDICATE — "target player
+        # discards a card for each swamp YOU CONTROL" put a YOU-controller
+        # restriction on the TARGET, so Mind Sludge at the opponent was
+        # rejected "wrong controller" all game (game_1542340516212117566).
+        # Cut the phrase at the first predicate verb: a legitimate qualifier
+        # ("you control", "with power 4 or greater") always precedes the
+        # verb, while scaling/effect clauses always follow one. Cache-swept:
+        # exactly 7 cards change, every one an improvement (Mind Sludge,
+        # Altar of Dementia's "power" tail, Priest of the Haunted Edge's
+        # "you control" tail, Domri/Ram Through swallowing into the SECOND
+        # target's restriction). A cut that loosens an unmodeled "that
+        # deals..." qualifier fails toward under-restriction — the safe
+        # direction; the current bug over-restricts and blocks legal casts.
+        _phrase = tm.group(1)
+        _verb_m = re.search(_TARGET_PREDICATE_VERBS, _phrase)
+        if _verb_m:
+            _phrase = _phrase[:_verb_m.start()].rstrip()
+        restriction = TargetTextParser.parse(
+            ('target ' + _phrase).strip().rstrip('.,;'))
         # Sweep for every type-word that appears within ANY "target ..."
         # phrase in the oracle, including those joined by "and/or" or
         # listed with commas. Union them into target_types. We use a

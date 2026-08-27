@@ -965,6 +965,17 @@ class Card:
     # steal permanent through an undo.
     temp_control_revert_to: Optional[int] = None
 
+    # Aug 27 batch audit (D3): Extraction Specialist-class riders — "that
+    # creature can't attack or block for as long as you control this
+    # creature". Holds the LOCKING permanent's NAME; can_attack/can_block
+    # refuse while the creature's controller still controls a permanent so
+    # named. Name-keyed (not id) because the emitting template only knows
+    # names; a same-named second copy extending the lock is the documented
+    # approximation, as is a stolen creature checking its NEW controller's
+    # board. Cleared by reset_battlefield_state (CR 400.7). Serialized like
+    # temp_control_revert_to — dropping it on !undo would free the creature.
+    combat_locked_while_controlling: Optional[str] = None
+
     # Mutate tracking
     mutated_cards: List['Card'] = field(default_factory=list)  # Cards merged via mutate
     mutated_under: bool = False  # True if this card was placed under via mutate
@@ -1050,6 +1061,7 @@ class Card:
         self.original_controller_index = None
         self.control_gained_by = None
         self.temp_control_revert_to = None
+        self.combat_locked_while_controlling = None
         # Reset transform state — cards re-enter on their front face (CR 712.10a)
         if self.is_transformed and self.has_transform:
             self.transform()
@@ -1826,6 +1838,35 @@ class Card:
                         if t in (c.type_line or '').lower():
                             types_seen.add(t)
             return len(types_seen)
+        # Aug 27 batch audit (A2): Nighthawk Scavenger — printed power "1+*",
+        # "power is equal to 1 plus the number of card types among cards in
+        # your OPPONENTS' graveyards". int("1+*") raises, base fell to 0, and
+        # no branch matched the opponents' scope — a permanent 0-power
+        # creature, filtered from every attack (game_1542340295906033747).
+        # The additive prefix is parsed from the oracle (word or digit), so
+        # the whole "N plus <count>" family lands here, and CR-correctly can
+        # never resolve below N.
+        _plus_m = re.search(
+            r'(\w+) plus the number of card types among cards in your '
+            r"opponents.{0,2} graveyards", oracle)
+        if _plus_m:
+            _word_n = {'one': 1, 'two': 2, 'three': 3}.get(
+                _plus_m.group(1), None)
+            if _word_n is None:
+                try:
+                    _word_n = int(_plus_m.group(1))
+                except ValueError:
+                    _word_n = 1
+            types_seen = set()
+            for p in game.players:
+                if p is owner:
+                    continue
+                for c in p.graveyard:
+                    for t in ['creature', 'land', 'instant', 'sorcery',
+                              'artifact', 'enchantment', 'planeswalker']:
+                        if t in (c.type_line or '').lower():
+                            types_seen.add(t)
+            return _word_n + len(types_seen)
         # Generic "cards in all graveyards" (Lhurgoyf, Mortivore) — MUST be after the type-counting check
         # above, otherwise Tarmogoyf ("card TYPES among cards in all graveyards") would match this first
         if 'creature cards in all graveyards' in oracle or 'cards in all graveyards' in oracle:
@@ -2096,6 +2137,28 @@ class Card:
     def has_defender(self, game=None) -> bool:
         return self.has_keyword('Defender', game=game)
     
+    def _combat_lock_ok(self, game) -> bool:
+        """Aug 27 batch audit (D3): the Extraction Specialist-class rider.
+
+        The lock names the returning permanent; it holds while the creature's
+        controller still controls a permanent with that name (approximation:
+        control changes on either side are name-checked against the CURRENT
+        controller's battlefield — documented at the field).
+        """
+        lock = getattr(self, 'combat_locked_while_controlling', None)
+        if not lock or game is None:
+            return True
+        lock_l = lock.lower()
+        for p in game.players:
+            if any(c.id == self.id for c in p.battlefield):
+                if any((getattr(perm, 'name', '') or '').lower() == lock_l
+                       for perm in p.battlefield):
+                    return False  # the locking permanent is still around
+                # The lock's source left: the restriction has ended for good.
+                self.combat_locked_while_controlling = None
+                return True
+        return True
+
     def can_attack(self, game=None) -> bool:
         """Check if creature can legally attack."""
         if not self.is_creature(game=game):
@@ -2131,6 +2194,8 @@ class Card:
         # did not exist anywhere in the engine (the creature blocked and
         # killed a commander at six permanents, game_1535486721779568700).
         if not self._city_blessing_combat_ok(game):
+            return False
+        if not self._combat_lock_ok(game):
             return False
         # Aug 10 audit (CRITICAL, game-deciding): a GLOBAL, non-Aura "creatures
         # you control can't attack" static had no consultation point anywhere.
@@ -2192,6 +2257,8 @@ class Card:
         # blessing") — the live defect WAS a block (Wayward Swordtooth
         # killed Jorn as a blocker at six permanents).
         if not self._city_blessing_combat_ok(game):
+            return False
+        if not self._combat_lock_ok(game):
             return False
         if attacker:
             # Flying creatures can only be blocked by flying/reach
@@ -2327,6 +2394,7 @@ class Card:
             "original_controller_index": self.original_controller_index,
             "control_gained_by": self.control_gained_by,
             "temp_control_revert_to": self.temp_control_revert_to,
+            "combat_locked_while_controlling": self.combat_locked_while_controlling,
         }
     
     @classmethod
@@ -2374,6 +2442,7 @@ class Card:
             original_controller_index=data.get("original_controller_index"),
             control_gained_by=data.get("control_gained_by"),
             temp_control_revert_to=data.get("temp_control_revert_to"),
+            combat_locked_while_controlling=data.get("combat_locked_while_controlling"),
         )
         # Restore mutated cards list
         card.mutated_cards = [Card.from_dict(mc) for mc in data.get("mutated_cards", [])]
@@ -2910,6 +2979,21 @@ class Player:
         # reads "lands YOU control", so an opponent's Dryad correctly does
         # nothing for us.
         if card.is_land() and self._all_lands_are_all_basic_types():
+            return {'any': 1}
+
+        # Aug 27 batch audit (D6): Chromatic Lantern's headline half — "Lands
+        # you control have '{T}: Add one mana of any color.'" — was
+        # unimplemented (only the Lantern's own tap worked). Same seam, same
+        # phrase-not-name matching, and same placement convention as the
+        # Dryad branch above: special/dynamic lands (Ancient Tomb's {C}{C},
+        # fetchlands' deliberate zero) return before this, so the grant
+        # upgrades ordinary lands only — the documented Dryad approximation.
+        # Scoped by self.battlefield ("lands you control").
+        if card.is_land() and any(
+                "lands you control have \"{t}: add one mana of any color"
+                in (getattr(p, 'oracle_text', '') or '').lower()
+                for p in self.battlefield
+                if not getattr(p, '_phased_out', False)):
             return {'any': 1}
 
         # Lands that produce any color

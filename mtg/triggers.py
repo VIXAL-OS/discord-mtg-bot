@@ -620,6 +620,17 @@ def _check_creature_etb_triggers_sync(engine, game: GameState, entering_player: 
             if trigger_requires_your_control and _ci != entering_player_idx:
                 continue
 
+            # Aug 27 batch audit (C2): the "nontoken" qualifier — enforced on
+            # the DIES side since June 10 (V16) — was never wired for ENTERS
+            # watchers, so Soul of the Harvest drew two cards off two Rhys
+            # token entries (game_1542325919534817281). Same sentence-scoped
+            # read as the controller gate above.
+            if ('nontoken' in enters_trigger_text
+                    and getattr(entering_creature, 'is_token', False)):
+                print(f"[TRIGGER-SKIP] {card.name}: nontoken qualifier — "
+                      f"{entering_creature.name} is a token")
+                continue
+
             # Skip triggers already handled by _handle_etb_triggers hardcoded handlers
             handled_set = getattr(game, '_handled_triggers_this_etb', set())
             if card.name.lower() in handled_set:
@@ -1342,6 +1353,40 @@ def scan_damaged_creature(rules, game: GameState, damaged: Card,
     return msgs
 
 
+def static_cascade_grant_count(caster: Player, card: Card) -> int:
+    """Aug 27 batch audit (D7): Zhulodok, Void Gorger — "Colorless spells
+    you cast from your hand with mana value 7 or greater have 'Cascade,
+    cascade.'" — was entirely unimplemented (grep zero; the only grant
+    machinery was Yidris's turn-recorded one, a structurally different
+    per-turn triggered mechanism). Static battlefield scan, phrase-anchored
+    so Imoti's "Spells you cast with mana value 6 or greater have cascade"
+    rides the same branch; Yidris's own "they gain cascade" text does NOT
+    match (no "with mana value" clause), so he cannot self-grant here.
+    Colorless reads card.colors (mana-cost colors, the CR 202.2 convention
+    — never color_identity, which absorbs colors from oracle text).
+    Module-scope so pins drive the object production uses.
+    """
+    total = 0
+    for grant_perm in caster.battlefield:
+        if getattr(grant_perm, '_phased_out', False):
+            continue
+        go = (getattr(grant_perm, 'oracle_text', '') or '').lower()
+        gm = re.search(
+            r'(colorless )?spells you cast (?:from your hand )?with '
+            r'mana value (\d+) or greater have "?cascade(, cascade)?', go)
+        if not gm:
+            continue
+        if gm.group(1) and getattr(card, 'colors', None):
+            continue  # the grant demands a colorless spell
+        if (card.cmc or 0) < int(gm.group(2)):
+            continue
+        granted = 2 if gm.group(3) else 1
+        total += granted
+        print(f"[CASCADE-GRANT] {card.name} gains cascade x{granted} "
+              f"({grant_perm.name} static grant)")
+    return total
+
+
 async def _check_cast_triggers(engine, game: GameState, caster: Player, card: Card) -> List[str]:
     """
     Check for on-cast triggers — abilities that fire when a spell is cast,
@@ -1510,6 +1555,15 @@ async def _check_cast_triggers(engine, game: GameState, caster: Player, card: Ca
         _cascade_count = 1
         print(f"[CASCADE-GRANT] {card.name} gains cascade (Yidris grant, "
               f"hand cast this turn)")
+    # Aug 27 batch audit (D7): Zhulodok, Void Gorger — see
+    # static_cascade_grant_count below. ADDITIVE: multiple cascade instances
+    # trigger separately (CR 702.85), so a printed-cascade spell under
+    # Zhulodok cascades printed+granted times.
+    if (not getattr(card, '_cast_from_graveyard', False)
+            and not getattr(card, '_from_cascade', False)):
+        _granted = static_cascade_grant_count(caster, card)
+        if _granted:
+            _cascade_count += _granted
     if _cascade_count > 0 and not getattr(card, '_cascade_done', False):
         card._cascade_done = True  # Prevent re-entry if _check_cast_triggers called multiple times
         # Apex Devastator: "Cascade, cascade, cascade, cascade" = 4 cascades
@@ -6898,6 +6952,38 @@ def queue_cast_triggers_sync(engine, game, caster, card, via: str = "sync") -> i
     return queued
 
 
+def _detach_stale_attachments_subscriber(game, card=None, controller=None,
+                                         **_kw):
+    """Aug 27 batch audit (D1, CRITICAL): CR 400.7 — a re-entering permanent
+    is a NEW object, but Card ids persist across zone changes, so an Aura
+    whose attached_to still names the id re-latched onto the returned
+    creature: Arrest kept a REANIMATED Viscera Seer locked down for turns
+    (game_1542336224440614952). The flicker path got this detach inline on
+    July 23; every OTHER re-entry path (move_card reanimation, the reanimate
+    action, undying/persist, recast commanders, escape/unearth) shared the
+    bug. The bus fires once per physical entry (slice 2's proven property),
+    so one subscriber covers every path — registered FIRST so watcher scans
+    never read a stale attachment's P/T. Exemption: an Animate Dead-class
+    bind created IN this entry stamps _bound_creature_id before the emit;
+    that legitimate fresh binding must survive.
+    """
+    if game is None or card is None:
+        return
+    for _p in game.players:
+        for _att in _p.battlefield:
+            if (getattr(_att, 'attached_to', None) == card.id
+                    and getattr(_att, '_bound_creature_id', None) != card.id):
+                _att.attached_to = None
+                print(f"[STALE-ATTACH] {_att.name} detached — "
+                      f"{card.name} re-entered as a new object (CR 400.7)")
+    # The entering card's own attachments list is stale too (it names the
+    # auras that rode its PREVIOUS existence).
+    if getattr(card, 'attachments', None):
+        _bound = getattr(card, '_reanimated_by_aura_id', None)
+        card.attachments = [a for a in card.attachments if a == _bound]
+
+
+events.subscribe(events.PERMANENT_ENTERED, _detach_stale_attachments_subscriber)
 events.subscribe(events.PERMANENT_ENTERED, _snow_permanent_entered_watcher)
 # Slice 2b (July 21, 2026): the creature-enters watcher scan is DRIVEN BY
 # the bus. Slice 2c (July 24, 2026): the parity recorder that shadowed the

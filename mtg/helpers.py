@@ -561,6 +561,17 @@ def is_aluren_free_cast(game, card) -> bool:
     """
     if game is None or card is None:
         return False
+    # Aug 27 batch audit (B1, CRITICAL): an Adventure card cast on its
+    # adventure half is an INSTANT or SORCERY spell, not a creature spell
+    # (CR 715.3) — but is_creature() reads the creature face's type line, so
+    # Aluren free-cast On Alert and Dizzying Swoop, including a free unpaid
+    # tap-down of the opponent's blocker on a lethal turn
+    # (game_1542331644390678682 ×2). The cast_as_adventure stamp precedes
+    # every consult of this predicate on the payment path (the executor sets
+    # it before _compute_alt_costs); un-stamped HAND cards still advertise
+    # the creature half's free cast, which is correct.
+    if getattr(card, 'cast_as_adventure', False):
+        return False
     return bool(
         card.is_creature(game)
         and (getattr(card, 'cmc', 0) or 0) <= 3
@@ -880,7 +891,23 @@ def resolve_cast_target(game, caster, card, target_name=None, *,
         r'target\s+(?:[\w-]+\s+){0,3}'
         r'(?:creature|permanent|artifact|enchantment|land|planeswalker)\b'
         r'(?!\s+card)', oracle))
-    if not (_reaches_graveyard and not _targets_battlefield):
+    # Aug 27 batch audit (C3): the graveyard-phrase scan covered the WHOLE
+    # oracle, so an Aura whose ETB TRIGGER mentions "from your graveyard"
+    # (Mantle of the Ancients) read as graveyard-only and its declared
+    # ENCHANT target was silently dropped to auto-select
+    # (game_1542325802329309264: declared Heavenly Blademaster, attached to
+    # White Cat). Cast-time targets come from the spell's own text, never a
+    # triggered ability's (CR 601.2c vs 603.3d) — so the battlefield
+    # SUPPRESSION gate reads the oracle with trigger sentences stripped,
+    # while the graveyard LOOKUP above keeps the full scan (finding a named
+    # graveyard card still threads AI intent to ETB templates harmlessly).
+    _main_text = '. '.join(
+        s for s in re.split(r'[.\n]', oracle)
+        if not s.strip().startswith(('when ', 'whenever ', 'at ')))
+    _gy_main = any(phrase in _main_text for phrase in
+                   ('in a graveyard', 'in your graveyard',
+                    'from your graveyard', 'from a graveyard'))
+    if not (_gy_main and not _targets_battlefield):
         for p in game.players:
             found = p.find_card(target_name, Zone.BATTLEFIELD)
             if found:

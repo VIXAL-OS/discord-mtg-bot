@@ -286,6 +286,180 @@
    "reviewer": "D: replacement",
    "confidence": "recorded",
    "note": "Card-targeted read; no accepted finding from this game."
+  },
+  "game_1537520648857981098": {
+   "wave": "aug13-seventh-cycle-card-targeted",
+   "reviewer": "A: lands+multitarget",
+   "confidence": "recorded",
+   "note": "Khalni Heart Expedition searched one basic; Decimate cast without all four mandatory target classes."
+  },
+  "game_1537520495342387300": {
+   "wave": "aug13-seventh-cycle-card-targeted",
+   "reviewer": "A: snow",
+   "confidence": "recorded",
+   "note": "Arcum's Astrolabe clean; several snow activations unexercised."
+  },
+  "game_1537515171222650911": {
+   "wave": "aug13-seventh-cycle-card-targeted",
+   "reviewer": "A: adventure+graveyard",
+   "confidence": "recorded",
+   "note": "Normal Reanimate target clean; explicit player adverse case and Granted remained unexercised."
+  },
+  "game_1537525606588358726": {
+   "wave": "aug13-seventh-cycle-card-targeted",
+   "reviewer": "A: boros+meld",
+   "confidence": "recorded",
+   "note": "Aurelia's Fury omitted its damaged-player noncreature lock; lone-Gisela negative meld control passed."
+  },
+  "game_1537515210078687286": {
+   "wave": "aug13-seventh-cycle-card-targeted",
+   "reviewer": "B: stack+transform",
+   "confidence": "recorded",
+   "note": "Arlinn resolved while a Counterspell decision was still in flight, invalidating the late response."
+  },
+  "game_1537515133671047239": {
+   "wave": "aug13-seventh-cycle-card-targeted",
+   "reviewer": "B: transform",
+   "confidence": "recorded",
+   "note": "Card-targeted transform read; no additional accepted finding."
+  },
+  "game_1537510442090373260": {
+   "wave": "aug13-seventh-cycle-card-targeted",
+   "reviewer": "B: static-permissions",
+   "confidence": "recorded",
+   "note": "Aluren charged mana and lacked its all-player flash permission."
+  },
+  "game_1537510392752775172": {
+   "wave": "aug13-seventh-cycle-card-targeted",
+   "reviewer": "B: transform",
+   "confidence": "recorded",
+   "note": "Tovolar's direct night transform bypassed the shared transforms-into dispatcher."
+  },
+  "game_1537525597755023407": {
+   "wave": "aug13-seventh-cycle-card-targeted",
+   "reviewer": "C: equipment+burn",
+   "confidence": "recorded",
+   "note": "Sword equip/combat triggers were unexercised; Aurelia's Fury X=0 was countered cleanly."
+  },
+  "game_1537525542721691708": {
+   "wave": "aug13-seventh-cycle-card-targeted",
+   "reviewer": "C: vampires+graveyard",
+   "confidence": "recorded",
+   "note": "Killing Wave let Gravecrawler survive without life payment or sacrifice."
+  },
+  "game_1537520504833966251": {
+   "wave": "aug13-seventh-cycle-card-targeted",
+   "reviewer": "C: snow+compound-etb",
+   "confidence": "recorded",
+   "note": "Blizzard Strix exiled Thought Vessel but never scheduled its next-end-step return; Inscription's player-target defect was mechanism-confirmed."
+  },
+  "game_1537515141246099467": {
+   "wave": "aug13-seventh-cycle-card-targeted",
+   "reviewer": "C: transform+lands",
+   "confidence": "recorded",
+   "note": "Gruul Turf and Moonmist clean; Traverse delirium branch unexercised."
+  },
+  "game_1542340532271849542": {
+   "wave": "aug27-eighth-cycle-card-targeted",
+   "reviewer": "A: layers/devotion",
+   "confidence": "recorded",
+   "note": "Mind Sludge target-parse finding (A1); Bloodline Keeper/Mutavault clean."
+  },
+  "game_1542340295906033747": {
+   "wave": "aug27-eighth-cycle-card-targeted",
+   "reviewer": "A: devotion cluster (stompy opponent)",
+   "confidence": "recorded",
+   "note": "Nighthawk Scavenger 1+* CDA finding (A2); Reanimate rejections correct."
+  },
+  "game_1542340516212117566": {
+   "wave": "aug27-eighth-cycle-card-targeted",
+   "reviewer": "A: aristocrats/devotion",
+   "confidence": "recorded",
+   "note": "Mind Sludge live blocked all game; Ob Nixilis loyalty math verified."
+  },
+  "game_1542331644390678682": {
+   "wave": "aug27-eighth-cycle-card-targeted",
+   "reviewer": "B: transform/adventure",
+   "confidence": "recorded",
+   "note": "Aluren free-cast adventure instants (B1 CRITICAL); Oaken Boon wrong target (B2); Plummet verified both directions."
+  },
+  "game_1542344952065822814": {
+   "wave": "aug27-eighth-cycle-card-targeted",
+   "reviewer": "B: combat_keywords/layers",
+   "confidence": "recorded",
+   "note": "Brightclimb/Lord of Extinction clean; Reanimate MV-charge correct."
+  },
+  "game_1542344959280152586": {
+   "wave": "aug27-eighth-cycle-card-targeted",
+   "reviewer": "B: partner_brallin/madness",
+   "confidence": "recorded",
+   "note": "Reanimate land-target paid-and-fizzled (B3); Sulfurous Springs tap-damage split verified."
+  },
+  "game_1542318453988266056": {
+   "wave": "aug27-eighth-cycle-card-targeted",
+   "reviewer": "C: aminatou/voltron",
+   "confidence": "recorded",
+   "note": "Nevermaker owner-routing latent (C4); Sword of Feast and Famine both halves verified; Mantle P/T math verified."
+  },
+  "game_1542325802329309264": {
+   "wave": "aug27-eighth-cycle-card-targeted",
+   "reviewer": "C: mythic/voltron",
+   "confidence": "recorded",
+   "note": "Robber of the Rich silent no-op (C1); Mantle declared-target drop (C3); Emeria 7-Plains gate verified."
+  },
+  "game_1542325919534817281": {
+   "wave": "aug27-eighth-cycle-card-targeted",
+   "reviewer": "C: tokens/voltron",
+   "confidence": "recorded",
+   "note": "Soul of the Harvest drew off tokens (C2); Increasing Devotion + Parallel Lives verified."
+  },
+  "game_1542331602439250030": {
+   "wave": "aug27-eighth-cycle-card-targeted",
+   "reviewer": "D: aminatou/partner",
+   "confidence": "recorded",
+   "note": "Shalai player-hexproof miss (D5); Chromatic Lantern land-grant absent (D6); Eladamri's Call vs Ashiok verified."
+  },
+  "game_1542312288982401068": {
+   "wave": "aug27-eighth-cycle-card-targeted",
+   "reviewer": "D: mythic/baral",
+   "confidence": "recorded",
+   "note": "Zhulodok cascade grant absent (D7); Dissolve scry + Forbid buyback-decline verified."
+  },
+  "game_1542336224440614952": {
+   "wave": "aug27-eighth-cycle-card-targeted",
+   "reviewer": "D: aura_equipment/death_replacement",
+   "confidence": "recorded",
+   "note": "Stale-attachment CR 400.7 finding (D1 CRITICAL); Extraction Specialist lock absent (D3); Living Death exile-first verified CORRECT (the wave's one flat FP refuted)."
+  },
+  "game_1542318482451070987": {
+   "wave": "aug27-eighth-cycle-card-targeted",
+   "reviewer": "coordinator",
+   "confidence": "recorded",
+   "note": "Act of Treason steal won mid-combat — no revert owed (CR 104.2a); stolen Sun Titan's attack trigger fired under the thief."
+  },
+  "game_1542312111533858928": {
+   "wave": "aug27-eighth-cycle-card-targeted",
+   "reviewer": "coordinator",
+   "confidence": "recorded",
+   "note": "The no-win-grep outlier: decisive turn-17 Warstorm lethal via [TOKEN-TRIGGER]; post-loss lines are print-order unwind, not state."
+  },
+  "game_1542336110145839114": {
+   "wave": "aug27-eighth-cycle-card-targeted",
+   "reviewer": "coordinator",
+   "confidence": "recorded",
+   "note": "Narfi multi-subtype anthem registered on cast AND Living Death return; Icebreaker Kraken freeze via re-entry; Dictate edicts correct."
+  },
+  "game_1542325839742500946": {
+   "wave": "aug27-eighth-cycle-card-targeted",
+   "reviewer": "coordinator",
+   "confidence": "recorded",
+   "note": "Temp-control steal + end-of-turn revert pair verified (Worldgorger)."
+  },
+  "game_1542326068478873670": {
+   "wave": "aug27-eighth-cycle-card-targeted",
+   "reviewer": "coordinator",
+   "confidence": "recorded",
+   "note": "Temp-control steal + revert pair verified (Armored Skyhunter)."
   }
  }
 }

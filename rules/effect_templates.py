@@ -1696,15 +1696,24 @@ class EffectTemplateLibrary:
         # without actually firing the effect.
         # =================================================================
 
-        # Oaken Boon (Tuinvale Treefolk — sorcery): two +1/+1 counters on a creature
+        # Oaken Boon (Tuinvale Treefolk — sorcery): two +1/+1 counters on a creature.
+        # Aug 27 batch audit (B2): the lambda went straight to the best-own
+        # heuristic and never read explicit_target_name — the AI declared
+        # Craterhoof Behemoth and the counters landed on Chulane
+        # (game_1542331644390678682, CR 601.2c). Declared target wins; the
+        # heuristic stays as the no-declaration fallback.
         self._add_card("oaken boon", EffectTemplate(
             name="Oaken Boon",
             description="Put two +1/+1 counters on target creature",
             action_generator=lambda ctrl, opp, ctx: (
                 [{"action": "add_counters",
-                  "card": ctx.get('best_own_creature') or ctx.get('best_etb_creature') or '',
+                  "card": (ctx.get('explicit_target_name')
+                           or ctx.get('best_own_creature')
+                           or ctx.get('best_etb_creature') or ''),
                   "counter_type": "+1/+1", "amount": 2}]
-                if (ctx.get('best_own_creature') or ctx.get('best_etb_creature'))
+                if (ctx.get('explicit_target_name')
+                    or ctx.get('best_own_creature')
+                    or ctx.get('best_etb_creature'))
                 else [{"action": "no_action", "reason": "Oaken Boon: no creature target"}]
             ),
         ))
@@ -4059,12 +4068,17 @@ class EffectTemplateLibrary:
         ))
 
 
+        # Aug 27 batch audit (C1): the old emission was a move_card carrying
+        # the sentinel "top_of_library" — no real card has that name, so
+        # find_card_in_zone returned None and the whole ability was a silent
+        # no-op every time its condition was met (game_1542325802329309264).
+        # The dedicated exile_top_of_library action is the vocabulary Ragavan
+        # already uses; the silent-no-op class strikes again.
         self._add_attack_card("robber of the rich", EffectTemplate(
             name="Robber of the Rich",
             description="Whenever Robber attacks, conditionally exile the defending player's top card",
             action_generator=lambda ctrl, opp, ctx: [
-                {"action": "move_card", "card": "top_of_library", "from_zone": "library",
-                 "to_zone": "exile", "player": opp,
+                {"action": "exile_top_of_library", "player": opp, "count": 1,
                  "reason": "Robber of the Rich: exile top card"}
             ] if len(ctx.get('opponent_hand', [])) > len(ctx.get('controller_hand', [])) else [
                 {"action": "no_action", "reason": "Robber of the Rich: defending player does not have more cards in hand"}
@@ -8073,14 +8087,31 @@ class EffectTemplateLibrary:
             if not candidates:
                 return [{"action": "no_action",
                          "reason": "Extraction Specialist: no MV-2 creature in graveyard"}]
-            # Prefer highest CMC (more value)
+            # Aug 27 batch audit (D4): honor a declared target when it is a
+            # legal candidate (CR 601.2c); the highest-CMC heuristic stays as
+            # the no-declaration fallback.
             candidates.sort(key=lambda x: -x[0])
+            chosen = candidates[0][1]
+            declared = (ctx.get('explicit_target_name') or '').lower()
+            if declared:
+                for _cmc, _name in candidates:
+                    if _name.lower() == declared:
+                        chosen = _name
+                        break
+            # Aug 27 batch audit (D3): the printed rider — "That creature
+            # can't attack or block for as long as you control this
+            # creature" — was entirely unimplemented (the old comment even
+            # mis-described it as "this turn"). The move_card handler stamps
+            # the lock from combat_lock_while_controlling; can_attack /
+            # can_block enforce it while a permanent with that name remains
+            # under the returning player's control.
             return [{
                 "action": "move_card",
-                "card": candidates[0][1],
+                "card": chosen,
                 "from_zone": "graveyard",
                 "to_zone": "battlefield",
                 "player": ctrl,
+                "combat_lock_while_controlling": "Extraction Specialist",
             }]
 
         self._add_card("extraction specialist", EffectTemplate(
@@ -8363,10 +8394,26 @@ class EffectTemplateLibrary:
             if not target:
                 return [{"action": "no_action",
                          "reason": "Nevermaker: no legal nonland permanent"}]
+            # Aug 27 batch audit (C4): "player" was hardcoded to opp, but
+            # move_card resolves BOTH the source battlefield and the
+            # destination library from that one argument — so a declared
+            # own-side target (legal: "target nonland permanent", no
+            # restriction) would silently fail the opp-side lookup, and a
+            # same-named pair could misroute. Route by whichever battlefield
+            # actually holds the named permanent (the Primal Command
+            # convention). Residual: a STOLEN permanent routes to its
+            # current controller's library rather than its owner's —
+            # documented approximation, same as move_card's own zone model.
+            _tname = str(target).lower()
+            _holder = opp
+            for _pc in (ctx.get('controller_battlefield') or []):
+                if (getattr(_pc, 'name', '') or '').lower() == _tname:
+                    _holder = ctrl
+                    break
             return [{
                 "action": "move_card", "card": target,
                 "from_zone": "battlefield", "to_zone": "library",
-                "position": "top", "player": opp,
+                "position": "top", "player": _holder,
             }]
 
         self._add_card("nevermaker ltb", EffectTemplate(

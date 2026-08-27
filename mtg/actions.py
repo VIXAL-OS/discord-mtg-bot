@@ -1578,6 +1578,15 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
                     card.tapped = bool(action.get("tapped", False))
                     card.summoning_sick = True if card.is_creature() else False
                     card.entered_this_turn = True
+                    # Aug 27 batch audit (D3): Extraction Specialist-class
+                    # riders — "that creature can't attack or block for as
+                    # long as you control this creature". The emitting
+                    # template names the LOCKING permanent; can_attack /
+                    # can_block enforce while the creature's controller still
+                    # controls a permanent with that name.
+                    _lock_src = action.get("combat_lock_while_controlling")
+                    if _lock_src:
+                        card.combat_locked_while_controlling = str(_lock_src)
                     # June 10 audit (V8): initialize planeswalker loyalty on
                     # non-cast battlefield entry (Rashmi free-cast, reanimation
                     # via move_card). The cast path does this in spells.py;
