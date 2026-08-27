@@ -5896,6 +5896,11 @@ class EffectTemplateLibrary:
         # Ambition's Cost, Read the Bones-without-scry, Promise of Power, etc.)
         # May 20 audit: previously silently partial-resolved — life paid, no
         # cards drawn — because no template covered "lose N life, draw N cards".
+        # Aug 26 (the taxonomy audit's ordering nit): all three print
+        # "draw ... AND lose ..." — DRAW first. The old lose-first emission
+        # could end the game at exactly-N life before the draws happened
+        # (the tail SBA wave detects the zero mid-list), and draw watchers
+        # (Sheoldred) saw the wrong intermediate state.
         for _card_name, _amt in (
             ("night's whisper", 2),
             ("sign in blood", 2),
@@ -5903,11 +5908,11 @@ class EffectTemplateLibrary:
         ):
             self._add_card(_card_name, EffectTemplate(
                 name=_card_name.title(),
-                description=f"Lose {_amt} life and draw {_amt} cards",
+                description=f"Draw {_amt} cards and lose {_amt} life",
                 action_generator=lambda ctrl, opp, ctx, _a=_amt: [
+                    {"action": "draw_cards", "player": ctrl, "amount": _a},
                     {"action": "lose_life", "player": ctrl, "amount": _a,
                      "_source_card_name": ctx.get('_source_card_name', '')},
-                    {"action": "draw_cards", "player": ctrl, "amount": _a},
                 ],
             ))
 

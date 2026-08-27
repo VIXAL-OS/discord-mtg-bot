@@ -141,6 +141,47 @@ def additional_sacrifice_requirement(card):
     return count, permanent_type
 
 
+_ADDITIONAL_DISCARD_RE = re.compile(
+    # Aug 26 (the taxonomy audit — Tormenting Voice was a pure "draw 2 for
+    # {1}{R}", its printed discard never charged). Bulk-swept before the
+    # regex: 17x 'a card' + 1x 'two cards' are the plain fixed-count family
+    # this accepts; the lookahead structurally DECLINES every other printed
+    # shape — 'X cards' (unthreaded X), 'at random' (a different choice
+    # model), 'or pay {N}/N life' (modal cost — Lightning Axe stays castable
+    # by its mana half), typed forms ('a land card', 'a red or green card'),
+    # and compounds ('and sacrifice a creature'). Declined forms keep the
+    # historical under-charge rather than bricking the cast — same posture
+    # as buyback's unmodeled cost forms.
+    r"as an additional cost to cast this spell, discard "
+    r"(a|an|one|two|three) cards?(?=[.,\n])",
+    re.IGNORECASE,
+)
+
+
+def additional_discard_requirement(card):
+    """Return the card count for a plain printed additional-discard cost
+    (Tormenting Voice, Cathartic Reunion), or None for every other shape —
+    see the regex comment for the declined tail."""
+    match = _ADDITIONAL_DISCARD_RE.search(
+        getattr(card, "oracle_text", "") or "")
+    if not match:
+        return None
+    number_word = match.group(1).lower()
+    return {"a": 1, "an": 1, "one": 1, "two": 2, "three": 3}[number_word]
+
+
+def can_pay_additional_discard(card, player) -> bool:
+    """Whether player holds enough OTHER cards to pay card's printed
+    additional-discard cost (CR 601.2g — the spell itself is still in hand
+    at decision time and cannot pay its own cost). Shared by advertisement
+    and the authoritative cast gate, like its sacrifice sibling."""
+    requirement = additional_discard_requirement(card)
+    if requirement is None:
+        return True
+    others = sum(1 for c in getattr(player, "hand", []) if c is not card)
+    return others >= requirement
+
+
 def can_pay_additional_sacrifice(card, player, game=None) -> bool:
     """Whether player can pay card's mandatory sacrifice cost.
 
@@ -493,6 +534,10 @@ def castable_entries(game, player, mana_by_color: Dict, any_color_mana: int,
         # CR 601.2b/g: do not advertise a spell whose mandatory additional
         # sacrifice cannot be paid. The cast gate calls the same predicate.
         if not can_pay_additional_sacrifice(card, player, game):
+            continue
+        # Aug 26: the discard sibling — never advertise a cast the CR 601.2g
+        # gate will refuse for lack of a card to pitch.
+        if not can_pay_additional_discard(card, player):
             continue
         # July 29 batch audit: split cards store the COMBINED Scryfall
         # string ("{3}{U} // {4}{U}{U}"), which parses as one 10-CMC cost

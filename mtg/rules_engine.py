@@ -796,7 +796,9 @@ class RulesEngine:
         from mtg.helpers import untap_permanent
         _became_untapped = []
         for card in player.battlefield:
-            if untap_permanent(card):
+            # game + during_untap_step: this IS the untap step, so the
+            # Claustrophobia-class no-untap static applies here (Aug 26).
+            if untap_permanent(card, game=game, during_untap_step=True):
                 _became_untapped.append((card, player))
             # Clear summoning sickness for creatures that were sick
             if card.is_creature() and card.summoning_sick:

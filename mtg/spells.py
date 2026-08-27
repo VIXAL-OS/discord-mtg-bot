@@ -615,7 +615,9 @@ def _validate_cast(engine, game: GameState, player: Player, card: Card,
     # sacrifice" (game_1526071467035459665). Gate it here so EVERY cast path
     # is covered (CR 601.2g — a spell can't be cast without paying its costs).
     from mtg.legal_actions import (
+        additional_discard_requirement,
         additional_sacrifice_requirement,
+        can_pay_additional_discard,
         can_pay_additional_sacrifice,
     )
     _sac_requirement = additional_sacrifice_requirement(card)
@@ -626,6 +628,16 @@ def _validate_cast(engine, game: GameState, player: Player, card: Card,
         return ((False,
                  f"{card.name} needs {_sac_count} {_sac_noun} to sacrifice "
                  f"as an additional cost",
+                 []), _cast_from_graveyard, target)
+    # Aug 26: the discard sibling (Tormenting Voice / Cathartic Reunion) —
+    # same CR 601.2g gate, same every-cast-path coverage rationale.
+    _disc_requirement = additional_discard_requirement(card)
+    if (_disc_requirement is not None
+            and not can_pay_additional_discard(card, player)):
+        _disc_noun = "card" if _disc_requirement == 1 else "cards"
+        return ((False,
+                 f"{card.name} needs {_disc_requirement} other {_disc_noun} "
+                 f"in hand to discard as an additional cost",
                  []), _cast_from_graveyard, target)
 
     # [TARGETING] Pre-cast target validation (CR 601.2c) — block spells with
@@ -1562,6 +1574,35 @@ def _pay_costs(engine, game: GameState, player: Player, card: Card,
             })
             if _sac_msg:
                 _cost_messages.append(_sac_msg)
+
+    # Aug 26: the MANDATORY additional-discard cost (Tormenting Voice /
+    # Cathartic Reunion — the sacrifice loop's sibling above). Paid after the
+    # mana for the same reason as buyback's discard below; the CR 601.2g gate
+    # in _validate_cast guarantees the hand can pay at cast decision time,
+    # and the len guard here is the graceful degrade if state shifted. Routes
+    # through the madness choke point like every true discard.
+    from mtg.legal_actions import additional_discard_requirement as _adr
+    _add_discard = _adr(card) or 0
+    if _add_discard:
+        _pitchable = [c for c in player.hand if c is not card]
+        _cost_messages = costs.setdefault('additional_cost_messages', [])
+        _pitched = []
+        for _ in range(min(_add_discard, len(_pitchable))):
+            _worst = max(_pitchable, key=lambda c: (c.is_land(), -(c.cmc or 0)))
+            _pitchable.remove(_worst)
+            player.hand.remove(_worst)
+            if helpers.madness_discard_to_exile(game, player, _worst) is None:
+                player.graveyard.append(_worst)
+            _pitched.append(_worst.name)
+        if _pitched:
+            _cost_messages.append(
+                f"🗑️ {player.name} discards {', '.join(_pitched)} "
+                f"({card.name}'s additional cost)")
+            print(f"[ADDITIONAL-COST] {card.name}: discarded "
+                  f"{', '.join(_pitched)}")
+        if len(_pitched) < _add_discard:
+            print(f"[ADDITIONAL-COST] {card.name}: hand short — paid "
+                  f"{len(_pitched)}/{_add_discard} discards")
 
     # Buyback's non-mana form (CR 702.26a — Forbid's "Discard two cards"),
     # paid HERE rather than in the cost stage so a cast that dies at the mana

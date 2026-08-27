@@ -2821,7 +2821,7 @@ def protection_prevents_damage(game, creature, source_card=None,
     return False, ""
 
 
-def untap_permanent(card) -> bool:
+def untap_permanent(card, game=None, during_untap_step=False) -> bool:
     """Untap one permanent. Returns True only if it actually TRANSITIONED.
 
     Aug 10 deferred (C3). Two things live here rather than at the call sites:
@@ -2842,12 +2842,41 @@ def untap_permanent(card) -> bool:
        fix proposed to use, is dead on arrival for exactly this reason: it
        reads False for every card on every real invocation because
        on_untap_step untapped them a moment earlier.
+
+    3. (Aug 26, the taxonomy audit) The continuous "doesn't untap during
+       its controller's untap step" STATIC from an attached Aura/Equipment
+       (Claustrophobia, Paralyze) — previously enforced nowhere; the aura
+       tapped the creature once and it politely untapped next turn. The
+       check is STEP-scoped (`during_untap_step`): an effect untap (Twiddle,
+       Seedborn Muse, the untap action) is not the untap step and must still
+       work. It needs `game` because the Aura sits on ITS controller's
+       battlefield — usually the opponent's, not the enchanted creature's —
+       so the card's own controller cannot resolve the attachment ids alone.
+       Sentence-scoped match (the Jitte line discipline): the sentence must
+       BEGIN with enchanted/equipped so unrelated "doesn't untap" prose in
+       a rider can't freeze the bearer.
     """
     if getattr(card, '_skip_next_untap', False):
         card._skip_next_untap = False
         print(f"[UNTAP] {card.name} skips this untap "
               f"(don't-untap-next-step flag)")
         return False
+    if during_untap_step and game is not None and getattr(card, 'attachments', None):
+        att_ids = set(card.attachments or [])
+        for p in game.players:
+            for perm in p.battlefield:
+                if (getattr(perm, 'attached_to', None) == card.id
+                        or getattr(perm, 'id', None) in att_ids):
+                    oracle = (getattr(perm, 'oracle_text', '') or '').lower()
+                    if "doesn't untap during" not in oracle:
+                        continue
+                    for sent in re.split(r'[.\n]', oracle):
+                        s = sent.strip()
+                        if ("doesn't untap during" in s
+                                and s.startswith(("enchanted", "equipped"))):
+                            print(f"[NO-UNTAP-STATIC] {card.name} doesn't "
+                                  f"untap ({perm.name})")
+                            return False
     if not getattr(card, 'tapped', False):
         return False
     card.tapped = False

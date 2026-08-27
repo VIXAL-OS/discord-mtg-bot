@@ -2202,7 +2202,7 @@ class GameEngine:
         card.tapped = False
         return True
     
-    def untap_all(self, player: Player):
+    def untap_all(self, player: Player, game: GameState = None):
         """Untap all permanents for a player and clear summoning sickness."""
         # Aug 10 deferred (C3): the per-card untap (including the Icebreaker
         # Kraken / Frozen Aether `_skip_next_untap` check that used to live
@@ -2213,9 +2213,13 @@ class GameEngine:
         # False for every card on every real invocation. "Becomes untapped"
         # therefore dispatches from on_untap_step, not from here; by the time
         # this pass runs nothing is still tapped, so it cannot double-fire.
+        # Aug 26: `game` threads through so the Claustrophobia-class
+        # no-untap static holds HERE too — with the static keeping cards
+        # tapped past on_untap_step, this pass would otherwise become the
+        # bypass that untaps them a moment later.
         from mtg.helpers import untap_permanent
         for card in player.battlefield:
-            untap_permanent(card)
+            untap_permanent(card, game=game, during_untap_step=True)
             # Clear summoning sickness for creatures (only creatures have it)
             if card.summoning_sick:
                 card.summoning_sick = False
@@ -3258,7 +3262,7 @@ class GameEngine:
             self.rules.on_untap_step(game)
         except Exception as e:
             print(f"[UNTAP] Error in on_untap_step from end_turn: {e}")
-        self.untap_all(game.active_player)
+        self.untap_all(game.active_player, game=game)
         game.active_player.lands_played_this_turn = 0
         game.active_player.landfall_count_this_turn = 0
         # Recalculate max land drops from static abilities
