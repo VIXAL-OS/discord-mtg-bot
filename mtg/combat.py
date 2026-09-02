@@ -211,6 +211,18 @@ def drain_combat_damage_triggers(rules, game: GameState,
                                 messages.append(f"💥 {_att.name} trigger: {_msg}")
                         print(f"[COMBAT-TRIGGER] {_att.name} (equipment on "
                               f"{attacker.name}): {_explanation}")
+                    elif _actions is not None:
+                        # Sep 1 2026 batch audit: the library contract (July
+                        # 21) is None = unhandled, [] = handled no-op. This
+                        # branch read [] as unhandled and queued it, so Sword
+                        # of Sinew and Steel's empty-board "up to one" no-op
+                        # (CR 603.3c) burned a Tier-3 call and a combat-shape
+                        # refusal on every connect (x6 in one batch). The
+                        # sibling attacker-trigger branch below already tests
+                        # `is None`.
+                        print(f"[COMBAT-TRIGGER] {_att.name} (equipment on "
+                              f"{attacker.name}): handled no-op (no legal "
+                              f"target)")
                     elif not _equipment_charge_claims(_att):
                         # Aug 10 audit: with no template this branch used to
                         # fall through with NO else — no queue, no tag — so

@@ -3575,8 +3575,23 @@ class Player:
             self.battlefield.remove(victim)
         except ValueError:
             return None
+        # Sep 1 2026 batch audit (reviewer B, F3): this appended to SELF's
+        # graveyard — the TAPPER's. A Gisela stolen with Act of Treason and
+        # fed to the thief's Phyrexian Tower landed in the thief's graveyard,
+        # and the thief's Eternal Witness then returned her to the thief's
+        # HAND: a temporary steal made permanent (game_1544046649792266290).
+        # CR 404.3: a card goes to its OWNER's graveyard. route_dead_permanent
+        # is the shared seam (owner routing + the CR 903.9a commander
+        # redirect + unearth's exile), so the commander branch below no
+        # longer needs its own copy.
+        _dest = None
         if not getattr(victim, 'is_token', False):
-            self.graveyard.append(victim)
+            if game is not None:
+                from mtg.helpers import route_dead_permanent
+                _dest = route_dead_permanent(
+                    game, victim, self, reason="Phyrexian Tower sacrifice")
+            else:
+                self.graveyard.append(victim)
         print(f"[PHYREXIAN-TOWER] {self.name} sacrifices {victim.name} to tap Phyrexian Tower for {{B}}{{B}}")
         # Track for dies-trigger emission (Blood Artist, Zulaport, etc.)
         if game is not None:
@@ -3600,13 +3615,10 @@ class Player:
                 # CR 903.9: a sacrificed commander may go to the command zone
                 # instead of the graveyard; autoplay always chooses it. June 11
                 # audit: Meren was Tower-sacrificed into the graveyard and
-                # vanished for the rest of the game.
-                if (getattr(victim, 'is_commander', False)
-                        and victim in self.graveyard):
-                    self.graveyard.remove(victim)
-                    if not hasattr(self, 'command_zone') or self.command_zone is None:
-                        self.command_zone = []
-                    self.command_zone.append(victim)
+                # vanished for the rest of the game. Sep 1 2026: the redirect
+                # itself now happens inside route_dead_permanent (to the
+                # OWNER's command zone); only the display line lives here.
+                if _dest == 'command_zone':
                     print(f"[CR-903.9] {victim.name} (commander) redirected graveyard → command zone after Tower sacrifice")
                     game._pending_messages.append(
                         f"👑 **{victim.name}** returns to the command zone (CR 903.9)")

@@ -2761,6 +2761,17 @@ def unattach_equipment(game, equipment) -> bool:
     return True
 
 
+def _controller_name_of(game, card) -> str:
+    """Name of the player whose battlefield holds `card`, else ''. The
+    targeting adapter wants a controller NAME; passing the GameState there
+    (positionally) is the bug that hid every equipment-granted protection
+    (Sep 1 2026)."""
+    for p in (getattr(game, 'players', None) or []):
+        if card in (getattr(p, 'battlefield', None) or []):
+            return p.name
+    return ""
+
+
 def protection_blocks_from(game, protected_card, source_card):
     """Does `protected_card`'s protection apply to `source_card`? (bool, why).
 
@@ -2787,7 +2798,18 @@ def protection_blocks_from(game, protected_card, source_card):
     if protected_card is None or source_card is None:
         return False, ""
     try:
-        prot = getattr(_card_to_targetable(protected_card, game), 'protection', None)
+        # Sep 1 2026 batch audit (reviewer B, F2): this was
+        # `_card_to_targetable(protected_card, game)` — POSITIONAL, so the
+        # GameState landed in `ctrl_name` and `game` stayed None, and the
+        # equipment/aura grant scan inside is gated on `game is not None`.
+        # Result: only PRINTED protection was ever seen here — a Sword of
+        # Light and Shadow bearer was blocked by a white Archangel of Thune
+        # and died (game_1544072987039367239, CR 702.16c). Both mtg/helpers
+        # call sites had the same slip; every rules/targeting_helpers site
+        # passes game= by keyword.
+        prot = getattr(_card_to_targetable(
+            protected_card, _controller_name_of(game, protected_card),
+            game=game), 'protection', None)
     except (AttributeError, TypeError, ValueError):
         return False, ""
     if not prot:
@@ -2838,7 +2860,10 @@ def protection_prevents_damage(game, creature, source_card=None,
         return False, ""
     try:
         from rules.targeting_helpers import _card_to_targetable
-        prot = getattr(_card_to_targetable(creature, game), 'protection', None)
+        # Sep 1 2026: keyword `game=` — see protection_blocks_from.
+        prot = getattr(_card_to_targetable(
+            creature, _controller_name_of(game, creature), game=game),
+            'protection', None)
     except (ImportError, AttributeError, TypeError, ValueError):
         return False, ""
     for ability in (prot or ()):

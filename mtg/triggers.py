@@ -1319,6 +1319,21 @@ def scan_damaged_creature(rules, game: GameState, damaged: Card,
     _deffect = _dm.group(1).strip()
     _damaged_owner = next(
         (p for p in game.players if damaged in p.battlefield), None)
+    if _damaged_owner is None:
+        # Sep 1 2026 batch audit: the combat drain runs AFTER the SBA sweep,
+        # so a creature that died to the very damage that triggered it is
+        # already in a graveyard — Phyrexian Negator blocked, took lethal,
+        # and its "sacrifice that many permanents" fell to the unhandled
+        # queue because nobody controlled it any more. CR 603.10 looks back:
+        # its last controller sacrifices. Find the card in a graveyard, else
+        # fall back to its owner (2-player: owner == last controller unless
+        # stolen, and a stolen Negator's death is the rarer shape).
+        _damaged_owner = next(
+            (p for p in game.players if damaged in p.graveyard), None)
+        if _damaged_owner is None:
+            _oi = getattr(damaged, 'owner_index', -1)
+            if 0 <= _oi < len(game.players):
+                _damaged_owner = game.players[_oi]
     # WHO sacrifices differs between the two printings, and getting it
     # backwards would be worse than not firing at all: Phyrexian Obliterator
     # says "that SOURCE'S controller sacrifices", while Phyrexian Negator
@@ -1341,6 +1356,28 @@ def scan_damaged_creature(rules, game: GameState, damaged: Card,
                 msgs.append(_m)
         print(f"[DAMAGED-TRIGGER] {damaged.name}: {_sac_player.name} "
               f"sacrifices {dmg_amount} permanent(s)")
+    elif (_passive and re.match(r'it deals that much damage to any target',
+                                _deffect)
+          and source_controller is not None and _damaged_owner is not None):
+        # Sep 1 2026 batch audit: Boros Reckoner ("Whenever this creature is
+        # dealt damage, it deals that much damage to any target") reached
+        # Tier 3, which reflected the damage correctly AND fabricated a
+        # 3-life gain for the controller ("gaining life due to the
+        # simultaneous..." — no lifelink source on the board). Deterministic
+        # here: the reflect goes to the damaging source's controller's face —
+        # the conservative "any target" choice that never invents a state
+        # change. Reckoner itself may already be dead; the reflect still
+        # fires (CR 603.10).
+        _m = rules._execute_action_on_state(game, {
+            "action": "deal_damage", "amount": int(dmg_amount),
+            "target_player": source_controller.name,
+            "_source_card_name": damaged.name,
+            "_source_controller": _damaged_owner.name,
+        })
+        if _m:
+            msgs.append(_m)
+        print(f"[DAMAGED-TRIGGER] {damaged.name}: reflects {dmg_amount} "
+              f"damage to {source_controller.name}")
     else:
         print(f"[DAMAGED-TRIGGER-UNHANDLED] {damaged.name}: "
               f"{_deffect[:100]}")
@@ -6706,6 +6743,97 @@ def fire_discard_triggers(game, player, discarded):
                     msgs.append(f"🗑️ **{perm.name}**: {out}")
             print(f"[DISCARD-TRIGGER] {perm.name} fired on "
                   f"{player.name} discarding {discarded.name}")
+    msgs.extend(_fire_opponent_discard_watchers(game, rules, player, discarded))
+    return msgs
+
+
+_OPP_DISCARD_CLAUSE = re.compile(r'whenever an opponent discards a card,\s*(.*)')
+
+
+def _fire_opponent_discard_watchers(game, rules, discarder, discarded):
+    """"Whenever an OPPONENT discards a card" watchers (Sep 1 2026 batch
+    audit, reviewer A): the you-scope scan above deliberately reads only the
+    discarding player's battlefield, so this whole punisher class had no
+    scan at all — Liliana's Caress sat on Qwen's board while Rick discarded
+    to Liliana of the Veil's +1 and lost nothing (game_1544046765932810291).
+
+    Scans every OTHER player's battlefield. Bulk-swept before the regex was
+    written: the family is 12 printings, and the shapes modeled here cover
+    the deck-reachable ones — "that player/they lose N life" (Liliana's
+    Caress, Entropic Battlecruiser), Megrim's damage, Sangromancer's optional
+    gain (taken), Geth's Grimoire's optional draw (taken), Tourach's counter,
+    Nath's Elf token. The "one or more"/"two or more" batch qualifiers are
+    excluded by the anchor on purpose (per-card firing would over-fire them).
+    Anything else prints [DISCARD-TRIGGER-UNHANDLED] like the you-scope tail.
+    """
+    msgs = []
+    if rules is None or discarded is None or game is None:
+        return msgs
+    for watcher_owner in game.players:
+        if watcher_owner is discarder or getattr(watcher_owner, 'eliminated', False):
+            continue
+        for perm in list(getattr(watcher_owner, 'battlefield', []) or []):
+            if getattr(perm, '_phased_out', False):
+                continue
+            oracle = getattr(perm, 'oracle_text', '') or ''
+            for raw in oracle.split('\n'):
+                line = re.sub(r'\([^)]*\)', '', raw).strip().lower()
+                if re.match(r'^[+\-−]?\d+\s*:', line) or ':' in line.split(',')[0]:
+                    continue  # loyalty / activated line
+                m = _OPP_DISCARD_CLAUSE.search(line)
+                if not m:
+                    continue
+                effect = m.group(1)
+                actions = []
+                lose = re.search(r'\b(?:that player|they) loses? (\d+) life', effect)
+                if lose:
+                    actions.append({"action": "lose_life", "player": discarder.name,
+                                    "amount": int(lose.group(1)),
+                                    "_source_card_name": perm.name})
+                dmg = re.search(r'deals (\d+) damage to that player', effect)
+                if dmg:
+                    actions.append({"action": "deal_damage",
+                                    "amount": int(dmg.group(1)),
+                                    "target_player": discarder.name,
+                                    "source": perm.name,
+                                    "_source_card_name": perm.name,
+                                    "_source_controller": watcher_owner.name})
+                gain = re.search(r'you may gain (\d+) life', effect)
+                if gain:
+                    actions.append({"action": "gain_life",
+                                    "player": watcher_owner.name,
+                                    "amount": int(gain.group(1))})
+                if re.search(r'you may draw a card', effect):
+                    actions.append({"action": "draw_cards",
+                                    "player": watcher_owner.name, "amount": 1})
+                if re.search(r'put a \+1/\+1 counter on', effect):
+                    actions.append({"action": "add_counters", "card": perm.name,
+                                    "counter_type": "+1/+1", "amount": 1})
+                tok = re.search(r'create a (\d+)/(\d+) (\w+) (\w+) (\w+) creature token',
+                                effect)
+                if tok:
+                    actions.append({"action": "create_token",
+                                    "player": watcher_owner.name,
+                                    "name": f"{tok.group(4).title()} {tok.group(5).title()}",
+                                    "power": int(tok.group(1)),
+                                    "toughness": int(tok.group(2)),
+                                    "types": f"Creature — {tok.group(4).title()} {tok.group(5).title()}",
+                                    "count": 1})
+                if not actions:
+                    print(f"[DISCARD-TRIGGER-UNHANDLED] {perm.name}: {line}")
+                    continue
+                for action in actions:
+                    try:
+                        out = rules._execute_action_on_state(game, action)
+                    except Exception as e:  # noqa: BLE001 - crash barrier
+                        print(f"[DISCARD-TRIGGER] {perm.name} action failed: {e}")
+                        from mtg.util import maybe_reraise
+                        maybe_reraise(e)
+                        continue
+                    if out:
+                        msgs.append(f"🗑️ **{perm.name}**: {out}")
+                print(f"[DISCARD-TRIGGER] {perm.name} fired on opponent "
+                      f"{discarder.name} discarding {discarded.name}")
     return msgs
 
 

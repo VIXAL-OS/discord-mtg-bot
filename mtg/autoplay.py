@@ -2387,7 +2387,13 @@ async def _autoplay_execute_action(cog, thread, game: GameState, player_idx: int
                 print(f"[FORETELL-CAST] Autoplay cast {card.name} from exile")
             source = " from exile" if from_exile else (" from command zone" if from_command_zone else "")
             tax_msg = f" (paid {{{commander_tax}}} commander tax)" if commander_tax > 0 else ""
-            result_msg = f"✨ {player.name} cast **{card.name}**{source}{tax_msg}"
+            # Sep 1 2026 (reviewer D, F3): name the adventure half when that
+            # is what was cast — the spells.py twin.
+            _announce_name = (card.adventure_name
+                              if getattr(card, 'cast_as_adventure', False)
+                              and getattr(card, 'adventure_name', None)
+                              else card.name)
+            result_msg = f"✨ {player.name} cast **{_announce_name}**{source}{tax_msg}"
             # May 7 audit fix #1: cast_spell_async may have already announced
             # the cast BEFORE the priority window (so the announcement appears
             # before any counterspell response). If so, skip the duplicate

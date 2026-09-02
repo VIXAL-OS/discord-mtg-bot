@@ -1903,7 +1903,15 @@ async def _await_stack_window(engine, game: GameState, player: Player,
                 source_tag = " from command zone"
             elif getattr(card, '_cast_from_graveyard', False):
                 source_tag = " from graveyard"
-            await send_func(f"✨ {player.name} cast **{card.name}**{source_tag}")
+            # Sep 1 2026 batch audit (reviewer D, F3): an adventure-half cast
+            # announced the CREATURE's name ("cast Fae of Wishes" for a
+            # {3}{U} Granted). The conditional the resolution site already
+            # uses, applied at the early announcement too.
+            _announce_name = (card.adventure_name
+                              if getattr(card, 'cast_as_adventure', False)
+                              and getattr(card, 'adventure_name', None)
+                              else card.name)
+            await send_func(f"✨ {player.name} cast **{_announce_name}**{source_tag}")
             stack_entry._cast_announced = True
             # Mark on the game so callers can suppress duplicate announcement.
             # Use a dict keyed by id(card) so multiple in-flight casts don't collide.
@@ -4943,6 +4951,16 @@ async def resolve_pending_miracles(engine, game: GameState) -> List[str]:
                   f"wipe only their own board")
             continue
         card._cast_via_miracle = True
+        # Sep 1 2026 batch audit (reviewer D, F4): the reveal line used to be
+        # appended AFTER the whole async cast — including the opponent's
+        # response window — so Discord read "Dissolve counters Entreat the
+        # Angels ... Rick reveals and casts Entreat the Angels", as if it had
+        # been cast again. Announce first (the early-announcement pattern the
+        # ordinary cast path uses), then let the cast's own lines follow.
+        print(f"[MIRACLE] {player.name} reveals {card.name} and casts it for "
+              f"its miracle cost {cost}")
+        messages.append(f"✨ **{player.name}** reveals and casts "
+                        f"**{card.name}** for its miracle cost {cost}")
         try:
             success, msg, effect_msgs = await engine.cast_spell_async(
                 game, player, card)
@@ -4955,8 +4973,6 @@ async def resolve_pending_miracles(engine, game: GameState) -> List[str]:
         if success:
             print(f"[MIRACLE] {player.name} casts {card.name} for its miracle "
                   f"cost {cost}")
-            messages.append(f"✨ **{player.name}** reveals and casts "
-                            f"**{card.name}** for its miracle cost {cost}")
             messages.extend(effect_msgs or [])
         else:
             print(f"[MIRACLE] {player.name}'s miracle cast of {card.name} "

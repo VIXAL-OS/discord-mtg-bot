@@ -5917,6 +5917,18 @@ class GameEngine:
                         print(f"[ACTIVATE-CLAUDE-TIER3] {perm.name}: resolved via judge "
                               f"({len(t3_actions)} action(s))")
                         _body = t3_msgs or [f"{player.name} activates {perm.name}"]
+                        # Sep 1 2026 batch audit (reviewer C, F1): this branch
+                        # returned without a state-based check, unlike the
+                        # sibling `resolve` branch below. Yawgmoth's third
+                        # -1/-1 counter took Gisela, the Broken Blade to
+                        # toughness 0 and she STAYED on the battlefield until
+                        # the next spell's SBA sweep — Living Death then
+                        # sacrificed her live instead of returning her from the
+                        # graveyard (CR 704.5f / 704.3;
+                        # game_1544046811151339640). Same name discipline as
+                        # the resolve branch: never bind the bare name `events`.
+                        sba_events = self.check_state_based_actions(game)
+                        _body = list(_body) + [f"⚡ {e}" for e in sba_events]
                         return "\n".join(cost_msgs + _body)
                     if t3_msgs:
                         print(f"[ACTIVATE-CLAUDE-TIER3] {perm.name}: no actions — "

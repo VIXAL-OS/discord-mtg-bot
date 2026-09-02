@@ -1124,6 +1124,31 @@ def execute_action_on_state(rules, game: GameState, action: Dict) -> Optional[st
             return f"🔮 Fateshift: top of {' and '.join(moved)}'s library moved to bottom"
         return None
 
+    elif action_type == "library_to_bottom":
+        # Sep 1 2026 batch audit (reviewer D, F1): the "look at the top N,
+        # put one into your hand and the rest on the bottom" family
+        # (Anticipate, Impulse) had no vocabulary for "the rest on the
+        # bottom" — Tier 3 invented card names it cannot see and the spell
+        # did nothing. Moves the named cards (matched from the TOP of the
+        # library, where the look happened) to the bottom, in the given
+        # order. The message deliberately names no card (hidden information).
+        player = find_player(action.get("player", ""))
+        names = [str(n) for n in (action.get("cards") or []) if n]
+        if not player or not names:
+            return None
+        moved = 0
+        for nm in names:
+            idx = next((i for i, c in enumerate(player.library)
+                        if c.name.lower() == nm.lower()), None)
+            if idx is None:
+                continue
+            player.library.append(player.library.pop(idx))
+            moved += 1
+        if not moved:
+            return None
+        return (f"🔮 **{player.name}** puts {moved} card{'s' if moved != 1 else ''} "
+                f"on the bottom of their library")
+
     elif action_type == "scry":
         player = find_player(action.get("player", ""))
         amount = int(action.get("amount", 1))

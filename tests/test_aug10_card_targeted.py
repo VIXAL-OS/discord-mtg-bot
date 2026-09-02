@@ -295,7 +295,11 @@ class TestPassiveDamagedTrigger:
         with open(os.path.join(root, 'mtg/triggers.py'), encoding='utf-8') as handle:
             src = handle.read()
         index = src.find('def scan_damaged_creature')
-        body = src[index:index + 4000]
+        # Sep 1 2026: slice to the enclosing function, not a 4000-char
+        # window — the dead-owner fallback and the Reckoner branch pushed
+        # the breadcrumb past it (the char-window-outgrown class).
+        end = src.find('\ndef ', index + 1)
+        body = src[index:end if end != -1 else None]
         assert '_passive = bool(_dm)' in body
         assert 'DAMAGED-TRIGGER-UNHANDLED' in body
 

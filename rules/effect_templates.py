@@ -1526,6 +1526,38 @@ class EffectTemplateLibrary:
             description="At the beginning of each player's upkeep, that player destroys a nonartifact creature they control",
             action_generator=self._gen_the_abyss_upkeep,
         ))
+        # Sep 1 2026 batch audit (8cc5a1a): the two top deterministic
+        # entries in the Tier-3 drain ranking — Eldrazi Monument's upkeep
+        # sacrifice (x4) and Herald of Anguish's end-step discard (x2).
+        # Suffix keys (the Soulherder convention) so a bare-name lookup can
+        # never fire them on the permanent's own ETB.
+        # Sep 1 2026 batch audit (reviewer C, F2): Sage's Reverie's ETB
+        # "draw a card for each Aura you control that's attached to a
+        # creature" fell to the generic ETB-draw pattern, which captured the
+        # word "a" and drew ONE while the static half of the same sentence
+        # (mtg/models.py) correctly counted two. Same count, same rule, one
+        # template so the two halves cannot drift again.
+        self._add_card("sage's reverie", EffectTemplate(
+            name="Sage's Reverie",
+            description=("When this Aura enters, draw a card for each Aura "
+                         "you control that's attached to a creature"),
+            action_generator=self._gen_sages_reverie,
+        ))
+        self._add_card("eldrazi monument upkeep", EffectTemplate(
+            name="Eldrazi Monument",
+            description=("At the beginning of your upkeep, sacrifice a "
+                         "creature. If you can't, sacrifice this artifact"),
+            action_generator=self._gen_eldrazi_monument_upkeep,
+        ))
+        self._add_card("herald of anguish endstep", EffectTemplate(
+            name="Herald of Anguish",
+            description=("At the beginning of your end step, each opponent "
+                         "discards a card"),
+            # 2-player shape (the Sword of Feast and Famine convention);
+            # a multi-seat game gets the default opponent only.
+            action_generator=lambda ctrl, opp, ctx: [
+                {"action": "discard", "player": opp, "card": "worst"}],
+        ))
 
         # Etali, Primal Storm — attack trigger template is registered below (line ~1251)
         # with a proper etali_trigger action that actually exiles and casts cards
@@ -4452,6 +4484,39 @@ class EffectTemplateLibrary:
             )
         )
 
+        # Sep 1 2026 batch audit (reviewer D, F1): Anticipate resolved as
+        # NOTHING — "put one of them into your hand" defeats the library-look
+        # shortcut (correctly), so it reached Tier 3, which cannot see the
+        # library and invented "Top Card 1/2/3"; two moves were rejected as
+        # same-zone no-ops and the third matched no real card. The engine
+        # itself knows the library, so the pick is deterministic here. Cache
+        # sweep: exactly Anticipate and Impulse carry this shape.
+        self._add_pattern(
+            r"look at the top (\w+) cards of your library\. put one of them "
+            r"into your hand and the rest on the bottom of your library",
+            EffectTemplate(
+                name="Impulse Look",
+                description="Look at the top N cards, put one into your hand and the rest on the bottom",
+                action_generator=self._gen_impulse_look,
+            )
+        )
+
+        # Sep 1 2026 batch audit (reviewer D, F2): "target creature can't
+        # block this turn" had a name-keyed template (Goblin Shortcutter) and
+        # a working action, but no generic pattern AND no judge vocabulary —
+        # Demonic Dread's whole effect resolved at Tier 3 as five actions
+        # that changed nothing. The generator declines compound texts (a
+        # second non-keyword sentence would be silently dropped).
+        self._add_pattern(
+            r"target creature can't block this turn",
+            EffectTemplate(
+                name="Can't Block",
+                description="Target creature can't block this turn",
+                action_generator=self._gen_cant_block_target,
+                needs_target=True,
+            )
+        )
+
         # Aug 26 taxonomy audit (the MaRo design-skeleton pass): four common
         # spell-category families that resolved at Tier 3 (or dropped a
         # printed rider there) despite being fully deterministic.
@@ -6289,6 +6354,16 @@ class EffectTemplateLibrary:
                          "destroy up to one target planeswalker and up to one "
                          "target artifact"),
             action_generator=self._gen_sword_sinew_steel,
+        ))
+        # Sep 1 2026 batch audit (8cc5a1a): Quietus Spike had no template —
+        # Glissa Sunslayer connected with Qwen at 4 life, the "loses half
+        # their life, rounded up" trigger queued to Tier 3 and was refused as
+        # combat-shaped (a genuine lost effect: 4 should have become 2).
+        self._add_attack_card("quietus spike", EffectTemplate(
+            name="Quietus Spike",
+            description=("Equipped creature deals combat damage to a player: "
+                         "that player loses half their life, rounded up"),
+            action_generator=self._gen_quietus_spike,
         ))
         # (July 31 slice 5b: the "ohran frostfang" AND "tovolar, dire
         # overlord" own-connect registrations that lived here were DELETED.
@@ -9586,7 +9661,50 @@ class EffectTemplateLibrary:
                 if c.name.lower() == explicit.lower():
                     target = c
                     break
-            if target is None or not _legal(target):
+            if target is None:
+                # Sep 1 2026 batch audit (8cc5a1a): the caster targeting its
+                # OWN creature is legal ("target creature" is unrestricted)
+                # and the AI does it — Qwen aimed Act of Treason at its own
+                # commander Korvold, Rick at his own Midnight Reaper. This
+                # branch returned None, the spell fell to Tier 3, and the
+                # judge refused it on haste's reminder text: mana paid,
+                # nothing happened, three times in one batch. On your own
+                # creature the control change is a no-op and the RIDERS are
+                # the whole effect (untap + haste — a real, if weak, line on
+                # a summoning-sick creature). Resolve exactly that; the
+                # never-silently-retarget rule still holds for a name found
+                # on NEITHER battlefield.
+                own_bf = [c for c in (ctx.get('controller_battlefield') or [])
+                          if hasattr(c, 'name')]
+                own = next((c for c in own_bf
+                            if c.name.lower() == explicit.lower()), None)
+                if (own is not None and not getattr(own, '_phased_out', False)
+                        and _cls_ok(own) and _qual_ok(own)):
+                    untap = (bool(m.group(2))
+                             or bool(re.search(r"\buntap (it|that|target)\b",
+                                               line)))
+                    haste = "gains haste" in line
+                    actions: List[Dict] = []
+                    if untap:
+                        actions.append({"action": "untap", "card": own.name})
+                    if haste:
+                        actions.append({"action": "grant_keywords",
+                                        "player": ctrl,
+                                        "target_card": own.name,
+                                        "keywords": ["haste"]})
+                    if "+1/+1 counter" in line:
+                        actions.append({"action": "add_counters",
+                                        "card": own.name,
+                                        "counter_type": "+1/+1", "amount": 1})
+                    ms = re.search(r"\bscry (\d+)", line)
+                    if ms:
+                        actions.append({"action": "scry", "player": ctrl,
+                                        "amount": int(ms.group(1))})
+                    print(f"[TEMP-CONTROL] {explicit} is already controlled "
+                          f"by {ctrl} — control unchanged, riders only")
+                    return actions
+                return None
+            if not _legal(target):
                 # Declared target absent or illegal for the printed class —
                 # never silently retarget (the Abrupt Decay precedent).
                 return None
@@ -9624,6 +9742,115 @@ class EffectTemplateLibrary:
             actions.append({"action": "scry", "player": ctrl,
                             "amount": int(ms.group(1))})
         return actions
+
+    def _gen_impulse_look(self, ctrl: str, opp: str, ctx: Dict) -> Optional[List[Dict]]:
+        """Anticipate / Impulse: look at the top N, one to hand, rest to the
+        bottom. Reads the REAL library through ctx['_game'] (the Land Tax
+        convention); the choice heuristic mirrors the scry handler's
+        flood/screw reading — a land when the controller is short on lands
+        and holds none, else the highest-value nonland the board can cast
+        soon, else the best card by mana value.
+        """
+        m = ctx.get('_match')
+        game = ctx.get('_game')
+        if m is None or game is None:
+            return None
+        n = word_to_num(m.group(1))
+        if not n:
+            return None
+        player = _find_player_by_name(game, ctrl)
+        if player is None:
+            return None
+        top = list(player.library[:n])
+        if not top:
+            return []
+        lands_out = sum(1 for c in player.battlefield if c.is_land())
+        land_in_hand = any(c.is_land() for c in player.hand)
+        lands_top = [c for c in top if c.is_land()]
+        spells_top = [c for c in top if not c.is_land()]
+        if lands_out < 4 and not land_in_hand and lands_top:
+            pick = lands_top[0]
+        elif spells_top:
+            castable = [c for c in spells_top if int(c.cmc or 0) <= lands_out]
+            pool = castable or spells_top
+            pick = max(pool, key=lambda c: int(c.cmc or 0))
+        else:
+            pick = top[0]
+        rest = [c.name for c in top if c is not pick]
+        actions: List[Dict] = [{"action": "move_card", "card": pick.name,
+                                "from_zone": "library", "to_zone": "hand",
+                                "player": ctrl, "hide_card_name": True}]
+        if rest:
+            actions.append({"action": "library_to_bottom", "player": ctrl,
+                            "cards": rest})
+        return actions
+
+    def _gen_cant_block_target(self, ctrl: str, opp: str, ctx: Dict) -> Optional[List[Dict]]:
+        """"Target creature can't block this turn" (Sep 1 2026). Honors a
+        declared target (never silently retargets; an own-creature target is
+        legal and resolves — pointless but printed); otherwise the largest
+        opposing creature. Declines when the sentence has non-keyword
+        siblings (a rider would be dropped) — the compound-drop class.
+        """
+        m = ctx.get('_match')
+        oracle = ctx.get('_oracle', '') or ''
+        if m is None:
+            return None
+        event = ctx.get('_event_type', 'etb') or 'etb'
+        if event not in ('etb', 'activated'):
+            return None
+        stripped = re.sub(r'\([^)]*\)', '', oracle)
+        _KEYWORD_LINES = ('cascade', 'flash', 'devoid', 'split second',
+                          'this spell can\'t be countered')
+        sentences = []
+        for ln in stripped.split('\n'):
+            ln = ln.strip()
+            if not ln:
+                continue
+            if any(ln.lower().startswith(k) for k in _KEYWORD_LINES) and len(ln) < 40:
+                continue
+            sentences.extend(s.strip() for s in ln.split('.') if s.strip())
+        if len(sentences) != 1:
+            return None  # compound text — Tier 3's problem
+        game = ctx.get('_game')
+        _ct = ctx.get('_can_target')
+        _opp_pl = ctx.get('_opponent_player')
+        opp_bf = [c for c in (ctx.get('opponent_battlefield') or []) if hasattr(c, 'name')]
+        own_bf = [c for c in (ctx.get('controller_battlefield') or []) if hasattr(c, 'name')]
+
+        def _is_cre(c):
+            return c.is_creature(game) if hasattr(c, 'is_creature') else 'creature' in (getattr(c, 'type_line', '') or '').lower()
+
+        explicit = (ctx.get('explicit_target_name') or '').strip().lower()
+        if explicit:
+            for c in opp_bf:
+                if c.name.lower() == explicit and _is_cre(c) and (_ct is None or _ct(c, _opp_pl)):
+                    return [{"action": "cant_block_this_turn", "target_card": c.name,
+                             "target_controller": opp,
+                             "_source_card_name": getattr(ctx.get('_source_card'), 'name', None) or "effect",
+                             "_source_controller": ctrl}]
+            for c in own_bf:
+                if c.name.lower() == explicit and _is_cre(c):
+                    return [{"action": "cant_block_this_turn", "target_card": c.name,
+                             "target_controller": ctrl,
+                             "_source_card_name": getattr(ctx.get('_source_card'), 'name', None) or "effect",
+                             "_source_controller": ctrl}]
+            return None
+        candidates = [c for c in opp_bf if _is_cre(c) and not getattr(c, '_phased_out', False)
+                      and (_ct is None or _ct(c, _opp_pl))]
+        if not candidates:
+            return []
+
+        def _pw(c):
+            try:
+                return c.get_effective_power(game) if game is not None else int(getattr(c, 'power', 0) or 0)
+            except (TypeError, ValueError):
+                return 0
+        target = max(candidates, key=_pw)
+        return [{"action": "cant_block_this_turn", "target_card": target.name,
+                 "target_controller": opp,
+                 "_source_card_name": getattr(ctx.get('_source_card'), 'name', None) or "effect",
+                 "_source_controller": ctrl}]
 
     def _temp_line_and_cond(self, ctx):
         """Shared line/condition extraction for the Aug 26 taxonomy patterns
@@ -10912,6 +11139,25 @@ class EffectTemplateLibrary:
                 actions.append({"action": "destroy", "card": victim,
                                 "target_controller": opp})
         return actions
+
+    def _gen_quietus_spike(self, ctrl, opp, ctx) -> List[Dict]:
+        """Quietus Spike: the damaged player loses half their life, rounded
+        up (CR 107.1b rounding is explicit on the card). The damaged player
+        is the combat drain's `opp`; the amount is read from the live Player
+        object at resolution (ctx['_opponent_player']), never estimated —
+        a missing player declines rather than guesses.
+        """
+        if int(ctx.get('damage_dealt') or 0) <= 0:
+            return []
+        victim = ctx.get('_opponent_player')
+        life = getattr(victim, 'life', None)
+        if life is None:
+            return None
+        amount = (int(life) + 1) // 2
+        if amount <= 0:
+            return []
+        return [{"action": "lose_life", "player": opp, "amount": amount,
+                 "_source_card_name": "Quietus Spike"}]
 
     @staticmethod
     def _best_creature_in_graveyard(ctx, key) -> Optional[str]:
@@ -12852,6 +13098,58 @@ class EffectTemplateLibrary:
         chosen = min(candidates, key=lambda c: getattr(c, 'cmc', 0) or 0)
         return [{"action": "destroy", "card": chosen.name,
                  "target_controller": active.name}]
+
+    def _gen_sages_reverie(self, ctrl, opp, ctx) -> List[Dict]:
+        """Draw one per Aura the controller controls that is attached to a
+        creature — counting Sage's Reverie ITSELF, which is attached by the
+        time its own ETB resolves (CR 603.3d; the engine attaches at
+        resolution, and a Reverie with no legal target is never cast at all).
+        The ETB template runs before the attach line, so the entering Aura
+        is counted explicitly rather than read off the battlefield.
+        """
+        game = ctx.get('_game')
+        src = ctx.get('_source_card')
+        count = 0
+        for perm in (ctx.get('controller_battlefield') or []):
+            if not hasattr(perm, 'type_line'):
+                continue
+            if src is not None and perm is src:
+                continue
+            if 'aura' not in (perm.type_line or '').lower():
+                continue
+            att = getattr(perm, 'attached_to', None)
+            if not att or game is None:
+                continue
+            found = game.find_card_global(att)
+            if found and found[0].is_creature(game):
+                count += 1
+        count += 1  # itself
+        return [{"action": "draw_cards", "player": ctrl, "amount": count}]
+
+    def _gen_eldrazi_monument_upkeep(self, ctrl, opp, ctx) -> List[Dict]:
+        """Eldrazi Monument: "At the beginning of your upkeep, sacrifice a
+        creature. If you can't, sacrifice this artifact." The controller
+        chooses the creature; the handler's worst-first choice stands in.
+        With no creature at all the Monument itself goes (the printed
+        fallback), which is what keeps a creatureless board honest.
+        """
+        game = ctx.get('_game')
+        creatures = [
+            c for c in (ctx.get('controller_battlefield') or [])
+            if hasattr(c, 'is_creature') and c.is_creature(game)
+            and not getattr(c, '_phased_out', False)]
+        if creatures:
+            return [{"action": "sacrifice_permanent", "player": ctrl,
+                     "type_filter": "creature",
+                     "reason": "Eldrazi Monument's upkeep trigger"}]
+        # only_preferred is defence-in-depth, stated plainly: the handler
+        # already PREFERS preferred_card, so the flag changes nothing while
+        # the Monument is on the battlefield — and the upkeep dispatch only
+        # runs this generator when it is. (Mutation-tested Sep 1 2026: the
+        # flag's mutant is an equivalent, not a pin gap.)
+        return [{"action": "sacrifice_permanent", "player": ctrl,
+                 "preferred_card": "Eldrazi Monument", "only_preferred": True,
+                 "reason": "Eldrazi Monument: no creature to sacrifice"}]
 
     def _gen_aura_shards(self, ctrl, opp, ctx) -> List[Dict]:
         """Aura Shards: you may destroy target artifact or enchantment when a creature enters."""

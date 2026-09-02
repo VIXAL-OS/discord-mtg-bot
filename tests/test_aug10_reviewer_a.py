@@ -342,7 +342,14 @@ class TestSilentDropsClosed:
         src = _src('mtg/combat.py')
         index = src.find("'equipped creature deals combat damage to a player'")
         assert index != -1
-        assert 'queue_unhandled_combat_damage' in src[index:index + 3000], (
+        # Sep 1 2026: the window grew past 3000 chars once the [] = handled
+        # no-op branch (and its comment) landed between the phrase and the
+        # queue call — slice to the enclosing dispatch instead of a fixed
+        # window the next comment will outgrow again.
+        end = src.find('# Crash barrier mirroring the sibling attacker-loop catch',
+                       index)
+        assert end != -1, 'the equipment dispatch lost its crash barrier'
+        assert 'queue_unhandled_combat_damage' in src[index:end], (
             'the untemplated case must queue like its sibling watcher loop')
 
     def test_protection_keeps_every_printed_colour(self):

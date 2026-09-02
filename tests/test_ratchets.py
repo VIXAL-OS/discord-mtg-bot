@@ -163,7 +163,10 @@ EXCEPT_BASELINE = {
     # triggers.py 53→54 (Aug 11, block triggers): the template-library
     # lookup inside check_block_triggers. Logged + maybe_reraise, so
     # strict batches still see it.
-    "triggers.py": 54,
+    # triggers.py 54->55 (Sep 1, opponent-discard watchers): the per-action
+    # crash barrier in _fire_opponent_discard_watchers, twin of the you-scope
+    # barrier above it; logged, carries maybe_reraise.
+    "triggers.py": 55,
     "util.py": 6,
 }
 

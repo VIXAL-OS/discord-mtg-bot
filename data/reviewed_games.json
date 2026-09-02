@@ -460,6 +460,78 @@
    "reviewer": "coordinator",
    "confidence": "recorded",
    "note": "Temp-control steal + revert pair verified (Armored Skyhunter)."
+  },
+  "game_1544046754201079861": {
+   "wave": "sep1-ninth-cycle-card-targeted",
+   "reviewer": "A: aristocrats/devotion",
+   "confidence": "recorded",
+   "note": "captivating vampire, crypt of agadeem, gravecrawler, killing wave, nirkana revenant, ob nixilis reignited, whip of erebos; all four [CHOICE-STALE] refusals correct; Negator's Tier-3 sacrifice (fixed)"
+  },
+  "game_1544046580502499358": {
+   "wave": "sep1-ninth-cycle-card-targeted",
+   "reviewer": "A: devotion/layers",
+   "confidence": "recorded",
+   "note": "bloodline keeper, charcoal diamond, killing wave, magus of the coffers, sword of feast and famine (discard half live; untap silent = no tapped lands, plausible)"
+  },
+  "game_1544046765932810291": {
+   "wave": "sep1-ninth-cycle-card-targeted",
+   "reviewer": "A: layers/devotion",
+   "confidence": "recorded",
+   "note": "drana, liliana's caress (F1: opponent-discard watcher class missing -- FIXED), ob nixilis reignited, vampire nighthawk"
+  },
+  "game_1544046672160493578": {
+   "wave": "sep1-ninth-cycle-card-targeted",
+   "reviewer": "B: replacement_chain/layers",
+   "confidence": "recorded",
+   "note": "akroma, eldrazi monument (Tier-3 fabricated damage -- judge guard + template), sword of feast and famine (unequipped), sword of fire and ice, volcanic geyser"
+  },
+  "game_1544046649792266290": {
+   "wave": "sep1-ninth-cycle-card-targeted",
+   "reviewer": "B: replacement_chain/aristocrats",
+   "confidence": "recorded",
+   "note": "aurelia's fury (X=0 no-op, correct), boros signet, gisela the broken blade (Tower sacrifice to the TAPPER's graveyard -- FIXED), grim haruspex"
+  },
+  "game_1544072987039367239": {
+   "wave": "sep1-ninth-cycle-card-targeted",
+   "reviewer": "B: layers/replacement_chain (7e0ad86 re-run)",
+   "confidence": "recorded",
+   "note": "boros signet, bruna (cast trigger declined correctly; Gisela tBB never drawn -- MELD unreachable), inspiring vantage, sword of light and shadow (granted protection invisible to blocking -- FIXED; reanimate-shape plan misclassification -- FIXED)"
+  },
+  "game_1544028356108881952": {
+   "wave": "sep1-ninth-cycle-card-targeted",
+   "reviewer": "C: voltron/aminatou",
+   "confidence": "recorded",
+   "note": "counterspell, mantle of the ancients (10 and 35 power reconstructed exactly), mask of memory (unequipped), sphinx of uthuun (x4 flickers correct), sword of feast and famine (unequipped)"
+  },
+  "game_1544032774996893756": {
+   "wave": "sep1-ninth-cycle-card-targeted",
+   "reviewer": "C: tokens/voltron",
+   "confidence": "recorded",
+   "note": "mantle of the ancients, sage's reverie (ETB draw counted 1 of 2 -- FIXED), sword of fire and ice (unequipped), sword of sinew and steel (empty-board no-op queued -- FIXED)"
+  },
+  "game_1544046811151339640": {
+   "wave": "sep1-ninth-cycle-card-targeted",
+   "reviewer": "C: aristocrats/replacement_chain",
+   "confidence": "recorded",
+   "note": "aurelia's fury (X=1), gisela the broken blade (0-toughness survived past a Tier-3 activation -- FIXED), mind's eye (both branches), sword of light and shadow (static only); also the Act of Treason self-target refusal (FIXED)"
+  },
+  "game_1544046690787663975": {
+   "wave": "sep1-ninth-cycle-card-targeted",
+   "reviewer": "D: rashmi/stifle",
+   "confidence": "recorded",
+   "note": "anticipate (resolved as nothing -- FIXED), dissolve, stifle (correct; two independent Rhystic triggers verified), vineglimmer snarl"
+  },
+  "game_1544042380594782278": {
+   "wave": "sep1-ninth-cycle-card-targeted",
+   "reviewer": "D: cascade/mythic",
+   "confidence": "recorded",
+   "note": "decimate (all four classes), demonic dread (can't-block had no vocabulary -- FIXED), khalni heart expedition (landfall half), shardless agent"
+  },
+  "game_1544073040122618060": {
+   "wave": "sep1-ninth-cycle-card-targeted",
+   "reviewer": "D: partner_brallin/baral (7e0ad86 re-run)",
+   "confidence": "recorded",
+   "note": "dissolve, fae of wishes (Granted announced under the creature's name -- FIXED; countered -> graveyard correct), mask of memory (Conspiracy Theorist folded the discard line; zone hop noted, accepted)"
   }
  }
 }

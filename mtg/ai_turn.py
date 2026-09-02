@@ -929,18 +929,31 @@ def _validate_plan_mana(engine, game: GameState, player_idx: int, plan: list) ->
                 # Per CR 601.2c the spell can't even be cast without a legal
                 # target; the engine accepts the cast and then fizzles on
                 # resolution, wasting the mana payment.
+                # Sep 1 2026 batch audit (reviewer B, F4): these were bare
+                # substring tests over the WHOLE oracle, so Sword of Light and
+                # Shadow's combat-damage TRIGGER ("you may return up to one
+                # target creature card from your graveyard") read as a
+                # reanimate-shape SPELL and its cast was rejected with an
+                # empty graveyard (game_1544072987039367239). Only text that
+                # is the spell's own resolution counts — not a triggered
+                # ability's effect (the sibling sacrifice check three lines
+                # down already gates by card type).
+                _spell_lines = " ".join(
+                    ln for ln in oracle_lower.split('\n')
+                    if not ln.lstrip().startswith(
+                        ('when', 'whenever', 'at the beginning')))
                 requires_own_gy_creature = (
-                    'target creature card from your graveyard' in oracle_lower
-                    or 'target creature card in your graveyard' in oracle_lower
+                    'target creature card from your graveyard' in _spell_lines
+                    or 'target creature card in your graveyard' in _spell_lines
                 )
                 requires_any_gy_creature = (
-                    'target creature card from a graveyard' in oracle_lower
-                    or 'target creature card in a graveyard' in oracle_lower
+                    'target creature card from a graveyard' in _spell_lines
+                    or 'target creature card in a graveyard' in _spell_lines
                 )
                 # Victimize's full pattern: "Sacrifice a creature, then return
                 # TWO target creature cards from your graveyard."
                 requires_two_own_gy_creatures = (
-                    'two target creature cards from your graveyard' in oracle_lower
+                    'two target creature cards from your graveyard' in _spell_lines
                 )
                 if requires_own_gy_creature or requires_two_own_gy_creatures:
                     own_gy_creatures = sum(1 for c in player.graveyard if c.is_creature())
@@ -2158,13 +2171,23 @@ def _get_action_error(engine, game: GameState, player_index: int, action: Dict) 
         # "unknown reason — mana looks sufficient" — the AI then re-proposed
         # the same doomed cast (Animate Dead ×36 in the 15289 batch).
         _lcf = getattr(game, '_last_cast_failure', None)
+        adventure_name = action.get("adventure")
         if _lcf:
             _lcf_turn, _lcf_name, _lcf_msg = _lcf
-            if (_lcf_turn == game.turn_number and card_name
-                    and _lcf_name.lower() == str(card_name).lower()):
+            # Sep 1 2026 batch audit: the producers stash under the CAST-AS
+            # name (the adventure half, e.g. "Shield's Might" — the Aug 1 S3
+            # rule) while this consumer compared only the action's parent
+            # card ("Garenbrig Carver"), so an adventure-half targeting
+            # rejection fell through to the mana re-derivation and the AI
+            # was told "unknown reason — mana looks sufficient" three
+            # retries running. Match either name.
+            _names = {str(card_name).lower()} if card_name else set()
+            if adventure_name:
+                _names.add(str(adventure_name).lower())
+            if (_lcf_turn == game.turn_number and _names
+                    and _lcf_name.lower() in _names):
                 game._last_cast_failure = None
                 return _lcf_msg
-        adventure_name = action.get("adventure")
         card = player.find_card(card_name, Zone.HAND)
         if not card:
             # Check if card_name is an adventure name

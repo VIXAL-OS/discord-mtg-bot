@@ -101,7 +101,15 @@ def is_combat_shaped_resolve(effect_description: str) -> bool:
              damage ("until your next turn, if that creature would deal
              combat damage ... instead").
     """
-    lowered = (effect_description or "").lower()
+    # Sep 1 2026 batch audit (8cc5a1a): haste's REMINDER text "(It can attack
+    # and {T} this turn.)" carries the word "attack", so every haste-granting
+    # resolution was refused as combat-shaped — Act of Treason x3 live (cost
+    # paid, effect lost). A cache sweep found 17 cards refused ONLY because of
+    # reminder text (Akroan Crusader, Bloodbraid Elf, Swiftfoot Boots,
+    # Thundermaw Hellkite...). Reminder text is never rules text (CR 207.2);
+    # the substring family's latest instance.
+    from mtg.helpers import strip_reminder_text
+    lowered = strip_reminder_text(effect_description or "").lower()
     if _SETS_UP_FUTURE_DAMAGE_RE.search(lowered):
         return False
     # "Whenever this creature ... attacks, search your library" is a legal
@@ -233,6 +241,7 @@ PART 2 - ACTIONS: A JSON array of game state changes to apply. Use these action 
 - {{"action": "scry", "player": "name", "amount": N}}
 - {{"action": "tap", "card": "X"}} — add "skip_next_untap": true for "doesn't untap during its controller's next untap step" riders (Frost Lynx family); omitting it silently drops the printed rider
 - {{"action": "untap", "card": "X"}}
+- {{"action": "cant_block_this_turn", "target_card": "Card Name", "target_controller": "name"}} — "target creature can't block this turn"
 - {{"action": "add_mana", "player": "name", "color": "C", "amount": N}}
 - {{"action": "discard", "player": "name", "card": "Card Name"}}
 - {{"action": "no_action", "reason": "why"}}
@@ -616,9 +625,17 @@ async def resolve_effect(rules, game: GameState, effect_description: str,
         # cast this card" first.
         def _repl(m):
             body = m.group(1)
+            # Sep 1 2026 batch audit: FORETELL's reminder ("During your turn,
+            # you may pay {2} and exile this card from your hand face down.
+            # Cast it on a later turn...") is a cast-time alternative too
+            # (CR 702.143) with neither phrase above — a hand-cast Behold the
+            # Multiverse was refused at Tier 3 after paying {3}{U}: draw-2
+            # lost. Cache sweep: exactly one other "you may pay" reminder
+            # shape exists (extort's), and it stays guarded on purpose.
             if ('you may pay' in body
                     and ('as you cast this spell' in body
-                         or 'rather than cast this card' in body)):
+                         or 'rather than cast this card' in body
+                         or 'exile this card from your hand face down' in body)):
                 return ''
             return m.group(0)
         return re.sub(r'\(([^)]*)\)', _repl, text)
@@ -903,6 +920,7 @@ zones: hand, battlefield, graveyard, exile, library
 - {{"action": "prevent_next_damage", "card": "Name", "amount": N}} — "prevent the next N damage that would be dealt to X this turn" (Eiganjo Castle). A consumable shield, NOT a full prevention: it absorbs N and lets the rest through.
 - {{"action": "tap", "card": "Card Name"}} — add "skip_next_untap": true for "doesn't untap during its controller's next untap step" riders (Frost Lynx family); omitting it silently drops the printed rider
 - {{"action": "untap", "card": "Card Name"}}
+- {{"action": "cant_block_this_turn", "target_card": "Card Name", "target_controller": "name"}} — "target creature can't block this turn" (Demonic Dread, Goblin Shortcutter family)
 - {{"action": "add_mana", "player": "name", "color": "R", "amount": N}} — colors: W/U/B/R/G/C
 - {{"action": "destroy", "card": "Card Name"}} — destroy (goes to graveyard, respects indestructible)
 - {{"action": "grant_keywords", "player": "name", "target_card": "Card Name", "keywords": ["keyword1", "keyword2"]}} — grant keywords (vigilance, reach, haste, trample, etc.) to a specific creature until end of turn
@@ -1126,6 +1144,22 @@ Respond with ONLY the JSON object, no markdown, no backticks, no preamble."""
                               f"lethality is decided by state-based actions "
                               f"(CR 704.5g), not by the resolver")
                         continue
+
+                # Sep 1 2026 batch audit (reviewer B, F1): Tier 3 resolved
+                # Eldrazi Monument's upkeep ("sacrifice a creature. If you
+                # can't, sacrifice this artifact.") as a sacrifice of an
+                # UNRELATED artifact plus 1 damage to the opponent — damage
+                # from a text that never mentions damage or life. The batch-11
+                # D class (fabricated destroy) generalized: an effect whose
+                # printed text carries no damage/life/fight vocabulary cannot
+                # emit a deal_damage or lose_life action.
+                if (action_type in ("deal_damage", "lose_life")
+                        and not re.search(r'\b(damage|fight|loses?|life)\b',
+                                          _guard_desc.lower())):
+                    print(f"[RESOLVE-REFUSED] {action_type} from an effect "
+                          f"whose printed text never mentions damage or life "
+                          f"— dropping the fabricated action")
+                    continue
 
                 if (action_type == "add_counters"
                         and 'target creature' in _guard_desc.lower()

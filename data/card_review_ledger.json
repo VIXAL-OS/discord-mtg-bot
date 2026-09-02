@@ -29,9 +29,9 @@
  ],
  "cards": {
   "akroma, angel of wrath": {
-   "status": "unexercised",
-   "since_sha": "a59953c",
-   "note": "In replacement_chain's coverage list, never drawn."
+   "status": "verified",
+   "since_sha": "8cc5a1a",
+   "note": "Batch 8cc5a1a (Sep 1 wave): flying/first strike/vigilance/haste live; +1/+1 from Eldrazi Monument applied; trample/protection unexercised."
   },
   "anger of the gods": {
    "status": "verified",
@@ -77,16 +77,19 @@
    "note": "Held in hand, never cast."
   },
   "bloodline keeper": {
-   "status": "unexercised",
-   "note": "Cast, cost-reduced, activated, token entered and attacked - but the token's FLYING was never tested (no untapped blockers)."
+   "status": "verified",
+   "since_sha": "8cc5a1a",
+   "note": "Batch 8cc5a1a (Sep 1 wave): front-face token ability inline-parsed; attacked at printed power."
   },
   "boros signet": {
-   "status": "unexercised",
-   "note": "Same as Battlefield Forge - the tap is invisible in the logs."
+   "status": "verified",
+   "since_sha": "8cc5a1a",
+   "note": "Batch 8cc5a1a (Sep 1 wave): entered tapped under Blind Obedience only (not Authority); {1}: {R}{W} live."
   },
   "captivating vampire": {
-   "status": "unexercised",
-   "note": "Its own P/T is correct and its ANTHEM was the subject of a fix, but the control-stealing tap ability was never activated."
+   "status": "verified",
+   "since_sha": "8cc5a1a",
+   "note": "Batch 8cc5a1a (Sep 1 wave): subtype anthem registered (+1/+1 other Vampires); tap-five activation unexercised."
   },
   "cast down": {
    "status": "verified",
@@ -94,12 +97,14 @@
    "note": "Correctly REFUSED a legendary target (Kambal) - 'doesn't have required type'. The nonlegendary exclusion is live."
   },
   "charcoal diamond": {
-   "status": "unexercised",
-   "note": "Entered tapped correctly; the mana ability was never activated."
+   "status": "verified",
+   "since_sha": "8cc5a1a",
+   "note": "Batch 8cc5a1a (Sep 1 wave): enters tapped; targetless mana ability refuses a target; same-turn re-tap refused."
   },
   "crypt of agadeem": {
    "status": "unexercised",
-   "note": "Entered tapped correctly in two games; the {2},{T} scaling ability was never activated, so the arithmetic is untested."
+   "since_sha": "8cc5a1a",
+   "note": "Batch 8cc5a1a (Sep 1 wave): second ability never activated (only {T}: Add {B})."
   },
   "dark depths": {
    "status": "unexercised",
@@ -172,12 +177,14 @@
    "note": "[COMBAT-BEGIN-TRIGGER] resolved the token half INLINE (no Tier-3 call); no phantom extra attacker and no team pump."
   },
   "gravecrawler": {
-   "status": "unexercised",
-   "note": "Cast and attacked at printed power; never in a graveyard, so cast-from-graveyard is untested."
+   "status": "verified",
+   "since_sha": "8cc5a1a",
+   "note": "Batch 8cc5a1a (Sep 1 wave): can't block -- never declared as a blocker; attacked at printed power."
   },
   "grim haruspex": {
-   "status": "unexercised",
-   "note": "Cast and attacked in two games; no nontoken creature its controller owned died while it was out, so the draw trigger never fired."
+   "status": "verified",
+   "since_sha": "8cc5a1a",
+   "note": "Batch 8cc5a1a (Sep 1 wave): fired exactly 4x on a 5-creature wipe that killed it too (another + last-known information)."
   },
   "heart's desire": {
    "status": "verified",
@@ -214,9 +221,9 @@
    "note": "Both halves; aftermath zone gate correct in BOTH directions (rejected from hand, cast from graveyard); two-target split resolved. Its invisibility to MASS damage is the mass-damage handler's defect, not this card's."
   },
   "killing wave": {
-   "status": "awaiting",
-   "since_sha": "bf0c128",
-   "note": "X=1 let a creature survive without payment or sacrifice. Each creature now takes its controller's explicit deterministic pay-or-sacrifice branch; X=0 is a keep control."
+   "status": "verified",
+   "since_sha": "8cc5a1a",
+   "note": "Batch 8cc5a1a (Sep 1 wave): X=0 resolved as pay-0 for every creature incl. a devotion-5 Erebos (dynamic creature check)."
   },
   "kozilek, the broken reality": {
    "status": "verified",
@@ -224,8 +231,9 @@
    "note": "Combat damage and graveyard return resolved correctly."
   },
   "magus of the coffers": {
-   "status": "unexercised",
-   "note": "Both activation refusals were correct; the scaling arithmetic is untested."
+   "status": "verified",
+   "since_sha": "8cc5a1a",
+   "note": "Batch 8cc5a1a (Sep 1 wave): cast; died as a 3/3 under a -1/-1 layer debuff to lethal damage; mana ability unexercised."
   },
   "mana confluence": {
    "status": "unexercised",
@@ -238,9 +246,9 @@
    "note": "In test_escape_kroxa, drawn but never resolved (rejected for mana)."
   },
   "mind's eye": {
-   "status": "unexercised",
-   "since_sha": "a59953c",
-   "note": "Not in the corpus."
+   "status": "verified",
+   "since_sha": "8cc5a1a",
+   "note": "Batch 8cc5a1a (Sep 1 wave): decline-when-unaffordable and pay-{1}-draw both live on the opponent's draw."
   },
   "mindcrank": {
    "status": "unexercised",
@@ -267,14 +275,14 @@
    "note": "Not in the corpus."
   },
   "ob nixilis reignited": {
-   "status": "unexercised",
-   "since_sha": "a59953c",
-   "note": "Not in the corpus."
+   "status": "verified",
+   "since_sha": "8cc5a1a",
+   "note": "Batch 8cc5a1a (Sep 1 wave): +1 draw/lose 1 and -3 destroy (creature-only) both correct across two games; -8 unexercised."
   },
   "phyrexian negator": {
-   "status": "verified",
-   "since_sha": "a59953c",
-   "note": "[DAMAGED-TRIGGER] sacrificed exactly as many permanents as damage taken, twice, attributed to the right controller."
+   "status": "awaiting",
+   "since_sha": "12f9c66",
+   "note": "Batch 8cc5a1a: died to the damage that triggered it, so the drain's owner lookup came back None and the sacrifice fell to Tier 3 (which removed two permanents via a substitute action). Owner now resolved from the graveyard/owner_index. Awaiting a live death-with-trigger."
   },
   "reanimate": {
    "status": "awaiting",
@@ -318,8 +326,8 @@
   },
   "sword of light and shadow": {
    "status": "awaiting",
-   "since_sha": "516d8bf",
-   "note": "New template: gain 3 life + return a creature card from your graveyard. Did not connect this batch."
+   "since_sha": "2ce9be6",
+   "note": "Batch 8cc5a1a: its GRANTED protection was invisible to blocking (positional game arg) and its cast was held by the reanimate-shape check. Both fixed. Static +2/+2 verified live; the connect trigger still unexercised."
   },
   "syr konrad, the grim": {
    "status": "verified",
@@ -352,9 +360,9 @@
    "note": "Loaded as an adventure half only, never cast."
   },
   "vampire nighthawk": {
-   "status": "unexercised",
-   "since_sha": "a59953c",
-   "note": "Not in the corpus."
+   "status": "verified",
+   "since_sha": "8cc5a1a",
+   "note": "Batch 8cc5a1a (Sep 1 wave): flying (block refusals) + lifelink live; deathtouch unexercised."
   },
   "vile entomber": {
    "status": "verified",
@@ -367,9 +375,9 @@
    "note": "Proposed and rejected for mana, never resolved."
   },
   "drana, liberator of malakir": {
-   "status": "awaiting",
-   "since_sha": "516d8bf",
-   "note": "Her first-strike 'deals combat damage' trigger landed AFTER the regular step had already dealt un-pumped damage (CR 510.4). The drain now runs once per damage step."
+   "status": "verified",
+   "since_sha": "8cc5a1a",
+   "note": "Batch 8cc5a1a (Sep 1 wave): fired 6x with CR 510.4-correct timing -- a regular-step co-attacker's power tracked the FS-step counters."
   },
   "boar umbra": {
    "status": "awaiting",
@@ -382,9 +390,9 @@
    "note": "Shared the plain _counter_action, so its 'exile it instead' clause was dropped and the countered spell went to the graveyard. Dedicated generator now sets countered_to=exile."
   },
   "dissolve": {
-   "status": "awaiting",
-   "since_sha": "516d8bf",
-   "note": "Same class, found by sweeping the COUNTERSPELLS list: its Scry 1 was dropped. Dedicated generator now emits it."
+   "status": "verified",
+   "since_sha": "8cc5a1a",
+   "note": "Batch 8cc5a1a (Sep 1 wave): counter + scry 1 live twice (incl. Sapphire Medallion cost reduction)."
   },
   "setessan champion": {
    "status": "awaiting",
@@ -397,24 +405,24 @@
    "note": "Its adventure half could never escalate to Tier 3 - the gate read `if not adv_msgs` while Tier 2 had already filled that list with a 'complex effect, escalating' placeholder. Cast three times, effect never happened."
   },
   "mask of memory": {
-   "status": "awaiting",
-   "since_sha": "516d8bf",
-   "note": "New equipment combat-damage template (draw two, discard one). It connected 5 times this batch and resolved nothing."
+   "status": "unexercised",
+   "since_sha": "8cc5a1a",
+   "note": "Batch 8cc5a1a (Sep 1 wave): cast but never equipped in two games; the connect trigger exercised in a third (Conspiracy Theorist folded the discard line)."
   },
   "sword of fire and ice": {
-   "status": "awaiting",
-   "since_sha": "a49460a",
-   "note": "Its combat-damage template remains pinned; sixth-cycle live evidence additionally found invalid explicit Equip targets consuming mana. Equip target legality now precedes payment and never auto-falls back."
+   "status": "verified",
+   "since_sha": "8cc5a1a",
+   "note": "Batch 8cc5a1a (Sep 1 wave): +2/+2 and both trigger halves (2 damage + draw) live twice."
   },
   "sword of feast and famine": {
-   "status": "awaiting",
-   "since_sha": "a49460a",
-   "note": "Its combat-damage template remains pinned; sixth-cycle live evidence additionally found invalid explicit Equip targets consuming mana. Equip target legality now precedes payment and never auto-falls back."
+   "status": "verified",
+   "since_sha": "8cc5a1a",
+   "note": "Batch 8cc5a1a (Sep 1 wave): +2/+2 and the connect trigger's discard half live; untap-all silent when no land was tapped (plausible, not proven); protection unexercised."
   },
   "sword of sinew and steel": {
    "status": "awaiting",
-   "since_sha": "516d8bf",
-   "note": "New template: destroy up to one opponent planeswalker and one artifact."
+   "since_sha": "12f9c66",
+   "note": "Batch 8cc5a1a: the empty-board 'up to one' no-op ([]) was queued as unhandled by the equipment dispatch (x6 Tier-3 calls). The non-empty path resolved correctly live (Sol Ring, Arcane Signet destroyed). Awaiting a live empty-board connect showing 'handled no-op'."
   },
   "strangleroot geist": {
    "status": "awaiting",
@@ -432,24 +440,24 @@
    "note": "Seventh-cycle live upkeep created exactly five Wolves from the pre-resolution Wolf/Werewolf snapshot, including the source."
   },
   "gisela, the broken blade": {
-   "status": "awaiting",
-   "since_sha": "a49460a",
-   "note": "A lone Gisela reached Tier 3 and fabricated Brisela. Meld is now deterministic only at its controller's end step with both owned and controlled halves."
+   "status": "verified",
+   "since_sha": "8cc5a1a",
+   "note": "Batch 8cc5a1a (Sep 1 wave): flying/first strike/lifelink live; P/T with Sword of Light and Shadow exact."
   },
   "bruna, the fading light": {
-   "status": "awaiting",
-   "since_sha": "a49460a",
-   "note": "The old deterministic meld fired on ETB. The pair now waits for Gisela's controller-end-step trigger and produces the corrected 9/10 Brisela characteristics."
+   "status": "unexercised",
+   "since_sha": "8cc5a1a",
+   "note": "Batch 8cc5a1a (Sep 1 wave): cast trigger correctly declined (no Angel/Human in graveyard); Gisela tBB never drawn so MELD stayed unreachable."
   },
   "mantle of the ancients": {
-   "status": "awaiting",
-   "since_sha": "a49460a",
-   "note": "Its multiplier now counts every Aura/Equipment actually attached to the enchanted creature, instead of flattening the restrictive tail."
+   "status": "verified",
+   "since_sha": "8cc5a1a",
+   "note": "Batch 8cc5a1a (Sep 1 wave): ETB return + auto-attach; static reconstructed exactly at 10 and 35 power; correct no-target no-op in another game."
   },
   "sage's reverie": {
    "status": "awaiting",
-   "since_sha": "a49460a",
-   "note": "Its multiplier now counts only Auras its controller controls that are attached to creatures."
+   "since_sha": "2ce9be6",
+   "note": "Batch 8cc5a1a: ETB drew 1 while the static half counted 2 (generic pattern captured 'a'). Name template counts every attached Aura incl. itself. Awaiting a live 2+ draw."
   },
   "gorgon recluse": {
    "status": "awaiting",
@@ -458,8 +466,8 @@
   },
   "fae of wishes": {
    "status": "awaiting",
-   "since_sha": "a49460a",
-   "note": "Granted no longer leaks a complex-effect placeholder. With no sideboard/outside-game object, it truthfully reports unsupported no-action while preserving Adventure exile."
+   "since_sha": "2ce9be6",
+   "note": "Batch 8cc5a1a: Granted announced under the creature's name (display). Countered -> graveyard verified correct. Wish effect unexercised (countered)."
   },
   "eldrazi conscription": {
    "status": "awaiting",
@@ -477,19 +485,19 @@
    "note": "Seventh-cycle live cross-controller evidence: Spider Umbra saved Puppeteer Clique and the Aura went to its owner's graveyard."
   },
   "khalni heart expedition": {
-   "status": "awaiting",
-   "since_sha": "bf0c128",
-   "note": "Activation searched only one basic despite Oracle allowing up to two; now performs a bounded two-card search with tapped entry and landfall per land."
+   "status": "verified",
+   "since_sha": "8cc5a1a",
+   "note": "Batch 8cc5a1a (Sep 1 wave): landfall quest counter live; the three-counter search unexercised."
   },
   "decimate": {
-   "status": "awaiting",
-   "since_sha": "bf0c128",
-   "note": "Was cast without every mandatory target class and destroyed only one permanent. It now gates before payment and preserves four stable target IDs through resolution."
+   "status": "verified",
+   "since_sha": "8cc5a1a",
+   "note": "Batch 8cc5a1a (Sep 1 wave): all four target classes destroyed via template."
   },
   "aurelia's fury": {
-   "status": "awaiting",
-   "since_sha": "bf0c128",
-   "note": "Damage resolved but the damaged-player noncreature cast restriction was prose-only. The turn-scoped cast gate is now deterministic; creatures and later turns are controls."
+   "status": "verified",
+   "since_sha": "8cc5a1a",
+   "note": "Batch 8cc5a1a (Sep 1 wave): X=1: 1 damage + tap; X=0 with no target is a legal no-op."
   },
   "blizzard strix": {
    "status": "awaiting",
@@ -507,9 +515,9 @@
    "note": "Tovolar's direct night path transformed the card without the shared transforms-into dispatcher. Awaiting a live Wildsong Howler draw-trigger confirmation."
   },
   "counterspell": {
-   "status": "awaiting",
-   "since_sha": "bf0c128",
-   "note": "A response decision finished after the fixed stack timeout had already resolved its target. Stack entries now remain live while the bounded AI decision is in flight."
+   "status": "verified",
+   "since_sha": "8cc5a1a",
+   "note": "Batch 8cc5a1a (Sep 1 wave): counter + CR 903.9 command-zone redirect of a countered commander."
   },
   "bonecrusher giant": {
    "status": "awaiting",
@@ -557,9 +565,89 @@
    "note": "Pre-fix strict cube FFA game 1537891334034165935 fired Nevermaker's LTB trigger but resolved zero actions because its template used the ETB key. Implementation 43d8370 registers the LTB suffix handler and tucks exactly one legal nonland permanent. Awaiting fresh live evidence."
   },
   "sphinx of uthuun": {
+   "status": "verified",
+   "since_sha": "8cc5a1a",
+   "note": "Batch 8cc5a1a (Sep 1 wave): 3/2 pile split correct on 4 separate flickers (the awaiting entry's live evidence)."
+  },
+  "act of treason": {
    "status": "awaiting",
-   "since_sha": "43d8370",
-   "note": "Pre-fix strict cube FFA game 1537891334034165935 drew three cards from a stale JSON template and left the other two revealed cards in the library. Implementation 43d8370 uses the deterministic 3/2 pile handler so all five cards leave the library exactly once. Awaiting fresh live evidence."
+   "since_sha": "12f9c66",
+   "note": "Batch 8cc5a1a: three casts at the caster's OWN creature fell to Tier 3 (_gen_temp_control searched only the opponent's board) and were refused on haste's reminder text. Fix resolves the untap/haste riders with no control change; the judge guard strips reminder text. Awaiting a live self-target cast."
+  },
+  "behold the multiverse": {
+   "status": "awaiting",
+   "since_sha": "12f9c66",
+   "note": "Batch 8cc5a1a: a normal hand cast reached Tier 3 and the optional-payment guard refused it on foretell's reminder text ({3}{U} paid, draw-2 lost). Foretell's reminder is now a cast-time strip. Awaiting a live resolution."
+  },
+  "quietus spike": {
+   "status": "awaiting",
+   "since_sha": "12f9c66",
+   "note": "Batch 8cc5a1a: no template — Glissa Sunslayer connected with the defender at 4 life and the 'loses half, rounded up' trigger was refused at Tier 3. Template added. Awaiting a live connect."
+  },
+  "boros reckoner": {
+   "status": "awaiting",
+   "since_sha": "12f9c66",
+   "note": "Batch 8cc5a1a: reflect resolved via Tier 3, which also fabricated a 3-life gain for the controller. Deterministic branch reflects to the damaging source's controller. Awaiting a live reflect with no life gain."
+  },
+  "eldrazi monument": {
+   "status": "awaiting",
+   "since_sha": "e889937",
+   "note": "Batch 8cc5a1a: x4 Tier-3 upkeep drains. Suffix template sacrifices a creature, else the Monument itself. Awaiting a live upkeep."
+  },
+  "herald of anguish": {
+   "status": "awaiting",
+   "since_sha": "e889937",
+   "note": "Batch 8cc5a1a: x2 Tier-3 end-step drains (the M3 false-sacrifice is long gone; the real discard reached Tier 3). Suffix template. Awaiting a live end step."
+  },
+  "volcanic geyser": {
+   "status": "verified",
+   "since_sha": "8cc5a1a",
+   "note": "Batch 8cc5a1a (Sep 1 wave): X=2 to the face, exact."
+  },
+  "inspiring vantage": {
+   "status": "verified",
+   "since_sha": "8cc5a1a",
+   "note": "Batch 8cc5a1a (Sep 1 wave): entered untapped as the 3rd land; {R} chosen."
+  },
+  "stifle": {
+   "status": "verified",
+   "since_sha": "8cc5a1a",
+   "note": "Batch 8cc5a1a (Sep 1 wave): countered a Rhystic Study trigger; a second, independent trigger resolved separately (correct)."
+  },
+  "vineglimmer snarl": {
+   "status": "verified",
+   "since_sha": "8cc5a1a",
+   "note": "Batch 8cc5a1a (Sep 1 wave): entered tapped with no Forest/Island revealable."
+  },
+  "shardless agent": {
+   "status": "verified",
+   "since_sha": "8cc5a1a",
+   "note": "Batch 8cc5a1a (Sep 1 wave): cascade into Cyclonic Rift, cast free, bounce + CR 903.9a redirect."
+  },
+  "liliana's caress": {
+   "status": "awaiting",
+   "since_sha": "2ce9be6",
+   "note": "Batch 8cc5a1a: the opponent-discard watcher class had no scan at all -- Rick discarded under Qwen's Caress and lost nothing. _fire_opponent_discard_watchers added. Awaiting a live drain."
+  },
+  "anticipate": {
+   "status": "awaiting",
+   "since_sha": "2ce9be6",
+   "note": "Batch 8cc5a1a: resolved as nothing at Tier 3 (invented card names). Impulse-look pattern + library_to_bottom action. Awaiting a live resolution."
+  },
+  "impulse": {
+   "status": "awaiting",
+   "since_sha": "2ce9be6",
+   "note": "Same shape as Anticipate (the only other cache card); pattern-covered. Awaiting a live resolution."
+  },
+  "demonic dread": {
+   "status": "awaiting",
+   "since_sha": "2ce9be6",
+   "note": "Batch 8cc5a1a: 'target creature can't block this turn' had no pattern and no judge vocabulary. Generic pattern + both vocabulary blocks. Awaiting a live block refusal."
+  },
+  "whip of erebos": {
+   "status": "unexercised",
+   "since_sha": "8cc5a1a",
+   "note": "Batch 8cc5a1a (Sep 1 wave): reanimate activation never affordable before it was destroyed; the lifelink static verified live."
   }
  }
 }
