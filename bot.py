@@ -25,6 +25,16 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
+try:
+    from mtg.util import (looks_like_billing_error as is_billing_error,
+                          register_billing_alert_callback)
+except ImportError:  # engine package absent
+    def is_billing_error(exc: BaseException) -> bool:  # type: ignore[misc]
+        return False
+
+    def register_billing_alert_callback(name, callback) -> None:  # type: ignore[misc]
+        return None
+
 import aiohttp
 import anthropic
 import discord
@@ -45,6 +55,10 @@ class BotConfig:
     # switching; here we just want fast, capable chat during games.)
     model_default: str = "claude-sonnet-5"
     max_tokens: int = 2048
+    # DM the maintainer when a provider returns a billing / balance error
+    # (Anthropic "credit balance is too low", DeepSeek 402 "Insufficient
+    # Balance", DashScope arrears). Once per provider per this many hours.
+    billing_alert_cooldown_hours: int = 6
 
     # Context management
     max_messages_per_thread: int = 20
@@ -73,6 +87,18 @@ class BotConfig:
 
 
 CONFIG = BotConfig()
+
+
+def _billing_provider_label(model_or_provider: str) -> Tuple[str, str]:
+    """(cooldown key, human label + where to top up) for a model/provider string."""
+    m = (model_or_provider or "").lower()
+    if m.startswith("deepseek") and "dashscope" not in m:
+        return "deepseek", "DeepSeek (platform.deepseek.com)"
+    if "qwen" in m or "dashscope" in m:
+        return "dashscope", "Qwen / DashScope (Alibaba Model Studio console)"
+    if "claude" in m or m == "anthropic":
+        return "anthropic", "Anthropic (console.anthropic.com, Plans & Billing)"
+    return m or "unknown", model_or_provider or "unknown provider"
 
 
 # =============================================================================
@@ -193,6 +219,14 @@ class MTGBot(commands.Bot):
         # {guild_id: channel_id}; the None key applies to every guild.
         self.mtg_channel_ids: Dict[Optional[int], int] = {}
         self.excluded_channels: set[int] = set()
+        # Billing alerts: provider -> last DM time, and the DM target
+        # (config `maintainer_user_id`, else the application owner).
+        self.maintainer_user_id: Optional[int] = None
+        self._billing_alert_last: Dict[str, datetime] = {}
+        # Engine-side providers (DeepSeek / Qwen during autoplay batches)
+        # report balance errors through mtg.util's hook; route them to a DM.
+        # Keyed by name so a second bot object can't stack copies.
+        register_billing_alert_callback("discord-dm", self._billing_alert_from_engine)
 
         # Active persona — populated by load_config -> load_persona.
         # Minimal default so any pre-load access doesn't crash.
@@ -366,6 +400,7 @@ class MTGBot(commands.Bot):
                 self.mtg_channel_ids = self._parse_mtg_channels(
                     config.get("mtg_channel_id"))
                 self.excluded_channels = set(config.get("excluded_channels", []))
+                self.maintainer_user_id = config.get("maintainer_user_id")
                 self.persona = self.load_persona(config.get("bot_persona", "plain"))
         except FileNotFoundError:
             print("No config.json found, using defaults")
@@ -608,10 +643,70 @@ class MTGBot(commands.Bot):
                     block.text for block in response.content if hasattr(block, "text")
                 ).strip()
             except Exception as e:
-                reply_text = f"⚠️ Couldn't generate a reply: {type(e).__name__}: {e}"
+                if is_billing_error(e):
+                    # The account ran dry: DM the maintainer and keep the raw
+                    # billing text out of the channel.
+                    await self._maybe_billing_alert("anthropic", e)
+                    reply_text = ("⚠️ Couldn't generate a reply — the bot's Anthropic "
+                                  "account looks out of credit. The maintainer has been notified.")
+                else:
+                    reply_text = f"⚠️ Couldn't generate a reply: {type(e).__name__}: {e}"
 
         history.append({"role": "assistant", "content": reply_text})
         await self.send_long_message(message.channel, reply_text)
+
+    async def _maybe_billing_alert(self, provider: str, exc: BaseException) -> bool:
+        """DM the maintainer that a provider account ran dry.
+
+        Once per provider per CONFIG.billing_alert_cooldown_hours. Target is
+        config `maintainer_user_id`, else the application owner. Returns True
+        when a DM was actually sent. Never raises — an alert failing must not
+        take a reply or a game decision down with it.
+        """
+        key, label = _billing_provider_label(provider)
+        now = datetime.now()
+        last = self._billing_alert_last.get(key)
+        if last is not None and (now - last) < timedelta(hours=CONFIG.billing_alert_cooldown_hours):
+            return False
+        self._billing_alert_last[key] = now
+        target = None
+        try:
+            if self.maintainer_user_id:
+                uid = int(self.maintainer_user_id)
+                target = self.get_user(uid) or await self.fetch_user(uid)
+            else:
+                info = await self.application_info()
+                target = getattr(info, "owner", None)
+        except (discord.HTTPException, ValueError, TypeError, AttributeError) as e:
+            print(f"[BILLING-ALERT] Could not resolve the maintainer to DM: {e}")
+            return False
+        if target is None:
+            print("[BILLING-ALERT] No maintainer to DM (set maintainer_user_id in config.json)")
+            return False
+        detail = re.sub(r"\s+", " ", str(exc))[:300]
+        text = (f"🚨 **{label} billing error** at {now:%Y-%m-%d %H:%M} — the account looks "
+                f"out of credit. Until it is topped up, calls to that provider fail "
+                f"(autoplay games trip the circuit breaker after five failures).\n`{detail}`\n"
+                f"_(one DM per provider per {CONFIG.billing_alert_cooldown_hours}h)_")
+        try:
+            await target.send(text)
+        except (discord.HTTPException, AttributeError) as e:
+            print(f"[BILLING-ALERT] DM to maintainer failed: {e}")
+            return False
+        print(f"[BILLING-ALERT] DM sent to maintainer for {key}")
+        return True
+
+    def _billing_alert_from_engine(self, provider: str, exc: BaseException) -> None:
+        """mtg.util billing hook — schedules the DM from any thread, never raises."""
+        coro = self._maybe_billing_alert(provider, exc)
+        try:
+            try:
+                asyncio.get_running_loop().create_task(coro)
+            except RuntimeError:
+                asyncio.run_coroutine_threadsafe(coro, self.loop)
+        except Exception as e:  # crash barrier: a failed alert must never break a game decision
+            coro.close()
+            print(f"[BILLING-ALERT] scheduling failed: {e}")
 
     def get_game_context_for_channel(self, channel_id: int) -> str:
         """If an MTG game is active in this channel, return a brief

@@ -229,3 +229,52 @@ class StderrTee:
 
     def __getattr__(self, name):
         return getattr(self.original, name)
+
+
+# ---------------------------------------------------------------------------
+# Billing / balance errors (Sep 4, 2026)
+#
+# The live shape that motivated this: on Sep 3 at 8:39 PM the Anthropic
+# account ran dry mid-conversation. The error is an HTTP **400**
+# ``invalid_request_error: Your credit balance is too low to access the
+# Anthropic API`` — a status code cannot classify it, only the text can.
+# DeepSeek returns 402 ``Insufficient Balance``; DashScope reports the account
+# "in arrears"; OpenAI-compatible hosts say "exceeded your current quota ...
+# billing". Rate limits (429), timeouts and resets are NOT billing errors.
+#
+# The registry lets the Discord bot subscribe a DM without the engine knowing
+# anything about Discord. Keyed by name so re-registration replaces rather
+# than stacks (a second bot object must not produce two DMs).
+# ---------------------------------------------------------------------------
+import re as _re
+from typing import Callable as _Callable
+
+_BILLING_ERROR_RE = _re.compile(
+    r"credit balance|insufficient[ _]balance|insufficient[ _]quota|"
+    r"payment required|arrear|exceeded your current quota|\bbilling\b",
+    _re.IGNORECASE,
+)
+
+_BILLING_ALERT_CALLBACKS: Dict[str, "_Callable[[str, BaseException], None]"] = {}
+
+
+def looks_like_billing_error(exc: BaseException) -> bool:
+    """True when an API error is the account running dry, not a transient."""
+    if getattr(exc, "status_code", None) == 402:
+        return True
+    return bool(_BILLING_ERROR_RE.search(str(exc)))
+
+
+def register_billing_alert_callback(name: str, callback) -> None:
+    """Subscribe ``callback(provider_or_model: str, exc)`` to billing errors."""
+    _BILLING_ALERT_CALLBACKS[name] = callback
+
+
+def notify_billing_error(provider: str, exc: BaseException) -> None:
+    """Fan a billing error out to every registered callback.
+
+    Callbacks are responsible for their own error handling — a subscriber
+    that raises would otherwise replace the exception being reported.
+    """
+    for callback in list(_BILLING_ALERT_CALLBACKS.values()):
+        callback(provider, exc)

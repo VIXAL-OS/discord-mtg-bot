@@ -52,6 +52,7 @@ python bot.py
 | `bot_persona` | Character layer (a file under `personas/`). Default: `plain` (no roleplay). Try `ressapanda` for whimsy. |
 | `mtg_channel_id` | Discord channel where the bot auto-responds to every message. Set to `null` to require @-mentions in other channels. |
 | `excluded_channels` | Channel IDs where the bot never responds. |
+| `maintainer_user_id` | Optional. Discord user to DM when an API provider returns a billing error (Anthropic credit exhausted, DeepSeek 402, DashScope arrears). Defaults to the bot's application owner. |
 
 That's it — the bot is intentionally minimal in scope.
 
@@ -254,8 +255,9 @@ card cache re-fetches from Scryfall, and logs go to stdout for `fly logs`.
 starts on defaults and responds only to @-mentions. That's a fine first deploy.
 To pin it to a channel, delete the `config.json` line from `.dockerignore` and
 redeploy so it gets baked in. That's safe *in this fork specifically* because
-`config.json` holds no secrets — just `bot_persona`, `mtg_channel_id`, and
-`excluded_channels`; every credential lives in an environment variable.
+`config.json` holds no secrets — just `bot_persona`, `mtg_channel_id`,
+`excluded_channels` and the optional `maintainer_user_id`; every credential
+lives in an environment variable.
 
 **The XMage bridge (Tier 2.5) is the awkward part.** Its card DB is hundreds of
 megabytes that the Dockerfile deliberately keeps out of the image, and on a VPS

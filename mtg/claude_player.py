@@ -80,6 +80,7 @@ def _record_strategy_memo_result(game: GameState, accepted: bool) -> None:
 # module's docstring). Re-imported here because ~10 call sites in this
 # file use it directly.
 from mtg.legal_actions import _check_color_castable, castable_labels  # noqa: E402
+from mtg.util import looks_like_billing_error, notify_billing_error  # noqa: E402
 
 # Aug 2 batch-14: module-level so the density gate is testable — the
 # nested _sanitize_memo closure reads this tuple; tests import it and
@@ -1626,6 +1627,11 @@ RULES (apply to your output, not your reasoning):
         Returns True if the circuit breaker has tripped (API is disabled)."""
         self._consecutive_failures += 1
         error_str = str(error)
+        # Sep 4, 2026: a balance error is not a transient — tell whoever is
+        # subscribed (the Discord bot DMs the maintainer) before the
+        # breaker's five silent failures burn a wave of the batch.
+        if looks_like_billing_error(error):
+            notify_billing_error(getattr(self, 'model', 'unknown'), error)
         if self._consecutive_failures >= 5 and not self._api_disabled:
             self._api_disabled = True
             print(f"[CIRCUIT-BREAKER] API disabled after {self._consecutive_failures} consecutive failures. "
