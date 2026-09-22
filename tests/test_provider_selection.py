@@ -60,8 +60,9 @@ class _FakeAdapter:
 
 class TestRateTable:
     def test_rates_follow_the_model_string(self):
+        # Sep 21, 2026: 0.14 -> 0.15 (V4.1 Flash behind the legacy alias).
         hit, miss, out = rates_for_model("deepseek-v4-flash")
-        assert round(miss * 1e6, 3) == 0.14
+        assert round(miss * 1e6, 3) == 0.15
         hit, miss, out = rates_for_model("qwen3.7-flash")
         assert round(miss * 1e6, 3) == 0.028
 
@@ -79,7 +80,7 @@ class TestRateTable:
         # Same nesting on the DeepSeek side: the actor must not be priced
         # at the Pro catch-all.
         _, ds_flash_miss, _ = rates_for_model("deepseek-v4-flash")
-        assert round(ds_flash_miss * 1e6, 3) == 0.14
+        assert round(ds_flash_miss * 1e6, 3) == 0.15   # Sep 21: V4.1 Flash
 
     def test_unrecognised_family_member_still_prices_as_that_family(self):
         """The Qwen slugs are VERIFY-flagged. If the real callable name
@@ -95,7 +96,7 @@ class TestRateTable:
         lie."""
         hit, miss, out = rates_for_model("some-brand-new-model")
         assert hit == miss, "no phantom cache discount for an unknown model"
-        assert round(miss * 1e6, 3) == 0.14
+        assert round(miss * 1e6, 3) == 0.15   # Sep 21: tracks the V4.1 Flash miss rate
 
     def test_full_model_string_with_vendor_prefix_still_matches(self):
         """OpenRouter-style 'vendor/model' strings must not fall through."""
@@ -298,7 +299,7 @@ class TestResoldModelPricing:
         assert res_hit != own_hit, (
             "the resold model must not inherit DeepSeek's cache rate")
         assert round(res_hit * 1e6, 3) == 0.028
-        assert round(own_hit * 1e6, 4) == 0.0028
+        assert round(own_hit * 1e6, 4) == 0.003   # Sep 21: V4.1 Flash (was 0.0028)
 
     def test_provider_scoped_key_beats_the_substring_pass(self):
         """'dashscope:deepseek-v4-flash' CONTAINS 'deepseek-v4-flash', so
@@ -328,8 +329,11 @@ class TestResoldModelPricing:
         from rules.llm_adapter import create_dashscope_deepseek_actor_adapter
         a = create_dashscope_deepseek_actor_adapter()
         assert a is not None
-        assert a._model == "deepseek-v4-flash", "the API needs the real slug"
-        assert a.rate_key == "dashscope:deepseek-v4-flash", (
+        # Sep 21, 2026: -> deepseek-v4.1-flash. Alibaba's deepseek-v4-flash is
+        # still V4 while DeepSeek direct serves V4.1, so the old slug had
+        # stopped being "the same model" — the failover's whole point.
+        assert a._model == "deepseek-v4.1-flash", "the API needs the real slug"
+        assert a.rate_key == "dashscope:deepseek-v4.1-flash", (
             "but pricing must know it came from Alibaba")
 
 
@@ -554,8 +558,11 @@ class TestCostAwareSelection:
         from rules.llm_adapter import provider_cost_score
         qwen = provider_cost_score(_FakeAdapter("qwen3.7-flash"))
         ds = provider_cost_score(_FakeAdapter("deepseek-v4-flash"))
-        ali = _FakeAdapter("deepseek-v4-flash")
-        ali.rate_key = "dashscope:deepseek-v4-flash"
+        # Sep 21, 2026: the failover's key is the V4.1 resale now. Against
+        # the stale V4 resale row (0.138/0.275) the repriced direct V4.1
+        # would read ~0.7% DEARER and the probe could prefer the older model.
+        ali = _FakeAdapter("deepseek-v4.1-flash")
+        ali.rate_key = "dashscope:deepseek-v4.1-flash"
         ds_ali = provider_cost_score(ali)
         assert qwen < ds < ds_ali, (
             "the score must reproduce the verified per-token economics: "

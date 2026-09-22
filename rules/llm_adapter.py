@@ -53,13 +53,49 @@ class _ContentBlock:
         self.text = text
 
 
-class _Usage:
-    """Mimics anthropic.types.Usage with .input_tokens and .output_tokens."""
-    __slots__ = ('input_tokens', 'output_tokens')
+def _cache_split(usage):
+    """(hit, miss) prompt-cache tokens from an OpenAI-style usage block, or
+    None when the provider reports no cache data at all.
 
-    def __init__(self, prompt_tokens: int, completion_tokens: int):
+    Sep 21, 2026: DeepSeek sends its own `prompt_cache_hit_tokens` /
+    `prompt_cache_miss_tokens`, but DashScope (Qwen, and the resold DeepSeek)
+    reports only the OpenAI-standard `prompt_tokens_details.cached_tokens` —
+    so until now every Qwen hit was invisible and its implicit-cache rate in
+    MODEL_RATES was dead. On the standard shape, miss = prompt - hit. DeepSeek
+    can send both shapes for the SAME hits, so its own fields win and the two
+    are never summed.
+    """
+    hit = getattr(usage, 'prompt_cache_hit_tokens', None)
+    miss = getattr(usage, 'prompt_cache_miss_tokens', None)
+    if hit is not None or miss is not None:
+        return hit or 0, miss or 0
+    details = getattr(usage, 'prompt_tokens_details', None)
+    cached = (details.get('cached_tokens') if isinstance(details, dict)
+              else getattr(details, 'cached_tokens', None))
+    if cached is None:
+        return None
+    prompt = getattr(usage, 'prompt_tokens', 0) or 0
+    try:
+        cached = max(0, min(int(cached), prompt))
+    except (TypeError, ValueError):
+        return None
+    return cached, prompt - cached
+
+
+class _Usage:
+    """Mimics anthropic.types.Usage with .input_tokens and .output_tokens.
+
+    `prompt_cache_hit_tokens` (Sep 21, 2026) is the cached SUBSET of
+    input_tokens — DeepSeek semantics, NOT Anthropic's separate
+    cache_read_input_tokens, so never add it to input_tokens. The lifetime
+    V4.1 Flash bucket in bot.py prices hits with it; 0 if unknown."""
+    __slots__ = ('input_tokens', 'output_tokens', 'prompt_cache_hit_tokens')
+
+    def __init__(self, prompt_tokens: int, completion_tokens: int,
+                 cache_hit_tokens: int = 0):
         self.input_tokens = prompt_tokens
         self.output_tokens = completion_tokens
+        self.prompt_cache_hit_tokens = cache_hit_tokens
 
 
 class _AdaptedResponse:
@@ -91,6 +127,7 @@ class _AdaptedResponse:
         self.usage = _Usage(
             prompt_tokens=getattr(usage, 'prompt_tokens', 0) or 0,
             completion_tokens=getattr(usage, 'completion_tokens', 0) or 0,
+            cache_hit_tokens=(_cache_split(usage) or (0, 0))[0],
         )
 
 
@@ -166,15 +203,16 @@ class _StreamingResponse:
                 ct = getattr(self._final_usage, 'completion_tokens', 0) or 0
                 self._namespace._total_prompt_tokens += pt
                 self._namespace._total_completion_tokens += ct
-                # Cache stats if exposed (DeepSeek's prompt_cache_*).
-                ch = getattr(self._final_usage, 'prompt_cache_hit_tokens', None)
-                cm = getattr(self._final_usage, 'prompt_cache_miss_tokens', None)
-                if ch is not None or cm is not None:
+                # Cache stats if exposed (DeepSeek's prompt_cache_*, or the
+                # OpenAI-standard cached_tokens DashScope sends — _cache_split).
+                split = _cache_split(self._final_usage)
+                if split is not None:
+                    ch, cm = split
                     if not hasattr(self._namespace, '_total_cache_hit_tokens'):
                         self._namespace._total_cache_hit_tokens = 0
                         self._namespace._total_cache_miss_tokens = 0
-                    self._namespace._total_cache_hit_tokens += ch or 0
-                    self._namespace._total_cache_miss_tokens += cm or 0
+                    self._namespace._total_cache_hit_tokens += ch
+                    self._namespace._total_cache_miss_tokens += cm
                 self._usage_posted = True
             except Exception as e:
                 print(f"[{self._log_tag}] Stream usage-post error: {e}")
@@ -268,6 +306,7 @@ class _StreamingResponse:
         return _Usage(
             prompt_tokens=getattr(self._final_usage, 'prompt_tokens', 0),
             completion_tokens=getattr(self._final_usage, 'completion_tokens', 0),
+            cache_hit_tokens=(_cache_split(self._final_usage) or (0, 0))[0],
         )
 
     @property
@@ -413,7 +452,8 @@ class _MessagesNamespace:
                 print(f"[CALL-BREAKDOWN] [{self._log_tag}] call#{self._call_count}: {breakdown}")
 
             # Track API-side prompt cache hits when the provider exposes them
-            # (DeepSeek's `prompt_cache_hit_tokens` field). This tells us how
+            # (DeepSeek's `prompt_cache_hit_tokens` field, or since Sep 21 the
+            # OpenAI-standard cached_tokens DashScope sends). This tells us how
             # well the provider's automatic prefix caching is working — the
             # local _state_fingerprint cache only avoids Python work, not
             # token cost. If hit_ratio stays low across a batch, it means the
@@ -421,9 +461,9 @@ class _MessagesNamespace:
             # is needed (move volatile state to the end).
             try:
                 usage = openai_response.usage
-                cache_hit = getattr(usage, 'prompt_cache_hit_tokens', None)
-                cache_miss = getattr(usage, 'prompt_cache_miss_tokens', None)
-                if cache_hit is not None or cache_miss is not None:
+                split = _cache_split(usage)
+                cache_hit, cache_miss = split if split is not None else (None, None)
+                if split is not None:
                     if not hasattr(self, '_total_cache_hit_tokens'):
                         self._total_cache_hit_tokens = 0
                         self._total_cache_miss_tokens = 0
@@ -667,6 +707,10 @@ def create_deepseek_adapter(api_key: str = None) -> 'OpenAICompatibleAdapter | N
     try:
         return OpenAICompatibleAdapter(
             api_key=key,
+            # Legacy alias DeepSeek now serves as V4.1 Flash (since Sep 10,
+            # 2026; reports model=deepseek-flash). Kept rather than renamed so
+            # rate_key / the pinned tests stay put — MODEL_RATES prices both
+            # names identically.
             model="deepseek-v4-flash",
             log_tag="DEEPSEEK",
             thinking_enabled=False,  # actor: fast JSON, no chain-of-thought
@@ -752,6 +796,7 @@ def create_deepseek_reasoner_adapter(api_key: str = None) -> 'OpenAICompatibleAd
             # thinking_enabled, restore reasoning_effort="medium", restore
             # the Pro STRAT_* rates in mtg/autoplay.py, and the swap-block
             # strings there — five edits, all tagged "Aug 2" + "A/B".
+            # Sep 21, 2026: this alias is V4.1 Flash now (see the actor).
             model="deepseek-v4-flash",
             log_tag="DEEPSEEK:REASONER",
             thinking_enabled=True,
@@ -934,20 +979,20 @@ def create_qwen_strategist_adapter(api_key: str = None):
 # 66-84% of input tokens are hits here, so blended input is far below the
 # headline miss rate.
 MODEL_RATES = {
-    # DeepSeek — verified against the account's own usage export (reproduced
-    # a known monthly bill to the cent); the April 2026 price cut put the hit
-    # rate at 98% off, which is unusually aggressive (most providers do 90%).
-    #
-    # ⚠️ PENDING INCREASE (Aug 7, 2026): DeepSeek emailed that "a significant
-    # increase" to API pricing is coming "in the near future" — no numbers,
-    # no date. These DeepSeek rows are correct only until that lands. When
-    # the official notice arrives: update these rows SAME DAY (from the
-    # official pricing page, never the email or an aggregator — the Aug 4
-    # source lesson), reconcile one bill, and drop this warning. Until then
-    # every [STATS-*] line on a DeepSeek batch after the change silently
-    # under-reports.
-    "deepseek-v4-flash": (0.0028, 0.14, 0.28),
-    "deepseek-v4-pro": (0.0036, 0.435, 0.87),
+    # DeepSeek — Sep 21, 2026, from the OFFICIAL pricing page
+    # (api-docs.deepseek.com/quick_start/pricing), replacing the Aug-7
+    # "pending increase" rows. The increase landed with V4.1 Flash on Sep 10:
+    # these are OFF-PEAK rates, and weekday peak hours bill every item at
+    # DEEPSEEK_PEAK_MULTIPLIER (2x) — see deepseek_pricing_window below.
+    # `deepseek-v4-flash` is now a legacy alias DeepSeek serves as V4.1 Flash
+    # at V4.1 prices (the API reports model=deepseek-flash — verified live
+    # Sep 21), so both names carry the same row. History: V4 Flash was
+    # 0.0028 / 0.14 / 0.28 through Sep 9 (the April-2026 cut, reconciled
+    # against the account's usage export); V4 Pro was 0.0036 / 0.435 / 0.87
+    # on the May promo. Still owed: reconcile one post-Sep-10 bill.
+    "deepseek-flash": (0.003, 0.15, 0.60),
+    "deepseek-v4-flash": (0.003, 0.15, 0.60),
+    "deepseek-v4-pro": (0.022, 0.66, 1.98),
 
     # Qwen via DashScope — from Alibaba's PER-MODEL doc pages, which is the
     # only source that has held up. Both an aggregator listing and a
@@ -970,6 +1015,15 @@ MODEL_RATES = {
     # "List Price $0.276" and the pricing table). Output from the table only.
     "qwen3.7-plus": (0.0276, 0.276, 1.101),
     "qwen3.7-max": (0.165, 1.65, 4.951),
+    # qwen3.8-flash (Sep 21, 2026) — priced so QWEN_ACTOR_MODEL /
+    # QWEN_STRATEGIST_MODEL=qwen3.8-flash reprices [STATS-*] by itself instead
+    # of falling to the Plus-rate catch-all. US-Virginia list price from the
+    # model-pricing page, flat to 1M (no tiers, same in thinking mode); ~4x
+    # qwen3.7-flash's <=32k tier, which is why 3.7 stays the default. Cache:
+    # $0.014 from help/en/model-studio/qwen3-8-flash — region not stated
+    # (likely Singapore), so VERIFY for US. Callable on this account's US
+    # key (verified live Sep 21).
+    "qwen3.8-flash": (0.014, 0.113, 0.382),
 
     # DeepSeek RESOLD BY DASHSCOPE — provider-scoped keys, because the model
     # strings are identical to DeepSeek's own and would otherwise be priced
@@ -985,6 +1039,14 @@ MODEL_RATES = {
     # quality instead of trading it for availability.
     "dashscope:deepseek-v4-flash": (0.028, 0.138, 0.275),
     "dashscope:deepseek-v4-pro": (0.028, 0.138, 0.275),
+    # Sep 21, 2026: DashScope's `deepseek-v4-flash` is STILL V4 (served_as
+    # deepseek-v4-flash, verified live) while DeepSeek direct now serves V4.1,
+    # so the failover moved to Alibaba's separate `deepseek-v4.1-flash` to
+    # stay the IDENTICAL model. US-Virginia idle rates from the model-pricing
+    # page (busy hours bill 2x: 0.283 / 1.131 — scored via the peak
+    # multiplier, see _PEAK_PRICED_RESALE). Cache rate not published on the
+    # page: 20% of input, the ratio of the v4-flash resale row above — VERIFY.
+    "dashscope:deepseek-v4.1-flash": (0.0282, 0.141, 0.565),
 
     # Family catch-alls, so an unrecognised member still prices as its family
     # rather than falling to the unknown-model rate. They also make the
@@ -1000,15 +1062,15 @@ MODEL_RATES = {
     # no more than one that is wrong. The mitigation is the real one: add the
     # slug to the table when a new tier starts being used.
     "qwen": (0.0276, 0.276, 1.101),
-    "deepseek": (0.0036, 0.435, 0.87),
+    "deepseek": (0.022, 0.66, 1.98),
 }
 
-# What to charge a model we have no entry for. DeepSeek V4-Flash's MISS rate
-# is used for all three columns: it is the provider we actually run, and
-# pricing an unknown model at the no-discount rate over-reports rather than
-# under-reports. A cost line that reads high is a prompt to add a rate entry;
-# one that reads low is a silent lie.
-_UNKNOWN_MODEL_RATE = (0.14, 0.14, 0.28)
+# What to charge a model we have no entry for. DeepSeek Flash's MISS rate is
+# used for the input columns (V4.1 Flash since Sep 21, 2026): it is the
+# provider we actually run, and pricing an unknown model at the no-discount
+# rate over-reports rather than under-reports. A cost line that reads high
+# is a prompt to add a rate entry; one that reads low is a silent lie.
+_UNKNOWN_MODEL_RATE = (0.15, 0.15, 0.60)
 
 
 def rates_for_model(model: str):
@@ -1087,13 +1149,15 @@ async def probe_adapter_latency(adapter, samples: int = 2,
 # Beijing weekday peak windows. Weekends are exempt entirely as of Aug 23.
 _DS_PEAK_WINDOWS_BEIJING = ((9, 12), (14, 18))
 
-# The one unknown, deliberately isolated. DeepSeek has published the WINDOWS
-# but never the peak RATES -- its Aug 6 notice said "a significant increase"
-# with no figure and no effective date. 1.0 == today's behaviour, so nothing
-# changes until a real number is known. Set MTG_DS_PEAK_MULTIPLIER once the
-# official pricing page carries it, and update MODEL_RATES in the same commit.
+# Sep 21, 2026: PUBLISHED. The official pricing page (live since the Sep 10
+# V4.1 Flash launch) states "off-peak rates are half of the peak rates" on
+# every item, in these same windows (01:00-04:00 + 06:00-10:00 UTC, Mon-Fri,
+# excluding Chinese public holidays — holidays are not modelled, so a
+# holiday reads as peak, the over-reporting direction). MODEL_RATES moved in
+# the same commit, as the Aug-24 note required. MTG_DS_PEAK_MULTIPLIER still
+# overrides (1.0 reproduces the pre-Sep-21 no-op).
 DEEPSEEK_PEAK_MULTIPLIER = float(
-    os.getenv("MTG_DS_PEAK_MULTIPLIER", "1.0"))
+    os.getenv("MTG_DS_PEAK_MULTIPLIER", "2.0"))
 
 
 def deepseek_pricing_window(now_utc=None) -> str:
@@ -1129,6 +1193,38 @@ def _is_direct_deepseek(model: str) -> bool:
         model or "").lower().startswith("dashscope:")
 
 
+# Resold models Alibaba ALSO bills busy/idle, 2x (Sep 21, 2026: shown on the
+# model-pricing page for deepseek-v4.1-flash). Alibaba's busy-hour windows
+# are ASSUMED to match DeepSeek's — VERIFY. Scoring them with the multiplier
+# is what keeps direct DeepSeek ranked below the resale at peak too; without
+# it the resale would look half-price exactly when it is not.
+_PEAK_PRICED_RESALE = ("dashscope:deepseek-v4.1-flash",)
+
+
+def _is_peak_priced(model: str) -> bool:
+    return _is_direct_deepseek(model) or (model or "").lower() in _PEAK_PRICED_RESALE
+
+
+def deepseek_v41_call_cost(model: str, input_tokens: int, cache_hit_tokens: int,
+                           output_tokens: int, now_utc=None):
+    """Exact dollars for ONE DeepSeek V4.1 Flash call -> (cost, was_peak).
+
+    Sep 21, 2026: backs the lifetime V4.1 bucket in bot.py. `model` is the
+    string the adapter reports to track_mtg_usage — Alibaba's resale is
+    `deepseek-v4.1-flash` (a name DeepSeek direct does not serve), anything
+    else is DeepSeek direct. `input_tokens` INCLUDES the cache hits
+    (DeepSeek semantics); hits bill at the cache rate, the rest at the miss
+    rate, everything x DEEPSEEK_PEAK_MULTIPLIER inside a peak window.
+    """
+    rate_key = ("dashscope:deepseek-v4.1-flash" if "v4.1" in (model or "").lower()
+                else "deepseek-flash")
+    hit_r, miss_r, out_r = rates_for_model(rate_key)
+    hits = max(0, min(cache_hit_tokens or 0, input_tokens))
+    peak = deepseek_pricing_window(now_utc) == "peak"
+    cost = (input_tokens - hits) * miss_r + hits * hit_r + output_tokens * out_r
+    return cost * (DEEPSEEK_PEAK_MULTIPLIER if peak else 1.0), peak
+
+
 def provider_cost_score(adapter) -> float:
     """Heuristic $-per-token-mix score for ORDERING providers by price.
 
@@ -1154,11 +1250,10 @@ def provider_cost_score(adapter) -> float:
     # DS-via-Alibaba ~1.39 at today's table).
     blended_in = 0.75 * hit + 0.25 * miss
     score = (blended_in * 20.0 + out) * 1_000_000
-    # Aug 22, 2026: DeepSeek bills a weekday peak surcharge. The multiplier is
-    # 1.0 until the real figure is published, so this is structure rather than
-    # a guess -- but the window is real, and the day a number lands the
-    # ordering corrects itself without touching this function.
-    if _is_direct_deepseek(model) and deepseek_pricing_window() == "peak":
+    # Aug 22, 2026: DeepSeek bills a weekday peak surcharge. Sep 21: the
+    # figure is published (2x) and Alibaba bills its V4.1 resale busy/idle
+    # the same way, so both are scaled here (_is_peak_priced).
+    if _is_peak_priced(model) and deepseek_pricing_window() == "peak":
         score *= DEEPSEEK_PEAK_MULTIPLIER
     return score
 
@@ -1235,12 +1330,18 @@ async def choose_fastest_provider(candidates: list, samples: int = 2,
 
 
 def create_dashscope_deepseek_actor_adapter(api_key: str = None):
-    """DeepSeek V4-Flash, served by Alibaba rather than DeepSeek.
+    """DeepSeek V4.1 Flash, served by Alibaba rather than DeepSeek.
 
     The lowest-risk failover there is: when DeepSeek's own API is congested
     this is the SAME MODEL on different infrastructure, so nothing about play
     quality changes — unlike switching to Qwen, which is a real A/B. Costs
-    ~1.45x DeepSeek direct on blended input (the cache rate is 10x worse).
+    ~1.4x DeepSeek direct on blended input (the cache rate is ~9x worse),
+    slightly less on output.
+
+    Sep 21, 2026: moved `deepseek-v4-flash` -> `deepseek-v4.1-flash`. DeepSeek
+    direct now serves V4.1 behind the old name, but Alibaba's
+    `deepseek-v4-flash` is still V4, so the old slug had silently stopped
+    being "the same model". Thinking on/off both verified live on the US key.
 
     Availability note: NOT offered in Singapore. Regions are Beijing,
     Frankfurt, US-Virginia and Tokyo, so this needs DASHSCOPE_REGION set to
@@ -1248,15 +1349,15 @@ def create_dashscope_deepseek_actor_adapter(api_key: str = None):
     fail, and the pre-flight probe will skip it rather than break a batch.
     """
     return create_dashscope_adapter(
-        "deepseek-v4-flash", api_key=api_key,
+        "deepseek-v4.1-flash", api_key=api_key,
         log_tag="DASHSCOPE:DEEPSEEK-ACTOR", thinking_enabled=False,
-        rate_key="dashscope:deepseek-v4-flash")
+        rate_key="dashscope:deepseek-v4.1-flash")
 
 
 def create_dashscope_deepseek_strategist_adapter(api_key: str = None):
     """Strategist twin of the above — flash in THINKING mode, mirroring the
     Aug 2 A/B that this repo already validated on DeepSeek direct."""
     return create_dashscope_adapter(
-        "deepseek-v4-flash", api_key=api_key,
+        "deepseek-v4.1-flash", api_key=api_key,
         log_tag="DASHSCOPE:DEEPSEEK-STRATEGIST", thinking_enabled=True,
-        rate_key="dashscope:deepseek-v4-flash", request_timeout=180.0)
+        rate_key="dashscope:deepseek-v4.1-flash", request_timeout=180.0)

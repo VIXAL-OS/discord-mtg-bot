@@ -8,6 +8,10 @@ The window is published; the peak RATE is not. So these pin the STRUCTURE and
 deliberately assert the multiplier defaults to a no-op -- a guessed number
 would be worse than none, because provider_cost_score decides which provider
 runs a 160-game batch.
+
+Sep 21, 2026: the rate IS published now (peak = 2x off-peak on every item,
+official pricing page), so the no-op pin became `test_the_published_multiplier
+_is_two`, and Alibaba's V4.1 resale is peak-scored too.
 """
 import datetime as dt
 
@@ -62,22 +66,46 @@ class TestSurchargeScope:
         assert not _is_direct_deepseek("dashscope:deepseek-v4-flash")
         assert not _is_direct_deepseek("qwen3.7-flash")
 
-    def test_the_multiplier_is_a_no_op_until_a_real_rate_is_published(self):
-        """DeepSeek announced "a significant increase" with no figure. A
-        guessed multiplier would silently steer a 160-game batch, so the
-        default must stay 1.0 until MODEL_RATES carries the real number."""
-        assert DEEPSEEK_PEAK_MULTIPLIER == 1.0
+    def test_the_published_multiplier_is_two(self):
+        """Sep 21, 2026 — supersedes the Aug-24 "no-op until published" pin.
+        DeepSeek's official pricing page now states off-peak is HALF of peak
+        on every item, and MODEL_RATES moved to the real (off-peak) numbers
+        in the same commit, which is the condition that pin was waiting on."""
+        assert DEEPSEEK_PEAK_MULTIPLIER == 2.0
 
-    def test_scoring_is_unchanged_while_the_multiplier_is_a_no_op(self):
+    def test_the_default_multiplier_doubles_the_peak_score(self, monkeypatch):
+        import rules.llm_adapter as la
+
         class _A:
             rate_key = "deepseek-v4-flash"
             model = "deepseek-v4-flash"
 
-        peak = provider_cost_score(_A())
-        assert peak > 0
-        # Same adapter, same table: with a 1.0 multiplier the window cannot
-        # change the number, which is what "no behaviour change" means.
-        assert peak == provider_cost_score(_A())
+        monkeypatch.setattr(la, "deepseek_pricing_window", lambda *a: "off_peak")
+        base = provider_cost_score(_A())
+        assert base > 0
+        monkeypatch.setattr(la, "deepseek_pricing_window", lambda *a: "peak")
+        assert provider_cost_score(_A()) == pytest.approx(base * 2.0)
+
+    def test_resold_v41_is_peak_priced_resold_v4_and_qwen_are_not(self, monkeypatch):
+        """Alibaba bills its deepseek-v4.1-flash resale busy/idle 2x as well
+        (Sep 21 model-pricing page) — the failover must scale at peak too, or
+        it reads half-price exactly when it is not. The old V4 resale row and
+        Qwen stay flat."""
+        import rules.llm_adapter as la
+
+        class _R:
+            def __init__(self, k):
+                self.rate_key = self.model = k
+
+        def ratio(k):
+            monkeypatch.setattr(la, "deepseek_pricing_window", lambda *a: "off_peak")
+            off = provider_cost_score(_R(k))
+            monkeypatch.setattr(la, "deepseek_pricing_window", lambda *a: "peak")
+            return provider_cost_score(_R(k)) / off
+
+        assert ratio("dashscope:deepseek-v4.1-flash") == pytest.approx(2.0)
+        assert ratio("dashscope:deepseek-v4-flash") == pytest.approx(1.0)
+        assert ratio("qwen3.7-flash") == pytest.approx(1.0)
 
     def test_a_published_multiplier_would_raise_the_peak_score(self,
                                                                monkeypatch):
@@ -90,6 +118,11 @@ class TestSurchargeScope:
             rate_key = "deepseek-v4-flash"
             model = "deepseek-v4-flash"
 
+        # Sep 22, 2026: take the base with the window pinned OFF-PEAK. With
+        # the published 2.0 default, a base read at the real clock is already
+        # doubled inside a peak window — the fork suite caught this running at
+        # 01:40 UTC after both private runs had happened to land off-peak.
+        monkeypatch.setattr(la, "deepseek_pricing_window", lambda *a: "off_peak")
         base = provider_cost_score(_A())
         monkeypatch.setattr(la, "DEEPSEEK_PEAK_MULTIPLIER", 2.0)
         monkeypatch.setattr(la, "deepseek_pricing_window", lambda *a: "peak")

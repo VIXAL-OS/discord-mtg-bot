@@ -267,6 +267,21 @@ class MTGBot(commands.Bot):
         self.mtg_game_qwen_plus_output_tokens: int = 0
         self.mtg_game_qwen_max_input_tokens: int = 0
         self.mtg_game_qwen_max_output_tokens: int = 0
+        # Sep 21, 2026: DeepSeek V4.1 Flash — what every non-Pro DeepSeek
+        # name now serves (direct, or the deepseek-v4.1-flash failover) —
+        # gets its own bucket, priced EXACTLY per call at record time by
+        # rules.llm_adapter.deepseek_v41_call_cost (MODEL_RATES + cache hits
+        # + the peak window). The deepseek_* buckets above are frozen V4
+        # history, so lifetime totals are not re-priced. Input includes hits.
+        self.deepseek_v41_input_tokens: int = 0
+        self.deepseek_v41_cache_hit_tokens: int = 0
+        self.deepseek_v41_output_tokens: int = 0
+        self.deepseek_v41_calls: int = 0
+        self.deepseek_v41_peak_calls: int = 0
+        self.deepseek_v41_cost: float = 0.0
+        self.mtg_game_deepseek_v41_input_tokens: int = 0
+        self.mtg_game_deepseek_v41_output_tokens: int = 0
+        self.mtg_game_deepseek_v41_cost: float = 0.0
         self._load_persistent_costs()
 
         self.load_config()
@@ -431,6 +446,11 @@ class MTGBot(commands.Bot):
             "mtg_game_qwen_input_tokens", "mtg_game_qwen_output_tokens",
             "mtg_game_qwen_plus_input_tokens", "mtg_game_qwen_plus_output_tokens",
             "mtg_game_qwen_max_input_tokens", "mtg_game_qwen_max_output_tokens",
+            "deepseek_v41_input_tokens", "deepseek_v41_cache_hit_tokens",
+            "deepseek_v41_output_tokens", "deepseek_v41_calls",
+            "deepseek_v41_peak_calls", "deepseek_v41_cost",
+            "mtg_game_deepseek_v41_input_tokens", "mtg_game_deepseek_v41_output_tokens",
+            "mtg_game_deepseek_v41_cost",
         ]
         data = {k: getattr(self, k, 0) for k in tracked_fields}
         with open("data/api_costs.json", 'w', encoding='utf-8') as f:
@@ -487,9 +507,22 @@ class MTGBot(commands.Bot):
                 self.deepseek_pro_output_tokens += output_tokens
                 self.deepseek_pro_calls += 1
             else:
-                self.deepseek_input_tokens += input_tokens
-                self.deepseek_output_tokens += output_tokens
-                self.deepseek_calls += 1
+                # Sep 21, 2026: every non-Pro DeepSeek name is V4.1 Flash now
+                # (deepseek-v4-flash is an alias for it; the Alibaba failover
+                # reports deepseek-v4.1-flash) -> exact-priced V4.1 bucket.
+                from rules.llm_adapter import deepseek_v41_call_cost
+                hits = getattr(usage, 'prompt_cache_hit_tokens', 0) or 0
+                cost, peak = deepseek_v41_call_cost(
+                    model, input_tokens, hits, output_tokens)
+                self.deepseek_v41_input_tokens += input_tokens
+                self.deepseek_v41_cache_hit_tokens += min(hits, input_tokens)
+                self.deepseek_v41_output_tokens += output_tokens
+                self.deepseek_v41_calls += 1
+                self.deepseek_v41_peak_calls += int(peak)
+                self.deepseek_v41_cost += cost
+                self.mtg_game_deepseek_v41_input_tokens += input_tokens
+                self.mtg_game_deepseek_v41_output_tokens += output_tokens
+                self.mtg_game_deepseek_v41_cost += cost
         self._save_persistent_costs()
     def get_cost_summary(self) -> str:
         """Return a human-readable lifetime cost summary."""
@@ -499,12 +532,14 @@ class MTGBot(commands.Bot):
             chat_in * CONFIG.sonnet_input_cost_per_million / 1_000_000
             + chat_out * CONFIG.sonnet_output_cost_per_million / 1_000_000
         )
-        ds_cost = (
+        ds_legacy_cost = (
             self.deepseek_input_tokens * CONFIG.deepseek_input_cost_per_million / 1_000_000
             + self.deepseek_output_tokens * CONFIG.deepseek_output_cost_per_million / 1_000_000
             + self.deepseek_pro_input_tokens * CONFIG.deepseek_pro_input_cost_per_million / 1_000_000
             + self.deepseek_pro_output_tokens * CONFIG.deepseek_pro_output_cost_per_million / 1_000_000
         )
+        # Sep 21, 2026: V4.1 Flash is priced exactly per call at record time.
+        ds_cost = ds_legacy_cost + self.deepseek_v41_cost
         from rules.llm_adapter import MODEL_RATES
         qf = MODEL_RATES["qwen3.7-flash"]
         qp = MODEL_RATES["qwen3.7-plus"]
@@ -518,9 +553,11 @@ class MTGBot(commands.Bot):
             + self.qwen_max_output_tokens * qm[2] / 1_000_000
         )
         cheap_in = (self.deepseek_input_tokens + self.deepseek_pro_input_tokens
+                    + self.deepseek_v41_input_tokens
                     + self.qwen_input_tokens + self.qwen_plus_input_tokens
                     + self.qwen_max_input_tokens)
         cheap_out = (self.deepseek_output_tokens + self.deepseek_pro_output_tokens
+                     + self.deepseek_v41_output_tokens
                      + self.qwen_output_tokens + self.qwen_plus_output_tokens
                      + self.qwen_max_output_tokens)
         mtg_sonnet_in = max(0, self.mtg_game_input_tokens - cheap_in)
@@ -541,10 +578,14 @@ class MTGBot(commands.Bot):
             f"Chat (Sonnet): {chat_in:,} in / {chat_out:,} out -> ${chat_cost:.4f}",
             f"MTG games (Sonnet portion): {mtg_sonnet_in:,} in / "
             f"{mtg_sonnet_out:,} out -> ${mtg_sonnet_cost:.4f}",
-            f"DeepSeek + legacy pre-split Qwen aggregate: "
+            f"DeepSeek V4.1 Flash: {self.deepseek_v41_input_tokens:,} in "
+            f"({self.deepseek_v41_cache_hit_tokens:,} cached) / "
+            f"{self.deepseek_v41_output_tokens:,} out ({self.deepseek_v41_calls} calls, "
+            f"{self.deepseek_v41_peak_calls} at peak) -> ${self.deepseek_v41_cost:.4f}",
+            f"DeepSeek + legacy pre-split Qwen aggregate (V4, frozen): "
             f"{self.deepseek_input_tokens + self.deepseek_pro_input_tokens:,} in / "
             f"{self.deepseek_output_tokens + self.deepseek_pro_output_tokens:,} out "
-            f"-> ${ds_cost:.4f}",
+            f"-> ${ds_legacy_cost:.4f}",
             f"Qwen (provider-specific): {qwen_in:,} in / {qwen_out:,} out "
             f"({qwen_calls} calls) -> ${qwen_cost:.4f}",
             "",

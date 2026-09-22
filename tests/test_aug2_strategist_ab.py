@@ -68,8 +68,9 @@ class TestStrategistFlashAB:
 
         adapter = create_deepseek_reasoner_adapter(api_key="test-key-not-used")
         hit, miss, out = rates_for_model(adapter._model)
+        # Sep 21, 2026: V4.1 Flash rates (the alias; was 0.0028/0.14/0.28).
         assert (round(hit * 1e6, 4), round(miss * 1e6, 3),
-                round(out * 1e6, 2)) == (0.0028, 0.14, 0.28), (
+                round(out * 1e6, 2)) == (0.003, 0.15, 0.6), (
             "the strategist bills at Flash rates; Pro would over-report ~3x")
 
     def test_a_pro_strategist_would_reprice_itself(self):
@@ -78,5 +79,6 @@ class TestStrategistFlashAB:
         indirection worth having rather than just longer."""
         from rules.llm_adapter import rates_for_model
         hit, miss, out = rates_for_model("deepseek-v4-pro")
+        # Sep 21, 2026: current V4 Pro list (was the 0.0036/0.435/0.87 promo).
         assert (round(hit * 1e6, 4), round(miss * 1e6, 3),
-                round(out * 1e6, 2)) == (0.0036, 0.435, 0.87)
+                round(out * 1e6, 2)) == (0.022, 0.66, 1.98)
