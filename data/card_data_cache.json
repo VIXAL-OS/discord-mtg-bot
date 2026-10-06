@@ -1035,7 +1035,7 @@
   "mana_cost": "{5}{R}{R}{R}",
   "cmc": 8.0,
   "type_line": "Legendary Creature — Angel",
-  "oracle_text": "This spell can't be countered.\nFlying, trample, protection from white and from blue\n{R}: Akroma gets +1/+0 until end of turn.\nMorph {3}{R}{R}{R} (You may cast this card face down as a 2/2 creature for {3}. Turn it face up any time for its morph cost.)",
+  "oracle_text": "This spell can't be countered.\nFlying, trample, protection from white and from blue\n{R}: Akroma gets +1/+0 until end of turn.\nMorph {3}{R}{R}{R} (You may cast this card face down as a 2/2 creature for {3}. Turn her face up any time for her morph cost.)",
   "power": "6",
   "toughness": "6",
   "colors": [
@@ -67961,7 +67961,7 @@
   "mana_cost": "{1}{B}{B}",
   "cmc": 3.0,
   "type_line": "Enchantment",
-  "oracle_text": "At the beginning of your upkeep, you draw a card and you lose 1 life.",
+  "oracle_text": "At the beginning of your upkeep, you draw a card and lose 1 life.",
   "colors": [
    "B"
   ],
@@ -109958,7 +109958,7 @@
   "mana_cost": "{1}{B}",
   "cmc": 2.0,
   "type_line": "Creature — Zombie Merfolk",
-  "oracle_text": "Deathtouch\nWhen this creature enters, mill two cards and you gain 2 life. (To mill a card, put the top card of your library into your graveyard.)",
+  "oracle_text": "Deathtouch\nWhen this creature enters, mill two cards and you gain 2 life. (To mill two cards, put the top two cards of your library into your graveyard.)",
   "power": "2",
   "toughness": "1",
   "colors": [
@@ -141487,7 +141487,7 @@
   "mana_cost": "{4}{R}{R}{R}",
   "cmc": 7.0,
   "type_line": "Legendary Creature — Dragon",
-  "oracle_text": "Flying\nWhenever Drakuseth attacks, it deals 4 damage to any target and 3 damage to each of up to two other targets.",
+  "oracle_text": "Flying\nWhenever Drakuseth attacks, Drakuseth deals 4 damage to any target and 3 damage to each of up to two other targets.",
   "power": "7",
   "toughness": "7",
   "colors": [

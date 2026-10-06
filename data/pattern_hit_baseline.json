@@ -44,7 +44,7 @@
  "living weapon": 21,
  "look at the top (\\w+) cards of your library\\. put one of them into your hand and the rest on the bottom of your library": 26,
  "look at the top \\w+ cards? of your library.*?(?:put (?:them|the rest|it)|in any order)": 410,
- "ninjutsu \\{": 49,
+ "ninjutsu \\{": 41,
  "put all creatures on the bottom of their owners.? librar": 2,
  "return target (?:nonland )?(?:creature|permanent) (?:an opponent controls )?to (?:its|their) owner'?s? hand": 177,
  "reveal the top card of your library\\W+if it'?s a land card, put it onto the battlefield tapped\\W+otherwise,? draw a card": 1,
