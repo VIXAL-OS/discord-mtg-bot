@@ -153,6 +153,13 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
         usage_callback = getattr(bot, 'track_mtg_usage', None)
         self.engine = GameEngine(bot.claude, usage_callback=usage_callback)
         self.display = GameDisplay()
+        # Background XMage startup (see _start_xmage_bridge). The pending
+        # bridge is held separately from engine.xmage_bridge so consumers
+        # never see a half-started process, while cog_unload can still
+        # stop one.
+        self._xmage_start_task: Optional[asyncio.Task] = None
+        self._xmage_pending_bridge = None
+        self._xmage_start_began: Optional[float] = None
         self.player_decks: Dict[int, Dict] = {}  # user_id -> deck_data
         self.lobbies = LobbyStore(
             Path(__file__).resolve().parent.parent / "data" / "lobbies")
@@ -265,23 +272,25 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
 
         # The retired integrated-engine wrapper no longer owns XMage.
         # Start the bridge directly; failure remains graceful.
+        #
+        # Oct 21, 2026: the start runs in the BACKGROUND. discord.py opens
+        # the gateway only after setup_hook returns, and setup_hook awaits
+        # this cog_load, so awaiting the bridge here kept the bot offline
+        # for the whole card-database scan -- ~13s warm, but ~10 minutes
+        # cold off the USB drive the JAR lives on. Every consumer already
+        # gates on engine._xmage_available, so the not-ready-yet window
+        # degrades exactly like "Java missing" (Tier 2.5 skipped).
         self.engine._xmage_init_reason = ""
         if not HAS_XMAGE_BRIDGE:
             self.engine._xmage_init_reason = (
                 "HAS_XMAGE_BRIDGE=False "
                 "(rules.xmage_bridge import failed at module load)")
         else:
-            try:
-                from rules.xmage_bridge import XMageBridge
-                bridge = XMageBridge()
-                await bridge.start()
-                self.engine.xmage_bridge = bridge
-                self.engine._xmage_available = True
-                print("[XMAGE] Bridge spawned directly")
-            except Exception as e:
-                self.engine._xmage_init_reason = (
-                    f"direct-spawn failed: {type(e).__name__}: {e}")
-                print(f"[XMAGE] Direct spawn failed: {e} \u2014 Tier 2.5 inactive")
+            self.engine._xmage_init_reason = (
+                "starting in the background (card database scan in progress)")
+            self._xmage_start_began = time.monotonic()
+            self._xmage_start_task = asyncio.create_task(
+                self._start_xmage_bridge(), name="xmage-bridge-start")
 
         # Rebind saved priority windows to fresh callbacks/tasks after a bot
         # restart. GameState.from_dict deliberately never deserializes asyncio
@@ -310,8 +319,80 @@ class MTGGameCog(commands.Cog, name="MTG Game"):
                 ),
             )
 
+    async def _start_xmage_bridge(self) -> None:
+        """Start the XMage bridge off the setup_hook path (see cog_load).
+
+        engine.xmage_bridge is published only once the bridge reports
+        ready, so no consumer can reach a process still scanning its card
+        database. A failure stops the half-started process rather than
+        leaving a JVM orphaned for the life of the bot.
+        """
+        try:
+            from rules.xmage_bridge import XMageBridge
+            bridge = XMageBridge()
+            self._xmage_pending_bridge = bridge
+            await bridge.start()
+        except Exception as e:
+            self.engine._xmage_init_reason = (
+                f"direct-spawn failed: {type(e).__name__}: {e}")
+            print(f"[XMAGE] Direct spawn failed: {e} — Tier 2.5 inactive")
+            await self._stop_pending_xmage_bridge()
+            return
+        self._xmage_pending_bridge = None
+        self.engine.xmage_bridge = bridge
+        self.engine._xmage_available = True
+        self.engine._xmage_init_reason = ""
+        elapsed = time.monotonic() - (self._xmage_start_began or time.monotonic())
+        print(f"[XMAGE] Bridge spawned directly "
+              f"(ready {elapsed:.0f}s after launch, started in the background)")
+
+    async def _stop_pending_xmage_bridge(self) -> None:
+        """Stop a bridge whose start never completed (failure or unload)."""
+        bridge, self._xmage_pending_bridge = self._xmage_pending_bridge, None
+        if bridge is None or getattr(bridge, "process", None) is None:
+            return
+        try:
+            await bridge.stop()
+        except (OSError, ValueError) as e:
+            print(f"[XMAGE] Could not stop the half-started bridge: {e}")
+
+    def xmage_starting(self) -> bool:
+        """True while the background bridge start is still in flight."""
+        task = self._xmage_start_task
+        return task is not None and not task.done()
+
+    async def wait_for_xmage(self, max_wait: float) -> bool:
+        """Wait for an in-flight bridge start; return whether it is available.
+
+        The deadline is measured from when the start BEGAN, not from this
+        call, so concurrent and later callers share one budget: a bridge
+        that never becomes ready stalls autoplay by at most ``max_wait``
+        seconds in total, not that much per game or per wave. The start
+        is shielded, so a caller timing out never cancels it.
+        """
+        task = self._xmage_start_task
+        if task is not None and not task.done():
+            began = self._xmage_start_began or time.monotonic()
+            remaining = began + max_wait - time.monotonic()
+            if remaining > 0:
+                try:
+                    await asyncio.wait_for(asyncio.shield(task), remaining)
+                except asyncio.TimeoutError:
+                    pass
+        return bool(getattr(self.engine, "_xmage_available", False))
+
     async def cog_unload(self):
         """Called when the cog is unloaded - clean up."""
+        # A bridge start still in flight is cancelled and its JVM stopped,
+        # or a reload would leave a second card-database scan running.
+        # asyncio.wait (not `await task` + `except CancelledError`) so a
+        # cancellation of cog_unload ITSELF is never swallowed.
+        task, self._xmage_start_task = self._xmage_start_task, None
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.wait({task})
+        await self._stop_pending_xmage_bridge()
+
         # Detach logging handler first — it holds a reference to the tee.
         if self._stderr_log_handler:
             logging.getLogger().removeHandler(self._stderr_log_handler)

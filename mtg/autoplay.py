@@ -220,6 +220,12 @@ def _mark_active_turn_narration_sent(game: GameState) -> None:
 _ACTIVE_AUTOPLAY_GAMES = 0
 _AUTOPLAY_GAMES_STARTED = 0
 
+# Oct 21, 2026: how long autoplay games wait for a background XMage start,
+# measured from when the start began (one shared budget, never per game).
+# A cold card-database scan off the USB drive took ~10 minutes; 15 covers it
+# with headroom while still bounding a bridge that never becomes ready.
+XMAGE_AUTOPLAY_WAIT_SECONDS = 900.0
+
 
 def _format_post_combat_message(player_name: str, actions: List[str]) -> str:
     """Format a user-visible post-combat summary for the actual AI seat."""
@@ -3627,6 +3633,16 @@ async def _run_single_autoplay(cog, channel, game_format: str, deck1_name: str, 
             )
         except Exception as e:
             print(f"[GAME-INIT] log emission failed: {e}")
+
+        # Oct 21, 2026: the bridge now starts in the background (cog.py
+        # cog_load), so a batch launched at boot can reach here mid-scan.
+        # Wait on the shared budget so audit games keep Tier 2.5 instead of
+        # silently running the first wave without it. Live play never waits.
+        wait_for_xmage = getattr(cog, 'wait_for_xmage', None)
+        if wait_for_xmage is not None and getattr(cog, 'xmage_starting', lambda: False)():
+            print(f"[XMAGE-INIT] Waiting for the background bridge start "
+                  f"(up to {XMAGE_AUTOPLAY_WAIT_SECONDS:.0f}s after launch)")
+            await wait_for_xmage(XMAGE_AUTOPLAY_WAIT_SECONDS)
 
         # Apr 30 audit: emit XMage bridge state into per-game logs so audits
         # can tell at a glance whether Tier 2.5 was active. The cog_load

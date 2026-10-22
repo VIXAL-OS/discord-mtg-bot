@@ -906,6 +906,14 @@ class MTGCog(commands.Cog, name="MTG"):
                 # if it's running — saves a ~13s JAR cold start.
                 mtg_cog = self.bot.get_cog("MTG Game")
                 bridge = None
+                # Oct 21, 2026: the cog starts its bridge in the background.
+                # While that card-database scan is running, a one-shot
+                # fallback would start a SECOND scan on the same slow drive
+                # and finish no sooner, so say so instead.
+                if mtg_cog is not None and getattr(mtg_cog, "xmage_starting", lambda: False)():
+                    await ctx.send("⏳ The XMage rules bridge is still loading its card "
+                                   "database. Try `!xmage` again in a minute or two.")
+                    return
                 if mtg_cog is not None:
                     engine = getattr(mtg_cog, "engine", None)
                     if engine is not None and getattr(engine, "_xmage_available", False):
