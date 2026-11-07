@@ -17,6 +17,8 @@ import time
 # Add the project root to the import path.
 sys.path.insert(0, os.path.dirname(__file__))
 
+from scryfall_utils import SCRYFALL_HEADERS
+
 
 async def main():
     # Collect all unique card names from all deck files
@@ -61,7 +63,7 @@ async def main():
 
     # Fetch missing cards from Scryfall with rate limiting
     import aiohttp
-    session = aiohttp.ClientSession()
+    session = aiohttp.ClientSession(headers=SCRYFALL_HEADERS)
     fetched = 0
     failed = []
 

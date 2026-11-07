@@ -17,6 +17,8 @@ from typing import Dict, List, Optional, Tuple
 
 import aiohttp
 
+from scryfall_utils import SCRYFALL_HEADERS
+
 from mtg.constants import MDFC_PATHWAYS
 
 
@@ -503,7 +505,7 @@ class DeckLoader:
         if DeckLoader._scryfall_lock is None:
             DeckLoader._scryfall_lock = asyncio.Lock()
         if DeckLoader._scryfall_session is None or DeckLoader._scryfall_session.closed:
-            DeckLoader._scryfall_session = aiohttp.ClientSession()
+            DeckLoader._scryfall_session = aiohttp.ClientSession(headers=SCRYFALL_HEADERS)
 
         max_retries = 7
         for attempt in range(max_retries):
@@ -629,7 +631,7 @@ class DeckLoader:
         if DeckLoader._scryfall_lock is None:
             DeckLoader._scryfall_lock = asyncio.Lock()
         if DeckLoader._scryfall_session is None or DeckLoader._scryfall_session.closed:
-            DeckLoader._scryfall_session = aiohttp.ClientSession()
+            DeckLoader._scryfall_session = aiohttp.ClientSession(headers=SCRYFALL_HEADERS)
 
         fetched = 0
         # Process in chunks of 75 (Scryfall collection limit)

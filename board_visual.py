@@ -14,6 +14,8 @@ from PIL import Image, ImageDraw, ImageFont
 from pathlib import Path
 import hashlib
 
+from scryfall_utils import SCRYFALL_HEADERS, get_image_url
+
 if TYPE_CHECKING:
     from mtg_game import GameState, Player, Card
 
@@ -95,7 +97,7 @@ class CardImageFetcher:
     
     async def _get_session(self) -> aiohttp.ClientSession:
         if self.session is None or self.session.closed:
-            self.session = aiohttp.ClientSession()
+            self.session = aiohttp.ClientSession(headers=SCRYFALL_HEADERS)
         return self.session
     
     def _cache_path(self, card_name: str) -> Path:
@@ -137,12 +139,8 @@ class CardImageFetcher:
                         return None
                     data = await resp.json()
 
-                # Get image URL (prefer large for hand view)
-                image_uris = data.get("image_uris", {})
-                if not image_uris and data.get("card_faces"):
-                    image_uris = data["card_faces"][0].get("image_uris", {})
-
-                image_url = image_uris.get("large") or image_uris.get("normal") or image_uris.get("small")
+                # Prefer the full-size scan for the hand view.
+                image_url = get_image_url(data, "display", "grid", "thumb")
                 if not image_url:
                     return None
 

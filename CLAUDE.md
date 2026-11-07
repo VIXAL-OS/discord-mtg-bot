@@ -239,3 +239,40 @@ Plan in `mtg/events.py`.
 - Help text and code comments are genericized (`@Player`, "the player").
 - `rules/tarot_visuals.py` and its test class are upstream-only.
 - Suite is 452 vs upstream 453 — the difference is that tarot test.
+
+
+## Nov 7, 2026 upstream sync — chat prompt cache + Scryfall headers
+
+**Scryfall.** Every Scryfall request now carries `SCRYFALL_HEADERS` (a
+User-Agent naming this app, which Scryfall's API policy asks for, plus an
+`Accept` header) from the new `scryfall_utils.py`, and image selection goes
+through `get_image_url()`: WebP at the requested size first, then JPEG and the
+legacy keys Scryfall retires after January 1, 2027, with the old size names
+still accepted and double-faced cards handled in one place. `scryfall_utils.py`
+is a **fork-divergent file by exactly one line**: its User-Agent names this
+app (`discord-mtg-bot/1.0`), not the upstream deployment's. Re-apply that line
+on any future sync; `tests/test_scryfall_images.py` compares against the
+constant, so it copies wholesale.
+
+**Chat prompt caching.** `_chat_reply` used to append the game state to the
+system prompt, so the system block changed on every move. The game state now
+rides at the tail of the newest user turn (`append_volatile_context`, which
+returns a copy and never edits the stored history), and the persona prompt
+carries an ephemeral `cache_control` breakpoint (`claude_system_param`). Cache
+tokens get their own counters and `!cost` line, kept out of
+`total_input_tokens` because `get_cost_summary` prices that at the full Sonnet
+rate.
+
+**Honest caveat:** measured with `count_tokens`, the chat prompt is **536
+tokens** with the plain persona and **782** with the Ressapanda example, against
+`claude-sonnet-5`'s **1,024-token** minimum cacheable prefix, and this call
+sends no tools to pad it. So on the shipped personas the breakpoint is inert:
+the API ignores it, with no error and no write premium. It starts paying if the
+persona prompt grows past the minimum or the chat model moves to one with a
+lower minimum (`claude-sonnet-5-5`'s is 512 at the same $2/$10 price). Caching
+the message history instead was considered and not done: the history is a
+rolling window, and once full it drops a message from the front every turn,
+which would make every turn a cold write at 1.25x.
+
+Guarded by `tests/test_nov7_chat_prompt_cache.py` (fork-own) and
+`tests/test_scryfall_images.py`.

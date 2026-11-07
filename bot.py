@@ -41,6 +41,8 @@ import discord
 from discord.ext import commands
 from dotenv import load_dotenv
 
+from scryfall_utils import SCRYFALL_HEADERS, get_image_url
+
 load_dotenv()
 
 
@@ -68,6 +70,11 @@ class BotConfig:
     # Cost tracking (Sonnet 4)
     sonnet_input_cost_per_million: float = 3.0
     sonnet_output_cost_per_million: float = 15.0
+    # Prompt-cache rates for the chat path (claude-sonnet-5: $2.00/MTok in, so
+    # reads 0.1x = $0.20 and 5-minute writes 1.25x = $2.50). Absolute rather
+    # than multiples of the two above, which are an older model's.
+    sonnet_cache_read_cost_per_million: float = 0.20
+    sonnet_cache_write_cost_per_million: float = 2.50
 
     # DeepSeek V4 pricing — used by the MTG actor/strategist split in autoplay.
     # REAL rates verified May 30 2026 against an account usage export (the old
@@ -112,7 +119,7 @@ class ScryfallClient:
 
     async def search_card(self, query: str) -> Optional[Dict]:
         """Search for a card by name (fuzzy match)."""
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(headers=SCRYFALL_HEADERS) as session:
             url = f"{self.BASE_URL}/cards/named"
             params = {"fuzzy": query}
             try:
@@ -133,7 +140,7 @@ class ScryfallClient:
 
     async def random_card(self, query: str = None) -> Optional[Dict]:
         """Get a random card, optionally filtered with a Scryfall query."""
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(headers=SCRYFALL_HEADERS) as session:
             url = f"{self.BASE_URL}/cards/random"
             params = {"q": query} if query else {}
             try:
@@ -172,13 +179,10 @@ class ScryfallClient:
         text = "\n".join(lines)
 
         embed = None
-        image_uris = card.get("image_uris", {})
-        if not image_uris and "card_faces" in card:
-            image_uris = card["card_faces"][0].get("image_uris", {})
-
-        if image_uris:
+        image_url = get_image_url(card, "grid", "display", "thumb")
+        if image_url:
             embed = discord.Embed(title=name, description=f"{mana}\n{type_line}")
-            embed.set_image(url=image_uris.get("normal") or image_uris.get("large") or image_uris.get("small"))
+            embed.set_image(url=image_url)
             if card.get("scryfall_uri"):
                 embed.url = card["scryfall_uri"]
             colors = card.get("colors", [])
@@ -246,6 +250,11 @@ class MTGBot(commands.Bot):
         self.mtg_game_input_tokens: int = 0
         self.mtg_game_output_tokens: int = 0
         self.mtg_game_calls: int = 0
+        # Prompt-cache buckets for the chat path. usage.input_tokens counts
+        # only the UNCACHED part of a request, so cached tokens need their own
+        # counters or !cost would silently drop them.
+        self.chat_cache_read_tokens: int = 0
+        self.chat_cache_write_tokens: int = 0
         self.deepseek_input_tokens: int = 0
         self.deepseek_output_tokens: int = 0
         self.deepseek_calls: int = 0
@@ -437,6 +446,7 @@ class MTGBot(commands.Bot):
         os.makedirs("data", exist_ok=True)
         tracked_fields = [
             "total_input_tokens", "total_output_tokens", "api_calls",
+            "chat_cache_read_tokens", "chat_cache_write_tokens",
             "mtg_game_input_tokens", "mtg_game_output_tokens", "mtg_game_calls",
             "deepseek_input_tokens", "deepseek_output_tokens", "deepseek_calls",
             "deepseek_pro_input_tokens", "deepseek_pro_output_tokens", "deepseek_pro_calls",
@@ -467,6 +477,73 @@ class MTGBot(commands.Bot):
             self.mtg_game_output_tokens += output_tokens
             self.mtg_game_calls += 1
         self._save_persistent_costs()
+
+    def _record_cache_usage(self, usage) -> None:
+        """Bucket the chat path's prompt-cache tokens.
+
+        Kept OUT of total_input_tokens on purpose: get_cost_summary prices
+        `total - mtg_game` input at the full Sonnet rate, and a cache read
+        costs a tenth of that.
+        """
+        if usage is None:
+            return
+        read = getattr(usage, "cache_read_input_tokens", 0) or 0
+        write = getattr(usage, "cache_creation_input_tokens", 0) or 0
+        if not (read or write):
+            return
+        self.chat_cache_read_tokens += read
+        self.chat_cache_write_tokens += write
+        self._save_persistent_costs()
+
+    @staticmethod
+    def append_volatile_context(messages: List[Dict], volatile_context: str) -> Tuple[List[Dict], bool]:
+        """Return a per-request copy of `messages` with the volatile tail on it.
+
+        Appended to the newest USER turn, so it sits at the very end of the
+        prompt and churns there for free. NEVER mutates its argument: the
+        caller passes the stored conversation, and editing it in place would
+        bake one turn's game state into the history forever.
+
+        Returns (messages_for_this_request, landed); landed is False, with the
+        list unchanged, when the newest turn is not a user message.
+        """
+        if not messages or not volatile_context:
+            return messages, False
+        last = messages[-1]
+        if last.get("role") != "user":
+            return messages, False
+        content = last.get("content", "")
+        block = (
+            "\n\n---\n[Current context \u2014 regenerated every turn, not part of "
+            f"the conversation:]\n{volatile_context}\n---\n"
+        )
+        if isinstance(content, str):
+            new_last = dict(last, content=content + block)
+        elif isinstance(content, list):
+            new_last = dict(last, content=list(content) + [{"type": "text", "text": block}])
+        else:
+            return messages, False
+        return messages[:-1] + [new_last], True
+
+    @staticmethod
+    def claude_system_param(stable_system: str, cache: bool = True):
+        """Render `system=` with an ephemeral cache breakpoint.
+
+        Claude caches only what carries cache_control. A prefix under the
+        model's minimum cacheable length silently ignores the marker -- no
+        error, no write premium, just no cache. Measured Nov 7, 2026: the chat
+        prompt here is 536 tokens with the plain persona and 782 with the
+        Ressapanda example, against claude-sonnet-5's 1,024 minimum, so on the
+        shipped personas this marker is inert until the prompt grows or the
+        chat model moves to one with a lower minimum.
+        """
+        if not cache:
+            return stable_system
+        return [{
+            "type": "text",
+            "text": stable_system,
+            "cache_control": {"type": "ephemeral"},
+        }]
 
     def track_mtg_usage(self, usage, model: str) -> None:
         """Usage callback for ClaudePlayer and RulesEngine provider calls."""
@@ -528,9 +605,14 @@ class MTGBot(commands.Bot):
         """Return a human-readable lifetime cost summary."""
         chat_in = self.total_input_tokens - self.mtg_game_input_tokens
         chat_out = self.total_output_tokens - self.mtg_game_output_tokens
+        chat_cache_cost = (
+            self.chat_cache_read_tokens * CONFIG.sonnet_cache_read_cost_per_million / 1_000_000
+            + self.chat_cache_write_tokens * CONFIG.sonnet_cache_write_cost_per_million / 1_000_000
+        )
         chat_cost = (
             chat_in * CONFIG.sonnet_input_cost_per_million / 1_000_000
             + chat_out * CONFIG.sonnet_output_cost_per_million / 1_000_000
+            + chat_cache_cost
         )
         ds_legacy_cost = (
             self.deepseek_input_tokens * CONFIG.deepseek_input_cost_per_million / 1_000_000
@@ -576,6 +658,8 @@ class MTGBot(commands.Bot):
             f"Total API calls: {self.api_calls:,}",
             "",
             f"Chat (Sonnet): {chat_in:,} in / {chat_out:,} out -> ${chat_cost:.4f}",
+            f"  prompt cache: {self.chat_cache_read_tokens:,} read / "
+            f"{self.chat_cache_write_tokens:,} written -> ${chat_cache_cost:.4f}",
             f"MTG games (Sonnet portion): {mtg_sonnet_in:,} in / "
             f"{mtg_sonnet_out:,} out -> ${mtg_sonnet_cost:.4f}",
             f"DeepSeek V4.1 Flash: {self.deepseek_v41_input_tokens:,} in "
@@ -662,11 +746,19 @@ class MTGBot(commands.Bot):
         if len(history) > CONFIG.max_messages_per_thread * 2:
             history[:] = history[-CONFIG.max_messages_per_thread * 2:]
 
+        # CACHE DISCIPLINE: the persona prompt is the stable, cacheable
+        # prefix. The game state changes every turn, so it rides at the TAIL,
+        # on a per-request copy of the history, rather than being appended to
+        # the system prompt where it would change the prefix on every move.
         system_prompt = self.build_base_prompt()
-        # If a game is active in this thread, append a brief game-context line
         game_context = self.get_game_context_for_channel(channel_id=thread_id)
-        if game_context:
-            system_prompt += "\n\n--- Current MTG Game ---\n" + game_context
+        volatile = ("--- Current MTG Game ---\n" + game_context) if game_context else ""
+        request_messages, landed = self.append_volatile_context(history, volatile)
+        if volatile and not landed:
+            # No user turn to attach it to: old placement, and no breakpoint
+            # on a prefix that would change every turn.
+            system_prompt += "\n\n" + volatile
+        cache_prefix = landed or not volatile
 
         async with message.channel.typing():
             try:
@@ -674,12 +766,13 @@ class MTGBot(commands.Bot):
                     self.claude.messages.create,
                     model=CONFIG.model_default,
                     max_tokens=CONFIG.max_tokens,
-                    system=system_prompt,
-                    messages=history,
+                    system=self.claude_system_param(system_prompt, cache=cache_prefix),
+                    messages=request_messages,
                 )
                 if hasattr(response, "usage"):
                     self._track_usage(response.usage.input_tokens,
                                       response.usage.output_tokens, bucket="chat")
+                    self._record_cache_usage(response.usage)
                 reply_text = "".join(
                     block.text for block in response.content if hasattr(block, "text")
                 ).strip()
@@ -854,7 +947,7 @@ class MTGCog(commands.Cog, name="MTG"):
         async with ctx.typing():
             card = await self.bot.scryfall.search_card(card_name)
             if card and "rulings_uri" in card:
-                async with aiohttp.ClientSession() as session:
+                async with aiohttp.ClientSession(headers=SCRYFALL_HEADERS) as session:
                     async with session.get(card["rulings_uri"]) as resp:
                         if resp.status == 200:
                             data = await resp.json()

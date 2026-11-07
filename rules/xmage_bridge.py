@@ -30,6 +30,8 @@ from typing import Optional, Dict, List, Any, Union
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 
+from scryfall_utils import SCRYFALL_HEADERS
+
 
 @dataclass
 class Permanent:
@@ -470,7 +472,7 @@ class StandaloneRulesEngine:
         
         import aiohttp
         
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(headers=SCRYFALL_HEADERS) as session:
             url = f"https://api.scryfall.com/cards/named?fuzzy={card_name}"
             async with session.get(url) as resp:
                 if resp.status != 200:
